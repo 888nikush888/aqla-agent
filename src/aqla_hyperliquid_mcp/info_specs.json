@@ -1,0 +1,598 @@
+{
+  "allMids": {
+    "fields": {
+      "dex": {
+        "type": "String",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Retrieve mids for all coins"
+  },
+  "openOrders": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      },
+      "dex": {
+        "type": "String",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Retrieve a user's open orders"
+  },
+  "frontendOpenOrders": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      },
+      "dex": {
+        "type": "String",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Retrieve a user's open orders with additional frontend info"
+  },
+  "userFills": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      },
+      "aggregateByTime": {
+        "type": "bool",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Retrieve a user's fills"
+  },
+  "userFillsByTime": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      },
+      "startTime": {
+        "type": "int",
+        "optional": false
+      },
+      "endTime": {
+        "type": "int",
+        "optional": true
+      },
+      "aggregateByTime": {
+        "type": "bool",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Retrieve a user's fills by time"
+  },
+  "userRateLimit": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query user rate limits"
+  },
+  "orderStatus": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      },
+      "oid": {
+        "type": "uint64 or string",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query order status by oid or cloid"
+  },
+  "l2Book": {
+    "fields": {
+      "coin": {
+        "type": "String",
+        "optional": false
+      },
+      "nSigFigs": {
+        "type": "Number",
+        "optional": true
+      },
+      "mantissa": {
+        "type": "Number",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "L2 book snapshot"
+  },
+  "candleSnapshot": {
+    "fields": {
+      "req": {
+        "type": "Object",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Candle snapshot"
+  },
+  "maxBuilderFee": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      },
+      "builder": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Check builder fee approval"
+  },
+  "historicalOrders": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Retrieve a user's historical orders"
+  },
+  "userTwapSliceFills": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Retrieve a user's TWAP slice fills"
+  },
+  "subAccounts": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Retrieve a user's subaccounts"
+  },
+  "vaultDetails": {
+    "fields": {
+      "vaultAddress": {
+        "type": "String",
+        "optional": false
+      },
+      "user": {
+        "type": "String",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Retrieve details for a vault"
+  },
+  "userVaultEquities": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Retrieve a user's vault deposits"
+  },
+  "userRole": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query a user's role"
+  },
+  "portfolio": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query a user's portfolio"
+  },
+  "referral": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query a user's referral information"
+  },
+  "userFees": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query a user's fees"
+  },
+  "delegations": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query a user's staking delegations"
+  },
+  "delegatorSummary": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query a user's staking summary"
+  },
+  "delegatorHistory": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query a user's staking history"
+  },
+  "delegatorRewards": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query a user's staking rewards"
+  },
+  "userDexAbstraction": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query a user's HIP-3 DEX abstraction state"
+  },
+  "userAbstraction": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query a user's abstraction state"
+  },
+  "borrowLendUserState": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query borrow/lend user state"
+  },
+  "borrowLendReserveState": {
+    "fields": {
+      "token": {
+        "type": "Number",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query borrow/lend reserve state"
+  },
+  "allBorrowLendReserveStates": {
+    "fields": {},
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query all borrow/lend reserve states"
+  },
+  "approvedBuilders": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint",
+    "title": "Query approved builders for user"
+  },
+  "perpDexs": {
+    "fields": {},
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve all perpetual dexs"
+  },
+  "meta": {
+    "fields": {
+      "dex": {
+        "type": "String",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve perpetuals metadata (universe and margin tables)"
+  },
+  "metaAndAssetCtxs": {
+    "fields": {
+      "dex": {
+        "type": "String",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve perpetuals asset contexts (includes mark price, current funding, open interest, etc.)"
+  },
+  "clearinghouseState": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      },
+      "dex": {
+        "type": "String",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve user's perpetuals account summary"
+  },
+  "userFunding": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      },
+      "startTime": {
+        "type": "int",
+        "optional": false
+      },
+      "endTime": {
+        "type": "int",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve a user's funding history or non-funding ledger updates"
+  },
+  "userNonFundingLedgerUpdates": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      },
+      "startTime": {
+        "type": "int",
+        "optional": false
+      },
+      "endTime": {
+        "type": "int",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve a user's funding history or non-funding ledger updates"
+  },
+  "fundingHistory": {
+    "fields": {
+      "coin": {
+        "type": "String",
+        "optional": false
+      },
+      "startTime": {
+        "type": "int",
+        "optional": false
+      },
+      "endTime": {
+        "type": "int",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve historical funding rates"
+  },
+  "predictedFundings": {
+    "fields": {},
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve predicted funding rates for different venues"
+  },
+  "perpsAtOpenInterestCap": {
+    "fields": {
+      "dex": {
+        "type": "String",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Query perps at open interest caps"
+  },
+  "perpDeployAuctionStatus": {
+    "fields": {},
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve information about the Perp Deploy Auction"
+  },
+  "activeAssetData": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      },
+      "coin": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve User's Active Asset Data"
+  },
+  "perpDexLimits": {
+    "fields": {
+      "dex": {
+        "type": "String",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve Builder-Deployed Perp Market Limits"
+  },
+  "perpDexStatus": {
+    "fields": {
+      "dex": {
+        "type": "String",
+        "optional": true
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Get Perp Market Status"
+  },
+  "allPerpMetas": {
+    "fields": {},
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve all perpetuals metadata (universe and margin tables)"
+  },
+  "perpAnnotation": {
+    "fields": {
+      "coin": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve perp annotation"
+  },
+  "perpCategories": {
+    "fields": {},
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve perp categories"
+  },
+  "perpConciseAnnotations": {
+    "fields": {},
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals",
+    "title": "Retrieve concise perp annotations"
+  },
+  "spotMeta": {
+    "fields": {},
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot",
+    "title": "Retrieve spot metadata"
+  },
+  "spotMetaAndAssetCtxs": {
+    "fields": {},
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot",
+    "title": "Retrieve spot asset contexts"
+  },
+  "spotClearinghouseState": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot",
+    "title": "Retrieve a user's token balances"
+  },
+  "spotDeployState": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot",
+    "title": "Retrieve information about the Spot Deploy Auction"
+  },
+  "spotPairDeployAuctionStatus": {
+    "fields": {},
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot",
+    "title": "Retrieve information about the Spot Pair Deploy Auction"
+  },
+  "tokenDetails": {
+    "fields": {
+      "tokenId": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot",
+    "title": "Retrieve information about a token"
+  },
+  "outcomeMeta": {
+    "fields": {},
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot",
+    "title": "Retrieve outcome metadata"
+  },
+  "settledOutcome": {
+    "fields": {
+      "outcome": {
+        "type": "int",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot",
+    "title": "Retrieve information about a settled outcome"
+  },
+  "outcomeDeployerLimits": {
+    "fields": {
+      "venue": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot",
+    "title": "Retrieve outcome deployer limits"
+  },
+  "outcomeTemplates": {
+    "fields": {},
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-4-deployer-actions",
+    "title": "Outcome templates"
+  },
+  "userToMultiSigSigners": {
+    "fields": {"user": {"type": "String", "optional": false}},
+    "source": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/2fdb18f9517675ea03695a0962bd19eece9c83f0/hyperliquid/info.py",
+    "title": "Retrieve authorized multisig users and threshold"
+  },
+  "extraAgents": {
+    "fields": {"user": {"type": "String", "optional": false}},
+    "source": "https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/2fdb18f9517675ea03695a0962bd19eece9c83f0/hyperliquid/info.py",
+    "title": "Retrieve approved additional API wallets"
+  },
+  "userStarState": {
+    "fields": {
+      "user": {
+        "type": "String",
+        "optional": false
+      }
+    },
+    "source": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions",
+    "title": "User star state"
+  }
+}

@@ -1,0 +1,150 @@
+name: Quality
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_NO_PROGRESS: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+      - run: uv sync --frozen --all-extras --python ${{ matrix.python }}
+      - run: uv run --no-sync ruff check src tests hermes_plugin scripts
+      - run: uv run --no-sync aqla-hyperliquid-mcp --check-coverage
+      - name: Tests, including the local WebSocket server
+        run: uv run --no-sync pytest -q --junitxml=reports/tests.xml --cov=aqla_agent --cov=aqla_hyperliquid_mcp --cov-branch --cov-fail-under=70 --cov-report=term-missing:skip-covered --cov-report=xml:reports/coverage.xml
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: test-reports-python-${{ matrix.python }}
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  security:
+    name: Dependencies and secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+      - run: python scripts/check_repository.py
+      - name: Scan complete Git history for secrets
+        run: |
+          python scripts/install_gitleaks.py
+          .cache/tools/gitleaks git . --redact=100 --no-banner
+      - name: Audit locked runtime and Telegram dependencies
+        run: |
+          uv export --quiet --frozen --no-emit-project --no-dev --extra sources --format requirements-txt --output-file .cache/runtime-requirements.txt
+          uvx --from pip-audit==2.10.1 pip-audit -r .cache/runtime-requirements.txt --disable-pip --require-hashes --strict --progress-spinner off
+
+  native-hermes:
+    name: Native Hermes integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+      - run: uv sync --frozen --all-extras --python 3.12
+      - name: Install the pinned, separate Hermes runtime
+        run: |
+          git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git .cache/hermes-source
+          AQLA_HERMES_COMMIT=$(.venv/bin/python -c 'from aqla_agent.install import HERMES_COMMIT; print(HERMES_COMMIT)')
+          git -C .cache/hermes-source checkout --detach "$AQLA_HERMES_COMMIT"
+          uv venv .cache/hermes-venv --python 3.14
+          uv pip install --python .cache/hermes-venv/bin/python -e '.cache/hermes-source[messaging,mcp]' Telethon==1.45.0 PyYAML==6.0.3
+      - name: Native sessions, database exclusion and Telegram commands
+        run: .cache/hermes-venv/bin/python tests/native_hermes_smoke.py --hermes-source .cache/hermes-source --home .cache/native-home
+      - name: Untrusted source, native agent hooks and stdio MCP
+        run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/source-pipeline --mcp-python .venv/bin/python --mode source
+      - name: Owner rules and bounded master-skill edits
+        run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/owner-pipeline --mcp-python .venv/bin/python --mode owner
+
+  package:
+    name: Build and verify VPS package
+    needs: [tests, security, native-hermes]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.17"
+          enable-cache: true
+      - run: uv sync --frozen --all-extras --python 3.12
+      - run: uv build
+      - run: uv run --no-sync aqla-build-vps --output dist/aqla-agent-vps.zip
+      - run: uv run --no-sync python scripts/verify_artifacts.py
+      - name: Verify the built wheel in a fresh environment
+        run: |
+          uv venv .cache/wheel-check --python 3.12
+          uv pip install --python .cache/wheel-check/bin/python dist/*.whl
+          .cache/wheel-check/bin/python -m aqla_hyperliquid_mcp --check-coverage
+          .cache/wheel-check/bin/aqla-install-hermes --destination .cache/wheel-deploy --owner-id 12345 --model ci-only --model-url https://example.invalid/v1 --prepare-only
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aqla-agent-vps
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  quality-gate:
+    name: Quality gate
+    needs: [tests, security, native-hermes, package]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every quality job to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ',') }}
+        run: test "$RESULTS" = "success,success,success,success"

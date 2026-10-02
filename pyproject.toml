@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aqla-agent"
+version = "0.1.0"
+description = "Minimal Hermes signal trading and a complete Python Hyperliquid MCP"
+requires-python = ">=3.12"
+dependencies = [
+  "mcp==2.2.0",
+  "hyperliquid-python-sdk==0.24.0",
+  "pydantic>=2.13,<3",
+  "httpx>=0.28,<1",
+  "portalocker>=3,<5",
+  "PyYAML>=6,<7",
+  "websockets>=15,<18",
+]
+
+[project.optional-dependencies]
+sources = ["Telethon>=1.42,<2"]
+dev = [
+    "pytest>=8.3,<10",
+    "pytest-asyncio>=1,<2",
+    "pytest-cov>=7,<8",
+    "ruff>=0.13,<1",
+]
+
+[project.scripts]
+aqla-hyperliquid-mcp = "aqla_hyperliquid_mcp.__main__:main"
+aqla-telegram-login = "aqla_agent.telegram:login_main"
+aqla-install-hermes = "aqla_agent.install:main"
+aqla-build-vps = "aqla_agent.release:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aqla_agent", "src/aqla_hyperliquid_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src", "/hermes_plugin", "/skills", "/tests", "/docs", "/scripts",
+  "/.github", "/plans", "/README.md", "/IMPLEMENTATION_STATUS.md",
+  "/pyproject.toml", "/uv.lock", "/config.example.yaml", "/.gitignore", "/.gitattributes",
+]
+exclude = ["**/__pycache__/**", "**/*.pyc"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["llm_eval: explicit real model evaluation (requires configured Hermes/model)"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]

@@ -1,0 +1,13 @@
+# aqla runs beside a separate Hermes installation on your VPS.
+network: testnet
+account: "0x0000000000000000000000000000000000000000"
+signer_role: api_wallet
+state_path: data/state.json
+private_key_file: secrets/hyperliquid.secret
+integration_key_file: secrets/integration.secret
+sources: []
+# Rules are set by you through Hermes; none are silently selected for you.
+policy: null
+telegram_session_file: secrets/telegram-session.secret
+telegram_api_id: null
+telegram_api_hash_file: secrets/telegram-api-hash.secret
