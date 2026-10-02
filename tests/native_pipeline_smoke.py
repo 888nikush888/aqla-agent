@@ -40,7 +40,9 @@ def main():
     (destination / "config.yaml").write_text(yaml.safe_dump(own_config))
     config_path = destination / "hermes-home" / "config.yaml"
     config = yaml.safe_load(config_path.read_text())
-    config["mcp_servers"]["aqla"]["command"] = str(Path(args.mcp_python).resolve())
+    # Linux venv executables are symlinks. Keep that path so Python loads the
+    # venv packages instead of resolving to the bare system interpreter.
+    config["mcp_servers"]["aqla"]["command"] = str(Path(args.mcp_python).expanduser().absolute())
     config["model"]["api_key"] = "local-test-only"
     config["display"]["tool_progress"] = "off"
     config["agent"]["stream"] = False

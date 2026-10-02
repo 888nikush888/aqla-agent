@@ -11,6 +11,7 @@ Stand: 03.10.2026. Geprüft wurden Ausführung und Wiederanlauf, Quellenaufnahme
 | Historischer Cutoff fehlte bei Live-Edits und beim erneuten Abruf bekannter Nachrichten | Eine historische Kontextrevision konnte als neuer Entry erscheinen | Einheitliche Cutoff-Klassifikation für Backfill, Rereads und Live-Ereignisse. `test_historical_edits_stay_context_in_reread_and_live_paths` |
 | Native Prüfkommandos vermischten Quell- und Deploymentverzeichnisse | Die dokumentierten Befehle waren nach Installation nicht ausführbar | README nutzt explizite `AQLA_SOURCE`- und `AQLA_DEPLOY`-Pfade |
 | Source-Distribution konnte trotz ignoriertem QA-Verzeichnis eine dortige `.env.example` aufnehmen | Lokale Referenz-/Testdateien gelangten unbeabsichtigt ins Quellpaket | Explizite sdist-Dateiliste und Prüfung jedes Archivmitglieds über `scripts/verify_artifacts.py` |
+| Native MCP-Prüfung löste den Linux-venv-Interpreter als Symlink auf | Der Systeminterpreter fand die getrennt installierten Aqla-Abhängigkeiten nicht | Absoluter Interpreterpfad ohne Symlinkauflösung; durch den tatsächlichen Linux-CI-Lauf aufgedeckt |
 
 ## Dauerhafte CI-Prüfungen
 
