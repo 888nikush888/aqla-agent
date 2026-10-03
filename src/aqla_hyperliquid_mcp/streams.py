@@ -58,6 +58,8 @@ class Streams:
         self.socket = None
         self.ready = asyncio.Event()
         self.sends = asyncio.Lock()
+        self.subscription_sync = asyncio.Lock()
+        self.active_subscriptions = {}
         self.pending_posts = {}
         self.posts = 0
         self.events = deque(maxlen=max_events)
@@ -69,9 +71,9 @@ class Streams:
         if self.task is None:
             self.task = asyncio.create_task(self._run(), name="aqla-hyperliquid-streams")
 
-    async def _send(self, payload):
+    async def _send(self, payload, *, socket=None):
         async with self.sends:
-            if self.socket is None:
+            if self.socket is None or socket is not None and socket is not self.socket:
                 raise AqlaError("WebSocket is disconnected")
             await self.socket.send(json.dumps(payload, separators=(",", ":")))
 
@@ -81,8 +83,8 @@ class Streams:
             try:
                 async with self.connector(self.url, ping_interval=20, ping_timeout=20, max_size=2**20) as socket:
                     self.socket = socket
-                    for subscription in list(self.subscriptions.values()):
-                        await self._send({"method": "subscribe", "subscription": subscription})
+                    self.active_subscriptions = {}
+                    await self._sync_subscriptions()
                     self.ready.set()
                     retry = 1
                     async for raw in socket:
@@ -94,6 +96,7 @@ class Streams:
             finally:
                 self.ready.clear()
                 self.socket = None
+                self.active_subscriptions = {}
                 if not self.closed:
                     self._event({"channel": "connection", "data": {"connected": False, "rest_reconciliation_required": True}})
                 for future in self.pending_posts.values():
@@ -103,6 +106,27 @@ class Streams:
             if not self.closed:
                 await asyncio.sleep(retry)
                 retry = min(retry * 2, 30)
+
+    async def _sync_subscriptions(self):
+        # Desired changes remain immediate while a transport send is suspended.
+        # Recompute after every awaited send before marking a connection ready.
+        async with self.subscription_sync:
+            socket = self.socket
+            while socket is not None and socket is self.socket:
+                removed = next((key for key in self.active_subscriptions if key not in self.subscriptions), None)
+                added = next((key for key in self.subscriptions if key not in self.active_subscriptions), None)
+                if removed is not None:
+                    subscription = self.active_subscriptions[removed]
+                    await self._send({"method": "unsubscribe", "subscription": subscription}, socket=socket)
+                    if socket is self.socket:
+                        self.active_subscriptions.pop(removed, None)
+                elif added is not None:
+                    subscription = self.subscriptions[added]
+                    await self._send({"method": "subscribe", "subscription": subscription}, socket=socket)
+                    if socket is self.socket:
+                        self.active_subscriptions[added] = subscription
+                else:
+                    return
 
     @staticmethod
     def decode_fast(value):
@@ -138,17 +162,16 @@ class Streams:
         if subscription.get("mantissa") is not None and subscription.get("nSigFigs") != 5:
             raise AqlaError("Book mantissa requires five significant figures")
         identity = digest(subscription)
-        existed = identity in self.subscriptions
         self.subscriptions[identity] = subscription
         self.start()
-        if self.ready.is_set() and not existed:
-            await self._send({"method": "subscribe", "subscription": subscription})
+        if self.ready.is_set():
+            await self._sync_subscriptions()
         return {"subscription_id": identity, "state": "requested", "confirmation_in_events": True}
 
     async def unsubscribe(self, subscription_id):
-        subscription = self.subscriptions.pop(subscription_id, None)
-        if subscription and self.ready.is_set():
-            await self._send({"method": "unsubscribe", "subscription": subscription})
+        self.subscriptions.pop(subscription_id, None)
+        if self.ready.is_set():
+            await self._sync_subscriptions()
         return {"subscription_id": subscription_id, "desired": False}
 
     def read(self, after=0, limit=100):

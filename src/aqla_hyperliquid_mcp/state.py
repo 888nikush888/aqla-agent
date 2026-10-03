@@ -80,6 +80,19 @@ class State:
         if (request.get("network") != settings.network
                 or not request.get("leader") and request.get("account", "").lower() != self.data["trading_account"]):
             raise AqlaError("Saved operation belongs to another trading target or network")
+        if request.get("operation"):
+            # Import locally: the API uses State, but replay validation needs the
+            # same explicit SDK contract map without a second mutable registry.
+            from .api import sdk_signing_scope
+            scope = sdk_signing_scope(request["operation"])
+            if "signing_scope" not in request:
+                if scope == "principal" and settings.vault_address:
+                    raise AqlaError("Legacy principal SDK operation has ambiguous vault signing scope")
+                return
+            expected_vault = settings.vault_address if scope == "trading" else None
+            if (request["signing_scope"] != scope or request.get("principal") != settings.account.lower()
+                    or "wire_vault_address" not in record or record["wire_vault_address"] != expected_vault):
+                raise AqlaError("Saved SDK operation has mismatched principal or signing scope")
 
     def _write(self, data):
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")

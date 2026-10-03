@@ -6,6 +6,7 @@ import zlib
 
 import pytest
 
+from aqla_hyperliquid_mcp.models import AqlaError
 from aqla_hyperliquid_mcp.streams import SUBSCRIPTION_ADAPTER, SUBSCRIPTION_MODELS, Streams
 
 
@@ -41,6 +42,81 @@ async def test_post_response_is_correlated_not_mistaken_for_a_feed_event():
     stream.receive({"channel": "post", "data": {"id": 42, "response": {"type": "action", "payload": {"status": "ok"}}}})
     assert await future == {"status": "ok"}
     assert stream.read()["events"] == []
+
+
+class PausedSocket:
+    def __init__(self):
+        self.payloads = []
+        self.entered, self.release, self.done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def send(self, payload):
+        self.payloads.append(json.loads(payload))
+        if len(self.payloads) == 1:
+            self.entered.set()
+            await self.release.wait()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await self.done.wait()
+        raise StopAsyncIteration
+
+
+class PausedConnection:
+    def __init__(self, socket):
+        self.socket = socket
+
+    async def __aenter__(self):
+        return self.socket
+
+    async def __aexit__(self, *_):
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remove_btc", [False, True])
+async def test_desired_changes_during_connect_are_sent_before_ready_without_duplicates(remove_btc):
+    socket = PausedSocket()
+    stream = Streams("https://unused.invalid", connector=lambda *_args, **_kwargs: PausedConnection(socket))
+    try:
+        btc = await stream.subscribe({"type": "trades", "coin": "BTC"})
+        await asyncio.wait_for(socket.entered.wait(), 1)
+        eth = await stream.subscribe({"type": "trades", "coin": "ETH"})
+        assert await stream.subscribe({"type": "trades", "coin": "ETH"}) == eth
+        if remove_btc:
+            await stream.unsubscribe(btc["subscription_id"])
+        assert not stream.ready.is_set()
+        socket.release.set()
+        await asyncio.wait_for(stream.ready.wait(), 1)
+        sent = [(row["method"], row["subscription"]["coin"]) for row in socket.payloads]
+        assert sent == ([('subscribe', 'BTC'), ('unsubscribe', 'BTC'), ('subscribe', 'ETH')] if remove_btc else
+                        [('subscribe', 'BTC'), ('subscribe', 'ETH')])
+        assert set(stream.active_subscriptions) == set(stream.subscriptions)
+        await stream.subscribe({"type": "trades", "coin": "ETH"})
+        assert len(socket.payloads) == len(sent)
+        await stream.unsubscribe(eth["subscription_id"])
+        assert socket.payloads[-1] == {"method": "unsubscribe", "subscription": {"type": "trades", "coin": "ETH"}}
+    finally:
+        await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_subscription_sync_waiting_for_send_does_not_cross_into_replacement_socket():
+    old, replacement = PausedSocket(), PausedSocket()
+    stream = Streams("https://unused.invalid")
+    stream.socket = old
+    stream.subscriptions["btc"] = {"type": "trades", "coin": "BTC"}
+    await stream.sends.acquire()
+    sync = asyncio.create_task(stream._sync_subscriptions())
+    await asyncio.sleep(0)
+    stream.socket = replacement
+    stream.sends.release()
+    with pytest.raises(AqlaError, match="disconnected"):
+        await sync
+    assert old.payloads == replacement.payloads == []
+    assert stream.active_subscriptions == {}
+    assert "btc" in stream.subscriptions
 
 
 @pytest.mark.skipif(os.name == "nt" and os.getenv("AQLA_LOCAL_NETWORK_TESTS") != "1", reason="Local socket permission must be explicitly enabled on the Windows sandbox")

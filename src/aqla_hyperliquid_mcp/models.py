@@ -190,6 +190,7 @@ class Market(Model):
     min_notional: Positive = Decimal("10")
     base_token: str | None = None
     quote_token: str = "USDC"
+    collateral_token: int | None = Field(default=None, ge=0)
 
 
 class AccountSnapshot(Model):

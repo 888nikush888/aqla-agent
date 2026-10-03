@@ -14,6 +14,35 @@ from hyperliquid.utils import signing
 from .models import TERMINAL_ORDER, AccountSnapshot, AqlaError, Market, Settings, digest, now_ms
 from .state import State
 
+SDK_PRINCIPAL_L1 = frozenset({
+    "set_referrer", "create_sub_account", "sub_account_transfer", "sub_account_spot_transfer", "vault_usd_transfer",
+    "spot_deploy_register_token", "spot_deploy_user_genesis", "spot_deploy_enable_freeze_privilege",
+    "spot_deploy_freeze_user", "spot_deploy_revoke_freeze_privilege", "spot_deploy_enable_quote_token",
+    "spot_deploy_genesis", "spot_deploy_register_spot", "spot_deploy_register_hyperliquidity",
+    "spot_deploy_set_deployer_trading_fee_share", "perp_deploy_register_asset", "perp_deploy_set_oracle",
+    "c_signer_unjail_self", "c_signer_jail_self", "c_validator_register", "c_validator_change_profile",
+    "c_validator_unregister", "use_big_blocks",
+})
+SDK_USER_SIGNED = frozenset({
+    "usd_class_transfer", "send_asset", "usd_transfer", "spot_transfer", "token_delegate", "withdraw_from_bridge",
+    "approve_builder_fee", "convert_to_multi_sig_user", "user_dex_abstraction", "user_set_abstraction",
+})
+SDK_TRADING_L1 = frozenset({
+    "order", "bulk_orders", "modify_order", "bulk_modify_orders_new", "market_open", "market_close",
+    "cancel", "cancel_by_cloid", "bulk_cancel", "bulk_cancel_by_cloid", "schedule_cancel", "update_leverage",
+    "update_isolated_margin", "agent_enable_dex_abstraction", "agent_set_abstraction", "noop", "gossip_priority_bid",
+})
+
+
+def sdk_signing_scope(operation):
+    if operation in SDK_PRINCIPAL_L1:
+        return "principal"
+    if operation in SDK_USER_SIGNED:
+        return "user"
+    if operation in SDK_TRADING_L1:
+        return "trading"
+    raise AqlaError("No explicit signing scope for this SDK operation")
+
 
 def wire_number(value) -> str:
     number = Decimal(str(value))
@@ -49,6 +78,17 @@ class Hyperliquid:
         result = {}
         if product == "perp":
             meta = await self.info("meta", **({"dex": dex} if dex else {}))
+            # The native perp DEX has protocol USDC collateral. A HIP-3 DEX
+            # must identify its collateral; a legacy/missing field proves none.
+            collateral = meta.get("collateralToken", 0 if not dex else None)
+            if type(collateral) is not int or collateral < 0:
+                collateral = None
+            quote = "USDC" if collateral == 0 else "UNKNOWN"
+            if collateral is not None and collateral != 0:
+                spot = await self.info("spotMeta")
+                token = next((item for item in spot["tokens"] if item["index"] == collateral), None)
+                if token:
+                    quote = token["name"]
             offset = 0
             if dex:
                 dexes = await self.info("perpDexs")
@@ -62,7 +102,7 @@ class Hyperliquid:
                 name = row["name"]
                 result[name] = Market(symbol=name, asset_id=offset + index, product="perp",
                                       size_decimals=row["szDecimals"], max_leverage=row["maxLeverage"],
-                                      mid=mids[name], dex=dex)
+                                      mid=mids[name], dex=dex, collateral_token=collateral, quote_token=quote)
         else:
             meta = await self.info("spotMeta")
             tokens = {item["index"]: item for item in meta["tokens"]}
@@ -96,7 +136,7 @@ class Hyperliquid:
         if len(unique) != 1:
             raise AqlaError("Source market cannot be resolved uniquely; no substitute market is used")
         market = next(iter(unique.values()))
-        if market.quote_token != "USDC":
+        if market.quote_token != "USDC" or market.product == "perp" and market.collateral_token != 0:
             raise AqlaError("Automatic risk sizing currently requires USDC quote currency")
         return market
 
@@ -188,7 +228,11 @@ class Hyperliquid:
             previous = self.state.snapshot()["operations"].get(operation_id)
             if previous:
                 self.state.assert_operation_binding(self.settings, previous)
-                if previous["request_hash"] != request_hash:
+                matches = previous["request_hash"] == request_hash
+                if not matches and request.get("operation") and "signing_scope" not in previous["request"]:
+                    legacy_request = {key: value for key, value in request.items() if key not in ("principal", "signing_scope")}
+                    matches = previous["request"] == legacy_request and previous["request_hash"] == digest(legacy_request)
+                if not matches:
                     raise AqlaError("Operation ID already identifies a different request")
                 return previous
             if deadline is not None and now_ms() >= deadline:
@@ -199,9 +243,10 @@ class Hyperliquid:
             payload = json.loads(json.dumps(build(nonce, expires), allow_nan=False))
             record = {"operation_id": operation_id, "request_hash": request_hash, "request": request,
                       "wire_action": payload["action"], "nonce": nonce, "expires_after": payload.get("expiresAfter"),
+                      "wire_vault_address": payload.get("vaultAddress"),
                       "phase": "prepared", "created_at": now_ms(), "result": None}
             def prepare(state):
-                self.state.assert_binding(self.settings)
+                self.state.assert_operation_binding(self.settings, record)
                 if prepare_guard is not None:
                     prepare_guard(state)
                 if deadline is not None and now_ms() >= deadline:
@@ -295,7 +340,9 @@ class Hyperliquid:
                               "update_leverage", "update_isolated_margin", "agent_enable_dex_abstraction", "agent_set_abstraction", "noop"}
         if not multisig and self.settings.signer_role != "master" and operation not in api_wallet_methods:
             raise AqlaError("This operation requires a master signer")
-        request_binding = {"network": self.settings.network, "account": self.account.lower(), "operation": operation, "params": params}
+        signing_scope = sdk_signing_scope(operation)
+        request_binding = {"network": self.settings.network, "account": self.account.lower(), "operation": operation, "params": params,
+                           "principal": self.settings.account.lower(), "signing_scope": signing_scope}
         # Fill in optional client identities before SDK signing, never after it.
         if operation in ("order", "market_open", "market_close", "modify_order") and params.get("cloid") is None:
             params["cloid"] = self.cloid(operation_id)
@@ -364,13 +411,28 @@ class Hyperliquid:
                 function.__kwdefaults__ = method.__kwdefaults__
                 setattr(sdk, name, types.MethodType(function, sdk))
 
+            def slippage_price(name, is_buy, slippage, px=None):
+                market = metadata[name]
+                price = float(market.mid) if not px else px
+                price *= (1 + slippage) if is_buy else (1 - slippage)
+                decimals = (6 if market.product == "perp" else 8) - market.size_decimals
+                return round(float(f"{price:.5g}"), decimals)
+
+            # An isolated facade override: HIP-3 IDs are above the spot range,
+            # but their price precision still follows the perpetual contract.
+            sdk._slippage_price = slippage_price
+
             def capture(action, signature, timestamp):
                 if timestamp != nonce:
                     raise AqlaError("SDK signing timestamp differs from the durable nonce; action was not sent")
                 payload = {"action": action, "signature": signature, "nonce": timestamp}
                 if "signatureChainId" not in action:
-                    payload["vaultAddress"] = self.settings.vault_address if action["type"] not in ("usdClassTransfer", "sendAsset") else None
+                    if signing_scope == "user":
+                        raise AqlaError("SDK action differs from its documented signing scope")
+                    payload["vaultAddress"] = None if signing_scope == "principal" else self.settings.vault_address
                     payload["expiresAfter"] = expires
+                elif signing_scope != "user":
+                    raise AqlaError("SDK action differs from its documented signing scope")
                 return payload
 
             sdk._post_action = capture
