@@ -61,6 +61,10 @@ Die Schlüsseldatei gehört nicht nach GitHub, ins Sheet, in Telegram oder in de
 
 `journal_status` zeigt den Tabellenlink und die verfügbare Struktur. `journal_read` liest begrenzte Seiten mit exakten Spaltenfiltern. `journal_statistics` berechnet Ergebnisse aus unveränderten abgeschlossenen Tradezeilen. Geänderte/inkonsistente Zeilen werden aus Statistikwerten ausgeschlossen und ausdrücklich gezählt. Der Hyperliquid-MCP zeigt in `status.journal` die ausstehenden Zeilen und den letzten bestätigten Abgleich.
 
+Der Abgleich liest zunächst schmale ID-/Digest-/Versionsindizes und prüft nur die betroffenen vollständigen Zeilen. Auch eine höhere Revision mit unverändertem Inhalt wird gespeichert, damit verspätete ältere Änderungen keinen neueren Stand überschreiben. Ohne Filter lädt `journal_read` nur die angeforderte Seite; `total` zählt dabei alle indizierten IDs, `unverified_rows` nur die geprüfte Seite (`unverified_rows_scope: page`). `next_offset` setzt eine durch das Lesebudget verkürzte Seite fort.
+
+Gefilterte Abfragen und Statistiken prüfen vollständige Zeilen in kleinen Paketen, höchstens zwölf Leseanfragen je Aufruf. Bei erreichtem Budget melden sie `complete: false` und `scan_truncated: true`. Ein gefiltertes `total` bleibt dann `null`; `matched_rows_scanned` und `scanned_rows` beschreiben nur den geprüften Ausschnitt. Teilstatistiken nennen `scanned_trades` und `total_trades` und dürfen nicht als Gesamtergebnis verwendet werden. Ein vollständiger ID-Scan ist auf zwölf Pakete mit je 10.000 Rasterzeilen begrenzt; größere Raster melden einen Fehler und lassen die Übertragung ausstehend. Es wird kein zusätzlicher Dateicache angelegt.
+
 Gewinnwerte sind **realisierte Ergebnisse vor Funding**. USDC-Gebühren werden aus eigenen Fills berücksichtigt; bei fehlender Gebühreninformation oder fremder Gebührenwährung bleibt Netto unbestimmt. Trefferquoten nennen nur bekannte abgeschlossene Ergebnisse. Ungeschlossene Positionen erhalten keine erfundene Mark-to-Market-PnL. Funding und die volle Hermes-Gesprächshistorie werden nicht gespiegelt.
 
 ## Prüfungen und API-Grenzen

@@ -28,17 +28,31 @@ class Google:
         if self.fail:
             raise OSError("Temporary Google outage")
         if method == "GET" and url.endswith("/values:batchGet"):
-            data = {"valueRanges": [{"values": copy.deepcopy(self.tables.get(query.split("'")[1], []))} for query in kwargs["params"]["ranges"]]}
+            ranges = []
+            for query in kwargs["params"]["ranges"]:
+                title, first_col, first_row, last_col, last_row = self.coordinates(query)
+                rows = copy.deepcopy(self.tables.get(title, [])[first_row - 1:last_row])
+                rows = [row[first_col - 1:last_col] for row in rows]
+                for row in rows:
+                    while row and row[-1] == "":
+                        row.pop()
+                while rows and not rows[-1]:
+                    rows.pop()
+                ranges.append({"range": query, "values": rows})
+            data = {"valueRanges": ranges}
         elif method == "GET":
             data = {"sheets": [{"properties": copy.deepcopy(value)} for value in self.properties.values()], "developerMetadata": copy.deepcopy(self.metadata)}
         elif url.endswith("/values:batchUpdate"):
             assert kwargs["json"]["valueInputOption"] == "RAW"
             for update in kwargs["json"]["data"]:
-                title, index = re.match(r"'([^']+)'!A(\d+)", update["range"]).groups()
+                title, first_col, first_row, last_col, last_row = self.coordinates(update["range"])
                 rows = self.tables[title]
-                while len(rows) < int(index):
+                while len(rows) < last_row:
                     rows.append([])
-                rows[int(index) - 1] = copy.deepcopy(update["values"][0])
+                for offset, cells in enumerate(update["values"]):
+                    row = rows[first_row - 1 + offset]
+                    row.extend([""] * max(0, last_col - len(row)))
+                    row[first_col - 1:first_col - 1 + len(cells)] = copy.deepcopy(cells)
             self.writes += 1
             if self.lose_reply:
                 self.lose_reply = False
@@ -62,6 +76,16 @@ class Google:
                     props["gridProperties"].update(update["gridProperties"])
             data = {}
         return SimpleNamespace(raise_for_status=lambda: None, json=lambda: data)
+
+    @staticmethod
+    def coordinates(query):
+        title, first_col, first_row, last_col, last_row = re.fullmatch(r"'([^']+)'!([A-Z]+)(\d+):([A-Z]+)(\d+)", query).groups()
+        def index(letters):
+            value = 0
+            for letter in letters:
+                value = value * 26 + ord(letter) - ord("A") + 1
+            return value
+        return title, index(first_col), int(first_row), index(last_col), int(last_row)
 
     def close(self):
         self.closed = True
@@ -98,7 +122,7 @@ def test_sorted_rows_updates_growth_and_old_revisions(sheets):
     newer["values"][3] = 3
     newer["revision"] = 3
     newer["fingerprint"] = fingerprint(newer["values"])
-    google.properties[PREFIX + "Regeln"]["gridProperties"]["rowCount"] = 2
+    google.properties[PREFIX + "Regeln"]["gridProperties"]["rowCount"] = 3
     third = record("Regeln", "third", "testnet", "ci-account", 1, True, "[]", "null")
     client.sync([newer, third])
     assert google.properties[PREFIX + "Regeln"]["gridProperties"]["rowCount"] >= 4

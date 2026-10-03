@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 from collections import defaultdict
 
@@ -12,6 +13,12 @@ from .journal import HEADERS, JournalRecord, fingerprint, record_key
 BASE = "https://sheets.googleapis.com/v4/spreadsheets/"
 PREFIX = "aqla "
 META_HEADERS = ["_digest", "_revision"]
+INDEX_CHUNK_ROWS = 10_000
+MAX_INDEX_REQUESTS = 12
+BODY_CHUNK_ROWS = 100
+TEXT_CHUNK_ROWS = 10
+MAX_BODY_REQUESTS = 12
+TEXT_TABLES = {"Signale", "Vorgänge", "Regeln", "Ereignisse"}
 
 
 def column(index):
@@ -85,25 +92,87 @@ class SheetsClient:
             self.request("POST", ":batchUpdate", json={"requests": requests})
         return properties
 
-    def existing(self, tables):
-        ranges = [f"'{PREFIX + table}'!A:{column(len(HEADERS[table]) + 2)}" for table in tables]
+    def values(self, ranges):
         response = self.request("GET", "/values:batchGet", params={"ranges": ranges, "valueRenderOption": "UNFORMATTED_VALUE"})
+        values = response.get("valueRanges", [])
+        if len(values) != len(ranges):
+            raise AqlaError("Google Sheets returned an incomplete range response")
+        return [item.get("values", []) for item in values]
+
+    def existing(self, tables, properties):
+        """Read bounded ID/version indexes, never historical record bodies."""
+        headers = self.values([f"'{PREFIX + table}'!A1:{column(len(HEADERS[table]) + 2)}1" for table in tables])
         result = {}
-        for table, value_range in zip(tables, response.get("valueRanges", []), strict=True):
-            values = value_range.get("values", [])
+        for table, values in zip(tables, headers, strict=True):
             expected = [*HEADERS[table], *META_HEADERS]
             if not values or values[0][:len(expected)] != expected:
                 raise AqlaError("Google Sheets journal headers changed; restore the generated schema")
-            found = {}
-            for index, row in enumerate(values[1:], 2):
-                if not row or not row[0]:
-                    continue
-                identity = str(row[0])
-                if identity in found:
-                    raise AqlaError("Duplicate journal IDs found in Google Sheets")
-                found[identity] = (index, [*row, *([""] * (len(expected) - len(row)))][:len(expected)])
-            result[table] = (found, len(values))
+            result[table] = ({}, 1)
+        capacities = {table: properties[PREFIX + table]["gridProperties"]["rowCount"] for table in tables}
+        start = 2
+        for _ in range(MAX_INDEX_REQUESTS):
+            active = [table for table in tables if start <= capacities[table]]
+            if not active:
+                return result
+            ranges = []
+            for table in active:
+                end = min(capacities[table], start + INDEX_CHUNK_ROWS - 1)
+                ranges.extend([f"'{PREFIX + table}'!A{start}:A{end}",
+                               f"'{PREFIX + table}'!{column(len(HEADERS[table]) + 1)}{start}:{column(len(HEADERS[table]) + 2)}{end}"])
+            values = self.values(ranges)
+            for position, table in enumerate(active):
+                identities, metadata = values[position * 2:position * 2 + 2]
+                found, last = result[table]
+                if identities or metadata:
+                    last = max(last, start + max(len(identities), len(metadata)) - 1)
+                for offset, cells in enumerate(identities):
+                    if not cells or not cells[0]:
+                        continue
+                    identity = str(cells[0])
+                    if identity in found:
+                        raise AqlaError("Duplicate journal IDs found in Google Sheets")
+                    meta = metadata[offset] if offset < len(metadata) else []
+                    found[identity] = (start + offset, [*meta, "", ""][:2])
+                result[table] = (found, last)
+            start += INDEX_CHUNK_ROWS
+        if any(start <= capacity for capacity in capacities.values()):
+            raise AqlaError("Google Sheets ID scan exceeded its request budget; journal remains pending")
         return result
+
+    def bodies(self, table, indices, budget):
+        """Fetch selected rows in small ranges with a shared request budget."""
+        result = {}
+        indices = list(dict.fromkeys(indices))
+        chunk = TEXT_CHUNK_ROWS if table in TEXT_TABLES else BODY_CHUNK_ROWS
+        width = len(HEADERS[table]) + 2
+        while indices and budget[0] > 0:
+            chosen = indices[:chunk]
+            indices = indices[chunk:]
+            # Coalesce adjacent IDs; cap the number of disjoint A1 ranges/URL size.
+            groups = []
+            for index in chosen:
+                if groups and groups[-1][-1] + 1 == index:
+                    groups[-1].append(index)
+                else:
+                    groups.append([index])
+            if len(groups) > 20:
+                deferred = [index for group in groups[20:] for index in group]
+                indices = deferred + indices
+                groups = groups[:20]
+            ranges = [f"'{PREFIX + table}'!A{group[0]}:{column(width)}{group[-1]}" for group in groups]
+            values = self.values(ranges)
+            budget[0] -= 1
+            for group, rows in zip(groups, values, strict=True):
+                for offset, index in enumerate(group):
+                    cells = rows[offset] if offset < len(rows) else []
+                    result[index] = [*cells, *([""] * width)][:width]
+        return result
+
+    @staticmethod
+    def revision(value):
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0 and int(value) == value:
+            return int(value)
+        return None
 
     def sync(self, records):
         validated = [JournalRecord.model_validate(row).model_dump(mode="json") for row in records]
@@ -112,30 +181,64 @@ class SheetsClient:
                 return {"accepted": {}, "synced": 0}
             properties = self.layout()
             tables = list(dict.fromkeys(row["table"] for row in validated))
-            existing = self.existing(tables)
+            existing = self.existing(tables, properties)
+            if len({record_key(row) for row in validated}) != len(validated):
+                raise AqlaError("Duplicate record IDs in journal delivery")
+            budget, loaded = [MAX_BODY_REQUESTS], {}
+            for table in tables:
+                found, count = existing[table]
+                capacity = properties[PREFIX + table]["gridProperties"]["rowCount"]
+                targets, next_append = [], count + 1
+                # Inspect append slots to avoid overwriting a trailing row whose ID was removed.
+                for row in validated:
+                    if row["table"] != table:
+                        continue
+                    if row["record_id"] in found:
+                        targets.append(found[row["record_id"]][0])
+                    else:
+                        if next_append <= capacity:
+                            targets.append(next_append)
+                        next_append += 1
+                loaded[table] = self.bodies(table, targets, budget)
             updates, accepted, needed = [], {}, {}
             for row in validated:
                 table, identity = row["table"], row["record_id"]
                 found, count = existing[table]
                 previous = found.get(identity)
                 if previous:
-                    index, cells = previous
+                    index, _ = previous
+                    cells = loaded[table].get(index)
+                    if cells is None:
+                        break
+                    if str(cells[0]) != identity:
+                        raise AqlaError("Journal row IDs moved during synchronization; retry after sorting finishes")
                     size = len(HEADERS[table])
-                    valid = cells[size] == fingerprint(cells[:size])
-                    revision = cells[size + 1]
-                    if valid and cells[size] == row["fingerprint"]:
-                        accepted[record_key(row)] = row["fingerprint"]
+                    revision = self.revision(cells[size + 1])
+                    if fingerprint(cells[:size]) == row["fingerprint"]:
+                        maximum = max(row["revision"], revision or 0)
+                        if cells[size] == row["fingerprint"] and revision == maximum:
+                            accepted[record_key(row)] = row["fingerprint"]
+                            continue
+                        update = {"range": f"'{PREFIX + table}'!{column(size + 1)}{index}:{column(size + 2)}{index}", "values": [[row["fingerprint"], maximum]]}
+                    elif revision is not None and revision > row["revision"]:
                         continue
-                    if valid and isinstance(revision, (int, float)) and revision > row["revision"]:
-                        continue
+                    else:
+                        update = {"range": f"'{PREFIX + table}'!A{index}:{column(size + 2)}{index}", "values": [[*row["values"], row["fingerprint"], row["revision"]]]}
                 else:
                     index = count + 1
-                update = {"range": f"'{PREFIX + table}'!A{index}:{column(len(HEADERS[table]) + 2)}{index}", "values": [[*row["values"], row["fingerprint"], row["revision"]]]}
+                    capacity = properties[PREFIX + table]["gridProperties"]["rowCount"]
+                    if index <= capacity:
+                        cells = loaded[table].get(index)
+                        if cells is None:
+                            break
+                        if any(value != "" for value in cells):
+                            raise AqlaError("Journal append row contains data without an ID; restore the generated schema")
+                    update = {"range": f"'{PREFIX + table}'!A{index}:{column(len(HEADERS[table]) + 2)}{index}", "values": [[*row["values"], row["fingerprint"], row["revision"]]]}
                 if len(json.dumps([*updates, update], ensure_ascii=True).encode()) > 1_500_000:
                     break
                 updates.append(update)
                 needed[table] = max(index, needed.get(table, 0))
-                found[identity] = (index, update["values"][0])
+                found[identity] = (index, [row["fingerprint"], row["revision"]])
                 existing[table] = (found, max(count, index))
                 accepted[record_key(row)] = row["fingerprint"]
             growth = []
@@ -153,31 +256,53 @@ class SheetsClient:
 
     def read(self, table, offset=0, limit=100, filters=None):
         with self.lock:
-            self.layout(create=False)
-            found, _ = self.existing([table])[table]
             headers = HEADERS[table]
             filters = filters or {}
             if any(key not in headers for key in filters):
                 raise AqlaError("Unknown journal filter column")
+            properties = self.layout(create=False)
+            found, _ = self.existing([table], properties)[table]
+            selected = list(found.items()) if filters else list(found.items())[offset:offset + limit]
+            loaded = self.bodies(table, [item[1][0] for item in selected], [MAX_BODY_REQUESTS])
             rows = []
-            invalid = 0
-            for _, cells in found.values():
+            invalid = matched = scanned = 0
+            for identity, (index, _) in selected:
+                cells = loaded.get(index)
+                if cells is None:
+                    break
+                if str(cells[0]) != identity:
+                    raise AqlaError("Journal row IDs moved during reading; retry after sorting finishes")
+                scanned += 1
                 row = dict(zip(headers, cells[:len(headers)], strict=True))
                 valid = fingerprint(cells[:len(headers)]) == cells[len(headers)]
                 if not valid:
                     invalid += 1
                 if all(str(row[key]) == value for key, value in filters.items()):
-                    rows.append({**row, "_verified": valid})
-            return {"table": table, "rows": rows[offset:offset + limit], "total": len(rows), "unverified_rows": invalid, "next_offset": offset + limit if offset + limit < len(rows) else None}
+                    if not filters or offset <= matched < offset + limit:
+                        rows.append({**row, "_verified": valid})
+                    matched += 1
+            complete = scanned == len(selected)
+            total = matched if filters and complete else None if filters else len(found)
+            next_offset = offset + len(rows) if (matched if filters else len(found)) > offset + len(rows) else None
+            return {"table": table, "rows": rows, "total": total, "total_complete": not filters or complete,
+                    "unverified_rows": invalid, "unverified_rows_scope": "scan" if filters else "page",
+                    "scanned_rows": scanned, "matched_rows_scanned": matched, "complete": complete,
+                    "scan_truncated": not complete, "next_offset": next_offset}
 
     def statistics(self, group_by="gesamt"):
         with self.lock:
-            self.layout(create=False)
-            found, _ = self.existing(["Trades"])["Trades"]
+            properties = self.layout(create=False)
+            found, _ = self.existing(["Trades"], properties)["Trades"]
+            loaded = self.bodies("Trades", [item[0] for item in found.values()], [MAX_BODY_REQUESTS])
             headers = HEADERS["Trades"]
             groups = defaultdict(lambda: {"trades": 0, "closed": 0, "wins": 0, "losses": 0, "break_even": 0, "net_before_funding_usd": 0.0, "incomplete_pnl": 0})
             unverified = 0
-            for _, cells in found.values():
+            for identity, (index, _) in found.items():
+                cells = loaded.get(index)
+                if cells is None:
+                    break
+                if str(cells[0]) != identity:
+                    raise AqlaError("Journal row IDs moved during analysis; retry after sorting finishes")
                 if fingerprint(cells[:len(headers)]) != cells[len(headers)]:
                     unverified += 1
                     continue
@@ -197,7 +322,9 @@ class SheetsClient:
             for group in groups.values():
                 known = group["wins"] + group["losses"] + group["break_even"]
                 group["win_rate_known_percent"] = group["wins"] * 100 / known if known else None
-            return {"groups": dict(groups), "unverified_rows_excluded": unverified, "funding_included": False, "read_only_analysis": True}
+            return {"groups": dict(groups), "unverified_rows_excluded": unverified, "funding_included": False, "read_only_analysis": True,
+                    "complete": len(loaded) == len(found), "scan_truncated": len(loaded) < len(found),
+                    "scanned_trades": len(loaded), "total_trades": len(found)}
 
     def close(self):
         if self.session is not None:
