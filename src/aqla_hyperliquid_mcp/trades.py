@@ -104,14 +104,19 @@ class Trading:
         refs = [item for item in snapshot["events"].values() if item["source_id"] in interpretation.source_refs]
         if not refs or any(item["source"]["chat_id"] != row["source"]["chat_id"] for item in refs):
             raise AqlaError("A setup may only combine messages from the same source")
+        if interpretation.kind in ("new_signal", "trade_update"):
+            if row["source"].get("historical"):
+                raise AqlaError("Historical context cannot authorize an exchange action")
+            if row["source_id"] not in interpretation.source_refs:
+                raise AqlaError("An actionable interpretation must reference its live anchor event")
+            if latest_sources(snapshot["events"], [row["source_id"]])[row["source_id"]]["event_id"] != event_id:
+                raise AqlaError("An actionable interpretation must use the latest anchor revision")
         verify_evidence(interpretation, snapshot["events"])
         previous = row.get("interpretation")
         if row["status"] in ("executed", "updated"):
             if previous != interpretation.model_dump(mode="json"):
                 raise AqlaError("An executed revision is immutable; interpret the edit as a new update revision")
             return row
-        if row["source"].get("historical") and interpretation.kind in ("new_signal", "trade_update"):
-            raise AqlaError("Historical context cannot authorize an exchange action")
         self.state.update(lambda state: state["events"][event_id].update(
             interpretation=interpretation.model_dump(mode="json"),
             status=interpretation.kind if interpretation.kind not in ("new_signal", "trade_update") else "interpreted"))
@@ -168,6 +173,8 @@ class Trading:
 
     def validate_admission(self, snapshot, plan, account=None, *, owned=False):
         self.assert_plan_binding(snapshot, plan)
+        if owned and snapshot["trades"][plan.trade_id]["status"] not in OPEN:
+            raise AqlaError("Entry was terminated; no unsent exposure may execute")
         if snapshot["paused"] or snapshot["policy_revision"] != plan.policy_revision:
             raise AqlaError("Pause or policy changed; create a new unsent plan")
         if now_ms() >= plan.deadline_at:
@@ -193,6 +200,10 @@ class Trading:
             reserved = sum(Decimal(trade["reserved_risk"]) for trade in active)
             if now_ms() - account.observed_at > 10000:
                 raise AqlaError("Account observation is stale")
+            if account.position_size is None:
+                raise AqlaError("Current exchange position is unknown; no new exposure")
+            if account.position_size != 0:
+                raise AqlaError("Current exchange exposure has no free logical owner; no additional entry")
             if (plan.risk_usdc + reserved > account.equity * plan.policy.max_total_risk_percent / 100
                     or plan.risk_usdc > account.equity * plan.policy.risk_percent / 100
                     or plan.quantity * plan.entry_limit / plan.policy.leverage > account.available_margin):
@@ -241,7 +252,7 @@ class Trading:
                 raise AqlaError("Exchange position changed after preview")
             await self.exchange.verify_signer()
             current_market = await self.exchange.market(plan.market.symbol, plan.market.product)
-            if (current_market.asset_id, current_market.size_decimals) != (plan.market.asset_id, plan.market.size_decimals):
+            if (current_market.asset_id, current_market.size_decimals, current_market.quote_token) != (plan.market.asset_id, plan.market.size_decimals, plan.market.quote_token):
                 raise AqlaError("Exchange market metadata changed after preview")
             account = await self.exchange.account_snapshot(plan.market)
             trade = {"trade_id": plan.trade_id, "chat_id": snapshot["events"][saved["event_id"]]["source"]["chat_id"],
@@ -295,6 +306,9 @@ class Trading:
         self.assert_plan_binding(snapshot, plan)
         try:
             self.validate_admission(snapshot, plan, owned=True)
+            market = await self.exchange.market(plan.market.symbol, plan.market.product)
+            if (market.asset_id, market.size_decimals, market.quote_token) != (plan.market.asset_id, plan.market.size_decimals, plan.market.quote_token):
+                raise AqlaError("Exchange market metadata changed after preview")
             if self.position_size(await self.positions(plan.market), plan.market) != 0:
                 raise AqlaError("Unsent entry cannot resume against an existing foreign position")
             account = await self.exchange.account_snapshot(plan.market)
@@ -484,9 +498,10 @@ class Trading:
         self._patch(trade_id, status="open")
         stage = plan.policy.break_even_after_tp
         if stage is not None:
-            budgets = split_targets(Decimal(trade["filled_quantity"]), len(plan.take_profits), plan.policy, plan.market)
-            filled = [Decimal(value) for value in self.state.snapshot()["trades"][trade_id]["tp_filled"]]
-            if stage <= len(budgets) and all(filled[i] >= budgets[i] for i in range(stage)):
+            current = self.state.snapshot()["trades"][trade_id]
+            budgets = [Decimal(value) if value is not None else Decimal(0) for value in current.get("target_budgets", [])]
+            filled = [Decimal(value) for value in current["tp_filled"]]
+            if stage <= len(budgets) and all(budgets[i] > 0 and filled[i] >= budgets[i] for i in range(stage)):
                 entry = Decimal(trade["entry_vwap"])
                 tighter = entry > Decimal(trade["stop_price"]) if plan.side == "long" else entry < Decimal(trade["stop_price"])
                 if tighter:
@@ -505,6 +520,17 @@ class Trading:
         plan = TradePlan.model_validate(trade["plan"])
         self.assert_plan_binding(self.state.snapshot(), plan)
         if trade["entry_operation_id"] not in self.state.snapshot()["operations"]:
+            def cancel_unsent(state):
+                row = state["trades"][trade_id]
+                self.assert_plan_binding(state, plan)
+                if row["entry_operation_id"] in state["operations"]:
+                    raise AqlaError("Entry preparation began; its outcome requires reconciliation")
+                if (Decimal(row["filled_quantity"]) or Decimal(row["remaining_quantity"])
+                        or any(fill["kind"] == "entry" for fill in row.get("fill_events", {}).values())):
+                    raise AqlaError("Entry fills exist without its operation; absence is not proved")
+                if row["status"] in OPEN:
+                    row.update(status="cancelled", reserved_risk="0", unsent_reason="Entry cancelled before preparation", cleanup_complete=True)
+            self.state.update(cancel_unsent)
             return {"not_sent": True}
         status = await self.exchange.order_status(trade["entry_cloid"])
         if status.get("order", {}).get("status") in TERMINAL_ORDER:

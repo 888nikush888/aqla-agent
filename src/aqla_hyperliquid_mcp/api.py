@@ -107,12 +107,24 @@ class Hyperliquid:
             if not balance:
                 raise AqlaError("No USDC balance for spot entry")
             available = Decimal(balance["total"]) - Decimal(balance.get("hold", "0"))
-            return AccountSnapshot(equity=Decimal(balance["total"]), available_margin=available)
+            position = next((row for row in raw["balances"] if row["coin"] == market.base_token), None)
+            size = Decimal(position["total"]) if position else Decimal(0)
+            return AccountSnapshot(equity=Decimal(balance["total"]), available_margin=available, position_size=size)
         abstraction = await self.info("userAbstraction", user=self.account)
         if abstraction not in ("disabled", None):
             raise AqlaError("Automatic sizing requires standard account abstraction; other modes remain available through the full MCP")
         raw = await self.info("clearinghouseState", user=self.account, **({"dex": market.dex} if market.dex else {}))
-        return AccountSnapshot(equity=raw["marginSummary"]["accountValue"], available_margin=raw["withdrawable"])
+        size = None
+        positions = raw.get("assetPositions")
+        if isinstance(positions, list):
+            if any(not isinstance(row, dict) or not isinstance(row.get("position"), dict)
+                   or not isinstance(row["position"].get("coin"), str) or "szi" not in row["position"] for row in positions):
+                raise AqlaError("Account position observation is malformed")
+            matching = [row["position"] for row in positions if row["position"]["coin"] == market.symbol]
+            if len(matching) > 1:
+                raise AqlaError("Account position observation is ambiguous")
+            size = Decimal(matching[0]["szi"]) if matching else Decimal(0)
+        return AccountSnapshot(equity=raw["marginSummary"]["accountValue"], available_margin=raw["withdrawable"], position_size=size)
 
     async def verify_signer(self):
         if self.wallet is None:

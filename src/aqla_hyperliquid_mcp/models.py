@@ -195,6 +195,7 @@ class Market(Model):
 class AccountSnapshot(Model):
     equity: Positive
     available_margin: Nonnegative
+    position_size: Decimal | None = None
     observed_at: int = Field(default_factory=now_ms)
 
 

@@ -73,6 +73,53 @@ async def test_completed_tp_budget_moves_stop_only_from_own_exchange_fills(setup
 
 
 @pytest.mark.asyncio
+async def test_break_even_uses_reduced_replacement_target_budget(setup, signal):
+    _, state, fake, _, trading = setup
+    state.update(lambda row: row["policy"].update(break_even_after_tp=1))
+    trade = await opened(setup, signal)
+    assert Decimal(trade["filled_quantity"]) == Decimal("4.80")
+    await trading.close_position(trade["trade_id"], Decimal(50), "reduction")
+    await trading.refresh_trade(trade["trade_id"])
+    source, interpretation = update(trading, 2, "replace_targets", "Neue Ziele 115 und 125", take_profits=["115", "125"])
+    interpretation.evidence = [Evidence(field="take_profits.0", source_id=source.source_id, quote="115"), Evidence(field="take_profits.1", source_id=source.source_id, quote="125")]
+    await trading.update_trade(source.event_id, interpretation)
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    target = next(order for order in current["orders"] if order["kind"] == "tp" and order["index"] == 0 and not order.get("retired"))
+    assert Decimal(target["quantity"]) == Decimal("1.20")
+    fake.mid = "115"
+    fake.fill(target["cloid"], target["quantity"], "115")
+    await trading.refresh_trade(trade["trade_id"])
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert Decimal(current["stop_price"]) == Decimal(current["entry_vwap"]) == 100
+    assert Decimal(current["remaining_quantity"]) == Decimal("1.20")
+    # A later replacement preserves the fulfilled first target instead of topping it up.
+    source, interpretation = update(trading, 3, "replace_targets", "Neue Ziele 120 und 130", take_profits=["120", "130"])
+    interpretation.evidence = [Evidence(field="take_profits.0", source_id=source.source_id, quote="120"), Evidence(field="take_profits.1", source_id=source.source_id, quote="130")]
+    await trading.update_trade(source.event_id, interpretation)
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert Decimal(current["target_budgets"][0]) == Decimal(current["tp_filled"][0]) == Decimal("1.20")
+    assert not any(order["kind"] == "tp" and order["index"] == 0 and not order.get("retired") for order in current["orders"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", ["0", None, "missing"])
+async def test_missing_or_removed_target_budget_does_not_prove_break_even_fill(setup, signal, budget):
+    _, state, _, _, trading = setup
+    state.update(lambda row: row["policy"].update(break_even_after_tp=1))
+    trade = await opened(setup, signal)
+
+    def remove_budget(data):
+        if budget == "missing":
+            data["trades"][trade["trade_id"]].pop("target_budgets")
+        else:
+            data["trades"][trade["trade_id"]]["target_budgets"][0] = budget
+
+    state.update(remove_budget)
+    await trading.refresh_trade(trade["trade_id"])
+    assert Decimal(state.snapshot()["trades"][trade["trade_id"]]["stop_price"]) == 90
+
+
+@pytest.mark.asyncio
 async def test_rejected_initial_stop_triggers_owned_emergency_reduction(setup, signal):
     _, state, fake, _, trading = setup
     fake.reject_stop = True
