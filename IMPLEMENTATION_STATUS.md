@@ -26,6 +26,6 @@ Ein echter lokaler WebSocket-Server prüfte Reconnect, Unsubscribe und einen ang
 
 ## Prüfgrenzen und Einrichtung
 
-Die anschließende VPS-Installation auf ausdrücklichen Nutzerauftrag ist in `docs/vps-deployment.md` dokumentiert: Dienst läuft, echter Modellaufruf funktioniert, Telegram-Bot antwortet und der Kanal-Leser ist per QR angemeldet. Hyperliquid-Testnet-Kontobindung wurde lesend geprüft; keine Exchange-Mutationen. Handelsregeln und Quellen wählt der Nutzer über den Bot. Google Sheets wird zuletzt nach Bereitstellung der Tabellen-ID und Servicekonto-Datei aktiviert.
+Die anschließende VPS-Installation auf ausdrücklichen Nutzerauftrag ist in `docs/vps-deployment.md` dokumentiert: Dienst läuft, echter Modellaufruf funktioniert, Telegram-Bot antwortet und der Kanal-Leser ist per QR angemeldet. Hyperliquid-Testnet-Kontobindung wurde lesend geprüft; keine Exchange-Mutationen. Google Sheets ist aktiv; sieben Journal-Tabs, verifizierte Regelzeile und leere Zustellungsqueue wurden tatsächlich geprüft. Handelsregeln und Quellen wählt der Nutzer über den Bot.
 
 Geskriptete Modellprüfungen beweisen Integration und Befugnisse, keine allgemeine sprachliche Erkennungsqualität. Für das gewünschte echte Modell liegen 30 Kontextfälle und ein ausdrücklich auszuführender Eval-Runner ohne Handels-/Telegram-Werkzeuge bei. Text und Captions werden verarbeitet; reine Bildsignale nicht. Native Stop-Ausführung ist kein garantierter maximaler tatsächlicher Verlust.
