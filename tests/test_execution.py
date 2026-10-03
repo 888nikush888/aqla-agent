@@ -70,3 +70,73 @@ def test_batch_ack_is_not_mistaken_for_acceptance_of_all_legs():
     rejected = {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"error": "one"}, {"error": "two"}]}}}
     assert Hyperliquid.decode_result(action, rejected)[:2] == ("rejected", "rejected")
     assert Hyperliquid.decode_result(action, {"status": "ok", "response": {"type": "default"}})[:2] == ("unknown", "unknown")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["cancel", "cancelByCloid"])
+async def test_cancel_reconciliation_requires_exact_terminal_proof_for_every_leg(setup, kind):
+    _, state, fake, exchange, _ = setup
+    identities = [exchange.cloid("owned", index) for index in range(2)]
+    for index, identity in enumerate(identities):
+        fake.orders[identity] = {"status": "open", "order": {"oid": 500 + index, "cloid": identity}}
+    cancels = [{"a": 0, "o": 500 + index} if kind == "cancel" else {"asset": 0, "cloid": identity} for index, identity in enumerate(identities)]
+    fake.lost_response = True
+    action = {"type": kind, "cancels": cancels}
+    result = await exchange.mutate("cancel-proof", action)
+    assert result["phase"] == "unknown"
+    for identity in identities:
+        fake.orders[identity]["status"] = "open"
+    assert not (await exchange.reconcile("cancel-proof"))["resolved"]
+    fake.orders[identities[0]]["status"] = "canceled"
+    assert not (await exchange.reconcile("cancel-proof"))["resolved"]
+    fake.orders[identities[1]]["status"] = "filled"
+    assert (await exchange.reconcile("cancel-proof"))["resolved"]
+    assert state.snapshot()["operations"]["cancel-proof"]["phase"] == "reconciled"
+    assert fake.actions.count(action) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["cancel", "cancelByCloid"])
+async def test_cancel_reconciliation_does_not_accept_another_terminal_order(setup, monkeypatch, kind):
+    _, state, fake, exchange, _ = setup
+    identity = exchange.cloid("owned")
+    action = {"type": kind, "cancels": [{"a": 0, "o": 500} if kind == "cancel" else {"asset": 0, "cloid": identity}]}
+    fake.lost_response = True
+    await exchange.mutate("cancel-proof", action)
+
+    async def wrong_order(*args):
+        return {"status": "order", "order": {"status": "canceled", "order": {"oid": 501, "cloid": exchange.cloid("foreign")}}}
+
+    monkeypatch.setattr(exchange, "order_status", wrong_order)
+    assert not (await exchange.reconcile("cancel-proof"))["resolved"]
+    assert state.snapshot()["operations"]["cancel-proof"]["phase"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_mutation_deadline_is_checked_again_after_signer_await(setup, monkeypatch):
+    _, state, fake, exchange, _ = setup
+    from aqla_hyperliquid_mcp import api
+    deadline = api.now_ms() + 10000
+    original = exchange.verify_signer
+
+    async def expired():
+        await original()
+        monkeypatch.setattr(api, "now_ms", lambda: deadline)
+
+    monkeypatch.setattr(exchange, "verify_signer", expired)
+    with pytest.raises(AqlaError, match="deadline has expired before preparation"):
+        await exchange.mutate("expires-during-await", {"type": "updateLeverage", "asset": 0, "isCross": False, "leverage": 2}, deadline=deadline)
+    assert fake.actions == []
+    assert "expires-during-await" not in state.snapshot()["operations"]
+
+
+@pytest.mark.parametrize("action,response", [
+    ({"type": "order", "orders": [{}]}, {"type": "cancel", "data": {"statuses": ["success"]}}),
+    ({"type": "cancel", "cancels": [{}]}, {"type": "order", "data": {"statuses": ["success"]}}),
+    ({"type": "updateLeverage"}, {"type": "unsupported", "data": {"statuses": []}}),
+    ({"type": "trailingStop"}, {"type": "default"}),
+    ({"type": "updateLeverage"}, {"type": "unsupported"}),
+])
+def test_malformed_non_default_acknowledgment_does_not_claim_acceptance(action, response):
+    from aqla_hyperliquid_mcp.api import Hyperliquid
+    assert Hyperliquid.decode_result(action, {"status": "ok", "response": response})[:2] == ("unknown", "unknown")

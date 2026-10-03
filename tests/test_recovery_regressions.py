@@ -150,3 +150,53 @@ async def test_crash_before_exit_cleanup_keeps_market_reserved_until_restart(set
     count = len(fake.actions)
     await trading.recover()
     assert len(fake.actions) == count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("percent", [Decimal(100), Decimal(50)])
+async def test_crash_before_close_dispatch_resumes_exact_saved_intent_once(setup, signal, monkeypatch, percent):
+    _, state, fake, exchange, trading = setup
+    source, interpretation = signal
+    plan = await trading.preview(source.event_id, interpretation)
+    trade = await trading.execute(plan["plan_id"])
+    original = exchange.mutate
+
+    async def interrupted(identity, action, **kwargs):
+        if identity == "saved-close":
+            raise RuntimeError("Crash before operation creation")
+        return await original(identity, action, **kwargs)
+
+    monkeypatch.setattr(exchange, "mutate", interrupted)
+    with pytest.raises(RuntimeError):
+        await trading.close_position(trade["trade_id"], percent, "saved-close")
+    staged = state.snapshot()["trades"][trade["trade_id"]]
+    intent = staged["close_intents"]["saved-close"]
+    assert staged["status"] == "closing" and staged["management_revision"] == 1
+    assert "saved-close" not in state.snapshot()["operations"]
+    assert Decimal(intent["action"]["orders"][0]["s"]) == Decimal(trade["remaining_quantity"]) * percent / 100
+    fake.mid = "115"  # Recovery must not recompute the saved price from a newer market read.
+    state.update(lambda row: row.update(paused=True, sources=[], policy_revision=2))
+    monkeypatch.setattr(exchange, "mutate", original)
+    await trading.recover()
+    await trading.recover()
+    assert fake.actions.count(intent["action"]) == 1
+    assert state.snapshot()["operations"]["saved-close"]["wire_action"] == intent["action"]
+    assert Decimal(str(fake.position)) == Decimal(trade["remaining_quantity"]) * (100 - percent) / 100
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["prepared", "sending", "unknown"])
+async def test_close_recovery_never_resends_an_existing_operation(setup, signal, phase):
+    _, state, fake, _, trading = setup
+    source, interpretation = signal
+    plan = await trading.preview(source.event_id, interpretation)
+    trade = await trading.execute(plan["plan_id"])
+    fake.lost_response = True
+    result = await trading.close_position(trade["trade_id"], Decimal(50), "unknown-close")
+    assert result["phase"] == "unknown"
+    state.update(lambda row: row["operations"]["unknown-close"].update(phase=phase))
+    action = state.snapshot()["trades"][trade["trade_id"]]["close_intents"]["unknown-close"]["action"]
+    await trading.recover()
+    await trading.close_position(trade["trade_id"], Decimal(50), "unknown-close")
+    assert fake.actions.count(action) == 1
+    assert Decimal(str(fake.position)) == Decimal(trade["remaining_quantity"]) / 2

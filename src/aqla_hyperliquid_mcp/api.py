@@ -11,7 +11,7 @@ from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import signing
 
-from .models import AccountSnapshot, AqlaError, Market, Settings, digest, now_ms
+from .models import TERMINAL_ORDER, AccountSnapshot, AqlaError, Market, Settings, digest, now_ms
 from .state import State
 
 
@@ -143,7 +143,7 @@ class Hyperliquid:
 
         return self.state.update(advance)
 
-    async def mutate(self, operation_id: str, action: dict, *, deadline=None, sign_method="l1", signer=None):
+    async def mutate(self, operation_id: str, action: dict, *, deadline=None, sign_method="l1", signer=None, prepare_guard=None):
         """Durable request binding, no automatic retries, per-leg result preservation."""
         request = {"network": self.settings.network, "account": self.account.lower(), "action": action,
                    "deadline": deadline, "sign_method": sign_method}
@@ -165,15 +165,17 @@ class Hyperliquid:
                 payload["vaultAddress"] = self.settings.vault_address
             return payload
 
-        return await self._dispatch(operation_id, request, build, deadline)
+        return await self._dispatch(operation_id, request, build, deadline, prepare_guard=prepare_guard)
 
-    async def _dispatch(self, operation_id, request, build, deadline=None, sender=None, nonce_override=None, allow_existing_nonce=False):
+    async def _dispatch(self, operation_id, request, build, deadline=None, sender=None, nonce_override=None, allow_existing_nonce=False, prepare_guard=None):
         if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 160:
             raise AqlaError("Operation identity must contain 1..160 characters")
+        self.state.assert_binding(self.settings)
         request_hash = digest(request)
         async with self.mutations:
             previous = self.state.snapshot()["operations"].get(operation_id)
             if previous:
+                self.state.assert_operation_binding(self.settings, previous)
                 if previous["request_hash"] != request_hash:
                     raise AqlaError("Operation ID already identifies a different request")
                 return previous
@@ -186,7 +188,14 @@ class Hyperliquid:
             record = {"operation_id": operation_id, "request_hash": request_hash, "request": request,
                       "wire_action": payload["action"], "nonce": nonce, "expires_after": payload.get("expiresAfter"),
                       "phase": "prepared", "created_at": now_ms(), "result": None}
-            self.state.update(lambda state: state["operations"].__setitem__(operation_id, record))
+            def prepare(state):
+                self.state.assert_binding(self.settings)
+                if prepare_guard is not None:
+                    prepare_guard(state)
+                if deadline is not None and now_ms() >= deadline:
+                    raise AqlaError("Operation deadline has expired before preparation")
+                state["operations"][operation_id] = record
+            self.state.update(prepare)
             self.state.update(lambda state: state["operations"][operation_id].update(phase="sending"))
             try:
                 if sender is None:
@@ -209,15 +218,41 @@ class Hyperliquid:
             return "unknown", "unknown", []
         if result["status"] == "err":
             return "rejected", "rejected", []
-        response = result.get("response", {})
-        statuses = response.get("data", {}).get("statuses")
+        response = result.get("response")
+        if not isinstance(response, dict):
+            return "unknown", "unknown", []
+        data = response.get("data", {})
+        if not isinstance(data, dict):
+            return "unknown", "unknown", []
+        status = data.get("status")
+        if isinstance(status, dict) and isinstance(status.get("error"), str):
+            if response.get("type") != action.get("type"):
+                return "unknown", "unknown", []
+            return "rejected", "rejected", [{"index": 0, "disposition": "rejected", "status": status}]
+        if action.get("type") in ("twapOrder", "twapCancel"):
+            if response.get("type") != action["type"]:
+                return "unknown", "unknown", []
+            if action["type"] == "twapCancel" and status == "success":
+                return "acknowledged", "accepted", []
+            running = status.get("running") if isinstance(status, dict) else None
+            if action["type"] == "twapOrder" and isinstance(running, dict) and type(running.get("twapId")) is int and running["twapId"] > 0:
+                return "acknowledged", "accepted", []
+            return "unknown", "unknown", []
+        if action.get("type") == "trailingStop":
+            if response.get("type") == "trailingStop" and type(data.get("oid")) is int and data["oid"] > 0:
+                return "acknowledged", "accepted", []
+            return "unknown", "unknown", []
+        statuses = data.get("statuses")
         expected = len(action.get("orders", action.get("modifies", action.get("cancels", []))))
         if action.get("type") == "modify":
             expected = 1
         if statuses is None:
             if expected:
                 return "unknown", "unknown", []
-            return "acknowledged", "accepted", []
+            return ("acknowledged", "accepted", []) if response.get("type") == "default" else ("unknown", "unknown", [])
+        response_type = {"order": "order", "modify": "order", "batchModify": "order", "cancel": "cancel", "cancelByCloid": "cancel"}.get(action.get("type"))
+        if response_type is None or response.get("type") != response_type:
+            return "unknown", "unknown", []
         if not isinstance(statuses, list) or expected and len(statuses) != expected:
             return "unknown", "unknown", []
         legs = []
@@ -343,8 +378,8 @@ class Hyperliquid:
         requested = binding["params"]["nonce"] if noop else None
         return await self._dispatch(operation_id, binding, build, sender=sender, nonce_override=requested, allow_existing_nonce=noop)
 
-    async def order_status(self, identity):
-        return await self.info("orderStatus", user=self.account, oid=identity)
+    async def order_status(self, identity, user=None):
+        return await self.info("orderStatus", user=user or self.account, oid=identity)
 
     async def native_action(self, operation_id, request, *, sender=None):
         from .actions import native_payload, sign_native
@@ -361,17 +396,25 @@ class Hyperliquid:
                                     lambda nonce, expires: sign_native(self.wallet, action, nonce, expires, self.settings), sender=sender)
 
     async def reconcile(self, operation_id):
+        self.state.assert_binding(self.settings)
         record = self.state.snapshot()["operations"].get(operation_id)
         if not record:
             raise AqlaError("Unknown operation")
+        self.state.assert_operation_binding(self.settings, record)
         action = record["wire_action"]
         identities = [order["c"] for order in action.get("orders", []) if order.get("c")]
         if action.get("type") == "cancelByCloid":
             identities = [order["cloid"] for order in action["cancels"]]
         if action.get("type") == "cancel":
             identities = [order["o"] for order in action["cancels"]]
-        observations = [await self.order_status(identity) for identity in identities]
-        proven = bool(identities) and all(row.get("status") == "order" and row.get("order", {}).get("status") not in (None, "unknownOid") for row in observations)
+        observations = [await self.order_status(identity, record["request"].get("account")) for identity in identities]
+        def proves(identity, row):
+            detail = row.get("order", {})
+            order = detail.get("order", {})
+            matches = type(order.get("oid")) is int and order["oid"] == identity if type(identity) is int else str(order.get("cloid", "")).lower() == identity.lower()
+            terminal = action.get("type") not in ("cancel", "cancelByCloid") or detail.get("status") in TERMINAL_ORDER
+            return row.get("status") == "order" and matches and terminal and detail.get("status") not in (None, "unknownOid")
+        proven = bool(identities) and all(proves(identity, row) for identity, row in zip(identities, observations, strict=True))
         if proven:
             self.state.update(lambda state: state["operations"][operation_id].update(phase="reconciled", evidence=observations))
         return {"operation": self.state.snapshot()["operations"][operation_id], "evidence": observations,

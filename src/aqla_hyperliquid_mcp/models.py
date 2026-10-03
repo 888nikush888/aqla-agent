@@ -170,6 +170,15 @@ class Interpretation(Model):
         return value
 
 
+TERMINAL_ORDER = {"filled", "canceled", "rejected", "marginCanceled", "vaultWithdrawalCanceled", "openInterestCapCanceled",
+                  "selfTradeCanceled", "reduceOnlyCanceled", "siblingFilledCanceled", "delistedCanceled", "liquidatedCanceled",
+                  "scheduledCancel", "tickRejected", "minTradeNtlRejected", "perpMarginRejected", "reduceOnlyRejected",
+                  "badAloPxRejected", "iocCancelRejected", "badTriggerPxRejected", "marketOrderNoLiquidityRejected",
+                  "positionIncreaseAtOpenInterestCapRejected", "positionFlipAtOpenInterestCapRejected",
+                  "tooAggressiveAtOpenInterestCapRejected", "openInterestIncreaseRejected", "insufficientSpotBalanceRejected",
+                  "oracleRejected", "perpMaxPositionRejected"}
+
+
 class Market(Model):
     symbol: str
     asset_id: int = Field(ge=0)
@@ -198,6 +207,7 @@ class TradePlan(Model):
     policy: Policy
     network: str
     account: str
+    principal: str | None = None
     market: Market
     side: Literal["long", "short"]
     entry_kind: Literal["market", "limit"]

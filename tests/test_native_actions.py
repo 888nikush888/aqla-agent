@@ -5,7 +5,9 @@ from eth_account import Account
 from eth_account.messages import encode_typed_data
 
 from aqla_hyperliquid_mcp.actions import NATIVE_ADAPTER, NATIVE_MODELS, native_payload
+from aqla_hyperliquid_mcp.api import Hyperliquid
 from aqla_hyperliquid_mcp.models import AqlaError
+from aqla_hyperliquid_mcp.state import State
 
 ADDRESS = "0x" + "1" * 40
 ORDER = {"a": 0, "b": True, "p": "100", "s": "1", "r": True, "t": {"limit": {"tif": "Gtc"}}}
@@ -99,10 +101,61 @@ async def test_user_signed_actions_require_master_and_testnet_variants_fail_befo
     with pytest.raises(AqlaError, match="master signer"):
         await exchange.native_action("denied-stake", {"type": "cDeposit", "wei": 1})
     settings.signer_role = "master"
-    settings.network = "mainnet"
-    with pytest.raises(AqlaError, match="testnet-only"):
-        await exchange.native_action("denied-outcome", {"type": "activateOutcomeDeployer", "deactivate": None})
+    mainnet = settings.model_copy(update={"network": "mainnet", "state_path": settings.state_path.with_name("mainnet.json")})
+    with State(mainnet) as mainnet_state:
+        mainnet_exchange = Hyperliquid(mainnet, mainnet_state, exchange.client)
+        with pytest.raises(AqlaError, match="testnet-only"):
+            await mainnet_exchange.native_action("denied-outcome", {"type": "activateOutcomeDeployer", "deactivate": None})
     assert fake.actions == []
+
+
+@pytest.mark.parametrize("kind", ["twapOrder", "twapCancel"])
+@pytest.mark.parametrize("status,expected", [
+    ({"error": "Exchange rejected the TWAP"}, ("rejected", "rejected")),
+    ({"running": {"twapId": 23}}, ("acknowledged", "accepted")),
+    ("success", ("acknowledged", "accepted")),
+    ({"running": {"twapId": True}}, ("unknown", "unknown")),
+    ({}, ("unknown", "unknown")),
+])
+def test_nested_twap_response_contract(kind, status, expected):
+    if kind == "twapOrder" and status == "success" or kind == "twapCancel" and isinstance(status, dict) and "running" in status:
+        expected = ("unknown", "unknown")
+    response = {"status": "ok", "response": {"type": kind, "data": {"status": status}}}
+    assert Hyperliquid.decode_result({"type": kind}, response)[:2] == expected
+    response["response"]["type"] = "default"
+    assert Hyperliquid.decode_result({"type": kind}, response)[:2] == ("unknown", "unknown")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["twapOrder", "twapCancel"])
+async def test_twap_nested_rejection_is_durable_and_not_retried(setup, kind):
+    _, state, _, exchange, _ = setup
+    count = 0
+
+    async def rejected(payload):
+        nonlocal count
+        count += 1
+        return {"status": "ok", "response": {"type": kind, "data": {"status": {"error": "Rejected"}}}}
+
+    request = {"type": kind, **copy.deepcopy(CASES[kind])}
+    result = await exchange.native_action("rejected:" + kind, request, sender=rejected)
+    assert result["phase"] == "rejected"
+    assert result["legs"][0]["disposition"] == "rejected"
+    assert state.snapshot()["operations"]["rejected:" + kind]["outcome"] == "rejected"
+    assert await exchange.native_action("rejected:" + kind, request, sender=rejected) == result
+    assert count == 1
+
+
+@pytest.mark.parametrize("oid,expected", [
+    (23, ("acknowledged", "accepted")),
+    (True, ("unknown", "unknown")),
+    ("23", ("unknown", "unknown")),
+    (0, ("unknown", "unknown")),
+    (None, ("unknown", "unknown")),
+])
+def test_documented_trailing_stop_acceptance_requires_order_identity(oid, expected):
+    response = {"status": "ok", "response": {"type": "trailingStop", "data": {"oid": oid}}}
+    assert Hyperliquid.decode_result({"type": "trailingStop"}, response)[:2] == expected
 
 
 def test_deployer_sorting_and_range_contracts():

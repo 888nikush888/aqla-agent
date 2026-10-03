@@ -53,8 +53,34 @@ def quoted_numbers(quote):
             continue
 
 
+def latest_sources(events: dict, refs=None):
+    latest = {}
+    revisions = {}
+    for row in events.values():
+        ref = row["source_id"]
+        if refs is not None and ref not in refs:
+            continue
+        previous = latest.get(ref)
+        version = row["source"].get("edited_at") or row["source"]["sent_at"]
+        identity = revisions.setdefault((ref, version), row["event_id"])
+        if identity != row["event_id"]:
+            raise AqlaError("Source revisions have conflicting content at the same timestamp")
+        prior_version = (previous["source"].get("edited_at") or previous["source"]["sent_at"]) if previous else -1
+        if version > prior_version:
+            latest[ref] = row
+    return latest
+
+
+def slippage_price(reference: Decimal, percent: Decimal, market: Market, buy: bool):
+    bound = reference * (1 + (1 if buy else -1) * percent / 100)
+    result = price_grid(bound, market, up=not buy)
+    if result <= 0 or (result > bound if buy else result < bound):
+        raise AqlaError("No positive price grid point satisfies the slippage bound")
+    return result
+
+
 def verify_evidence(signal: Interpretation, events: dict):
-    texts = {value["source_id"]: value["source"]["text"] for value in events.values()}
+    texts = {ref: row["source"]["text"] for ref, row in latest_sources(events, signal.source_refs).items()}
     if any(ref not in texts for ref in signal.source_refs):
         raise AqlaError("Unknown source reference")
     fields = {}
@@ -75,7 +101,7 @@ def verify_evidence(signal: Interpretation, events: dict):
 
 
 def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, policy: Policy,
-              revision: int, source_time: int, binding: tuple[str, str], reserved_risk=Decimal(0), stamp=None):
+              revision: int, source_time: int, binding: tuple[str, str], reserved_risk=Decimal(0), stamp=None, principal=None):
     stamp = now_ms() if stamp is None else stamp
     with localcontext() as context:
         context.prec = 50
@@ -107,7 +133,7 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
             limit = entry
         else:
             entry = market.mid
-            limit = price_grid(entry * (1 + (1 if long else -1) * policy.max_slippage_percent / 100), market, up=long)
+            limit = slippage_price(entry, policy.max_slippage_percent, market, buy=long)
         stop = price_grid(signal.stop_loss, market, up=not long)
         targets = [price_grid(value, market, up=not long) for value in signal.take_profits]
         ordered = sorted(set(targets), reverse=not long)
@@ -129,7 +155,7 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
             raise AqlaError("A TP leg is below the exchange notional minimum")
         trade_id = digest([*binding, sorted(signal.source_refs)])[:32]
         values = dict(trade_id=trade_id, source_refs=signal.source_refs, policy_revision=revision, policy=policy,
-                      network=binding[0], account=binding[1], market=market, side=signal.side, entry_kind=kind,
+                      network=binding[0], account=binding[1], principal=principal, market=market, side=signal.side, entry_kind=kind,
                       entry_price=entry, entry_limit=limit, stop_loss=stop, take_profits=targets, quantity=quantity,
                       tp_quantities=tp_sizes, risk_usdc=quantity * distance,
                       deadline_at=source_time + policy.max_signal_age_seconds * 1000, created_at=stamp)

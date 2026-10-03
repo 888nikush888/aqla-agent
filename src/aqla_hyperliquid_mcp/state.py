@@ -33,11 +33,32 @@ class State:
                     if key not in self.data:
                         raise AqlaError("State is incomplete; do not restore an old snapshot blindly")
             else:
-                self.data = {"schema": 1, "network": settings.network, "account": settings.account.lower(), "sequence": 0,
+                self.data = {"schema": 1, "network": settings.network, "account": settings.account.lower(), "trading_account": (settings.vault_address or settings.account).lower(), "sequence": 0,
                              "policy": settings.policy.model_dump(mode="json") if settings.policy else None,
                              "policy_revision": 1 if settings.policy else 0, "paused": False,
                              "sources": settings.sources, "source_aliases": {}, "events": {}, "trades": {}, "plans": {},
                              "bindings": {}, "operations": {}, "nonces": {}, "cursors": {}, "notifications": {}, "event_tombstones": {}}
+                self._write(self.data)
+            target = (settings.vault_address or settings.account).lower()
+            legacy = "trading_account" not in self.data
+            if legacy:
+                # Legacy state can inherit only a target proved by its own execution records.
+                targets = {row["plan"]["account"].lower() for row in self.data["plans"].values()}
+                targets.update(row["plan"]["account"].lower() for row in self.data["trades"].values())
+                targets.update(row["request"]["account"].lower() for row in self.data["operations"].values()
+                               if row.get("request", {}).get("account") and not row["request"].get("leader"))
+                inferred = next(iter(targets)) if len(targets) == 1 else settings.account.lower() if not targets else None
+                if inferred != target:
+                    raise AqlaError("Legacy execution state belongs to another or ambiguous trading target")
+                self.data["trading_account"] = inferred
+            self.assert_binding(settings)
+            for row in [*self.data["plans"].values(), *self.data["trades"].values()]:
+                plan = row["plan"]
+                if plan["account"].lower() != target or plan["network"] != settings.network or plan.get("principal") not in (None, settings.account.lower()):
+                    raise AqlaError("Saved plan belongs to another trading target or network")
+            for row in self.data["operations"].values():
+                self.assert_operation_binding(settings, row)
+            if legacy:
                 self._write(self.data)
             if self.journal_enabled:
                 from aqla_sheets_mcp.journal import seed
@@ -46,6 +67,19 @@ class State:
         except BaseException:
             self._lock.release()
             raise
+
+    def assert_binding(self, settings):
+        with self._thread_lock:
+            if (self.data["network"] != settings.network or self.data["account"].lower() != settings.account.lower()
+                    or self.data["trading_account"] != (settings.vault_address or settings.account).lower()):
+                raise AqlaError("State principal, trading target or network differs; use a separate state")
+
+    def assert_operation_binding(self, settings, record):
+        self.assert_binding(settings)
+        request = record["request"]
+        if (request.get("network") != settings.network
+                or not request.get("leader") and request.get("account", "").lower() != self.data["trading_account"]):
+            raise AqlaError("Saved operation belongs to another trading target or network")
 
     def _write(self, data):
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")

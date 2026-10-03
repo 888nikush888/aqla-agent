@@ -4,19 +4,20 @@ import asyncio
 from decimal import Decimal
 
 from .api import Hyperliquid, wire_number
-from .models import AqlaError, Interpretation, Policy, SourceEvent, TradePlan, digest, now_ms
-from .rules import make_plan, price_grid, quantity_grid, split_targets, verify_evidence
+from .models import TERMINAL_ORDER, AqlaError, Interpretation, Policy, SourceEvent, TradePlan, digest, now_ms
+from .rules import (
+    latest_sources,
+    make_plan,
+    price_grid,
+    quantity_grid,
+    slippage_price,
+    split_targets,
+    verify_evidence,
+)
 from .state import State
 
 OPEN = {"preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup"}
 UNFINISHED = {"pending", "interpreted", "needs_reconciliation"}
-TERMINAL_ORDER = {"filled", "canceled", "rejected", "marginCanceled", "vaultWithdrawalCanceled", "openInterestCapCanceled",
-                  "selfTradeCanceled", "reduceOnlyCanceled", "siblingFilledCanceled", "delistedCanceled", "liquidatedCanceled",
-                  "scheduledCancel", "tickRejected", "minTradeNtlRejected", "perpMarginRejected", "reduceOnlyRejected",
-                  "badAloPxRejected", "iocCancelRejected", "badTriggerPxRejected", "marketOrderNoLiquidityRejected",
-                  "positionIncreaseAtOpenInterestCapRejected", "positionFlipAtOpenInterestCapRejected",
-                  "tooAggressiveAtOpenInterestCapRejected", "openInterestIncreaseRejected", "insufficientSpotBalanceRejected",
-                  "oracleRejected", "perpMaxPositionRejected"}
 
 
 class Trading:
@@ -37,7 +38,7 @@ class Trading:
             if source.event_id in state.get("event_tombstones", {}):
                 return {"event_id": source.event_id, "source_id": source.source_id, "status": "already_processed"}
             row = {"event_id": source.event_id, "source_id": source.source_id, "source": source.model_dump(mode="json"),
-                   "status": "context" if source.historical else "pending", "interpretation": None}
+                   "status": "context" if source.historical else "pending", "interpretation": None, "native_forward": bool(trusted_forward)}
             state["events"][source.event_id] = row
             state["cursors"][source.chat_id] = max(source.message_id, state["cursors"].get(source.chat_id, 0))
             self.prune_events(state)
@@ -118,6 +119,7 @@ class Trading:
             raise AqlaError("New entries are paused; existing exits and protection continue")
         if snapshot["policy"] is None:
             raise AqlaError("User trading rules have not been configured")
+        self.state.assert_binding(self.exchange.settings)
         policy = Policy.model_validate(snapshot["policy"])
         if policy.product != "perp":
             raise AqlaError("Automatic source trading requires perpetual markets with native reduce-only protection; Spot remains available through the full MCP")
@@ -133,27 +135,61 @@ class Trading:
         if self.position_size(positions, market) != 0:
             raise AqlaError("Existing exchange exposure has no free logical owner; no additional entry")
         account = await self.exchange.account_snapshot(market)
-        refs = [item["source"]["sent_at"] for item in snapshot["events"].values() if item["source_id"] in interpretation.source_refs]
+        refs = [item["source"]["sent_at"] for item in latest_sources(snapshot["events"], interpretation.source_refs).values()]
         risk = sum(Decimal(trade["reserved_risk"]) for trade in active)
         plan = make_plan(interpretation, market, account, policy, snapshot["policy_revision"], min(refs),
-                         (self.exchange.settings.network, self.exchange.account.lower()), reserved_risk=risk)
+                         (self.exchange.settings.network, self.exchange.account.lower()), reserved_risk=risk,
+                         principal=self.exchange.settings.account.lower())
         plan.source_revisions = self.source_revisions(snapshot, interpretation.source_refs)
         plan.plan_id = digest(plan.model_dump(mode="json", exclude={"plan_id"}))
-        self.state.update(lambda state: state["plans"].__setitem__(plan.plan_id, {"event_id": event_id, "plan": plan.model_dump(mode="json")}))
+        def save(state):
+            self.assert_plan_binding(state, plan)
+            state["plans"][plan.plan_id] = {"event_id": event_id, "plan": plan.model_dump(mode="json")}
+        self.state.update(save)
         return plan.model_dump(mode="json")
 
     @staticmethod
     def source_revisions(snapshot, refs):
-        latest = {}
-        for row in snapshot["events"].values():
-            if row["source_id"] not in refs:
-                continue
-            previous = latest.get(row["source_id"])
-            key = row["source"].get("edited_at") or row["source"]["sent_at"]
-            previous_key = previous["source"].get("edited_at") or previous["source"]["sent_at"] if previous else -1
-            if previous is None or key >= previous_key:
-                latest[row["source_id"]] = row
-        return {ref: row["event_id"] for ref, row in latest.items()}
+        return {ref: row["event_id"] for ref, row in latest_sources(snapshot["events"], refs).items()}
+
+    def assert_plan_binding(self, snapshot, plan):
+        self.state.assert_binding(self.exchange.settings)
+        if (snapshot["network"] != plan.network or plan.network != self.exchange.settings.network
+                or plan.account.lower() != self.exchange.account.lower()
+                or plan.principal not in (None, self.exchange.settings.account.lower())):
+            raise AqlaError("Saved plan belongs to another trading target or network")
+
+    def validate_admission(self, snapshot, plan, account=None, *, owned=False):
+        self.assert_plan_binding(snapshot, plan)
+        if snapshot["paused"] or snapshot["policy_revision"] != plan.policy_revision:
+            raise AqlaError("Pause or policy changed; create a new unsent plan")
+        if now_ms() >= plan.deadline_at:
+            raise AqlaError("Entry plan deadline expired")
+        if self.source_revisions(snapshot, plan.source_refs) != plan.source_revisions:
+            raise AqlaError("Source changed after preview; the old unsent plan cannot execute")
+        subscribed = {*snapshot["sources"], *snapshot.get("source_aliases", {}).values()}
+        for row in latest_sources(snapshot["events"], plan.source_refs).values():
+            source = row["source"]
+            forwarded = row.get("native_forward") and source["chat_id"] == self.exchange.settings.telegram_owner_id
+            if source["chat_id"] not in subscribed and not forwarded:
+                raise AqlaError("Source is no longer subscribed; no unsent exposure may execute")
+        active = [trade for key, trade in snapshot["trades"].items() if trade["status"] in OPEN and (not owned or key != plan.trade_id)]
+        if len(active) >= plan.policy.max_open_trades or any(trade["plan"]["market"]["asset_id"] == plan.market.asset_id for trade in active):
+            raise AqlaError("Trade admission changed after preview")
+        for ref in plan.source_refs:
+            binding = snapshot["bindings"].get(ref)
+            if binding and (not owned or binding["trade_id"] != plan.trade_id):
+                raise AqlaError("Source has already been consumed")
+        if any(row["phase"] in ("prepared", "sending", "unknown") for row in snapshot["operations"].values()):
+            raise AqlaError("Unresolved exchange operations must be reconciled before new exposure")
+        if account is not None:
+            reserved = sum(Decimal(trade["reserved_risk"]) for trade in active)
+            if now_ms() - account.observed_at > 10000:
+                raise AqlaError("Account observation is stale")
+            if (plan.risk_usdc + reserved > account.equity * plan.policy.max_total_risk_percent / 100
+                    or plan.risk_usdc > account.equity * plan.policy.risk_percent / 100
+                    or plan.quantity * plan.entry_limit / plan.policy.leverage > account.available_margin):
+                raise AqlaError("Current equity/margin no longer permits this exact plan")
 
     async def positions(self, market):
         if market.product == "spot":
@@ -190,21 +226,10 @@ class Trading:
             if not saved:
                 raise AqlaError("Unknown immutable plan")
             plan = TradePlan.model_validate(saved["plan"])
+            self.assert_plan_binding(snapshot, plan)
             if plan.trade_id in snapshot["trades"]:
                 return snapshot["trades"][plan.trade_id]
-            if snapshot["paused"] or snapshot["policy_revision"] != plan.policy_revision:
-                raise AqlaError("Pause or policy changed; create a new unsent plan")
-            if now_ms() >= plan.deadline_at:
-                raise AqlaError("Entry plan deadline expired")
-            if self.source_revisions(snapshot, plan.source_refs) != plan.source_revisions:
-                raise AqlaError("Source changed after preview; the old unsent plan cannot execute")
-            if any(operation["phase"] in ("prepared", "sending", "unknown") for operation in snapshot["operations"].values()):
-                raise AqlaError("Unresolved exchange operations must be reconciled before new exposure")
-            active = [trade for trade in snapshot["trades"].values() if trade["status"] in OPEN]
-            if len(active) >= plan.policy.max_open_trades or any(trade["plan"]["market"]["asset_id"] == plan.market.asset_id for trade in active):
-                raise AqlaError("Trade admission changed after preview")
-            if any(ref in snapshot["bindings"] for ref in plan.source_refs):
-                raise AqlaError("Source has already been consumed")
+            self.validate_admission(snapshot, plan)
             if self.position_size(await self.positions(plan.market), plan.market) != 0:
                 raise AqlaError("Exchange position changed after preview")
             await self.exchange.verify_signer()
@@ -212,9 +237,6 @@ class Trading:
             if (current_market.asset_id, current_market.size_decimals) != (plan.market.asset_id, plan.market.size_decimals):
                 raise AqlaError("Exchange market metadata changed after preview")
             account = await self.exchange.account_snapshot(plan.market)
-            reserved = sum(Decimal(trade["reserved_risk"]) for trade in active)
-            if plan.risk_usdc + reserved > account.equity * plan.policy.max_total_risk_percent / 100 or plan.risk_usdc > account.equity * plan.policy.risk_percent / 100 or plan.quantity * plan.entry_limit / plan.policy.leverage > account.available_margin:
-                raise AqlaError("Current equity/margin no longer permits this exact plan")
             trade = {"trade_id": plan.trade_id, "chat_id": snapshot["events"][saved["event_id"]]["source"]["chat_id"],
                      "plan": plan.model_dump(mode="json"), "event_id": saved["event_id"], "status": "preparing",
                      "reserved_risk": str(plan.risk_usdc), "entry_operation_id": "entry:" + plan.trade_id,
@@ -224,6 +246,7 @@ class Trading:
                      "fill_events": {}, "exit_orders": [], "updates": {}, "targets": [str(price) for price in plan.take_profits]}
 
             def admit(state):
+                self.validate_admission(state, plan, account)
                 state["trades"][plan.trade_id] = trade
                 for ref in plan.source_refs:
                     state["bindings"][ref] = {"trade_id": plan.trade_id, "kind": "entry"}
@@ -236,17 +259,21 @@ class Trading:
         if plan.market.product == "perp":
             leverage = await self.exchange.mutate("leverage:" + plan.trade_id,
                                                  {"type": "updateLeverage", "asset": plan.market.asset_id,
-                                                  "isCross": plan.policy.margin_mode == "cross", "leverage": plan.policy.leverage}, deadline=plan.deadline_at)
+                                                  "isCross": plan.policy.margin_mode == "cross", "leverage": plan.policy.leverage}, deadline=plan.deadline_at,
+                                                  prepare_guard=lambda data: self.validate_admission(data, plan, owned=True))
             if leverage["phase"] != "acknowledged":
                 self._patch(plan.trade_id, status="unknown" if leverage["phase"] == "unknown" else "rejected")
                 return self.state.snapshot()["trades"][plan.trade_id]
+        account = await self.exchange.account_snapshot(plan.market)
+        self.validate_admission(self.state.snapshot(), plan, account, owned=True)
         entry = self.order(plan, plan.quantity, plan.entry_limit, cloid=trade["entry_cloid"])
         initial_stop = self.order(plan, plan.quantity, plan.stop_loss * (Decimal("0.95") if plan.side == "long" else Decimal("1.05")),
                                   reduce=True, trigger=("sl", plan.stop_loss), cloid=self.exchange.cloid(trade["entry_operation_id"], 1))
         initial_stop["p"] = wire_number(price_grid(Decimal(initial_stop["p"]), plan.market, up=plan.side == "short"))
         action = {"type": "order", "orders": [entry, initial_stop], "grouping": "normalTpsl"}
         self._patch(plan.trade_id, status="opening", orders=[{"kind": "sl", "cloid": initial_stop["c"], "quantity": str(plan.quantity), "price": str(plan.stop_loss)}])
-        result = await self.exchange.mutate(trade["entry_operation_id"], action, deadline=plan.deadline_at)
+        result = await self.exchange.mutate(trade["entry_operation_id"], action, deadline=plan.deadline_at,
+                                            prepare_guard=lambda data: self.validate_admission(data, plan, account, owned=True))
         if result["phase"] == "unknown":
             self._patch(plan.trade_id, status="unknown")
         await self.refresh_trade(plan.trade_id)
@@ -258,17 +285,17 @@ class Trading:
         plan = TradePlan.model_validate(trade["plan"])
         if trade["entry_operation_id"] in snapshot["operations"]:
             return await self.refresh_trade(trade_id)
-        if snapshot["paused"] or snapshot["policy_revision"] != plan.policy_revision or now_ms() >= plan.deadline_at or self.source_revisions(snapshot, plan.source_refs) != plan.source_revisions:
-            self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Pause, rules, source revision or deadline changed")
-            return self.state.snapshot()["trades"][trade_id]
-        if any(row["phase"] in ("prepared", "sending", "unknown") for row in snapshot["operations"].values()):
-            raise AqlaError("Unresolved action blocks the still-unsent entry")
-        if self.position_size(await self.positions(plan.market), plan.market) != 0:
-            raise AqlaError("Unsent entry cannot resume against an existing foreign position")
-        account = await self.exchange.account_snapshot(plan.market)
-        reserved = sum(Decimal(row["reserved_risk"]) for key, row in snapshot["trades"].items() if key != trade_id and row["status"] in OPEN)
-        if plan.risk_usdc + reserved > account.equity * plan.policy.max_total_risk_percent / 100 or plan.risk_usdc > account.equity * plan.policy.risk_percent / 100 or plan.quantity * plan.entry_limit / plan.policy.leverage > account.available_margin:
-            self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Current budget no longer permits the original plan")
+        self.assert_plan_binding(snapshot, plan)
+        try:
+            self.validate_admission(snapshot, plan, owned=True)
+            if self.position_size(await self.positions(plan.market), plan.market) != 0:
+                raise AqlaError("Unsent entry cannot resume against an existing foreign position")
+            account = await self.exchange.account_snapshot(plan.market)
+            self.validate_admission(self.state.snapshot(), plan, account, owned=True)
+        except AqlaError as error:
+            if any(row["phase"] in ("prepared", "sending", "unknown") for row in self.state.snapshot()["operations"].values()):
+                raise
+            self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason=str(error))
             return self.state.snapshot()["trades"][trade_id]
         return await self._entry_steps(plan, trade)
 
@@ -314,6 +341,7 @@ class Trading:
     async def capture_fills(self, trade_id, entry_status=None):
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(self.state.snapshot(), plan)
         entry_status = entry_status or await self.exchange.order_status(trade["entry_cloid"])
         observed = {trade["entry_cloid"]: entry_status}
         mapping = {}
@@ -360,6 +388,7 @@ class Trading:
     def owned_remaining(self, trade_id, signed):
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(self.state.snapshot(), plan)
         fills = trade.get("fill_events", {}).values()
         entered = sum((Decimal(row["sz"]) for row in fills if row["kind"] == "entry"), Decimal(0))
         exited = sum((Decimal(row["sz"]) for row in fills if row["kind"] != "entry"), Decimal(0))
@@ -407,6 +436,7 @@ class Trading:
     async def ensure_protection(self, trade_id):
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(self.state.snapshot(), plan)
         remaining = Decimal(trade["remaining_quantity"])
         if remaining <= 0:
             return
@@ -466,6 +496,7 @@ class Trading:
     async def cancel_entry(self, trade_id):
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(self.state.snapshot(), plan)
         if trade["entry_operation_id"] not in self.state.snapshot()["operations"]:
             return {"not_sent": True}
         status = await self.exchange.order_status(trade["entry_cloid"])
@@ -481,6 +512,7 @@ class Trading:
     async def replace_stop(self, trade_id, proposed: Decimal, operation_id=None):
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(self.state.snapshot(), plan)
         if trade["status"] not in OPEN:
             return {"already_closed": True}
         remaining = Decimal(trade["remaining_quantity"])
@@ -525,15 +557,40 @@ class Trading:
         self._patch(trade_id, status="protecting")
         return {"operation": result, "old_stop_retained": True, "replacement_unconfirmed": True}
 
-    async def close_position(self, trade_id, percent=Decimal(100), operation_id=None):
-        trade = self.state.snapshot()["trades"][trade_id]
+    async def dispatch_close_intent(self, trade_id, intent):
+        snapshot = self.state.snapshot()
+        trade = snapshot["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
-        if trade["status"] not in OPEN:
+        self.assert_plan_binding(snapshot, plan)
+        previous = snapshot["operations"].get(intent["operation_id"])
+        if previous:
+            return previous
+        if trade["status"] not in OPEN or trade["status"] == "cleanup":
+            return {"already_closed": True}
+        await self.cancel_entry(trade_id)
+        await self.capture_fills(trade_id)
+        remaining = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
+        if not remaining:
+            return {"already_closed": True}
+        return await self.exchange.mutate(intent["operation_id"], intent["action"],
+                                          prepare_guard=lambda data: self.assert_plan_binding(data, plan))
+
+    async def close_position(self, trade_id, percent=Decimal(100), operation_id=None):
+        snapshot = self.state.snapshot()
+        trade = snapshot["trades"][trade_id]
+        plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(snapshot, plan)
+        if trade["status"] not in OPEN or trade["status"] == "cleanup":
             return {"already_closed": True}
         operation_id = operation_id or "close:" + trade_id + ":" + str(trade["management_revision"])
-        existing = self.state.snapshot()["operations"].get(operation_id)
+        existing = snapshot["operations"].get(operation_id)
         if existing:
             return existing
+        staged = trade.get("close_intents", {}).get(operation_id)
+        if staged:
+            return await self.dispatch_close_intent(trade_id, staged)
+        if any(key not in snapshot["operations"] for key in trade.get("close_intents", {})):
+            raise AqlaError("Finish the saved close intention before another reduction")
         await self.cancel_entry(trade_id)
         await self.capture_fills(trade_id)
         size = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
@@ -543,17 +600,23 @@ class Trading:
         if amount <= 0:
             raise AqlaError("Reduction rounds to zero")
         market = await self.exchange.market(plan.market.symbol, plan.market.product)
-        long = plan.side == "long"
-        limit = price_grid(market.mid * (1 + (-1 if long else 1) * plan.policy.max_slippage_percent / 100), plan.market, up=not long)
+        limit = slippage_price(market.mid, plan.policy.max_slippage_percent, plan.market, buy=plan.side == "short")
         order = self.order(plan, amount, limit, reduce=True, cloid=self.exchange.cloid(operation_id))
         order["t"] = {"limit": {"tif": "Ioc"}}
-        self.state.update(lambda state: state["trades"][trade_id].setdefault("exit_orders", []).append({"kind": "close", "cloid": order["c"]}))
-        self._patch(trade_id, status="closing", management_revision=trade["management_revision"] + 1)
-        return await self.exchange.mutate(operation_id, {"type": "order", "orders": [order], "grouping": "na"})
+        intent = {"operation_id": operation_id, "action": {"type": "order", "orders": [order], "grouping": "na"}, "created_at": now_ms()}
+        def stage(data):
+            self.assert_plan_binding(data, plan)
+            row = data["trades"][trade_id]
+            row.setdefault("close_intents", {})[operation_id] = intent
+            row.setdefault("exit_orders", []).append({"kind": "close", "cloid": order["c"], "quantity": order["s"], "price": order["p"]})
+            row.update(status="closing", management_revision=row["management_revision"] + 1)
+        self.state.update(stage)
+        return await self.dispatch_close_intent(trade_id, intent)
 
     async def _cancel_owned_orders(self, trade_id, include_sl=False, operation_id=None):
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(self.state.snapshot(), plan)
         orders = [order for order in trade["orders"] if include_sl or order["kind"] != "sl"]
         if not orders:
             return
@@ -563,6 +626,7 @@ class Trading:
     def begin_cleanup(self, trade_id, terminal_status):
         snapshot = self.state.snapshot()
         trade = snapshot["trades"][trade_id]
+        self.assert_plan_binding(self.state.snapshot(), TradePlan.model_validate(trade["plan"]))
         identities = []
         for order in trade["orders"]:
             for operation in snapshot["operations"].values():
@@ -575,6 +639,7 @@ class Trading:
 
     async def finish_cleanup(self, trade_id):
         trade = self.state.snapshot()["trades"][trade_id]
+        self.assert_plan_binding(self.state.snapshot(), TradePlan.model_validate(trade["plan"]))
         if trade.get("cleanup_cloids"):
             await self._cancel_owned_orders(trade_id, include_sl=True)
             observations = [await self.exchange.order_status(identity) for identity in trade["cleanup_cloids"]]
@@ -610,16 +675,33 @@ class Trading:
 
     async def update_trade(self, event_id, signal: Interpretation):
         async with self.lock:
-            self.record_interpretation(event_id, signal)
             if signal.kind != "trade_update" or not signal.update_action:
                 raise AqlaError("An update needs a definite action")
-            candidates = self.update_candidates(event_id, signal)
+            snapshot = self.state.snapshot()
+            previous = snapshot["bindings"].get("update:" + event_id)
+            if previous:
+                if previous["kind"] != signal.update_action or previous["payload_hash"] != digest(signal.model_dump(mode="json")) or signal.bound_trade_id not in (None, previous["trade_id"]):
+                    raise AqlaError("Update source is already bound to another trade or action")
+                trade = snapshot["trades"][previous["trade_id"]]
+                self.assert_plan_binding(snapshot, TradePlan.model_validate(trade["plan"]))
+                if snapshot["events"][event_id]["status"] == "updated":
+                    return {"duplicate": True, "trade": trade}
+                if trade["status"] not in OPEN:
+                    operation = snapshot["operations"].get("update:" + event_id)
+                    uncertain = operation and operation["phase"] in ("prepared", "sending", "unknown")
+                    self.state.update(lambda data: data["events"][event_id].update(status="needs_reconciliation" if uncertain else "updated"))
+                    return {"trade_id": trade["trade_id"], "result": operation or {"already_closed": True}}
+                candidates = [trade]
+            else:
+                candidates = self.update_candidates(event_id, signal)
+            self.record_interpretation(event_id, signal)
             if len(candidates) != 1 or signal.bound_trade_id not in (None, candidates[0]["trade_id"]):
                 raise AqlaError("Trade update cannot be bound unambiguously")
             trade = candidates[0]
             if trade["status"] == "cleanup":
                 raise AqlaError("Exit cleanup must finish before further trade updates")
             plan = TradePlan.model_validate(trade["plan"])
+            self.assert_plan_binding(self.state.snapshot(), plan)
             if signal.update_action not in plan.policy.allowed_updates:
                 raise AqlaError("Update action is not allowed by this trade's user rules")
             previous = self.state.snapshot()["bindings"].get("update:" + event_id)
@@ -670,6 +752,7 @@ class Trading:
     async def replace_targets(self, trade_id, prices, operation_id):
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(self.state.snapshot(), plan)
         target_prices = self.validate_targets(trade, plan, prices)
         prior = self.state.snapshot()["operations"].get(operation_id)
         if prior:
@@ -743,6 +826,11 @@ class Trading:
                 except Exception:
                     reports.append({"operation_id": operation_id, "error": "Exact operation reconciliation is unavailable"})
         for trade_id, trade in self.state.snapshot()["trades"].items():
+            try:
+                self.assert_plan_binding(self.state.snapshot(), TradePlan.model_validate(trade["plan"]))
+            except AqlaError as error:
+                reports.append({"trade_id": trade_id, "error": str(error)})
+                continue
             if trade["status"] in ("closed", "rejected") and trade["orders"] and not trade.get("cleanup_complete"):
                 self.begin_cleanup(trade_id, trade["status"])
                 trade = self.state.snapshot()["trades"][trade_id]
@@ -753,6 +841,9 @@ class Trading:
                     elif trade["entry_operation_id"] not in self.state.snapshot()["operations"]:
                         reports.append(await self.resume_unsent_entry(trade_id))
                     else:
+                        for identity, intent in trade.get("close_intents", {}).items():
+                            if identity not in self.state.snapshot()["operations"]:
+                                reports.append(await self.dispatch_close_intent(trade_id, intent))
                         reports.append(await self.refresh_trade(trade_id))
                 except Exception as error:
                     reports.append({"trade_id": trade_id, "error": str(error) if isinstance(error, AqlaError) else "Trade reconciliation is unavailable"})

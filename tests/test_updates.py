@@ -147,3 +147,72 @@ async def test_repeated_interpretation_keeps_executed_source_state(setup, signal
     source, interpretation = signal
     trading.record_interpretation(source.event_id, copy.deepcopy(interpretation))
     assert state.snapshot()["events"][source.event_id]["status"] == "executed"
+
+
+@pytest.mark.asyncio
+async def test_completed_close_update_is_deduplicated_after_trade_disappears_from_candidates(setup, signal, monkeypatch):
+    _, state, fake, _, trading = setup
+    trade = await opened(setup, signal)
+    source, interpretation = update(trading, 2, "close", "Rest schließen")
+    await trading.update_trade(source.event_id, interpretation)
+    await trading.recover()
+    assert state.snapshot()["trades"][trade["trade_id"]]["status"] == "closed"
+    trading.ingest(source.model_copy(update={"edited_at": source.sent_at + 1, "text": "Neue Anweisung"}))
+    before = len(fake.actions)
+
+    def no_candidates(*args):
+        raise AssertionError("A bound completed update must not search open trade candidates")
+
+    monkeypatch.setattr(trading, "update_candidates", no_candidates)
+    result = await trading.update_trade(source.event_id, copy.deepcopy(interpretation))
+    assert result["duplicate"]
+    assert len(fake.actions) == before
+    with pytest.raises(AqlaError, match="already bound"):
+        await trading.update_trade(source.event_id, interpretation.model_copy(update={"update_action": "reduce", "reduce_percent": Decimal(50)}))
+    assert len(fake.actions) == before
+
+
+@pytest.mark.asyncio
+async def test_interrupted_close_update_keeps_its_binding_after_recovery_closes_trade(setup, signal, monkeypatch):
+    _, state, fake, exchange, trading = setup
+    trade = await opened(setup, signal)
+    source, interpretation = update(trading, 2, "close", "Rest schließen")
+    original = trading.close_position
+
+    async def interrupted(*args):
+        await original(*args)
+        raise RuntimeError("Crash after close dispatch before updating the event")
+
+    monkeypatch.setattr(trading, "close_position", interrupted)
+    with pytest.raises(RuntimeError):
+        await trading.update_trade(source.event_id, interpretation)
+    monkeypatch.setattr(trading, "close_position", original)
+    await trading.recover()
+    assert state.snapshot()["trades"][trade["trade_id"]]["status"] == "closed"
+    before = len(fake.actions)
+    result = await trading.update_trade(source.event_id, interpretation)
+    assert result["trade_id"] == trade["trade_id"]
+    assert result["result"]["operation_id"] == "update:" + source.event_id
+    assert state.snapshot()["events"][source.event_id]["status"] == "updated"
+    assert len(fake.actions) == before
+    assert "update:" + source.event_id in exchange.state.snapshot()["bindings"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["long", "short"])
+async def test_owned_close_limit_stays_inside_slippage_bound_on_each_side(setup, signal, side):
+    _, state, fake, _, trading = setup
+    source, interpretation = signal
+    if side == "short":
+        source = source.model_copy(update={"edited_at": source.sent_at + 1, "text": "BTC verkaufen. SL 110. Ziele 90 und 80."})
+        trading.ingest(source)
+        interpretation = interpretation.model_copy(update={"side": "short", "stop_loss": Decimal(110), "take_profits": [Decimal(90), Decimal(80)], "evidence": [
+            Evidence(field=field, source_id=source.source_id, quote=quote) for field, quote in [
+                ("symbol", "BTC"), ("side", "verkaufen"), ("stop_loss", "SL 110"), ("take_profits.0", "Ziele 90"), ("take_profits.1", "80")]]})
+    plan = await trading.preview(source.event_id, interpretation)
+    trade = await trading.execute(plan["plan_id"])
+    fake.mid = "100.0001"
+    await trading.close_position(trade["trade_id"], operation_id="rounded-close")
+    order = state.snapshot()["operations"]["rounded-close"]["wire_action"]["orders"][0]
+    bound = Decimal(fake.mid) * (Decimal("0.997") if side == "long" else Decimal("1.003"))
+    assert Decimal(order["p"]) >= bound if side == "long" else Decimal(order["p"]) <= bound

@@ -101,6 +101,12 @@ class FakeExchange:
                 if row and row["status"] == "open":
                     row["status"] = "canceled"
             data = {"status": "ok", "response": {"type": "cancel", "data": {"statuses": ["success"] * len(action["cancels"])}}}
+        elif action["type"] == "twapOrder":
+            data = {"status": "ok", "response": {"type": "twapOrder", "data": {"status": {"running": {"twapId": 1}}}}}
+        elif action["type"] == "twapCancel":
+            data = {"status": "ok", "response": {"type": "twapCancel", "data": {"status": "success"}}}
+        elif action["type"] == "trailingStop":
+            data = {"status": "ok", "response": {"type": "trailingStop", "data": {"oid": 1}}}
         else:
             data = {"status": "ok", "response": {"type": "default"}}
         if self.lost_response or self.lose_entry_response and action["type"] == "order" and any(not order["r"] for order in action["orders"]):
