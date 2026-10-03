@@ -16,6 +16,8 @@ Stand: 03.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Qu
 
 ## Geprüft
 
+Alle 20 Befunde der Vollprüfung von `d9f35d3` sind korrigiert und durch gezielte Regressionstests beziehungsweise Paket-/CI-Prüfungen abgesichert. Die Zuordnung steht in `docs/quality-review.md`. Der zusammengeführte Stand besteht lokal 396 Tests einschließlich der lokalen WebSocket-Prüfungen, mit 80,12 Prozent Branch-Coverage. Native Hermes-Smokes prüfen zusätzlich die echten Text-/Foto-/Queue-Batchpfade, Befehlsrechte und beide MCPs. Beide Abhängigkeitsgraphen melden zum Prüfzeitpunkt keine bekannten Advisories.
+
 Ruff; eingefrorene Installation; Paketbuild; separate Wheel-Installation und Offline-Installer; regel- und zustandsbezogene Tests einschließlich Crash vor TP-Versand, verlorenen Antworten, echten Teilfills, beendeter eigener Position mit fremdem Wiedereröffnen, frischer Equity bei Recovery und verlorener niedriger Telegram-ID.
 
 Mit dem tatsächlichen gepinnten Hermes: Gesprächswiederherstellung ohne DB, Gateway-Konstruktion ohne Session-DB, native AIAgent-Hooks und stdio-MCP. Ein lokales geskriptetes Modell prüfte Owner-Regeländerung, Master-Patch, Größenbegrenzung und die Abwehr von Kontrollaufrufen aus einer echten nativen Weiterleitung. Native Boot-Anbindung startet ohne neue Owner-Nachricht; geänderte Skills leeren den nativen Agentencache vor dem nächsten Turn.

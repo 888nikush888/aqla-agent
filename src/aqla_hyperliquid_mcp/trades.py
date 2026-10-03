@@ -31,6 +31,10 @@ class Trading:
         trusted_forward = native_forward and self.exchange.settings.telegram_owner_id and source.chat_id == self.exchange.settings.telegram_owner_id
         if not trusted_forward and source.chat_id not in {*snapshot["sources"], *snapshot.get("source_aliases", {}).values()}:
             raise AqlaError("Source is not subscribed")
+        if source.event_id in snapshot["events"]:
+            return snapshot["events"][source.event_id]
+        if source.event_id in snapshot.get("event_tombstones", {}):
+            return {"event_id": source.event_id, "source_id": source.source_id, "status": "already_processed"}
 
         def insert(state):
             if source.event_id in state["events"]:
@@ -41,18 +45,21 @@ class Trading:
                    "status": "context" if source.historical else "pending", "interpretation": None, "native_forward": bool(trusted_forward)}
             state["events"][source.event_id] = row
             state["cursors"][source.chat_id] = max(source.message_id, state["cursors"].get(source.chat_id, 0))
-            self.prune_events(state)
+            self.prune_events(state, inserted_event=source.event_id)
             return row
 
         return self.state.update(insert)
 
-    def prune_events(self, state):
+    def prune_events(self, state, *, inserted_event=None):
         maximum = self.exchange.settings.max_events
         if len(state["events"]) <= maximum:
             return
         protected_refs = {ref for trade in state["trades"].values() if trade["status"] in OPEN for ref in trade["plan"]["source_refs"]}
         protected_events = {event for plan in state["plans"].values() if plan["plan"]["deadline_at"] > now_ms() for event in plan["plan"].get("source_revisions", {}).values()}
         protected_events.update(key.removeprefix("Signale:") for key in state.get("journal_pending", {}) if key.startswith("Signale:"))
+        # State.update enqueues journal changes after this callback, in the same write.
+        if self.state.journal_enabled and inserted_event:
+            protected_events.add(inserted_event)
         by_chat = {}
         for row in state["events"].values():
             by_chat.setdefault(row["source"]["chat_id"], []).append(row)
