@@ -159,6 +159,12 @@ def main():
     configuration = GatewayConfig()
     runner = GatewayRunner(configuration)
     assert runner._session_db is None
+    from gateway.run import _await_thread_exit, _start_gateway_start_cron_and_housekeeping
+    stop, provider, cron_thread, housekeeping_thread = _start_gateway_start_cron_and_housekeeping(runner)
+    assert provider is None and cron_thread is None and housekeeping_thread is None
+    stop.set()
+    assert asyncio.run(_await_thread_exit(cron_thread, timeout=0))
+    assert asyncio.run(_await_thread_exit(housekeeping_thread, timeout=0))
     store = SessionStore(home / "sessions", configuration)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345")
     entry = store.get_or_create_session(source)

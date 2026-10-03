@@ -74,13 +74,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+KillMode=mixed
 User=aqla
 WorkingDirectory={destination}
 EnvironmentFile={env_path}
 ExecStart={destination}/hermes-venv/bin/python -m aqla_agent.hermes_runtime
 Restart=on-failure
 RestartSec=10
-TimeoutStopSec=30
+TimeoutStopSec=90
 UMask=0077
 NoNewPrivileges=true
 

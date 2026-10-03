@@ -16,7 +16,7 @@ Stand: 03.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Qu
 
 ## Geprüft
 
-Alle 32 bestätigten Befunde der Voll-, Nach- und Abschlussprüfung sind korrigiert und durch gezielte Regressionstests beziehungsweise Paket-/CI-Prüfungen abgesichert. Die Zuordnung steht in `docs/quality-review.md`. Der zusammengeführte Stand besteht lokal 498 Tests einschließlich der lokalen WebSocket-Prüfungen, mit 80,79 Prozent Branch-Coverage. Native Hermes-Smokes prüfen zusätzlich echte Text-/Foto-/Queue-Batchpfade, rekursive Folgeturns mit wiederverwendetem Agenten, Workerautorität, Befehlsabbruch, Adapterwechsel und beide MCPs. Beide Abhängigkeitsgraphen melden zum Prüfzeitpunkt keine bekannten Advisories.
+Alle 32 bestätigten Befunde der Voll-, Nach- und Abschlussprüfung sind korrigiert und durch gezielte Regressionstests beziehungsweise Paket-/CI-Prüfungen abgesichert. Die Zuordnung steht in `docs/quality-review.md`. Nach der zusätzlichen VPS-Startkorrektur besteht der Stand lokal 498 Tests einschließlich der lokalen WebSocket-Prüfungen, mit 80,74 Prozent Branch-Coverage. Native Hermes-Smokes prüfen zusätzlich echte Text-/Foto-/Queue-Batchpfade, rekursive Folgeturns mit wiederverwendetem Agenten, Workerautorität, Befehlsabbruch, Adapterwechsel, deaktivierte Cron-/Housekeeping-Factory und beide MCPs. Beide Abhängigkeitsgraphen melden zum Prüfzeitpunkt keine bekannten Advisories.
 
 Ruff; eingefrorene Installation; Paketbuild; separate Wheel-Installation und Offline-Installer; regel- und zustandsbezogene Tests einschließlich Crash vor TP-Versand, verlorenen Antworten, echten Teilfills, beendeter eigener Position mit fremdem Wiedereröffnen, frischer Equity bei Recovery und verlorener niedriger Telegram-ID.
 
@@ -26,6 +26,6 @@ Ein echter lokaler WebSocket-Server prüfte Reconnect, Unsubscribe und einen ang
 
 ## Prüfgrenzen und Einrichtung
 
-Keine echten Telegram-Nachrichten, keine Live-Exchange-Mutationen und keine Anmeldung am Konto des Nutzers. Der Linux-Dienst wurde hier nicht auf einem entfernten VPS gestartet. Zugangsdaten, Kontoadresse, Modell, Quellen und Handelsregeln werden auf dem VPS gesetzt; README.md enthält die Schritte.
+Die anschließende VPS-Installation auf ausdrücklichen Nutzerauftrag ist in `docs/vps-deployment.md` dokumentiert: Dienst läuft, echter Modellaufruf funktioniert, Telegram-Bot antwortet und der Kanal-Leser ist per QR angemeldet. Hyperliquid-Testnet-Kontobindung wurde lesend geprüft; keine Exchange-Mutationen. Handelsregeln und Quellen wählt der Nutzer über den Bot. Google Sheets wird zuletzt nach Bereitstellung der Tabellen-ID und Servicekonto-Datei aktiviert.
 
 Geskriptete Modellprüfungen beweisen Integration und Befugnisse, keine allgemeine sprachliche Erkennungsqualität. Für das gewünschte echte Modell liegen 30 Kontextfälle und ein ausdrücklich auszuführender Eval-Runner ohne Handels-/Telegram-Werkzeuge bei. Text und Captions werden verarbeitet; reine Bildsignale nicht. Native Stop-Ausführung ist kein garantierter maximaler tatsächlicher Verlust.

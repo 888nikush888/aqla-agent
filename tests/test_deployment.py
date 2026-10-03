@@ -18,6 +18,8 @@ def test_deployment_is_separate_and_has_native_hermes_transport(tmp_path):
     assert config["mcp_servers"]["sheets"]["tools"]["exclude"] == ["sync_internal"]
     assert (target / "hermes-home" / "skills" / "aqla-master" / "SKILL.md").exists()
     assert "aqla_agent.hermes_runtime" in (target / "aqla-agent.service").read_text()
+    assert "TimeoutStopSec=90" in (target / "aqla-agent.service").read_text()
+    assert "KillMode=mixed" in (target / "aqla-agent.service").read_text()
     assert not list(target.rglob("*.db"))
     with pytest.raises(ValueError, match="new and empty"):
         prepare(project, target, "12345", "test-model", "https://example.invalid/v1")

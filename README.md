@@ -68,7 +68,7 @@ Voraussetzungen: Linux mit systemd, Git und uv. Der Installer richtet eigene Pyt
    sudo journalctl -u aqla-agent -f
    ```
 
-   Ein schon vorhandenes Konto nicht erneut anlegen. Die Unit verwendet `User=aqla`, restriktive Dateirechte und Neustart bei Fehlern. Kein Webserver und kein eingehender öffentlicher Port werden benötigt.
+   Ein schon vorhandenes Konto nicht erneut anlegen. Die Unit verwendet `User=aqla`, restriktive Dateirechte und Neustart bei Fehlern. `KillMode=mixed` und 90 Sekunden Stop-Frist lassen den Gateway seine MCP-Kinder geordnet beenden. Kein Webserver und kein eingehender öffentlicher Port werden benötigt.
 
 6. Dem Bot einmal eine normale Nachricht senden, beispielsweise „Hallo“. Regeln und Quellen über Hermes festlegen. Neue zulässige Signale benötigen anschließend keine Freigabe pro Trade.
 

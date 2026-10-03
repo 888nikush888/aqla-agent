@@ -2,6 +2,7 @@
 import os
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 
 
@@ -22,6 +23,13 @@ def install_strict_profile():
         raise sqlite3.OperationalError("SQLite is disabled in the aqla VPS profile")
 
     replace(sqlite3, "connect", no_database)
+    import gateway.run as native_gateway
+
+    # This factory runs outside GatewayStartupMixin, after adapters connect.
+    # Its cron and housekeeping products attempt their own SQLite stores.
+    # Native async session/transport watchdogs remain enabled below.
+    replace(native_gateway, "_start_gateway_start_cron_and_housekeeping",
+            lambda runner: (threading.Event(), None, None, None))
     from gateway.platforms.base import BasePlatformAdapter
     from gateway.run import GatewayRunner
     from gateway.run_adapters import GatewayAdapterLifecycleMixin
@@ -149,6 +157,7 @@ def main():
         raise SystemExit("Pinned Hermes source is missing; run aqla-install-hermes on the VPS")
     sys.path.insert(0, str(source))
     os.environ["HERMES_SKIP_CONFIG_MIGRATION"] = "1"
+    os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
     install_strict_profile()
     sys.argv = ["hermes", "gateway", "run"]
     from hermes_cli.main import main as hermes_main

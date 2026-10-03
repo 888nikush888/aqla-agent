@@ -63,6 +63,8 @@ Der zusammengeführte Stand besteht lokal **498 Tests bei 80,79 Prozent Branch-C
 
 ## Dauerhafte CI-Prüfungen
 
+Beim tatsächlichen Debian-VPS-Start wurde zusätzlich eine außerhalb der Startup-Mixin liegende native Cron-/Housekeeping-Factory erkannt. Sie startete ungenutzte SQLite-Produkte trotz des Aqla-Profils. Das Profil deaktiviert nun auch diese Factory; native asynchrone Transport-/Sessionwatchdogs bleiben aktiv. Der native Smoke ruft die tatsächliche Factory auf und prüft die kompatible leere Thread-Shutdownstrecke. Die erzeugte systemd-Unit verwendet 90 Sekunden Stop-Frist und `KillMode=mixed`, damit zuerst der native Gateway seine MCP-Kinder geordnet beendet. Der Installer verwaltet die Dependencies; native Lazy-Installationen sind im Aqla-Launcher deaktiviert.
+
 - Frozen-Installation, Lint, Tests und Branch-Coverage auf Python 3.12, 3.13 und 3.14. Die Pipeline verlangt mindestens 70 Prozent.
 - API-Abdeckung und lokaler WebSocket-Test für Reconnect, Unsubscribe und verlorene Antworten.
 - Tatsächlicher gepinnter Hermes-Checkout: Dateiverlauf ohne DB, native Befehle, Quellenautorität, stdio-MCP, Nutzerregeln und Masterbearbeitung. Modellantworten sind dabei lokal geskriptet.
