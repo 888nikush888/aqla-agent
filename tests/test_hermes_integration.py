@@ -58,7 +58,7 @@ def test_tool_claim_comes_from_native_metadata_not_text(extension):
 
 
 @pytest.mark.asyncio
-async def test_native_handler_boundary_serializes_origin_for_queued_turns(extension):
+async def test_native_handler_context_is_task_local_for_concurrent_commands(extension):
     extension, ctx = extension
     began = asyncio.Event()
     finish = asyncio.Event()
@@ -86,7 +86,7 @@ async def test_native_handler_boundary_serializes_origin_for_queued_turns(extens
     await began.wait()
     source = asyncio.create_task(adapter._message_handler(message(injection=True)))
     await asyncio.sleep(0)
-    assert extension.active_context[0] == "operator"
+    assert extension.active_context is None
     finish.set()
     await asyncio.gather(owner, source)
     assert seen == ["operator", "source"]
@@ -97,6 +97,56 @@ async def test_native_handler_boundary_serializes_origin_for_queued_turns(extens
     for cleanup in ctx.cleanups:
         cleanup()
     assert adapter._message_handler is original
+
+
+@pytest.mark.asyncio
+async def test_finalizer_revokes_claim_already_copied_into_worker_thread(extension):
+    import threading
+
+    extension, _ = extension
+    entered, release = threading.Event(), threading.Event()
+    def worker():
+        entered.set()
+        release.wait(2)
+        assert extension.before_tool("mcp_aqla_control", {})["action"] == "block"
+    with extension.claim_scope(("operator", "1")):
+        task = asyncio.create_task(asyncio.to_thread(worker))
+        await asyncio.to_thread(entered.wait, 2)
+        extension.ended()
+        release.set()
+        await task
+    assert extension.active_context is None
+
+
+@pytest.mark.asyncio
+async def test_rebinding_replaces_handler_without_duplicate_workers(extension):
+    extension, ctx = extension
+    async def handler(event):
+        assert extension.active_context == ("operator", "1")
+    async def worker():
+        await asyncio.Event().wait()
+    extension.worker = extension.reader_worker = worker
+    def adapter():
+        value = SimpleNamespace(_message_handler=handler)
+        value.set_message_handler = lambda callback: setattr(value, "_message_handler", callback)
+        return value
+    first, second = adapter(), adapter()
+    gateway = SimpleNamespace(_delivery_adapter_for=lambda _: first,
+                              session_store=SimpleNamespace(_generate_session_key=lambda _: "owner"))
+    extension.attach(message(), gateway)
+    extension.attach(message(), gateway)
+    assert len(ctx.tasks) == 2
+    extension.attach(message(), gateway, adapter=second)
+    assert first._message_handler is handler
+    assert second._message_handler is not handler
+    assert len(ctx.tasks) == 2
+    await second._message_handler(message())
+    for task in ctx.tasks:
+        task.cancel()
+    await asyncio.gather(*ctx.tasks, return_exceptions=True)
+    for cleanup in ctx.cleanups:
+        cleanup()
+    assert second._message_handler is handler
 
 
 @pytest.mark.asyncio

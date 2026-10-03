@@ -22,7 +22,9 @@ class SourceAccessError(AqlaError):
         # Use only known exception types, never RPC text or credential values.
         codes = {"UnauthorizedError": "reader_session_unauthorized", "AuthKeyError": "reader_session_unauthorized",
                  "ApiIdInvalidError": "reader_api_credentials_invalid", "FloodError": "reader_rate_limited",
-                 "ChannelPrivateError": "sources_access_denied", "ChatAdminRequiredError": "sources_access_denied"}
+                 "ChannelPrivateError": "sources_access_denied", "ChatAdminRequiredError": "sources_access_denied",
+                 "ChannelInvalidError": "sources_access_denied", "PeerIdInvalidError": "sources_access_denied",
+                 "ChatIdInvalidError": "sources_access_denied", "UserBannedInChannelError": "sources_access_denied"}
         code = next((codes[base.__name__] for base in type(error).__mro__ if base.__name__ in codes), "reader_unavailable")
         return cls(code)
 
@@ -43,6 +45,8 @@ class TelegramReader:
         self.intake_lock = asyncio.Lock()
         self.last_backfill = 0.0
         self.unavailable_sources = []
+        self.missing_sources = []
+        self.failed_sources = {}
 
     def status_error(self):
         return {"code": "sources_unavailable", "sources": list(self.unavailable_sources)} if self.unavailable_sources else None
@@ -84,45 +88,63 @@ class TelegramReader:
             self.aliases = resolved
             self.entities = {chat: dialogs[chat][1] for chat in resolved.values()}
             self.selected = list(selected)
-            self.unavailable_sources = unavailable
+            self.missing_sources = unavailable
+            self.failed_sources = {chat: names for chat, names in self.failed_sources.items() if chat in self.entities}
+            self.update_source_status()
         configuration["source_aliases"] = self.aliases
         for chat, entity in self.entities.items():
             if chat_id is not None and chat != chat_id:
                 continue
-            cursor = configuration["cursors"].get(chat)
-            cutoff = configuration.get("context_cutoffs", {}).get(chat, 0)
-            context_ids = configuration.get("context_ids", {}).get(chat)
-            if cursor is None and chat not in configuration.get("context_cutoffs", {}):
-                history = [message async for message in self.client.iter_messages(entity, limit=self.settings.max_context_messages)]
-                cutoff = max((message.id for message in history), default=0)
-                context_ids = sorted(message.id for message in history)
-                if self.bootstrap:
-                    await self.bootstrap({chat: cutoff}, {chat: context_ids})
-                configuration.setdefault("context_cutoffs", {})[chat] = cutoff
-                configuration.setdefault("context_ids", {})[chat] = context_ids
-                # Persist the bounded selection before the first delivery. A retry
-                # must not replace this with an unbounded min_id=0 history scan.
-                for message in reversed(history):
-                    await self.deliver(self.source(message, historical=True))
-                cursor = cutoff
+            try:
+                await self.sync_source(chat, entity, configuration)
+            except Exception as error:
+                if SourceAccessError.from_error(error).code != "sources_access_denied":
+                    raise
+                self.failed_sources[chat] = [name for name, resolved_chat in self.aliases.items() if resolved_chat == chat]
             else:
-                cursor = cursor if cursor is not None else cutoff
-                if context_ids is None and cutoff:
-                    # Bounded recovery of an older state created before ID selection.
-                    history = [message async for message in self.client.iter_messages(entity, limit=self.settings.max_context_messages, max_id=cutoff + 1)]
-                    context_ids = sorted(message.id for message in history)
-                    if self.bootstrap:
-                        await self.bootstrap({chat: cutoff}, {chat: context_ids})
-                ids = sorted(set([*(context_ids or []), *configuration.get("tracked_ids", {}).get(chat, [])]))
-                if ids:
-                    messages = await self.client.get_messages(entity, ids=ids)
-                    for message in sorted((message for message in messages if message is not None), key=lambda item: item.id):
-                        await self.deliver(self.source(message, historical=message.id <= cutoff))
-            async for message in self.client.iter_messages(entity, min_id=max(cursor, cutoff), reverse=True):
-                await self.deliver(self.source(message))
+                self.failed_sources.pop(chat, None)
+            self.update_source_status()
         if chat_id is None:
             self.last_backfill = time.monotonic()
         return configuration
+
+    def update_source_status(self):
+        failed = set(self.missing_sources)
+        failed.update(name for names in self.failed_sources.values() for name in names)
+        self.unavailable_sources = [name for name in self.selected or [] if name in failed]
+
+    async def sync_source(self, chat, entity, configuration):
+        cursor = configuration["cursors"].get(chat)
+        cutoff = configuration.get("context_cutoffs", {}).get(chat, 0)
+        context_ids = configuration.get("context_ids", {}).get(chat)
+        if cursor is None and chat not in configuration.get("context_cutoffs", {}):
+            history = [message async for message in self.client.iter_messages(entity, limit=self.settings.max_context_messages)]
+            cutoff = max((message.id for message in history), default=0)
+            context_ids = sorted(message.id for message in history)
+            if self.bootstrap:
+                await self.bootstrap({chat: cutoff}, {chat: context_ids})
+            configuration.setdefault("context_cutoffs", {})[chat] = cutoff
+            configuration.setdefault("context_ids", {})[chat] = context_ids
+            # Persist the bounded selection before the first delivery. A retry
+            # must not replace this with an unbounded min_id=0 history scan.
+            for message in reversed(history):
+                await self.deliver(self.source(message, historical=True))
+            cursor = cutoff
+        else:
+            cursor = cursor if cursor is not None else cutoff
+            if context_ids is None and cutoff:
+                # Bounded recovery of an older state created before ID selection.
+                history = [message async for message in self.client.iter_messages(entity, limit=self.settings.max_context_messages, max_id=cutoff + 1)]
+                context_ids = sorted(message.id for message in history)
+                if self.bootstrap:
+                    await self.bootstrap({chat: cutoff}, {chat: context_ids})
+            ids = sorted(set([*(context_ids or []), *configuration.get("tracked_ids", {}).get(chat, [])]))
+            if ids:
+                messages = await self.client.get_messages(entity, ids=ids)
+                for message in sorted((message for message in messages if message is not None), key=lambda item: item.id):
+                    await self.deliver(self.source(message, historical=message.id <= cutoff))
+        async for message in self.client.iter_messages(entity, min_id=max(cursor, cutoff), reverse=True):
+            await self.deliver(self.source(message))
 
     async def received(self, event):
         chat = str(event.message.chat_id)
@@ -132,6 +154,8 @@ class TelegramReader:
         async with self.intake_lock:
             # Backfill ordered IDs first. A failed low ID prevents a later cursor advance.
             configuration = await self._sync_sources(force=True, chat_id=chat)
+            if chat in self.failed_sources:
+                return
             message = self.source(event.message)
             message.historical = message.message_id <= configuration.get("context_cutoffs", {}).get(message.chat_id, 0)
             if message.chat_id in {*configuration["sources"], *self.aliases.values()}:

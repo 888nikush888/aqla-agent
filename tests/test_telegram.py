@@ -394,3 +394,79 @@ def test_reader_rpc_errors_expose_only_safe_type_codes(exception, code):
     assert failure.code == code
     assert "private-credential-value" not in str(failure)
     assert SourceAccessError.from_error(RuntimeError("private-credential-value")).code == "reader_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["initial", "reread", "backfill"])
+async def test_channel_rpc_error_isolates_source_and_recovers_without_skipping(phase):
+    from telethon.errors import ChannelPrivateError
+
+    configuration = {"sources": ["@gone", "@good"], "cursors": {}, "tracked_ids": {}}
+    if phase != "initial":
+        configuration["cursors"] = {"-1001": 1, "-1002": 1}
+    if phase == "reread":
+        configuration["tracked_ids"] = {"-1001": [1], "-1002": [1]}
+    deliveries, queries = [], []
+    async def snapshot():
+        return configuration
+    async def deliver(item):
+        deliveries.append((item.chat_id, item.message_id))
+        configuration["cursors"][item.chat_id] = max(item.message_id, configuration["cursors"].get(item.chat_id, 0))
+    class Client:
+        failing = True
+        async def iter_dialogs(self):
+            for identity, name in ((-1001, "gone"), (-1002, "good")):
+                yield SimpleNamespace(id=identity, entity=SimpleNamespace(username=name, identity=identity))
+        def item(self, entity, identity):
+            item = message(identity)
+            item.chat_id = entity.identity
+            return item
+        async def iter_messages(self, entity, **kwargs):
+            queries.append((entity.username, "initial" if "limit" in kwargs else "backfill"))
+            if self.failing and entity.username == "gone" and phase != "reread":
+                raise ChannelPrivateError(request="private-rpc-details")
+            if "limit" in kwargs:
+                yield self.item(entity, 1)
+            elif kwargs["min_id"] < 2:
+                yield self.item(entity, 2)
+        async def get_messages(self, entity, ids):
+            queries.append((entity.username, "reread"))
+            if self.failing and entity.username == "gone":
+                raise ChannelPrivateError(request="private-rpc-details")
+            return [self.item(entity, identity) for identity in ids]
+    reader = TelegramReader(Settings(network="testnet", account="0x" + "0" * 40), deliver, snapshot)
+    reader.client = Client()
+    await reader.sync_sources()
+    assert any(chat == "-1002" for chat, _ in deliveries)
+    assert not any(chat == "-1001" for chat, _ in deliveries)
+    assert reader.status_error() == {"code": "sources_unavailable", "sources": ["@gone"]}
+    assert configuration["cursors"].get("-1001", 0) <= 1
+    # A high live ID cannot bypass an unsuccessful lower-ID backfill.
+    item = reader.client.item(SimpleNamespace(identity=-1001), 99)
+    await reader.received(SimpleNamespace(message=item))
+    assert ("-1001", 99) not in deliveries
+    reader.client.failing = False
+    await reader.sync_sources(force=True)
+    assert ("-1001", 2) in deliveries
+    assert reader.status_error() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure, code", [("SessionRevokedError", "reader_session_unauthorized"),
+                                          ("FloodWaitError", "reader_rate_limited")])
+async def test_global_reader_rpc_failures_still_escape_with_actionable_status(failure, code):
+    from telethon import errors
+
+    async def snapshot():
+        return {"sources": ["@signala"], "cursors": {}, "tracked_ids": {}}
+    class Client(ReaderClient):
+        async def iter_messages(self, entity, **kwargs):
+            raise getattr(errors, failure)(request="sensitive-rpc-details")
+            if False:
+                yield
+    reader = TelegramReader(Settings(network="testnet", account="0x" + "0" * 40), None, snapshot)
+    reader.client = Client()
+    with pytest.raises(getattr(errors, failure)) as captured:
+        await reader.sync_sources()
+    assert SourceAccessError.from_error(captured.value).code == code
+    assert reader.status_error() is None

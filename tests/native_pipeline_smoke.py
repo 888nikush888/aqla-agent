@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--hermes-source", required=True)
     parser.add_argument("--destination", required=True)
     parser.add_argument("--mcp-python", required=True)
-    parser.add_argument("--mode", choices=("source", "owner"), default="source")
+    parser.add_argument("--mode", choices=("source", "owner", "lifecycle"), default="source")
     args = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
     destination = Path(args.destination).resolve()
@@ -81,6 +81,12 @@ def main():
                     "policy": {"risk_percent": "0.75", "leverage": 2, "max_open_trades": 3}}),
                     ("skill_manage", {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.", "new_string": "x" * 8193}),
                     ("skill_manage", {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.", "new_string": "Du bist aqla Agent. Prüfe Replies besonders sorgfältig."})]
+    if args.mode == "lifecycle":
+        report = ("interpret_source", {"event_id": original.event_id, "interpretation": {"kind": "report", "source_refs": [original.source_id], "reason": "Ergebnisbericht"}})
+        expected = [("control", {"action": "set_policy", "expected_revision": 0, "policy": {"risk_percent": "0.75", "leverage": 2, "max_open_trades": 3}}), None,
+                    ("control", {"action": "pause"}), report, None,
+                    ("control", {"action": "set_policy", "expected_revision": 1, "policy": {"risk_percent": "0.5", "leverage": 2, "max_open_trades": 2}}), None,
+                    ("control", {"action": "pause"}), report, None]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -93,7 +99,8 @@ def main():
                 calls.append(request)
             index = len(calls) - 1
             message = {"role": "assistant", "content": "Bericht erkannt; keine Order." if tools else "ready"}
-            if tools and index < len(expected):
+            has_tool = tools and index < len(expected) and expected[index] is not None
+            if has_tool:
                 suffix, parameters = expected[index]
                 available = [tool["function"]["name"] for tool in tools]
                 target = suffix if suffix == "skill_manage" else ("mcp__sheets__" if suffix.startswith("journal_") else "mcp__aqla__") + suffix
@@ -107,7 +114,7 @@ def main():
                 message = {"role": "assistant", "content": None, "tool_calls": [{"id": "local-call-" + str(index), "type": "function",
                            "function": {"name": name, "arguments": json.dumps(parameters)}}]}
             response = {"id": "local-response", "object": "chat.completion", "created": now_ms() // 1000, "model": "qa-model",
-                        "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if index < len(expected) else "stop"}],
+                        "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if has_tool else "stop"}],
                         "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
             if request.get("stream"):
                 delta = dict(message)
@@ -143,6 +150,13 @@ def main():
                         platform="telegram", enabled_toolsets=["skills", *[name for name in available_toolsets if name in ("mcp-aqla", "mcp-sheets")]], max_iterations=8, session_db=None,
                         skip_memory=True, skip_background_review=True, quiet_mode=True, save_trajectories=False)
 
+        if args.mode == "lifecycle":
+            from native_lifecycle_smoke import verify_lifecycle
+            try:
+                return await verify_lifecycle(extension, agent, store, source, original)
+            finally:
+                agent.close()
+
         async def handler(event):
             return await asyncio.to_thread(agent.run_conversation, user_message=event.text)
 
@@ -171,8 +185,10 @@ def main():
             assert "Prüfe Replies besonders sorgfältig." in (destination / "hermes-home" / "skills" / "aqla-master" / "SKILL.md").read_text(encoding="utf-8")
         else:
             assert data["events"][original.event_id]["status"] == "report"
+        if args.mode == "lifecycle":
+            assert data["policy"]["risk_percent"] == "0.5"
         assert data["operations"] == {}
-        assert len(calls) == len(expected) + 1
+        assert len(calls) == len(expected) + (args.mode != "lifecycle")
         assert not list((destination / "hermes-home").rglob("*.db"))
         print(json.dumps({"native_agent": True, "stdio_mcp": True, "mode": args.mode, "authority_verified": True, "exchange_actions": 0, "model_calls": len(calls)}))
     finally:

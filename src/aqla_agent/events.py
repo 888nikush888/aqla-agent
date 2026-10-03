@@ -7,6 +7,9 @@ import logging
 import threading
 import time
 import weakref
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from aqla_hyperliquid_mcp.auth import Authority
@@ -20,6 +23,21 @@ TRADE_TOOLS = {"interpret_source", "trade_preview", "trade_execute", "trade_upda
 EXTENSIONS = weakref.WeakSet()
 
 
+@dataclass
+class TurnClaim:
+    origin: tuple | None
+    active: bool = True
+    lock: threading.RLock = field(default_factory=threading.RLock)
+
+    def read(self):
+        with self.lock:
+            return self.origin if self.active else None
+
+    def revoke(self):
+        with self.lock:
+            self.active = False
+
+
 class HermesExtension:
     """Native Hermes hooks and one reader task. No bot transport or separate agent."""
 
@@ -30,8 +48,10 @@ class HermesExtension:
         self.settings = Settings.load(self.config_path)
         self.authority = Authority.from_file(self.settings.integration_key_file)
         self.server = ctx.get_config("mcp_server", "aqla")
-        self.active_context = None
-        self.context_lock = threading.RLock()
+        self.turn_claim = ContextVar("aqla_turn_claim", default=None)
+        self.turn_event = ContextVar("aqla_turn_event", default=None)
+        self.gateway = None
+        self.binding = None
         self.session_key = None
         self.reader = None
         self.started = False
@@ -39,9 +59,50 @@ class HermesExtension:
         self.last_journal_sync = 0.0
         self.reader_error = None
         self.reported_reader_error = None
-        self.handler_lock = None
         self.master_path = Path(ctx.get_config("master_path", self.config_path.parent / "hermes-home" / "skills" / "aqla-master" / "SKILL.md"))
         self.master_hash = self.skill_hash()
+
+    @property
+    def active_context(self):
+        claim = self.turn_claim.get()
+        return claim.read() if claim else None
+
+    @active_context.setter
+    def active_context(self, origin):
+        claim = self.turn_claim.get()
+        if claim:
+            claim.revoke()
+        self.turn_claim.set(TurnClaim(origin) if origin else None)
+
+    @contextmanager
+    def claim_scope(self, origin):
+        # Native Hermes copies ContextVars into its executor. The shared receipt
+        # can also be revoked by its real finalizer or a cancelled async caller.
+        claim = TurnClaim(origin)
+        token = self.turn_claim.set(claim)
+        try:
+            yield
+        finally:
+            claim.revoke()
+            self.turn_claim.reset(token)
+
+    async def with_event(self, incoming, gateway, callback):
+        self.stamp(incoming)
+        token = self.turn_event.set(incoming)
+        try:
+            with self.claim_scope(self.origin(incoming) if incoming else None):
+                origin = self.active_context
+                if origin and origin[0] == "source" and not (getattr(incoming, "metadata", None) or {}).get("hermes_plugin_injection"):
+                    await self.call("native_forward", self.forward_event(incoming))
+                return await callback()
+        finally:
+            self.turn_event.reset(token)
+
+    def refresh_master(self, gateway):
+        new_hash = self.skill_hash()
+        if new_hash != self.master_hash:
+            gateway._evict_cached_agent(self.session_key)
+            self.master_hash = new_hash
 
     def skill_hash(self):
         if not self.master_path.exists():
@@ -158,6 +219,8 @@ class HermesExtension:
             await asyncio.sleep(3)
 
     def origin(self, event):
+        if event is None:
+            return None
         source = event.source
         platform = getattr(source.platform, "value", source.platform)
         if platform != "telegram" or source.chat_type != "dm" or str(source.chat_id) != self.owner:
@@ -192,42 +255,40 @@ class HermesExtension:
         event.metadata = metadata
         return event
 
-    def attach(self, event, gateway, *, bootstrap=False):
-        if self.started or not self.origin(event):
+    def attach(self, event, gateway, *, bootstrap=False, adapter=None):
+        if not self.origin(event):
             return
-        adapter = gateway._delivery_adapter_for(event.source)
+        adapter = adapter or gateway._delivery_adapter_for(event.source)
         if adapter is None or not adapter._message_handler:
             raise AqlaError("Native Hermes adapter handler is unavailable")
-        original = adapter._message_handler
+        self.gateway = gateway
         self.session_key = gateway.session_store._generate_session_key(event.source)
-        self.handler_lock = asyncio.Lock()
-        with self.context_lock:
-            self.active_context = None if bootstrap else self.origin(event)
+        if self.binding and self.binding[0] is adapter and adapter._message_handler is self.binding[2]:
+            return
+        if self.binding:
+            self.unbind_adapter()
+        original = adapter._message_handler
 
         async def native_handler(incoming):
-            async with self.handler_lock:
-                self.stamp(incoming)
-                new_hash = self.skill_hash()
-                if new_hash != self.master_hash:
-                    gateway._evict_cached_agent(self.session_key)
-                    self.master_hash = new_hash
-                with self.context_lock:
-                    self.active_context = self.origin(incoming)
-                try:
-                    if self.active_context and self.active_context[0] == "source" and not (getattr(incoming, "metadata", None) or {}).get("hermes_plugin_injection"):
-                        await self.call("native_forward", self.forward_event(incoming))
-                    return await original(incoming)
-                finally:
-                    with self.context_lock:
-                        self.active_context = None
+            self.refresh_master(gateway)
+            return await self.with_event(incoming, gateway, lambda: original(incoming))
 
         adapter.set_message_handler(native_handler)
-        self.ctx.on_unload(lambda: adapter.set_message_handler(original))
-        self.ctx.spawn_task(self.worker(), name="aqla-source-events")
-        self.ctx.spawn_task(self.reader_worker(), name="aqla-source-reader")
-        if self.settings.google_sheets.enabled:
-            self.ctx.spawn_task(self.journal_worker(), name="aqla-sheets-journal")
-        self.started = True
+        self.binding = adapter, original, native_handler
+        if not self.started:
+            self.ctx.on_unload(self.unbind_adapter)
+            self.ctx.spawn_task(self.worker(), name="aqla-source-events")
+            self.ctx.spawn_task(self.reader_worker(), name="aqla-source-reader")
+            if self.settings.google_sheets.enabled:
+                self.ctx.spawn_task(self.journal_worker(), name="aqla-sheets-journal")
+            self.started = True
+
+    def unbind_adapter(self):
+        if self.binding:
+            adapter, original, wrapper = self.binding
+            if adapter._message_handler is wrapper:
+                adapter.set_message_handler(original)
+            self.binding = None
 
     def forward_event(self, event):
         captured = (getattr(event, "metadata", None) or {}).get("aqla_forward_source")
@@ -245,7 +306,7 @@ class HermesExtension:
                            edited_at=int(edited.timestamp() * 1000) if edited else None,
                            reply_to_id=getattr(reply, "message_id", None), text=event.text or "", forward_from="native-owner-forward")
 
-    def boot(self, gateway):
+    def boot(self, gateway, *, adapter=None):
         from types import SimpleNamespace
 
         from gateway.config import Platform
@@ -253,7 +314,7 @@ class HermesExtension:
 
         source = SessionSource(platform=Platform.TELEGRAM, chat_id=self.owner, user_id=self.owner)
         gateway.session_store.get_or_create_session(source)
-        self.attach(SimpleNamespace(source=source, metadata={}, message_id=None), gateway, bootstrap=True)
+        self.attach(SimpleNamespace(source=source, metadata={}, message_id=None), gateway, bootstrap=True, adapter=adapter)
 
     def inbound(self, event, gateway, **_):
         source = event.source
@@ -270,8 +331,7 @@ class HermesExtension:
         if tool_name in ("mcp__sheets__sync_internal", "mcp_sheets_sync_internal"):
             return {"action": "block", "message": "Journal delivery is reserved for the native synchronizer"}
         short = tool_name.removeprefix("mcp__aqla__").removeprefix("mcp_aqla_")
-        with self.context_lock:
-            origin = self.active_context
+        origin = self.active_context
         if short == "integration" or short.startswith("hl_") or tool_name.startswith(("delegate", "terminal")):
             return {"action": "block", "message": "Tool is outside aqla's signal-trading authority"}
         if short in TRADE_TOOLS:
@@ -292,8 +352,9 @@ class HermesExtension:
         return None
 
     def ended(self, **_):
-        with self.context_lock:
-            self.active_context = None
+        claim = self.turn_claim.get()
+        if claim:
+            claim.revoke()
 
 
 def register(ctx):
@@ -309,6 +370,40 @@ def register(ctx):
 def gateway_ready(gateway):
     for extension in tuple(EXTENSIONS):
         extension.boot(gateway)
+
+
+def rebind_native_adapter(gateway, platform, adapter):
+    if getattr(platform, "value", platform) == "telegram":
+        for extension in tuple(EXTENSIONS):
+            if extension.gateway is gateway:
+                extension.boot(gateway, adapter=adapter)
+
+
+def gateway_extension(gateway):
+    return next((extension for extension in tuple(EXTENSIONS) if extension.gateway is gateway), None)
+
+
+async def run_native_turn(gateway, source, callback):
+    extension = gateway_extension(gateway)
+    if extension is None:
+        return await callback()
+    incoming = extension.turn_event.get()
+    # Provenance comes from an actual ingress event. An event-less native resume
+    # cannot borrow the permissions of another task or a cached agent.
+    origin = extension.origin(incoming) if incoming and incoming.source == source else None
+    extension.refresh_master(gateway)
+    # The handler/followup admission scope must not regain authority when the
+    # actual run unwinds. Native command-only handlers still use their own scope.
+    extension.ended()
+    with extension.claim_scope(origin):
+        return await callback()
+
+
+async def run_native_followup(gateway, pending_event, callback):
+    extension = gateway_extension(gateway)
+    if extension is None:
+        return await callback()
+    return await extension.with_event(pending_event, gateway, callback)
 
 
 def stamp_native_event(event):

@@ -24,14 +24,42 @@ def install_strict_profile():
     replace(sqlite3, "connect", no_database)
     from gateway.platforms.base import BasePlatformAdapter
     from gateway.run import GatewayRunner
+    from gateway.run_adapters import GatewayAdapterLifecycleMixin
     from gateway.run_startup import GatewayStartupMixin
+    from gateway.run_turn import GatewayTurnMixin
     from gateway.session import SessionStore
     from gateway.session_persistence import SessionPersistenceMixin
     from hermes_state_registry import __name__ as registry_name
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
     from .conversation import Conversations
-    from .events import gateway_ready, ingress_identity, stamp_native_event
+    from .events import (
+        gateway_ready,
+        ingress_identity,
+        rebind_native_adapter,
+        run_native_followup,
+        run_native_turn,
+        stamp_native_event,
+    )
+
+    native_turn = GatewayTurnMixin._run_agent
+    native_followup = GatewayTurnMixin._run_agent_queued_followup
+    reconnect = GatewayAdapterLifecycleMixin._install_reconnected_adapter
+
+    async def run_agent(self, message, context_prompt, history, source, session_id, **kwargs):
+        return await run_native_turn(self, source, lambda: native_turn(self, message, context_prompt, history, source, session_id, **kwargs))
+
+    async def queued_followup(self, turn_ctx, adapter, pending, pending_event, response, result, stream_task):
+        return await run_native_followup(self, pending_event,
+                                         lambda: native_followup(self, turn_ctx, adapter, pending, pending_event, response, result, stream_task))
+
+    async def install_reconnected_adapter(self, platform, adapter):
+        rebind_native_adapter(self, platform, adapter)
+        return await reconnect(self, platform, adapter)
+
+    replace(GatewayTurnMixin, "_run_agent", run_agent)
+    replace(GatewayTurnMixin, "_run_agent_queued_followup", queued_followup)
+    replace(GatewayAdapterLifecycleMixin, "_install_reconnected_adapter", install_reconnected_adapter)
 
     # Classify native Telegram events before any text, photo or busy-queue merge.
     # The transport and normal owner command handlers remain entirely native.
