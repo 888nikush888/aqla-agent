@@ -106,6 +106,8 @@ jobs:
         run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/source-pipeline --mcp-python .venv/bin/python --mode source
       - name: Owner rules and bounded master-skill edits
         run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/owner-pipeline --mcp-python .venv/bin/python --mode owner
+      - name: Native queued turns, cancellation and adapter reconnect
+        run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/lifecycle-pipeline --mcp-python .venv/bin/python --mode lifecycle
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

@@ -29,7 +29,26 @@ Die Vollprüfung von Commit `d9f35d3b5a1f2660f61526397083d15b6435de84` ergab 20 
 | 19 | Unabhängige positive Wire-Vektoren für jeden Info-Vertrag sowie Null-/CLOID-/Boundaryfälle prüfen | `info_contract_vectors.json`, `test_info_wire_contracts.py`: 61 HTTP-Fälle, 14 ungültige Grenzen, Pflicht-/Extrafelder |
 | 20 | Prüfscripte im VPS-ZIP ausliefern und den README-Lintcheck auf dessen extrahierten Inhalt ausführen | `verify_artifacts.py`, Paketjob |
 
-Der zusammengeführte Stand besteht lokal **396 Tests bei 80,12 Prozent Branch-Coverage**, ohne übersprungene Sockettests. Die separaten nativen Prüfungen bestehen mit dem tatsächlichen gepinnten Hermes unter Python 3.14: keine Sessiondatenbank, Betreiberbefehle erhalten, Quellenbefugnisse getrennt, beide stdio-MCPs und begrenzte Masterbearbeitung. Die Modellantworten dieser Integrationstests sind lokal geskriptet. Aqla- und native Hermes-Abhängigkeitsscans melden am 03.10.2026 keine bekannten Advisories; der Git-Historienscan meldet keine Secrets.
+## Behebung der Nach- und Abschlussprüfung
+
+Die anschließenden unabhängigen Prüfungen von `d5d6e60` fanden zwölf zusätzliche Fälle. Auf den ausdrücklichen Behebungsauftrag sind auch die IDs 21–32 korrigiert. Die alten Berichte bleiben als historische Ausgangsnachweise erhalten.
+
+| ID | Korrektur | Regression oder Gate |
+|---|---|---|
+| 21 | Nachweislich ungesendeten Entry atomar absagen, Risiko freigeben und Wiederanlauf/Dispatch dauerhaft sperren | `test_trade_guard_regressions.py`: Cancel/Close/Operator, Signer-await, Teilfills und unklare bereits vorbereitete Vorgänge |
+| 22 | Aktionsfähige Interpretation an tatsächlichen Liveanker und dessen aktuelle Revision binden | `test_trade_guard_regressions.py`: historische-only Referenzen verweigert, Live-Reply und jüngstes Edit zulässig |
+| 23 | Frische Marktposition aus Kontoantwort im letzten Entry-/Recoveryguard prüfen; fehlende Beobachtung bleibt unbekannt | `test_trade_guard_regressions.py`: spätere Fremdposition und fehlende Position vor Versand |
+| 24 | Herkunft und Ingest für jeden tatsächlichen nativen Turn setzen; kopierte Workerrechte nach Finalizer/Abbruch widerrufen | `native_pipeline_smoke.py --mode lifecycle`, `test_hermes_integration.py` |
+| 25 | Native Abbruchbefehle während laufendem Turn ohne gemeinsamen Laufzeitlock erreichen | Lifecycle-Smoke: echtes stop/new/reset, blockierter Worker behält Quellenrechte und verliert sie nach Abbruch |
+| 26 | Adapterbindung unabhängig vom einmaligen Workerstart bei Reconnect erneuern | Lifecycle-Smoke und `test_hermes_integration.py`: tatsächlicher Adapterwechsel und keine doppelten Worker |
+| 27 | Kanalbezogene RPC-Fehler lokal halten, gesunde Quellen weiter synchronisieren und globale Authfehler getrennt melden | `test_telegram.py`: History, Reread, Backfill und erfolgreiche Wiederaufnahme ohne übersprungene IDs |
+| 28 | Collateral-ID aus Metadaten bestimmen; automatische Strecke nur mit bewiesenem USDC, Full-MCP bleibt vollständig | `test_api_regressions.py` und Recovery-Metadatenfälle in `test_trade_guard_regressions.py` |
+| 29 | Break-even anhand aktueller positiver TP-Budgets und bewiesener eigener Fills auslösen | `test_updates.py`: Reduktion, Zielersatz, TP1-Fill sowie Zero/Null/fehlende Budgets |
+| 30 | Isolierter SDK-Markethelper rundet nach Produkttyp statt Asset-ID-Schwelle | `test_api_regressions.py`: unabhängige native/Spot/HIP-3-Wirepreise, Öffnen/Schließen, beide Seiten |
+| 31 | Explizite SDK-Scopekarte bindet Signatur, tatsächlichen Wire-Vault und dauerhaften Vorgang | `test_api_regressions.py`: alle 50 SDK-Dispatcher aus Vault-Konfiguration, unabhängige L1-Recovery, Legacy-/Manipulationsfälle |
+| 32 | Gewünschte Subscriptions nach jedem Send-await bis ready abgleichen; Send an ursprünglichen Socket binden | `test_streams.py`: Hinzufügen/Entfernen beim Aufbau, Duplikate, Socketwechsel und verlorene Aktion ohne Wiederholung |
+
+Der zusammengeführte Stand besteht lokal **498 Tests bei 80,79 Prozent Branch-Coverage**, ohne übersprungene Sockettests. Die separaten nativen Prüfungen bestehen mit dem tatsächlichen gepinnten Hermes unter Python 3.14: keine Sessiondatenbank, Betreiberbefehle erhalten, Quellenbefugnisse getrennt, beide stdio-MCPs und begrenzte Masterbearbeitung. Die neue Lifecycle-Prüfung verwendet einen tatsächlich wiederverwendeten AIAgent, native rekursive Folge-Turns, Executor-Kontextkopie, echte Toolhooks und Finalizer sowie Cancellation und Reconnect. Source-/Owner-Smokes verwenden je sechs, Lifecycle zehn lokale geskriptete Modellaufrufe. Keine tatsächlichen Exchange-Aktionen. Aqla- und native Hermes-Abhängigkeitsscans melden am 03.10.2026 keine bekannten Advisories; der Git-Historienscan meldet keine Secrets.
 
 ## Korrigierte Befunde
 

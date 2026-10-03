@@ -105,6 +105,8 @@ Das Agentenprofil enthält nur den regelgeprüften Handelspfad. Das vollständig
 
 Der State bindet Hauptkonto, effektives Handelskonto/Vault und Netzwerk dauerhaft. Für ein anderes Zielkonto einen neuen separaten State verwenden. Pause, Regeln, Quellenfreigabe und Nachrichtenrevision werden unmittelbar vor einem noch ungesendeten Entry erneut geprüft. Das Entfernen einer Quelle stoppt ihre neuen Entries; bestehende Trades werden weiter geschützt. Gespeicherte Close-/Reduktionsabsichten behalten ihre exakte Aktion über einen Neustart hinweg.
 
+Eine Absage eines nachweislich noch ungesendeten Entries bleibt nach Neustart wirksam. Neue Handelsaktionen brauchen die aktuelle auslösende Live-Nachricht; historische Angaben können sie ergänzen. Die frische Kontoantwort muss Positionsfreiheit bestätigen. Für automatische HIP-3-Trades muss das Collateral nachweislich USDC sein. Der vollständige MCP bleibt für andere Collateralverträge verfügbar. Seine Kontoaktionen unterscheiden Principal- und Vault-Scope ausdrücklich; uneindeutige alte Principal-Vault-Vorgänge werden konservativ abgewiesen.
+
 Der native Hermes-Gateway wird im separaten VPS-Prozess auf Dateiverlauf eingestellt; SQLite-Zugriffe sind in diesem Profil deaktiviert. Native Nachrichtenübertragung, Befehle und Agentenlauf bleiben bei Hermes. Kleine lokale JSON/JSONL-Dateien ersetzen keine Börsenbelege.
 
 Für einen vollständigen Snapshot den Dienst anhalten und den **gesamten Zielordner inklusive Secrets und State** geschützt sichern. Nach Wiederherstellung zuerst Konto, offene Orders, Fills und unklare Operationen abgleichen. Einen alten State nicht zum Freischalten einer unklaren Order zurückspielen. Ein dediziertes API-Wallet je Instanz verwenden.
@@ -128,9 +130,10 @@ AQLA_DEPLOY=/opt/aqla
 "$AQLA_DEPLOY/hermes-venv/bin/python" "$AQLA_SOURCE/tests/native_hermes_smoke.py" --hermes-source "$AQLA_DEPLOY/hermes-source" --home /tmp/aqla-session-qa
 "$AQLA_DEPLOY/hermes-venv/bin/python" "$AQLA_SOURCE/tests/native_pipeline_smoke.py" --hermes-source "$AQLA_DEPLOY/hermes-source" --destination /tmp/aqla-source-qa --mcp-python "$AQLA_DEPLOY/.venv/bin/python"
 "$AQLA_DEPLOY/hermes-venv/bin/python" "$AQLA_SOURCE/tests/native_pipeline_smoke.py" --hermes-source "$AQLA_DEPLOY/hermes-source" --destination /tmp/aqla-owner-qa --mcp-python "$AQLA_DEPLOY/.venv/bin/python" --mode owner
+"$AQLA_DEPLOY/hermes-venv/bin/python" "$AQLA_SOURCE/tests/native_pipeline_smoke.py" --hermes-source "$AQLA_DEPLOY/hermes-source" --destination /tmp/aqla-lifecycle-qa --mcp-python "$AQLA_DEPLOY/.venv/bin/python" --mode lifecycle
 ```
 
-Der Pipeline-Test verwendet einen lokalen geskripteten Modellserver. Er beweist native Agenten-/Hook-/stdio-Anbindung und verweigerte Quellenbefugnisse; er ist kein Nachweis der Erkennungsqualität eines echten Modells. Es wurden keine realen Telegram-Nachrichten oder Hyperliquid-Mutationen zur Entwicklung ausgeführt. Native Stop-/TP-Ausführung und mögliche Markt-/Teilfill-Effekte müssen im gewünschten Konto/Betrieb separat geprüft werden; berechnetes SL-Risiko ist keine garantierte maximale tatsächliche Ausführungsverlusthöhe.
+Der Pipeline-Test verwendet einen lokalen geskripteten Modellserver. Er beweist native Agenten-/Hook-/stdio-Anbindung und verweigerte Quellenbefugnisse. Der Lifecycle-Modus prüft zusätzlich rekursive Quellen-/Owner-/Wake-Folgeturns mit wiederverwendetem Agenten, Kontextkopie in Worker, Rechtewiderruf, stop/new/reset während eines laufenden Turns und Adapter-Reconnect. Er ist kein Nachweis der Erkennungsqualität eines echten Modells. Es wurden keine realen Telegram-Nachrichten oder Hyperliquid-Mutationen zur Entwicklung ausgeführt. Native Stop-/TP-Ausführung und mögliche Markt-/Teilfill-Effekte müssen im gewünschten Konto/Betrieb separat geprüft werden; berechnetes SL-Risiko ist keine garantierte maximale tatsächliche Ausführungsverlusthöhe.
 
 30 Kontextfälle für neue Signale, Replies, Updates, Berichte, unvollständige Angaben und Quellenanweisungen liegen in `tests/fixtures/context_cases.json`. Für eine ausdrückliche Prüfung deines echten Modells:
 
