@@ -7,7 +7,7 @@ Stand: 03.10.2026. Tatsächliche Installation auf Debian 13 x86_64, getrennt unt
 - Release-ZIP per verschlüsseltem SFTP übertragen, SHA-256 vor Extraktion verglichen.
 - Aqla Python 3.12.14, separat gepinntes Hermes mit Python 3.14.7 und geprüften Dependency-Overrides installiert.
 - Dienstkonto `aqla`, systemd-Autostart, geheime Dateien mit Modus 0600, privates Hermes-Home und Secretverzeichnis.
-- Tatsächlicher Modellaufruf über den nativen Hermes-AIAgent mit `glm-5.3-flash` über OpenCode Go erfolgreich. Provider-/Sessionrouting wird vom gepinnten Hermes unterstützt; [Provider-Endpunkte](https://opencode.ai/docs/go/).
+- Aktives Modell auf Nutzerwunsch: `deepseek-v4.1-flash` über OpenCode Go, Hermes `agent.reasoning_effort: ultra`. Hermes übersetzt dies in DeepSeeks höchste API-Stufe `max`; tatsächlicher nativer AIAgent-Aufruf aus der gespeicherten Konfiguration mit `reasoning_effort=max`, zurückgeliefertem Reasoning und erfolgreicher Antwort geprüft. Provider-/Sessionrouting wird vom gepinnten Hermes unterstützt; [Provider-Endpunkte](https://opencode.ai/docs/go/), [DeepSeek-Modellparameter](https://api-docs.deepseek.com/api/list-models/).
 - Telegram-Bot authentifiziert und in Pollingmodus verbunden. Nutzer bestätigt tatsächliche Antwort auf Systemstatus-Anfrage.
 - Telegram-Kanalleser über QR authentifiziert; angemeldete Nutzer-ID entspricht dem konfigurierten Betreiber. StringSession als geschützte Datei, keine SQLite-Sitzung.
 - Hyperliquid-API-Wallet an das konfigurierte **Testnet**-Hauptkonto gebunden; Konto und Marktmetadaten lesbar, Standardkonto-Abstraktion unterstützt.
