@@ -5,6 +5,7 @@ import pytest
 import yaml
 
 from aqla_agent.events import HermesExtension
+from aqla_agent.telegram import SourceAccessError
 
 
 class Context:
@@ -242,3 +243,85 @@ async def test_forwarded_native_owner_message_is_ingested_before_agent(extension
     for task in ctx.tasks:
         task.cancel()
     await asyncio.gather(*ctx.tasks, return_exceptions=True)
+
+
+def test_forwarded_slash_text_is_source_and_cannot_control_native_gateway(extension):
+    extension, _ = extension
+    source = message(text="/help")
+    source.raw_message = {"forward_origin": True}
+    extension.stamp(source)
+    assert source.allow_gateway_control is False
+    assert source.metadata["aqla_origin"] == "source"
+    assert extension.forward_event(source).text == "/help"
+    owner = message(text="/help")
+    owner.allow_gateway_control = True
+    extension.stamp(owner)
+    assert owner.allow_gateway_control is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_start", [False, True])
+@pytest.mark.parametrize("notification_only", [False, True])
+async def test_reader_failure_or_blocked_start_does_not_stop_pending_wake(extension, tmp_path, monkeypatch, blocked_start, notification_only):
+    extension, ctx = extension
+    extension.settings.telegram_session_file = tmp_path / "reader.secret"
+    extension.settings.telegram_session_file.write_text("")
+    started, woke = asyncio.Event(), asyncio.Event()
+    wakes = []
+    class Reader:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def start(self):
+            started.set()
+            if blocked_start:
+                await asyncio.Event().wait()
+            raise SourceAccessError("reader_session_unauthorized")
+        async def close(self):
+            pass
+    monkeypatch.setattr("aqla_agent.events.TelegramReader", Reader)
+    async def snapshot(*args, **kwargs):
+        await started.wait()
+        return {"pending": [] if notification_only else ["persisted-forward"], "notifications": ["protection-result"] if notification_only else []}
+    def inject(text, **kwargs):
+        wakes.append(text)
+        woke.set()
+        return True
+    extension.call, ctx.inject_message = snapshot, inject
+    tasks = [asyncio.create_task(extension.reader_worker()), asyncio.create_task(extension.worker())]
+    try:
+        await asyncio.wait_for(woke.wait(), 1)
+        assert wakes
+        if not blocked_start:
+            assert "reader_session_unauthorized" in wakes[0]
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_missing_reader_session_reports_status_and_preserves_pending_wake(extension, tmp_path):
+    extension, ctx = extension
+    extension.settings.telegram_session_file = tmp_path / "absent-session.secret"
+    extension.settings.telegram_api_id = 123
+    extension.settings.telegram_api_hash_file = tmp_path / "api-hash.secret"
+    extension.settings.telegram_api_hash_file.write_text("test-only-api-hash")
+    woke = asyncio.Event()
+    wakes = []
+    async def snapshot(*args, **kwargs):
+        return {"pending": ["persisted-forward"], "notifications": []}
+    def inject(text, **kwargs):
+        wakes.append(text)
+        woke.set()
+        return True
+    extension.call, ctx.inject_message = snapshot, inject
+    tasks = [asyncio.create_task(extension.reader_worker()), asyncio.create_task(extension.worker())]
+    try:
+        await asyncio.wait_for(woke.wait(), 1)
+        assert extension.reader_error == {"code": "reader_session_missing", "sources": []}
+        assert "reader_session_missing" in wakes[0]
+        assert "test-only-api-hash" not in wakes[0]
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

@@ -189,6 +189,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     @server.tool(annotations=write)
     async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack"], token: str, source: SourceEvent | None = None,
                           aliases: dict[str, str] | None = None, cutoffs: dict[str, int] | None = None,
+                          context_ids: dict[str, list[int]] | None = None,
                           accepted: dict[str, str] | None = None) -> dict:
         """Internal native-plugin access, filtered out of agent tools; token never enters model context."""
         if authority is None:
@@ -207,10 +208,18 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             allowed = {*snapshot["sources"], *snapshot.get("source_aliases", {}).values()}
             if cutoffs is None or any(chat not in allowed or cutoff < 0 for chat, cutoff in cutoffs.items()):
                 raise AqlaError("Context cutoffs must identify subscribed source messages")
+            if context_ids is None or set(context_ids) != set(cutoffs) or any(
+                len(ids) > settings.max_context_messages or ids != sorted(set(ids)) or any(identity < 1 or identity > cutoffs[chat] for identity in ids)
+                for chat, ids in context_ids.items()
+            ):
+                raise AqlaError("Supply the bounded sorted context IDs for every seeded source")
             def seed(data):
+                if any(chat in data.get("context_cutoffs", {}) and data["context_cutoffs"][chat] != cutoff for chat, cutoff in cutoffs.items()):
+                    raise AqlaError("An existing context cutoff cannot be replaced")
                 for chat, cutoff in cutoffs.items():
                     data.setdefault("context_cutoffs", {}).setdefault(chat, cutoff)
-                    data["cursors"].setdefault(chat, 0)
+                    data.setdefault("context_ids", {}).setdefault(chat, context_ids[chat])
+                    data["cursors"].setdefault(chat, cutoff)
                 return data["context_cutoffs"]
             return {"context_cutoffs": state.update(seed)}
         if action == "resolve_sources":
@@ -235,6 +244,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             tracked[chat] = sorted(set([*recent, *active]))
         return {"sources": snapshot["sources"], "cursors": snapshot["cursors"],
                 "context_cutoffs": snapshot.get("context_cutoffs", {}),
+                "context_ids": snapshot.get("context_ids", {}),
                 "source_aliases": snapshot.get("source_aliases", {}), "tracked_ids": tracked,
                 "pending": [row["event_id"] for row in snapshot["events"].values() if row["status"] in UNFINISHED][:50],
                 "notifications": snapshot["notifications"]}

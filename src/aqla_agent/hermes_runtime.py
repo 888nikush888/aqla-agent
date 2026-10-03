@@ -22,14 +22,54 @@ def install_strict_profile():
         raise sqlite3.OperationalError("SQLite is disabled in the aqla VPS profile")
 
     replace(sqlite3, "connect", no_database)
+    from gateway.platforms.base import BasePlatformAdapter
     from gateway.run import GatewayRunner
     from gateway.run_startup import GatewayStartupMixin
     from gateway.session import SessionStore
     from gateway.session_persistence import SessionPersistenceMixin
     from hermes_state_registry import __name__ as registry_name
+    from plugins.platforms.telegram.adapter import TelegramAdapter
 
     from .conversation import Conversations
-    from .events import gateway_ready
+    from .events import gateway_ready, ingress_identity, stamp_native_event
+
+    # Classify native Telegram events before any text, photo or busy-queue merge.
+    # The transport and normal owner command handlers remain entirely native.
+    build_event = TelegramAdapter._build_message_event
+    text_key = TelegramAdapter._text_batch_key
+    photo_key = TelegramAdapter._photo_batch_key
+    media_group = TelegramAdapter._queue_media_group_event
+    can_merge = BasePlatformAdapter._can_merge_text_debounce_events
+
+    def build_message_event(self, *args, **kwargs):
+        return stamp_native_event(build_event(self, *args, **kwargs))
+
+    def text_batch_key(self, event):
+        key = text_key(self, event)
+        kind, identity = ingress_identity(event)
+        return f"{key}:aqla-source:{identity}" if kind == "source" else key
+
+    def photo_batch_key(self, event, message):
+        key = photo_key(self, event, message)
+        kind, identity = ingress_identity(event)
+        return f"{key}:aqla-source:{identity}" if kind == "source" else key
+
+    async def queue_media_group(self, group_id, event):
+        kind, identity = ingress_identity(event)
+        if kind == "source":
+            # Keep native hold, acknowledgement and flush behavior for each item.
+            group_id = f"{group_id}:aqla-source:{identity}"
+        await media_group(self, group_id, event)
+
+    def can_merge_text(self, existing, event):
+        return ingress_identity(existing) == ingress_identity(event) and can_merge(self, existing, event)
+
+    replace(TelegramAdapter, "_build_message_event", build_message_event)
+    replace(TelegramAdapter, "_text_batch_key", text_batch_key)
+    replace(TelegramAdapter, "_photo_batch_key", photo_batch_key)
+    replace(TelegramAdapter, "_queue_media_group_event", queue_media_group)
+    replace(BasePlatformAdapter, "_can_merge_text_debounce_events", can_merge_text)
+    replace(GatewayRunner, "_SECURITY_METADATA_KEYS", (*GatewayRunner._SECURITY_METADATA_KEYS, "aqla_origin", "aqla_source_message_id"))
 
     # This is the host's explicitly supported fallback, not a new storage engine.
     replace(SessionPersistenceMixin, "_open_session_db_for_active_scope", lambda *args, **kwargs: None)
