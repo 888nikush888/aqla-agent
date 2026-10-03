@@ -56,7 +56,7 @@ def markdown():
     lines = ["# Hyperliquid API-Abdeckung", "", f"Vertragsstand: {expected['snapshot_date']}. Die Matrix beschreibt implementierte, typisierte Verträge; keine behauptete Live-Börsenabnahme.", "",
              expected["scope"], "", "| Familie | Vertrag | Werkzeug/Handler | Prüfdatei |", "|---|---|---|---|"]
     for name in expected["expected_info_types"]:
-        lines.append(f"| Info | `{name}` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |")
+        lines.append(f"| Info | `{name}` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |")
     for name in expected["expected_exchange_types"]:
         handler = "hl_action" if name in NATIVE_MODELS else "hl_multisig" if name == "multiSig" else "hl_exchange:" + SDK_WIRE_HANDLERS.get(name, "MISSING")
         test = "test_native_actions.py" if name in NATIVE_MODELS else "test_multisig.py" if name == "multiSig" else "test_sdk_actions.py"

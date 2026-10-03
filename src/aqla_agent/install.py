@@ -13,12 +13,18 @@ import yaml
 HERMES_COMMIT = "1a4508e2aff2db5f50409893a2115be777bd5643"
 
 
+def hermes_dependency_command(uv, source, python, overrides):
+    """One tested minimal runtime recipe for the VPS installer and CI."""
+    return [str(uv), "pip", "install", "--python", str(python), "--overrides", str(overrides),
+            "-e", str(source) + "[telegram,mcp]", "Telethon==1.45.0", "PyYAML==6.0.3"]
+
+
 def prepare(project: Path, destination: Path, owner: str, model: str, model_url: str):
     project, destination = project.resolve(), destination.resolve()
     if destination.exists() and any(destination.iterdir()):
         raise ValueError("Deployment destination must be new and empty; existing Hermes installations are never overwritten")
     destination.mkdir(parents=True, exist_ok=True)
-    for name in ("src", "hermes_plugin", "skills", "pyproject.toml", "uv.lock", "config.example.yaml"):
+    for name in ("src", "hermes_plugin", "skills", "pyproject.toml", "uv.lock", "config.example.yaml", "hermes-runtime-overrides.txt"):
         source, target = project / name, destination / name
         if source.is_dir():
             shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -104,7 +110,7 @@ def install_runtime(destination: Path):
     # support in its metadata exists only for the upstream upgrade path.
     run([uv, "venv", "--python", "3.14", "--python-preference", "only-managed", str(venv)])
     python = str(venv / "bin" / "python")
-    run([uv, "pip", "install", "--python", python, "-e", str(source) + "[messaging,mcp]", "Telethon==1.45.0", "PyYAML==6.0.3"])
+    run(hermes_dependency_command(uv, source, python, destination / "hermes-runtime-overrides.txt"))
     # The plugin imports only source/authority modules from Aqla; its MCP runs in its own venv.
     return venv
 

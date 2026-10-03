@@ -29,7 +29,7 @@ def main():
             raise SystemExit("VPS archive integrity failed")
         names = archive.namelist()
         verify_names(names)
-        for required in ("README.md", "uv.lock", "config.example.yaml", "src/aqla_agent/install.py", "src/aqla_sheets_mcp/server.py", "docs/google-sheets.md", "skills/aqla-master/SKILL.md", "hermes_plugin/aqla-events/plugin.yaml"):
+        for required in ("README.md", "uv.lock", "config.example.yaml", "hermes-runtime-overrides.txt", "src/aqla_agent/install.py", "src/aqla_sheets_mcp/server.py", "docs/google-sheets.md", "skills/aqla-master/SKILL.md", "hermes_plugin/aqla-events/plugin.yaml", "scripts/verify_artifacts.py"):
             if "aqla-agent/" + required not in names:
                 raise SystemExit("Missing VPS asset: " + required)
         if len(archive.read("aqla-agent/skills/aqla-master/SKILL.md")) > 8192:
@@ -41,6 +41,9 @@ def main():
             root = Path(target) / "aqla-agent"
             from aqla_agent.install import prepare
             prepare(root, Path(target) / "deployment", "12345", "ci-only", "https://example.invalid/v1")
+            import sys
+            from subprocess import run
+            run([sys.executable, "-m", "ruff", "check", "src", "tests", "hermes_plugin", "scripts"], cwd=root, check=True)
     wheels = list(dist.glob("*.whl"))
     sources = list(dist.glob("*.tar.gz"))
     if len(wheels) != 1 or len(sources) != 1:

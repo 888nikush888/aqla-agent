@@ -12,5 +12,7 @@ def test_release_archive_has_source_and_deployment_assets_but_no_local_state_or_
         assert "aqla-agent/README.md" in names
         assert "aqla-agent/skills/aqla-master/SKILL.md" in names
         assert "aqla-agent/docs/api-coverage.md" in names
+        assert "aqla-agent/scripts/verify_artifacts.py" in names
+        assert "aqla-agent/hermes-runtime-overrides.txt" in names
         assert not any(".cache/" in name or ".venv/" in name or "data/state" in name or name.endswith((".secret", ".session", ".env")) for name in names)
     assert len(result["sha256"]) == 64

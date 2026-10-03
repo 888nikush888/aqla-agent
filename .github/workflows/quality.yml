@@ -97,13 +97,22 @@ jobs:
           AQLA_HERMES_COMMIT=$(.venv/bin/python -c 'from aqla_agent.install import HERMES_COMMIT; print(HERMES_COMMIT)')
           git -C .cache/hermes-source checkout --detach "$AQLA_HERMES_COMMIT"
           uv venv .cache/hermes-venv --python 3.14
-          uv pip install --python .cache/hermes-venv/bin/python -e '.cache/hermes-source[messaging,mcp]' Telethon==1.45.0 PyYAML==6.0.3
+          uv run --no-sync python scripts/install_hermes_dependencies.py --source .cache/hermes-source --python .cache/hermes-venv/bin/python
+      - name: Audit the actually installed native Hermes environment
+        run: python scripts/audit_hermes_runtime.py --python .cache/hermes-venv/bin/python
       - name: Native sessions, database exclusion and Telegram commands
         run: .cache/hermes-venv/bin/python tests/native_hermes_smoke.py --hermes-source .cache/hermes-source --home .cache/native-home
       - name: Untrusted source, native agent hooks and stdio MCP
         run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/source-pipeline --mcp-python .venv/bin/python --mode source
       - name: Owner rules and bounded master-skill edits
         run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/owner-pipeline --mcp-python .venv/bin/python --mode owner
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: native-hermes-dependency-report
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 14
 
   package:
     name: Build and verify VPS package

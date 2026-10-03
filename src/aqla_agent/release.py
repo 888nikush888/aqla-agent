@@ -10,9 +10,9 @@ def build(project: Path, output: Path):
     project, output = project.resolve(), output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     files = []
-    for name in ("src", "hermes_plugin", "skills", "tests", "docs"):
+    for name in ("src", "hermes_plugin", "skills", "tests", "docs", "scripts"):
         files.extend(path for path in (project / name).rglob("*") if path.is_file() and "__pycache__" not in path.parts and path.suffix not in (".pyc", ".secret", ".session"))
-    files.extend(project / name for name in ("README.md", "IMPLEMENTATION_STATUS.md", "pyproject.toml", "uv.lock", "config.example.yaml"))
+    files.extend(project / name for name in ("README.md", "IMPLEMENTATION_STATUS.md", "pyproject.toml", "uv.lock", "config.example.yaml", "hermes-runtime-overrides.txt"))
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(files):
             if path.is_symlink():

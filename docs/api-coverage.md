@@ -6,65 +6,65 @@ Documented public HyperCore Info, Exchange, HIP-3/HIP-4 and WebSocket API; offic
 
 | Familie | Vertrag | Werkzeug/Handler | Prüfdatei |
 |---|---|---|---|
-| Info | `activeAssetData` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `allBorrowLendReserveStates` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `allMids` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `allPerpMetas` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `approvedBuilders` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `borrowLendReserveState` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `borrowLendUserState` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `candleSnapshot` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `clearinghouseState` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `delegations` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `delegatorHistory` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `delegatorRewards` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `delegatorSummary` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `extraAgents` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `frontendOpenOrders` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `fundingHistory` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `historicalOrders` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `l2Book` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `maxBuilderFee` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `meta` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `metaAndAssetCtxs` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `openOrders` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `orderStatus` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `outcomeDeployerLimits` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `outcomeMeta` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `outcomeTemplates` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `perpAnnotation` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `perpCategories` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `perpConciseAnnotations` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `perpDeployAuctionStatus` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `perpDexLimits` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `perpDexStatus` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `perpDexs` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `perpsAtOpenInterestCap` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `portfolio` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `predictedFundings` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `referral` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `settledOutcome` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `spotClearinghouseState` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `spotDeployState` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `spotMeta` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `spotMetaAndAssetCtxs` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `spotPairDeployAuctionStatus` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `subAccounts` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `tokenDetails` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userAbstraction` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userDexAbstraction` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userFees` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userFills` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userFillsByTime` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userFunding` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userNonFundingLedgerUpdates` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userRateLimit` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userRole` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userStarState` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userToMultiSigSigners` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userTwapSliceFills` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `userVaultEquities` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
-| Info | `vaultDetails` | `hl_info` / validierter InfoRequest | `test_api_contracts.py` |
+| Info | `activeAssetData` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `allBorrowLendReserveStates` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `allMids` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `allPerpMetas` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `approvedBuilders` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `borrowLendReserveState` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `borrowLendUserState` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `candleSnapshot` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `clearinghouseState` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `delegations` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `delegatorHistory` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `delegatorRewards` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `delegatorSummary` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `extraAgents` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `frontendOpenOrders` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `fundingHistory` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `historicalOrders` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `l2Book` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `maxBuilderFee` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `meta` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `metaAndAssetCtxs` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `openOrders` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `orderStatus` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `outcomeDeployerLimits` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `outcomeMeta` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `outcomeTemplates` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `perpAnnotation` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `perpCategories` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `perpConciseAnnotations` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `perpDeployAuctionStatus` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `perpDexLimits` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `perpDexStatus` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `perpDexs` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `perpsAtOpenInterestCap` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `portfolio` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `predictedFundings` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `referral` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `settledOutcome` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `spotClearinghouseState` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `spotDeployState` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `spotMeta` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `spotMetaAndAssetCtxs` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `spotPairDeployAuctionStatus` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `subAccounts` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `tokenDetails` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userAbstraction` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userDexAbstraction` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userFees` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userFills` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userFillsByTime` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userFunding` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userNonFundingLedgerUpdates` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userRateLimit` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userRole` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userStarState` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userToMultiSigSigners` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userTwapSliceFills` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `userVaultEquities` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
+| Info | `vaultDetails` | `hl_info` / validierter InfoRequest | `test_info_wire_contracts.py` / unabhängiger MCP-HTTP-Vektor |
 | Exchange | `activateOutcomeDeployer` | `hl_action` | `test_native_actions.py` |
 | Exchange | `agentEnableDexAbstraction` | `hl_exchange:agent_enable_dex_abstraction` | `test_sdk_actions.py` |
 | Exchange | `agentSendAsset` | `hl_action` | `test_native_actions.py` |

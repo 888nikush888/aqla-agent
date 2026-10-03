@@ -1,0 +1,5 @@
+# Reviewed security overrides for the pinned Hermes API surface.
+# Used in the isolated aqla VPS environment, never in an existing installation.
+PyJWT==2.15.1
+httpx2==2.13.1
+httpcore2==2.13.1

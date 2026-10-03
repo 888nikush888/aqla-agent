@@ -1,0 +1,698 @@
+[
+  {
+    "id": "allMids",
+    "request": {
+      "type": "allMids",
+      "dex": "xyz"
+    },
+    "wire": {
+      "type": "allMids",
+      "dex": "xyz"
+    }
+  },
+  {
+    "id": "openOrders",
+    "request": {
+      "type": "openOrders",
+      "user": "0x1111111111111111111111111111111111111111",
+      "dex": "xyz"
+    },
+    "wire": {
+      "type": "openOrders",
+      "user": "0x1111111111111111111111111111111111111111",
+      "dex": "xyz"
+    }
+  },
+  {
+    "id": "frontendOpenOrders",
+    "request": {
+      "type": "frontendOpenOrders",
+      "user": "0x1111111111111111111111111111111111111111",
+      "dex": "xyz"
+    },
+    "wire": {
+      "type": "frontendOpenOrders",
+      "user": "0x1111111111111111111111111111111111111111",
+      "dex": "xyz"
+    }
+  },
+  {
+    "id": "userFills",
+    "request": {
+      "type": "userFills",
+      "user": "0x1111111111111111111111111111111111111111",
+      "aggregateByTime": true
+    },
+    "wire": {
+      "type": "userFills",
+      "user": "0x1111111111111111111111111111111111111111",
+      "aggregateByTime": true
+    }
+  },
+  {
+    "id": "userFillsByTime",
+    "request": {
+      "type": "userFillsByTime",
+      "user": "0x1111111111111111111111111111111111111111",
+      "startTime": 1700000000000,
+      "endTime": 1700000060000,
+      "aggregateByTime": true
+    },
+    "wire": {
+      "type": "userFillsByTime",
+      "user": "0x1111111111111111111111111111111111111111",
+      "startTime": 1700000000000,
+      "endTime": 1700000060000,
+      "aggregateByTime": true
+    }
+  },
+  {
+    "id": "userRateLimit",
+    "request": {
+      "type": "userRateLimit",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "userRateLimit",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "orderStatus",
+    "request": {
+      "type": "orderStatus",
+      "user": "0x1111111111111111111111111111111111111111",
+      "oid": 123456
+    },
+    "wire": {
+      "type": "orderStatus",
+      "user": "0x1111111111111111111111111111111111111111",
+      "oid": 123456
+    }
+  },
+  {
+    "id": "l2Book",
+    "request": {
+      "type": "l2Book",
+      "coin": "BTC",
+      "nSigFigs": 5,
+      "mantissa": 2
+    },
+    "wire": {
+      "type": "l2Book",
+      "coin": "BTC",
+      "nSigFigs": 5,
+      "mantissa": 2
+    }
+  },
+  {
+    "id": "candleSnapshot",
+    "request": {
+      "type": "candleSnapshot",
+      "req": {
+        "coin": "BTC",
+        "interval": "1m",
+        "startTime": 1700000000000,
+        "endTime": 1700000060000
+      }
+    },
+    "wire": {
+      "type": "candleSnapshot",
+      "req": {
+        "coin": "BTC",
+        "interval": "1m",
+        "startTime": 1700000000000,
+        "endTime": 1700000060000
+      }
+    }
+  },
+  {
+    "id": "maxBuilderFee",
+    "request": {
+      "type": "maxBuilderFee",
+      "user": "0x1111111111111111111111111111111111111111",
+      "builder": "0x2222222222222222222222222222222222222222"
+    },
+    "wire": {
+      "type": "maxBuilderFee",
+      "user": "0x1111111111111111111111111111111111111111",
+      "builder": "0x2222222222222222222222222222222222222222"
+    }
+  },
+  {
+    "id": "historicalOrders",
+    "request": {
+      "type": "historicalOrders",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "historicalOrders",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "userTwapSliceFills",
+    "request": {
+      "type": "userTwapSliceFills",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "userTwapSliceFills",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "subAccounts",
+    "request": {
+      "type": "subAccounts",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "subAccounts",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "vaultDetails",
+    "request": {
+      "type": "vaultDetails",
+      "vaultAddress": "0x2222222222222222222222222222222222222222",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "vaultDetails",
+      "vaultAddress": "0x2222222222222222222222222222222222222222",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "userVaultEquities",
+    "request": {
+      "type": "userVaultEquities",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "userVaultEquities",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "userRole",
+    "request": {
+      "type": "userRole",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "userRole",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "portfolio",
+    "request": {
+      "type": "portfolio",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "portfolio",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "referral",
+    "request": {
+      "type": "referral",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "referral",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "userFees",
+    "request": {
+      "type": "userFees",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "userFees",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "delegations",
+    "request": {
+      "type": "delegations",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "delegations",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "delegatorSummary",
+    "request": {
+      "type": "delegatorSummary",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "delegatorSummary",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "delegatorHistory",
+    "request": {
+      "type": "delegatorHistory",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "delegatorHistory",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "delegatorRewards",
+    "request": {
+      "type": "delegatorRewards",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "delegatorRewards",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "userDexAbstraction",
+    "request": {
+      "type": "userDexAbstraction",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "userDexAbstraction",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "userAbstraction",
+    "request": {
+      "type": "userAbstraction",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "userAbstraction",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "borrowLendUserState",
+    "request": {
+      "type": "borrowLendUserState",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "borrowLendUserState",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "borrowLendReserveState",
+    "request": {
+      "type": "borrowLendReserveState",
+      "token": 0
+    },
+    "wire": {
+      "type": "borrowLendReserveState",
+      "token": 0
+    }
+  },
+  {
+    "id": "allBorrowLendReserveStates",
+    "request": {
+      "type": "allBorrowLendReserveStates"
+    },
+    "wire": {
+      "type": "allBorrowLendReserveStates"
+    }
+  },
+  {
+    "id": "approvedBuilders",
+    "request": {
+      "type": "approvedBuilders",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "approvedBuilders",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "perpDexs",
+    "request": {
+      "type": "perpDexs"
+    },
+    "wire": {
+      "type": "perpDexs"
+    }
+  },
+  {
+    "id": "meta",
+    "request": {
+      "type": "meta",
+      "dex": "xyz"
+    },
+    "wire": {
+      "type": "meta",
+      "dex": "xyz"
+    }
+  },
+  {
+    "id": "metaAndAssetCtxs",
+    "request": {
+      "type": "metaAndAssetCtxs",
+      "dex": "xyz"
+    },
+    "wire": {
+      "type": "metaAndAssetCtxs",
+      "dex": "xyz"
+    }
+  },
+  {
+    "id": "clearinghouseState",
+    "request": {
+      "type": "clearinghouseState",
+      "user": "0x1111111111111111111111111111111111111111",
+      "dex": "xyz"
+    },
+    "wire": {
+      "type": "clearinghouseState",
+      "user": "0x1111111111111111111111111111111111111111",
+      "dex": "xyz"
+    }
+  },
+  {
+    "id": "userFunding",
+    "request": {
+      "type": "userFunding",
+      "user": "0x1111111111111111111111111111111111111111",
+      "startTime": 1700000000000,
+      "endTime": 1700000060000
+    },
+    "wire": {
+      "type": "userFunding",
+      "user": "0x1111111111111111111111111111111111111111",
+      "startTime": 1700000000000,
+      "endTime": 1700000060000
+    }
+  },
+  {
+    "id": "userNonFundingLedgerUpdates",
+    "request": {
+      "type": "userNonFundingLedgerUpdates",
+      "user": "0x1111111111111111111111111111111111111111",
+      "startTime": 1700000000000,
+      "endTime": 1700000060000
+    },
+    "wire": {
+      "type": "userNonFundingLedgerUpdates",
+      "user": "0x1111111111111111111111111111111111111111",
+      "startTime": 1700000000000,
+      "endTime": 1700000060000
+    }
+  },
+  {
+    "id": "fundingHistory",
+    "request": {
+      "type": "fundingHistory",
+      "startTime": 1700000000000,
+      "endTime": 1700000060000,
+      "coin": "BTC"
+    },
+    "wire": {
+      "type": "fundingHistory",
+      "startTime": 1700000000000,
+      "endTime": 1700000060000,
+      "coin": "BTC"
+    }
+  },
+  {
+    "id": "predictedFundings",
+    "request": {
+      "type": "predictedFundings"
+    },
+    "wire": {
+      "type": "predictedFundings"
+    }
+  },
+  {
+    "id": "perpsAtOpenInterestCap",
+    "request": {
+      "type": "perpsAtOpenInterestCap",
+      "dex": "xyz"
+    },
+    "wire": {
+      "type": "perpsAtOpenInterestCap",
+      "dex": "xyz"
+    }
+  },
+  {
+    "id": "perpDeployAuctionStatus",
+    "request": {
+      "type": "perpDeployAuctionStatus"
+    },
+    "wire": {
+      "type": "perpDeployAuctionStatus"
+    }
+  },
+  {
+    "id": "activeAssetData",
+    "request": {
+      "type": "activeAssetData",
+      "user": "0x1111111111111111111111111111111111111111",
+      "coin": "BTC"
+    },
+    "wire": {
+      "type": "activeAssetData",
+      "user": "0x1111111111111111111111111111111111111111",
+      "coin": "BTC"
+    }
+  },
+  {
+    "id": "perpDexLimits",
+    "request": {
+      "type": "perpDexLimits",
+      "dex": "xyz"
+    },
+    "wire": {
+      "type": "perpDexLimits",
+      "dex": "xyz"
+    }
+  },
+  {
+    "id": "perpDexStatus",
+    "request": {
+      "type": "perpDexStatus",
+      "dex": "xyz"
+    },
+    "wire": {
+      "type": "perpDexStatus",
+      "dex": "xyz"
+    }
+  },
+  {
+    "id": "allPerpMetas",
+    "request": {
+      "type": "allPerpMetas"
+    },
+    "wire": {
+      "type": "allPerpMetas"
+    }
+  },
+  {
+    "id": "perpAnnotation",
+    "request": {
+      "type": "perpAnnotation",
+      "coin": "BTC"
+    },
+    "wire": {
+      "type": "perpAnnotation",
+      "coin": "BTC"
+    }
+  },
+  {
+    "id": "perpCategories",
+    "request": {
+      "type": "perpCategories"
+    },
+    "wire": {
+      "type": "perpCategories"
+    }
+  },
+  {
+    "id": "perpConciseAnnotations",
+    "request": {
+      "type": "perpConciseAnnotations"
+    },
+    "wire": {
+      "type": "perpConciseAnnotations"
+    }
+  },
+  {
+    "id": "spotMeta",
+    "request": {
+      "type": "spotMeta"
+    },
+    "wire": {
+      "type": "spotMeta"
+    }
+  },
+  {
+    "id": "spotMetaAndAssetCtxs",
+    "request": {
+      "type": "spotMetaAndAssetCtxs"
+    },
+    "wire": {
+      "type": "spotMetaAndAssetCtxs"
+    }
+  },
+  {
+    "id": "spotClearinghouseState",
+    "request": {
+      "type": "spotClearinghouseState",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "spotClearinghouseState",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "spotDeployState",
+    "request": {
+      "type": "spotDeployState",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "spotDeployState",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "spotPairDeployAuctionStatus",
+    "request": {
+      "type": "spotPairDeployAuctionStatus"
+    },
+    "wire": {
+      "type": "spotPairDeployAuctionStatus"
+    }
+  },
+  {
+    "id": "tokenDetails",
+    "request": {
+      "type": "tokenDetails",
+      "tokenId": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "wire": {
+      "type": "tokenDetails",
+      "tokenId": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  {
+    "id": "outcomeMeta",
+    "request": {
+      "type": "outcomeMeta"
+    },
+    "wire": {
+      "type": "outcomeMeta"
+    }
+  },
+  {
+    "id": "settledOutcome",
+    "request": {
+      "type": "settledOutcome",
+      "outcome": 42
+    },
+    "wire": {
+      "type": "settledOutcome",
+      "outcome": 42
+    }
+  },
+  {
+    "id": "outcomeDeployerLimits",
+    "request": {
+      "type": "outcomeDeployerLimits",
+      "venue": "test"
+    },
+    "wire": {
+      "type": "outcomeDeployerLimits",
+      "venue": "test"
+    }
+  },
+  {
+    "id": "outcomeTemplates",
+    "request": {
+      "type": "outcomeTemplates"
+    },
+    "wire": {
+      "type": "outcomeTemplates"
+    }
+  },
+  {
+    "id": "userToMultiSigSigners",
+    "request": {
+      "type": "userToMultiSigSigners",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "userToMultiSigSigners",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "extraAgents",
+    "request": {
+      "type": "extraAgents",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "extraAgents",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "userStarState",
+    "request": {
+      "type": "userStarState",
+      "user": "0x1111111111111111111111111111111111111111"
+    },
+    "wire": {
+      "type": "userStarState",
+      "user": "0x1111111111111111111111111111111111111111"
+    }
+  },
+  {
+    "id": "orderStatus-cloid",
+    "request": {
+      "type": "orderStatus",
+      "user": "0x1111111111111111111111111111111111111111",
+      "oid": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "wire": {
+      "type": "orderStatus",
+      "user": "0x1111111111111111111111111111111111111111",
+      "oid": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  {
+    "id": "meta-null-omitted",
+    "request": {
+      "type": "meta",
+      "dex": null
+    },
+    "wire": {
+      "type": "meta"
+    }
+  }
+]
