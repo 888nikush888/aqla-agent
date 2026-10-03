@@ -11,3 +11,9 @@ policy: null
 telegram_session_file: secrets/telegram-session.secret
 telegram_api_id: null
 telegram_api_hash_file: secrets/telegram-api-hash.secret
+google_sheets:
+  enabled: false
+  spreadsheet_id: null
+  credentials_file: secrets/google-service-account.secret
+  sync_interval_seconds: 30
+  batch_size: 100

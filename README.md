@@ -13,7 +13,7 @@ Voraussetzungen: Linux mit systemd, Git und uv. Der Installer richtet eigene Pyt
 1. Quellpaket in einen separaten Ordner entpacken, beispielsweise `/opt/aqla-source`. Im Quellordner:
 
    ```sh
-   uv sync --frozen --extra sources
+   uv sync --frozen --extra sources --extra sheets
    uv run aqla-install-hermes --destination /opt/aqla --owner-id DEINE_TELEGRAM_USER_ID --model DEIN_MODELL --model-url DEINE_OPENAI_KOMPATIBLE_API_URL
    ```
 
@@ -90,10 +90,13 @@ Der automatische Signalhandel verwendet Perpetuals mit nativem Reduce-only-Schut
 
 ## MCP und Zustand
 
+Ein zweiter eigener Python-MCP führt das [Google-Sheets-Journal](docs/google-sheets.md): Signale, Trade-Updates, Orders, Fills, Gebühren, Ergebnisse, Regeln und Statushistorie werden automatisch übertragen. Hermes kann die Tabelle lesen und nach Quelle, Symbol oder Richtung auswerten. `state.json` bleibt für sichere Ausführung und noch ausstehende Übertragungen erhalten; eine zusätzliche Analysedatei entfällt. Tabellen-ID und Servicekonto werden einmalig auf dem VPS gesetzt.
+
 ```sh
 uv run aqla-hyperliquid-mcp --config config.yaml
 uv run aqla-hyperliquid-mcp --config config.yaml --profile full
 uv run aqla-hyperliquid-mcp --check-coverage
+uv run --extra sheets aqla-google-sheets-mcp --config config.yaml
 ```
 
 Das Agentenprofil enthält nur den regelgeprüften Handelspfad. Das vollständige Profil bietet die typisierten öffentlichen HyperCore-Info-/Exchange-/WebSocket-Verträge, einschließlich Spot, HIP-3/HIP-4, Transfers, Kontofunktionen, Deployeraktionen und Multisig. Die [Abdeckungsmatrix](docs/api-coverage.md) dokumentiert Handler, Prüfdateien und Quellen. Rollen- und Testnet-Grenzen werden ausdrücklich geprüft; ein API-Wallet wird nicht als Masterwallet ausgegeben. HyperEVM-Contract-/Validatorbetrieb ist kein Teil dieses Exchange-MCP.
@@ -110,9 +113,9 @@ Die [GitHub-Qualitätspipeline](https://github.com/888nikush888/aqla-agent/actio
 
 ```sh
 uv sync --frozen --all-extras
-uv run ruff check src tests hermes_plugin scripts
-uv run pytest -q
-uv run aqla-hyperliquid-mcp --check-coverage
+uv run --no-sync ruff check src tests hermes_plugin scripts
+uv run --no-sync pytest -q
+uv run --no-sync aqla-hyperliquid-mcp --check-coverage
 ```
 
 Zusätzlich existieren echte Native-Hermes-Prüfprogramme für den gepinnten Checkout:

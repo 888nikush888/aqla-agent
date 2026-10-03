@@ -43,12 +43,15 @@ def prepare(project: Path, destination: Path, owner: str, model: str, model_url:
         "skills": {"auto_load": ["aqla-master"]},
         "agent": {"max_turns": 30},
         "display": {"busy_input_mode": "queue", "interim_assistant_messages": False, "tool_progress": "log"},
-        "platform_toolsets": {"telegram": ["skills", "mcp-aqla"], "cli": ["skills", "no_mcp"], "cron": ["skills", "no_mcp"]},
+        "platform_toolsets": {"telegram": ["skills", "mcp-aqla", "mcp-sheets"], "cli": ["skills", "no_mcp"], "cron": ["skills", "no_mcp"]},
         "mcp_servers": {"aqla": {"command": python, "args": ["-m", "aqla_hyperliquid_mcp", "--config", str(destination / "config.yaml")],
                                   "cwd": str(destination), "trust": "full", "supports_parallel_tool_calls": False,
-                                  "tools": {"exclude": ["integration"]}}},
+                                  "tools": {"exclude": ["integration"]}},
+                        "sheets": {"command": python, "args": ["-m", "aqla_sheets_mcp", "--config", str(destination / "config.yaml")],
+                                   "cwd": str(destination), "trust": "full", "supports_parallel_tool_calls": False,
+                                   "tools": {"exclude": ["sync_internal"]}}},
         "plugins": {"enabled": ["aqla-events"], "entries": {"aqla-events": {"allow_gateway_injection": True,
-                    "mcp_allowlist": ["aqla"], "settings": {"owner_id": owner, "config_path": str(destination / "config.yaml"), "mcp_server": "aqla", "master_path": str(home / "skills" / "aqla-master" / "SKILL.md")}}}},
+                    "mcp_allowlist": ["aqla", "sheets"], "settings": {"owner_id": owner, "config_path": str(destination / "config.yaml"), "mcp_server": "aqla", "master_path": str(home / "skills" / "aqla-master" / "SKILL.md")}}}},
         "platforms": {"telegram": {"enabled": True, "unauthorized_dm_behavior": "ignore", "extra": {"allow_from": [owner], "group_allow_from": []}}},
     }
     (home / "config.yaml").write_text(yaml.safe_dump(hermes_config, sort_keys=False), encoding="utf-8")
@@ -92,7 +95,7 @@ def install_runtime(destination: Path):
     def run(args):
         environment = dict(os.environ, UV_PYTHON_INSTALL_DIR=str(destination / ".python"))
         return subprocess.run(args, cwd=destination, check=True, env=environment)
-    run([uv, "sync", "--frozen", "--extra", "sources", "--python", "3.12", "--python-preference", "only-managed"])
+    run([uv, "sync", "--frozen", "--extra", "sources", "--extra", "sheets", "--python", "3.12", "--python-preference", "only-managed"])
     source = destination / "hermes-source"
     run([git, "clone", "--filter=blob:none", "https://github.com/NousResearch/hermes-agent.git", str(source)])
     run([git, "-C", str(source), "checkout", "--detach", HERMES_COMMIT])

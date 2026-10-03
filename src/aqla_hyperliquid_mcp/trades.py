@@ -51,6 +51,7 @@ class Trading:
             return
         protected_refs = {ref for trade in state["trades"].values() if trade["status"] in OPEN for ref in trade["plan"]["source_refs"]}
         protected_events = {event for plan in state["plans"].values() if plan["plan"]["deadline_at"] > now_ms() for event in plan["plan"].get("source_revisions", {}).values()}
+        protected_events.update(key.removeprefix("Signale:") for key in state.get("journal_pending", {}) if key.startswith("Signale:"))
         by_chat = {}
         for row in state["events"].values():
             by_chat.setdefault(row["source"]["chat_id"], []).append(row)
@@ -314,12 +315,14 @@ class Trading:
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
         entry_status = entry_status or await self.exchange.order_status(trade["entry_cloid"])
+        observed = {trade["entry_cloid"]: entry_status}
         mapping = {}
         entry_oid = entry_status.get("order", {}).get("order", {}).get("oid")
         if entry_oid is not None:
             mapping[entry_oid] = {"kind": "entry"}
         for order in [*trade["orders"], *trade.get("exit_orders", [])]:
             status = await self.exchange.order_status(order["cloid"])
+            observed[order["cloid"]] = status
             oid = status.get("order", {}).get("order", {}).get("oid")
             if oid is not None:
                 mapping[oid] = order
@@ -339,7 +342,20 @@ class Trading:
         target_fills = [sum((Decimal(row["sz"]) for row in owned.values() if row["kind"] == "tp" and row["index"] == index), Decimal(0)) for index in range(len(plan.take_profits))]
         self._patch(trade_id, fill_events=owned, filled_quantity=str(total), tp_filled=[str(size) for size in target_fills],
                     entry_vwap=str(cost / total) if total else trade["entry_vwap"])
+        self.observe_orders(trade_id, observed)
         return total, cost
+
+    def observe_orders(self, trade_id, observations):
+        previous = self.state.snapshot()["trades"][trade_id].get("order_observations", {})
+        proposed = dict(previous)
+        for identity, raw in observations.items():
+            detail = raw.get("order", {})
+            fact = {"status": detail.get("status") or raw.get("status", "unknown"), "oid": detail.get("order", {}).get("oid")}
+            old = previous.get(identity, {})
+            if {key: old.get(key) for key in fact} != fact:
+                proposed[identity] = {**fact, "changed_at": now_ms()}
+        if proposed != previous:
+            self._patch(trade_id, order_observations=proposed)
 
     def owned_remaining(self, trade_id, signed):
         trade = self.state.snapshot()["trades"][trade_id]
@@ -562,6 +578,7 @@ class Trading:
         if trade.get("cleanup_cloids"):
             await self._cancel_owned_orders(trade_id, include_sl=True)
             observations = [await self.exchange.order_status(identity) for identity in trade["cleanup_cloids"]]
+            self.observe_orders(trade_id, dict(zip(trade["cleanup_cloids"], observations, strict=True)))
             if any(row.get("order", {}).get("status") not in TERMINAL_ORDER for row in observations):
                 raise AqlaError("Owned exit cancellation is unconfirmed; market ownership remains reserved")
         self._patch(trade_id, status=trade["cleanup_target"], cleanup_complete=True, reserved_risk="0")

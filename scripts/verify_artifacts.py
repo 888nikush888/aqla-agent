@@ -29,7 +29,7 @@ def main():
             raise SystemExit("VPS archive integrity failed")
         names = archive.namelist()
         verify_names(names)
-        for required in ("README.md", "uv.lock", "config.example.yaml", "src/aqla_agent/install.py", "skills/aqla-master/SKILL.md", "hermes_plugin/aqla-events/plugin.yaml"):
+        for required in ("README.md", "uv.lock", "config.example.yaml", "src/aqla_agent/install.py", "src/aqla_sheets_mcp/server.py", "docs/google-sheets.md", "skills/aqla-master/SKILL.md", "hermes_plugin/aqla-events/plugin.yaml"):
             if "aqla-agent/" + required not in names:
                 raise SystemExit("Missing VPS asset: " + required)
         if len(archive.read("aqla-agent/skills/aqla-master/SKILL.md")) > 8192:
@@ -47,7 +47,7 @@ def main():
         raise SystemExit("Expected one wheel and one source distribution")
     with zipfile.ZipFile(wheels[0]) as archive:
         verify_names(archive.namelist())
-        for asset in ("aqla_hyperliquid_mcp/info_specs.json", "aqla_hyperliquid_mcp/api_manifest.json"):
+        for asset in ("aqla_hyperliquid_mcp/info_specs.json", "aqla_hyperliquid_mcp/api_manifest.json", "aqla_sheets_mcp/server.py"):
             if asset not in archive.namelist():
                 raise SystemExit("Wheel is missing API contracts")
     with tarfile.open(sources[0]) as archive:

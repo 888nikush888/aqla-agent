@@ -14,6 +14,8 @@ def test_deployment_is_separate_and_has_native_hermes_transport(tmp_path):
     config = yaml.safe_load((target / "hermes-home" / "config.yaml").read_text())
     assert config["plugins"]["entries"]["aqla-events"]["settings"]["owner_id"] == "12345"
     assert config["mcp_servers"]["aqla"]["command"].startswith(str(target))
+    assert config["mcp_servers"]["sheets"]["args"][1] == "aqla_sheets_mcp"
+    assert config["mcp_servers"]["sheets"]["tools"]["exclude"] == ["sync_internal"]
     assert (target / "hermes-home" / "skills" / "aqla-master" / "SKILL.md").exists()
     assert "aqla_agent.hermes_runtime" in (target / "aqla-agent.service").read_text()
     assert not list(target.rglob("*.db"))
@@ -29,7 +31,7 @@ def test_linux_install_uses_separate_managed_interpreters_and_pinned_hermes(tmp_
         commands.append((args, kwargs))
     monkeypatch.setattr(install.subprocess, "run", run)
     install.install_runtime(tmp_path)
-    assert commands[0][0] == ["uv", "sync", "--frozen", "--extra", "sources", "--python", "3.12", "--python-preference", "only-managed"]
+    assert commands[0][0] == ["uv", "sync", "--frozen", "--extra", "sources", "--extra", "sheets", "--python", "3.12", "--python-preference", "only-managed"]
     assert any("3.14" in args and "only-managed" in args for args, _ in commands)
     assert any(args[-1] == install.HERMES_COMMIT and "--detach" in args for args, _ in commands)
     assert all(options["env"]["UV_PYTHON_INSTALL_DIR"] == str(tmp_path / ".python") for _, options in commands)

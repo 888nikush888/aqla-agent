@@ -53,6 +53,7 @@ def test_tool_claim_comes_from_native_metadata_not_text(extension):
     assert extension.authority.verify(modern["args"]["context_auth"])["kind"] == "source"
     assert extension.origin(message(owner="intruder")) is None
     assert extension.origin(message(injection=True, plugin_id="different-plugin")) is None
+    assert extension.before_tool("mcp__sheets__sync_internal", {})["action"] == "block"
 
 
 @pytest.mark.asyncio
@@ -144,6 +145,77 @@ def test_master_edits_reject_batches_supporting_files_and_oversize(extension):
     for extra in ({"operations": [{"action": "delete"}]}, {"file_path": "other.md"}, {"content": "x" * 8193}):
         assert extension.before_tool("skill_manage", {**base, **extra})["action"] == "block"
     assert extension.before_tool("skill_manage", base) is None
+
+
+@pytest.mark.asyncio
+async def test_sheets_delivery_acknowledges_only_after_success_and_isolates_outage(extension, setup, tmp_path):
+    from aqla_hyperliquid_mcp.models import GoogleSheetsSettings
+    from aqla_sheets_mcp.journal import acknowledge, batch
+
+    extension, ctx = extension
+    _, state, *_ = setup
+    extension.settings.google_sheets = GoogleSheetsSettings(enabled=True, spreadsheet_id="ci-sheet-" + "0" * 30, credentials_file=tmp_path / "google.secret")
+    state.journal_enabled = True
+    state.update(lambda data: data.update(paused=True))
+    calls = []
+    failing = True
+    def call_mcp(server, tool, args):
+        calls.append((server, tool, args.get("action")))
+        extension.authority.internal(args["token"])
+        if server == "aqla":
+            result = batch(state.snapshot()) if args["action"] == "journal_snapshot" else state.update(lambda data: acknowledge(data, args["accepted"]))
+        else:
+            if failing:
+                raise OSError("Google temporarily unavailable")
+            result = {"accepted": {row["table"] + ":" + row["record_id"]: row["fingerprint"] for row in args["records"]}}
+        return {"ok": True, "result": result}
+    ctx.call_mcp = call_mcp
+    await extension.sync_journal()
+    assert state.snapshot()["journal_pending"]
+    assert not any(action == "journal_ack" for _, _, action in calls)
+    failing = False
+    extension.last_journal_sync = 0
+    await extension.sync_journal()
+    assert state.snapshot()["journal_pending"] == {}
+    assert any(action == "journal_ack" for _, _, action in calls)
+
+
+@pytest.mark.asyncio
+async def test_slow_google_sync_does_not_stop_source_wakeups(extension, tmp_path):
+    from aqla_hyperliquid_mcp.models import GoogleSheetsSettings
+
+    extension, ctx = extension
+    extension.settings.google_sheets = GoogleSheetsSettings(enabled=True, spreadsheet_id="ci-sheet-" + "0" * 30, credentials_file=tmp_path / "google.secret")
+    blocked, woke_twice = asyncio.Event(), asyncio.Event()
+    wakes = []
+    async def source_call(*args, **kwargs):
+        return {"pending": ["new-source"], "notifications": []}
+    async def slow_google():
+        blocked.set()
+        await asyncio.Event().wait()
+    def inject(*args, **kwargs):
+        wakes.append(1)
+        if len(wakes) == 2:
+            woke_twice.set()
+        return True
+    extension.call = source_call
+    extension.sync_journal = slow_google
+    ctx.inject_message = inject
+    async def handler(event):
+        pass
+    adapter = SimpleNamespace(_message_handler=handler)
+    adapter.set_message_handler = lambda value: setattr(adapter, "_message_handler", value)
+    gateway = SimpleNamespace(_delivery_adapter_for=lambda _: adapter, session_store=SimpleNamespace(_generate_session_key=lambda _: "owner"))
+    extension.attach(message(), gateway)
+    try:
+        await blocked.wait()
+        extension.last_wake = 0
+        await asyncio.wait_for(woke_twice.wait(), 5)
+        assert len(wakes) == 2
+    finally:
+        for task in ctx.tasks:
+            task.cancel()
+        await asyncio.gather(*ctx.tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio

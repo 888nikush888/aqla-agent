@@ -36,6 +36,7 @@ class HermesExtension:
         self.reader = None
         self.started = False
         self.last_wake = 0.0
+        self.last_journal_sync = 0.0
         self.handler_lock = None
         self.master_path = Path(ctx.get_config("master_path", self.config_path.parent / "hermes-home" / "skills" / "aqla-master" / "SKILL.md"))
         self.master_hash = self.skill_hash()
@@ -46,7 +47,7 @@ class HermesExtension:
         data = self.master_path.read_bytes()
         return hashlib.sha256(data).hexdigest()
 
-    async def call(self, action, source=None, *, aliases=None, cutoffs=None):
+    async def call(self, action, source=None, *, aliases=None, cutoffs=None, accepted=None):
         args = {"action": action, "token": self.authority.key.decode()}
         if source is not None:
             args["source"] = source.model_dump(mode="json")
@@ -54,7 +55,12 @@ class HermesExtension:
             args["aliases"] = aliases
         if cutoffs is not None:
             args["cutoffs"] = cutoffs
-        result = await asyncio.to_thread(self.ctx.call_mcp, self.server, "integration", args)
+        if accepted is not None:
+            args["accepted"] = accepted
+        return await self.mcp_call(self.server, "integration", args)
+
+    async def mcp_call(self, server, tool, args):
+        result = await asyncio.to_thread(self.ctx.call_mcp, server, tool, args)
         if not result.get("ok"):
             raise AqlaError("Native MCP integration call failed")
         value = result.get("structuredContent", result.get("result"))
@@ -73,6 +79,25 @@ class HermesExtension:
         if not isinstance(value, dict):
             raise AqlaError("Native MCP returned no structured integration result")
         return value
+
+    async def sync_journal(self):
+        if not self.settings.google_sheets.enabled or time.monotonic() - self.last_journal_sync < self.settings.google_sheets.sync_interval_seconds:
+            return
+        self.last_journal_sync = time.monotonic()
+        try:
+            pending = await self.call("journal_snapshot")
+            if not pending["records"]:
+                return
+            delivered = await self.mcp_call("sheets", "sync_internal", {"token": self.authority.key.decode(), "records": pending["records"]})
+            if delivered.get("accepted"):
+                await self.call("journal_ack", accepted=delivered["accepted"])
+        except Exception as error:
+            LOG.warning("aqla Sheets sync unavailable (%s); journal remains queued", type(error).__name__)
+
+    async def journal_worker(self):
+        while True:
+            await self.sync_journal()
+            await asyncio.sleep(3)
 
     async def worker(self):
         try:
@@ -151,6 +176,8 @@ class HermesExtension:
         adapter.set_message_handler(native_handler)
         self.ctx.on_unload(lambda: adapter.set_message_handler(original))
         self.ctx.spawn_task(self.worker(), name="aqla-source-events")
+        if self.settings.google_sheets.enabled:
+            self.ctx.spawn_task(self.journal_worker(), name="aqla-sheets-journal")
         self.started = True
 
     def forward_event(self, event):
@@ -187,6 +214,8 @@ class HermesExtension:
         return None
 
     def before_tool(self, tool_name, args, **_):
+        if tool_name in ("mcp__sheets__sync_internal", "mcp_sheets_sync_internal"):
+            return {"action": "block", "message": "Journal delivery is reserved for the native synchronizer"}
         short = tool_name.removeprefix("mcp__aqla__").removeprefix("mcp_aqla_")
         with self.context_lock:
             origin = self.active_context

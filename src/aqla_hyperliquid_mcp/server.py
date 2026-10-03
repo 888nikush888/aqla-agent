@@ -89,7 +89,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "pending": [row["event_id"] for row in snapshot["events"].values() if row["status"] in UNFINISHED],
                 "trades": [row for row in snapshot["trades"].values() if row["status"] in OPEN],
                 "unresolved_operations": [row for row in snapshot["operations"].values() if row["phase"] in ("prepared", "sending", "unknown")],
-                "notifications": snapshot["notifications"]}
+                "notifications": snapshot["notifications"],
+                "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})), "last_synced_at": snapshot.get("journal_synced_at")}}
 
     @server.tool(annotations=read)
     async def source_context(event_id: str) -> dict:
@@ -106,7 +107,15 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     async def trade_preview(event_id: str, interpretation: Interpretation, context_auth: str = "") -> dict:
         """Calculate and durably save an immutable source-bound plan under current user rules."""
         authorize(context_auth)
-        return await trading.preview(event_id, interpretation)
+        try:
+            result = await trading.preview(event_id, interpretation)
+            if state.snapshot()["events"][event_id].get("last_error"):
+                state.update(lambda data: data["events"][event_id].pop("last_error", None))
+            return result
+        except AqlaError as error:
+            if event_id in state.snapshot()["events"]:
+                state.update(lambda data, message=str(error): data["events"][event_id].update(last_error=message))
+            raise
 
     @server.tool(annotations=write)
     async def trade_execute(plan_id: str, context_auth: str = "") -> dict:
@@ -178,12 +187,21 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.update(apply)
 
     @server.tool(annotations=write)
-    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context"], token: str, source: SourceEvent | None = None,
-                          aliases: dict[str, str] | None = None, cutoffs: dict[str, int] | None = None) -> dict:
+    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack"], token: str, source: SourceEvent | None = None,
+                          aliases: dict[str, str] | None = None, cutoffs: dict[str, int] | None = None,
+                          accepted: dict[str, str] | None = None) -> dict:
         """Internal native-plugin access, filtered out of agent tools; token never enters model context."""
         if authority is None:
             raise AqlaError("Integration key is not configured")
         authority.internal(token)
+        if action == "journal_snapshot":
+            from aqla_sheets_mcp.journal import batch
+            return batch(state.snapshot(), settings.google_sheets.batch_size)
+        if action == "journal_ack":
+            from aqla_sheets_mcp.journal import acknowledge
+            if accepted is None:
+                raise AqlaError("Missing journal acknowledgements")
+            return state.update(lambda data: acknowledge(data, accepted))
         if action == "seed_context":
             snapshot = state.snapshot()
             allowed = {*snapshot["sources"], *snapshot.get("source_aliases", {}).values()}

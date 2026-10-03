@@ -61,6 +61,20 @@ class Policy(Model):
         return self
 
 
+class GoogleSheetsSettings(Model):
+    enabled: bool = False
+    spreadsheet_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{20,150}$")
+    credentials_file: Path | None = None
+    sync_interval_seconds: int = Field(default=30, ge=10, le=3600)
+    batch_size: int = Field(default=100, ge=1, le=500)
+
+    @model_validator(mode="after")
+    def configured(self):
+        if self.enabled and (not self.spreadsheet_id or not self.credentials_file):
+            raise ValueError("Enabled Google Sheets requires spreadsheet_id and credentials_file")
+        return self
+
+
 class Settings(Model):
     network: Literal["mainnet", "testnet"]
     account: Address
@@ -78,6 +92,7 @@ class Settings(Model):
     telegram_api_id: int | None = None
     telegram_api_hash_file: Path | None = None
     telegram_owner_id: str | None = None
+    google_sheets: GoogleSheetsSettings = Field(default_factory=GoogleSheetsSettings)
 
     @property
     def base_url(self):
@@ -96,6 +111,10 @@ class Settings(Model):
         for name in ("state_path", "private_key_file", "integration_key_file", "telegram_session_file", "telegram_api_hash_file"):
             if raw.get(name):
                 raw[name] = str((path.parent / raw[name]).resolve())
+        sheets = raw.get("google_sheets") or {}
+        if sheets.get("credentials_file"):
+            sheets["credentials_file"] = str((path.parent / sheets["credentials_file"]).resolve())
+            raw["google_sheets"] = sheets
         return cls.model_validate(raw)
 
 

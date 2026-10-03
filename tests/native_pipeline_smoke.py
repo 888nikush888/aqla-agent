@@ -43,6 +43,7 @@ def main():
     # Linux venv executables are symlinks. Keep that path so Python loads the
     # venv packages instead of resolving to the bare system interpreter.
     config["mcp_servers"]["aqla"]["command"] = str(Path(args.mcp_python).expanduser().absolute())
+    config["mcp_servers"]["sheets"]["command"] = str(Path(args.mcp_python).expanduser().absolute())
     config["model"]["api_key"] = "local-test-only"
     config["display"]["tool_progress"] = "off"
     config["agent"]["stream"] = False
@@ -60,6 +61,7 @@ def main():
     discover_plugins(force=True)
     tool_names = discover_mcp_tools()
     assert any(name.endswith("trade_preview") for name in tool_names), tool_names
+    assert any(name == "mcp__sheets__journal_status" for name in tool_names), tool_names
     from model_tools import get_available_toolsets
     available_toolsets = get_available_toolsets()
     print("MCP toolsets:", [name for name in available_toolsets if "mcp" in name or "aqla" in name])
@@ -69,12 +71,13 @@ def main():
     calls = []
     expected = [
         ("status", {}),
+        ("journal_status", {}),
         ("control", {"action": "pause"}),
         ("source_context", {"event_id": original.event_id}),
         ("interpret_source", {"event_id": original.event_id, "interpretation": {"kind": "report", "source_refs": [original.source_id], "reason": "Ergebnisbericht, kein neuer Trade"}}),
     ]
     if args.mode == "owner":
-        expected = [("status", {}), ("control", {"action": "set_policy", "expected_revision": 0,
+        expected = [("status", {}), ("journal_status", {}), ("control", {"action": "set_policy", "expected_revision": 0,
                     "policy": {"risk_percent": "0.75", "leverage": 2, "max_open_trades": 3}}),
                     ("skill_manage", {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.", "new_string": "x" * 8193}),
                     ("skill_manage", {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.", "new_string": "Du bist aqla Agent. Prüfe Replies besonders sorgfältig."})]
@@ -93,14 +96,14 @@ def main():
             if tools and index < len(expected):
                 suffix, parameters = expected[index]
                 available = [tool["function"]["name"] for tool in tools]
-                direct = next((name for name in available if name.endswith(suffix)), None)
+                target = suffix if suffix == "skill_manage" else ("mcp__sheets__" if suffix.startswith("journal_") else "mcp__aqla__") + suffix
+                direct = next((name for name in available if name == target), None)
                 if direct:
                     name = direct
                 elif "tool_call" in available:
-                    target = "skill_manage" if suffix == "skill_manage" else next(name for name in tool_names if name.endswith(suffix))
                     name, parameters = "tool_call", {"calls": [{"name": target, "arguments": parameters}]}
                 else:
-                    name = next(name for name in available if name.endswith(suffix))
+                    name = next(name for name in available if name == target)
                 message = {"role": "assistant", "content": None, "tool_calls": [{"id": "local-call-" + str(index), "type": "function",
                            "function": {"name": name, "arguments": json.dumps(parameters)}}]}
             response = {"id": "local-response", "object": "chat.completion", "created": now_ms() // 1000, "model": "qa-model",
@@ -132,10 +135,12 @@ def main():
         from gateway.session import SessionSource, SessionStore
         from run_agent import AIAgent
 
+        assert (await extension.mcp_call("sheets", "journal_status", {}))["enabled"] is False
+
         source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345")
         store = SessionStore(destination / "hermes-home" / "sessions", GatewayConfig())
         agent = AIAgent(model="qa-model", provider="custom", base_url=f"http://127.0.0.1:{model.server_port}/v1", api_key="local-test-only",
-                        platform="telegram", enabled_toolsets=["skills", *[name for name in available_toolsets if "aqla" in name]], max_iterations=8, session_db=None,
+                        platform="telegram", enabled_toolsets=["skills", *[name for name in available_toolsets if name in ("mcp-aqla", "mcp-sheets")]], max_iterations=8, session_db=None,
                         skip_memory=True, skip_background_review=True, quiet_mode=True, save_trajectories=False)
 
         async def handler(event):

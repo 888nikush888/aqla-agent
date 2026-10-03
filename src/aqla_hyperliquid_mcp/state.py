@@ -16,6 +16,7 @@ class State:
 
     def __init__(self, settings: Settings):
         self.path = Path(settings.state_path)
+        self.journal_enabled = settings.google_sheets.enabled
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._thread_lock = threading.RLock()
         self._lock = portalocker.Lock(str(self.path) + ".lock", timeout=0)
@@ -37,6 +38,10 @@ class State:
                              "policy_revision": 1 if settings.policy else 0, "paused": False,
                              "sources": settings.sources, "source_aliases": {}, "events": {}, "trades": {}, "plans": {},
                              "bindings": {}, "operations": {}, "nonces": {}, "cursors": {}, "notifications": {}, "event_tombstones": {}}
+                self._write(self.data)
+            if self.journal_enabled:
+                from aqla_sheets_mcp.journal import seed
+                seed(self.data)
                 self._write(self.data)
         except BaseException:
             self._lock.release()
@@ -68,6 +73,9 @@ class State:
             proposed = copy.deepcopy(self.data)
             result = callback(proposed)
             proposed["sequence"] += 1
+            if self.journal_enabled:
+                from aqla_sheets_mcp.journal import enqueue_changes
+                enqueue_changes(self.data, proposed)
             proposed = json.loads(json.dumps(proposed, allow_nan=False))
             self._write(proposed)
             self.data = proposed
