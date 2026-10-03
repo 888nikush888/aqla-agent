@@ -9,6 +9,7 @@ from collections import defaultdict
 from aqla_hyperliquid_mcp.models import AqlaError
 
 from .journal import HEADERS, JournalRecord, fingerprint, record_key
+from .parameters import OPERATING_PARAMETERS, PARAMETERS
 
 BASE = "https://sheets.googleapis.com/v4/spreadsheets/"
 PREFIX = "aqla "
@@ -18,7 +19,7 @@ MAX_INDEX_REQUESTS = 12
 BODY_CHUNK_ROWS = 100
 TEXT_CHUNK_ROWS = 10
 MAX_BODY_REQUESTS = 12
-TEXT_TABLES = {"Signale", "Vorgänge", "Regeln", "Ereignisse"}
+TEXT_TABLES = {"Signale", "Vorgänge", "Regeln", "Handelsparameter", "Ereignisse"}
 
 
 def column(index):
@@ -88,6 +89,17 @@ class SheetsClient:
                 {"setBasicFilter": {"filter": {"range": {"sheetId": identity, "startRowIndex": 0, "startColumnIndex": 0, "endColumnIndex": len(headers) + 2}}}},
                 {"updateDimensionProperties": {"range": {"sheetId": identity, "dimension": "COLUMNS", "startIndex": len(headers), "endIndex": len(headers) + 2}, "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}},
             ])
+            if table == "Handelsparameter":
+                end = 1 + OPERATING_PARAMETERS + len(PARAMETERS)
+                requests.extend([
+                    {"updateDimensionProperties": {"range": {"sheetId": identity, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1}, "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}},
+                    {"repeatCell": {"range": {"sheetId": identity, "startRowIndex": 0, "endRowIndex": end, "startColumnIndex": 1, "endColumnIndex": len(headers)}, "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP", "verticalAlignment": "TOP"}}, "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment"}},
+                    {"repeatCell": {"range": {"sheetId": identity, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 1, "endColumnIndex": len(headers)}, "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.94, "green": 0.94, "blue": 0.94}}}, "fields": "userEnteredFormat.backgroundColor"}},
+                    {"updateDimensionProperties": {"range": {"sheetId": identity, "dimension": "ROWS", "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 44}, "fields": "pixelSize"}},
+                    {"updateDimensionProperties": {"range": {"sheetId": identity, "dimension": "ROWS", "startIndex": 1, "endIndex": end}, "properties": {"pixelSize": 72}, "fields": "pixelSize"}},
+                ])
+                for index, width in enumerate((120, 170, 150, 95, 165, 145, 315), start=1):
+                    requests.append({"updateDimensionProperties": {"range": {"sheetId": identity, "dimension": "COLUMNS", "startIndex": index, "endIndex": index + 1}, "properties": {"pixelSize": width}, "fields": "pixelSize"}})
         if requests:
             self.request("POST", ":batchUpdate", json={"requests": requests})
         return properties
@@ -252,6 +264,10 @@ class SheetsClient:
             if updates:
                 # RAW keeps source text starting with '=' as literal text.
                 self.request("POST", "/values:batchUpdate", json={"valueInputOption": "RAW", "data": updates})
+            if any(key.startswith("Handelsparameter:") for key in accepted):
+                self.request("POST", ":batchUpdate", json={"requests": [{"autoResizeDimensions": {"dimensions": {
+                    "sheetId": properties[PREFIX + "Handelsparameter"]["sheetId"], "dimension": "ROWS",
+                    "startIndex": 0, "endIndex": existing["Handelsparameter"][1]}}}]})
             return {"accepted": accepted, "synced": len(accepted)}
 
     def read(self, table, offset=0, limit=100, filters=None):

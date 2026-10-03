@@ -12,11 +12,14 @@ aqla enthält einen zweiten Python-MCP für Google Sheets. Der native Hermes-Gat
 | `aqla Fills` | Eigene tatsächlich beobachtete Ausführungen, Zeit, Menge, Preis und Gebühren-Token |
 | `aqla Vorgänge` | Dauerhafte Ausführungs-ID, Nonce, Phase, Request und Ergebnis, einschließlich unklarer/abgelehnter Aufträge |
 | `aqla Regeln` | Konto, Netzwerk, wirksame Nutzerregeln, Quellen und Pause |
+| `aqla Handelsparameter` | Alle 19 Handelsregeln einzeln mit aktuellem Wert, Einheit, zulässigen Werten, Standard bei Regelerstellung und Erklärung; zusätzlich Netzwerk, Handelskonto, Pause, Quellen und Regelstand |
 | `aqla Ereignisse` | Zustandsänderungen mit Zeitpunkt, Sequenz und Vorher-/Nachher-Fakten |
 
 Die automatisch erzeugten Tabs haben Filter und eine feste Kopfzeile. Die internen ID-/Versionsprüfungen verwenden versteckte Metadaten-Spalten. Eigene zusätzliche Tabs bleiben unberührt. Originaltexte mit `=` werden als Text geschrieben und nicht als Sheets-Formeln ausgeführt. Sehr große einzelne Felder werden mit sichtbarem Hinweis gekürzt; der technische Originalzustand bleibt lokal erhalten.
 
 Für eigene Sortierungen Filteransichten oder zusätzliche Analyse-Tabs verwenden. Generierte Datenzellen, Kopfzeilen und Metadatenspalten während der Synchronisierung nicht manuell verschieben, überschreiben oder löschen. Die Tabelle dient der Auswertung; Änderungen dort steuern keine Trades.
+
+`aqla Handelsparameter` zeigt eine Zeile je Einstellung in verständlichem Deutsch. Solange keine Policy festgelegt ist, steht bei allen Handelsregeln **Nicht festgelegt**. Die getrennte Standardspalte beschreibt ausschließlich Modellvorgaben bei einer späteren Regelerstellung; sie aktiviert keine Regeln. Änderungen über Telegram/Hermes werden automatisch gespiegelt und im Ereignisblatt nachvollziehbar. Bestehende Tabellen erhalten das zusätzliche Blatt beim nächsten Neustart und Abgleich, ohne Änderungen an den bisherigen Blättern.
 
 ## Warum bleibt state.json?
 
@@ -48,13 +51,14 @@ Die Übertragung erfolgt mindestens einmal mit stabilen Zeilen-IDs. Nach verlore
    sudo systemctl restart aqla-agent
    ```
 
-   Beim ersten Abgleich entstehen die sieben Journal-Tabs automatisch; vorhandene Handelsdaten werden mit aufgenommen. Der Einstiegspunkt für einen separaten MCP-Client lautet `aqla-google-sheets-mcp --config config.yaml`.
+   Beim ersten Abgleich entstehen die acht Journal-Tabs automatisch; vorhandene Handelsdaten werden mit aufgenommen. Der Einstiegspunkt für einen separaten MCP-Client lautet `aqla-google-sheets-mcp --config config.yaml`.
 
 Die Schlüsseldatei gehört nicht nach GitHub, ins Sheet, in Telegram oder in den Master-Skill. Der CI-Lauf braucht keine echten Google-Zugangsdaten.
 
 ## Über Hermes auswerten
 
 - „Zeige mir den Stand des Sheets-Journals.“
+- „Zeige mir alle Handelsparameter mit ihren aktuellen Werten.“
 - „Wie viele abgeschlossene Trades gab es je Quelle?“
 - „Zeige die tatsächlichen Fills für diesen Trade.“
 - „Vergleiche realisierte Ergebnisse nach Symbol und Richtung.“

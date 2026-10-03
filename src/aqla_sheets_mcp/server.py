@@ -10,9 +10,7 @@ from aqla_hyperliquid_mcp.auth import Authority
 from aqla_hyperliquid_mcp.models import AqlaError
 
 from .client import SheetsClient
-from .journal import HEADERS, JournalRecord
-
-Table = Literal["Trades", "Signale", "Orders", "Fills", "Vorgänge", "Regeln", "Ereignisse"]
+from .journal import HEADERS, JournalRecord, Table
 
 
 def create_server(settings, *, client=None):

@@ -6,10 +6,11 @@ from types import SimpleNamespace
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from aqla_hyperliquid_mcp.models import AqlaError, GoogleSheetsSettings, Settings, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, GoogleSheetsSettings, Policy, Settings, SourceEvent, now_ms
 from aqla_hyperliquid_mcp.state import State
 from aqla_sheets_mcp.client import PREFIX, SheetsClient, column
 from aqla_sheets_mcp.journal import HEADERS, JournalRecord, acknowledge, batch, fingerprint, project, record
+from aqla_sheets_mcp.parameters import PARAMETERS
 from aqla_sheets_mcp.server import create_server
 
 
@@ -310,3 +311,85 @@ def test_pending_source_rows_are_not_pruned_before_sheet_delivery(setup, tmp_pat
         trading.ingest(source)
     assert len(state.snapshot()["events"]) == 110
     assert all("Signale:" + identity in state.snapshot()["journal_pending"] for identity in state.snapshot()["events"])
+
+
+def test_parameter_page_covers_every_rule_without_activating_defaults(setup):
+    _, state, *_ = setup
+    data = state.snapshot()
+    data["policy"] = None
+    data["policy_revision"] = 0
+    original = copy.deepcopy(data)
+    rows = {row["record_id"]: row for row in project(data).values() if row["table"] == "Handelsparameter"}
+    assert set(PARAMETERS) == set(Policy.model_fields)
+    assert len(rows) == len(Policy.model_fields) + 6
+    assert all(rows[name]["values"][3] == "Nicht festgelegt" for name in Policy.model_fields)
+    assert rows["risk_percent"]["values"][6] == 0.5
+    assert rows["policy_selected"]["values"][3] == "Nein"
+    assert data == original
+    for row in rows.values():
+        JournalRecord.model_validate(row)
+
+
+@pytest.mark.asyncio
+async def test_parameter_page_tracks_authenticated_rule_changes_and_stale_ack(setup, sheets):
+    from aqla_hyperliquid_mcp.server import close_server
+    from aqla_hyperliquid_mcp.server import create_server as core_server
+    from aqla_sheets_mcp.journal import seed
+
+    settings, state, fake, exchange, _ = setup
+    selected, _, client = sheets
+    settings.google_sheets = selected
+    state.update(lambda data: data.update(policy=None, policy_revision=0))
+    state.journal_enabled = True
+    state.update(seed)
+    old = client.sync(batch(state.snapshot(), 500)["records"])["accepted"]
+    server = core_server(settings, state=state, exchange=exchange)
+    try:
+        policy = Policy(risk_percent="1.25", sizing_mode="fixed_notional", fixed_notional_usdc="250",
+                        leverage=3, margin_mode="cross", take_profit_allocation="custom",
+                        take_profit_weights=[60, 40], break_even_after_tp=2,
+                        allowed_updates=[], allow_stop_widening=True, cost_reserve_bps="12")
+        result = await server.call_tool("control", {"action": "set_policy", "expected_revision": 0,
+            "policy": policy.model_dump(mode="json"), "context_auth": server.aqla_authority.sign("operator", "rules")})
+        assert result.is_error is not True
+        state.update(lambda data: acknowledge(data, old))
+        assert "Handelsparameter:leverage" in state.snapshot()["journal_pending"]
+        delivered = client.sync(batch(state.snapshot(), 500)["records"])["accepted"]
+        state.update(lambda data: acknowledge(data, delivered))
+        assert state.snapshot()["journal_pending"] == {}
+        rows = {row["ID"]: row for row in client.read("Handelsparameter")["rows"]}
+        assert rows["risk_percent"]["Aktueller Wert"] == 1.25
+        assert rows["leverage"]["Aktueller Wert"] == 3
+        assert rows["leverage"]["Standard bei Regelerstellung"] == 2
+        assert rows["fixed_notional_usdc"]["Aktueller Wert"] == 250
+        assert rows["margin_mode"]["Aktueller Wert"] == "Cross"
+        assert rows["break_even_after_tp"]["Aktueller Wert"] == 2
+        assert rows["allow_stop_widening"]["Aktueller Wert"] == "Ja"
+        assert rows["allowed_updates"]["Aktueller Wert"] == "Keine"
+        assert rows["take_profit_weights"]["Aktueller Wert"] == "60.0, 40.0"
+        assert rows["policy_selected"]["Aktueller Wert"] == "Ja"
+        assert rows["policy_revision"]["Aktueller Wert"] == 1
+        assert all(row["_verified"] for row in rows.values())
+        sheets_server = create_server(settings, client=client)
+        assert (await sheets_server.call_tool("journal_read", {"table": "Handelsparameter"})).is_error is not True
+        assert fake.actions == []
+    finally:
+        await close_server(server)
+
+
+def test_parameter_page_migrates_existing_journal_without_overwriting_other_tabs(setup, sheets):
+    _, state, *_ = setup
+    _, google, client = sheets
+    records = list(project(state.snapshot()).values())
+    legacy = [row for row in records if row["table"] != "Handelsparameter"]
+    client.sync(legacy)
+    google.properties.pop(PREFIX + "Handelsparameter")
+    google.tables.pop(PREFIX + "Handelsparameter")
+    google.properties["Eigene Notizen"] = {"title": "Eigene Notizen", "sheetId": 99,
+        "gridProperties": {"rowCount": 100, "columnCount": 2}}
+    google.tables["Eigene Notizen"] = [["Meine Notizen"], ["bleiben unverändert"]]
+    original = copy.deepcopy(google.tables)
+    parameters = [row for row in records if row["table"] == "Handelsparameter"]
+    assert len(client.sync(parameters)["accepted"]) == len(parameters)
+    assert all(google.tables[title] == values for title, values in original.items())
+    assert client.read("Handelsparameter")["total"] == len(Policy.model_fields) + 6

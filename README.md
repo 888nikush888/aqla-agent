@@ -90,7 +90,7 @@ Der automatische Signalhandel verwendet Perpetuals mit nativem Reduce-only-Schut
 
 ## MCP und Zustand
 
-Ein zweiter eigener Python-MCP führt das [Google-Sheets-Journal](docs/google-sheets.md): Signale, Trade-Updates, Orders, Fills, Gebühren, Ergebnisse, Regeln und Statushistorie werden automatisch übertragen. Hermes kann die Tabelle lesen und nach Quelle, Symbol oder Richtung auswerten. `state.json` bleibt für sichere Ausführung und noch ausstehende Übertragungen erhalten; eine zusätzliche Analysedatei entfällt. Tabellen-ID und Servicekonto werden einmalig auf dem VPS gesetzt.
+Ein zweiter eigener Python-MCP führt das [Google-Sheets-Journal](docs/google-sheets.md): Signale, Trade-Updates, Orders, Fills, Gebühren, Ergebnisse, Regeln, einzeln lesbare Handelsparameter und Statushistorie werden automatisch übertragen. Hermes kann die Tabelle lesen und nach Quelle, Symbol oder Richtung auswerten. `state.json` bleibt für sichere Ausführung und noch ausstehende Übertragungen erhalten; eine zusätzliche Analysedatei entfällt. Tabellen-ID und Servicekonto werden einmalig auf dem VPS gesetzt.
 
 ```sh
 uv run aqla-hyperliquid-mcp --config config.yaml

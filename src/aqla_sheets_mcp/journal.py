@@ -10,6 +10,8 @@ from pydantic import Field, model_validator
 
 from aqla_hyperliquid_mcp.models import AqlaError, Model, digest, now_ms
 
+from .parameters import parameter_values
+
 HEADERS = {
     "Trades": ["ID", "Quelle", "Symbol", "Richtung", "Status", "Erstellt (UTC)", "Entry geplant", "Entry realisiert", "Menge geplant", "Gefüllt", "Offen", "SL", "TPs", "Risiko geplant USD", "Risiko reserviert USD", "PnL realisiert vor Gebühren/Funding", "Gebühren USD", "Netto vor Funding USD", "Quellen-IDs"],
     "Signale": ["ID", "Quelle", "Nachrichten-ID", "Gesendet (UTC)", "Editiert (UTC)", "Reply-ID", "Kontext", "Status", "Klassifikation", "Symbol", "Richtung", "Update", "Grund", "Text", "Quellen-ID"],
@@ -17,13 +19,15 @@ HEADERS = {
     "Fills": ["ID", "Trade-ID", "Zeit (UTC)", "Symbol", "Art", "TP-Index", "Order-ID", "Menge", "Preis", "Gebühr", "Gebühren-Token"],
     "Vorgänge": ["ID", "Erstellt (UTC)", "Art", "Phase", "Ergebnis", "Nonce", "Ablauf (UTC)", "Request", "Response"],
     "Regeln": ["ID", "Netzwerk", "Konto", "Revision", "Pause", "Quellen", "Regeln"],
+    "Handelsparameter": ["ID", "Bereich", "Parameter", "Aktueller Wert", "Einheit", "Zulässige Werte", "Standard bei Regelerstellung", "Bedeutung"],
     "Ereignisse": ["ID", "Zeit (UTC)", "Sequenz", "Tabelle", "Datensatz-ID", "Vorher", "Nachher"],
 }
 TABLES = tuple(HEADERS)
+Table = Literal["Trades", "Signale", "Orders", "Fills", "Vorgänge", "Regeln", "Handelsparameter", "Ereignisse"]
 
 
 class JournalRecord(Model):
-    table: Literal["Trades", "Signale", "Orders", "Fills", "Vorgänge", "Regeln", "Ereignisse"]
+    table: Table
     record_id: str
     values: list[str | int | float | bool]
     fingerprint: str
@@ -101,6 +105,8 @@ def project(data):
     for identity, operation in data["operations"].items():
         add(record("Vorgänge", identity, timestamp(operation["created_at"]), operation["wire_action"].get("type", ""), operation["phase"], operation.get("outcome", ""), str(operation["nonce"]), timestamp(operation.get("expires_after")), text(operation["request"]), text(operation.get("result"))))
     add(record("Regeln", "aktuell", data["network"], data["account"], data["policy_revision"], data["paused"], text(data["sources"]), text(data["policy"])))
+    for values in parameter_values(data):
+        add(record("Handelsparameter", *values))
     for row in data.get("journal_history", {}).values():
         add(row)
     return rows
