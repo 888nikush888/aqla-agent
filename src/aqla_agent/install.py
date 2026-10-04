@@ -11,6 +11,8 @@ from pathlib import Path
 import yaml
 
 HERMES_COMMIT = "1a4508e2aff2db5f50409893a2115be777bd5643"
+DEFAULT_MODEL = "deepseek-v4.1-flash"
+DEFAULT_MODEL_URL = "https://opencode.ai/zen/go/v1"
 
 
 def hermes_dependency_command(uv, source, python, overrides):
@@ -19,7 +21,8 @@ def hermes_dependency_command(uv, source, python, overrides):
             "-e", str(source) + "[telegram,mcp]", "Telethon==1.45.0", "PyYAML==6.0.3"]
 
 
-def prepare(project: Path, destination: Path, owner: str, model: str, model_url: str):
+def prepare(project: Path, destination: Path, owner: str,
+            model: str = DEFAULT_MODEL, model_url: str = DEFAULT_MODEL_URL):
     project, destination = project.resolve(), destination.resolve()
     if destination.exists() and any(destination.iterdir()):
         raise ValueError("Deployment destination must be new and empty; existing Hermes installations are never overwritten")
@@ -47,7 +50,7 @@ def prepare(project: Path, destination: Path, owner: str, model: str, model_url:
     hermes_config = {
         "model": {"default": model, "provider": "custom", "base_url": model_url, "api_key": "${HERMES_MODEL_API_KEY}"},
         "skills": {"auto_load": ["aqla-master"]},
-        "agent": {"max_turns": 30},
+        "agent": {"max_turns": 30, "reasoning_effort": "ultra"},
         "display": {"busy_input_mode": "queue", "interim_assistant_messages": False, "tool_progress": "log"},
         "platform_toolsets": {"telegram": ["skills", "mcp-aqla", "mcp-sheets"], "cli": ["skills", "no_mcp"], "cron": ["skills", "no_mcp"]},
         "mcp_servers": {"aqla": {"command": python, "args": ["-m", "aqla_hyperliquid_mcp", "--config", str(destination / "config.yaml")],
@@ -120,8 +123,8 @@ def main():
     parser = argparse.ArgumentParser(description="Prepare a separate aqla VPS deployment")
     parser.add_argument("--destination", required=True)
     parser.add_argument("--owner-id", required=True)
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--model-url", required=True)
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model-url", default=DEFAULT_MODEL_URL)
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
     if not args.owner_id.isdigit() or "\n" in args.model or "\n" in args.model_url:

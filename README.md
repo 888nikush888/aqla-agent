@@ -14,16 +14,18 @@ Voraussetzungen: Linux mit systemd, Git und uv. Der Installer richtet eigene Pyt
 
    ```sh
    uv sync --frozen --extra sources --extra sheets
-   uv run aqla-install-hermes --destination /opt/aqla --owner-id DEINE_TELEGRAM_USER_ID --model DEIN_MODELL --model-url DEINE_OPENAI_KOMPATIBLE_API_URL
+   uv run aqla-install-hermes --destination /opt/aqla --owner-id DEINE_TELEGRAM_USER_ID
    ```
 
    `/opt/aqla` muss neu oder leer sein. Mit ausreichenden Verzeichnisrechten ausführen. Der Zielordner erhält eigene Quellen, Konfiguration, Secrets-Verzeichnis, Hermes-Home, zwei venvs und eine systemd-Datei. Interpreter werden ebenfalls dort verwaltet; der Dienst hängt nicht an einem Python unter dem privaten Root-Home.
+
+   Standardmodell ist **DeepSeek V4.1 Flash über OpenCode Go** (`deepseek-v4.1-flash`, `https://opencode.ai/zen/go/v1`) mit Hermes-Reasoning **ultra**. Hermes übersetzt `ultra` für DeepSeek in die API-Stufe `max`. Andere Modelle und Endpunkte lassen sich ausdrücklich mit `--model` und `--model-url` wählen; Reasoning kann anschließend über Hermes geändert werden.
 
 2. `/opt/aqla/vps.env` ausfüllen:
 
    ```dotenv
    TELEGRAM_BOT_TOKEN=DEIN_BOT_TOKEN
-   HERMES_MODEL_API_KEY=DEIN_MODELLZUGANG
+   HERMES_MODEL_API_KEY=DEIN_OPENCODE_GO_API_KEY
    ```
 
    `HERMES_HOME`, `PYTHONPATH`, Owner und Rückkanal setzt der Installer. Zugangsdaten gehören in diese geschützten Dateien, nicht in den Skill oder Signalnachrichten.

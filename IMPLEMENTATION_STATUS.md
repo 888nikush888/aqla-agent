@@ -12,6 +12,7 @@ Stand: 03.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Qu
 - Eigener vollständiger HyperCore-MCP: 59 Info-Verträge, 40 dokumentierte Exchange-Aktionstypen, 52 öffentliche SDK-Operationen einschließlich der gesonderten Approval-/Multisig-Pfade, 24 WebSocket-Abonnements, HIP-3/HIP-4 und Deployeraktionen. Siehe docs/api-coverage.md. API-Snapshot: 02.10.2026; keine Behauptung unbekannter zukünftiger API-Erweiterungen.
 - Atomarer JSON-Handelszustand und JSONL-Gesprächsverlauf. Keine Datenbank. SQLite-Zugriffe und ungenutzte Hermes-Hintergrundprodukte sind im separaten VPS-Profil deaktiviert. Native Hermes-Telegram-Befehle sind verfügbar.
 - Installer mit eigenem Hermes-Checkout/Home und systemd-Unit; Aqla Python 3.12, Hermes Python 3.14, beide im Zielordner verwaltet. Gepinnter Hermes-Commit: 1a4508e2aff2db5f50409893a2115be777bd5643.
+- Neuinstallationen verwenden standardmäßig DeepSeek V4.1 Flash über OpenCode Go und Hermes-Reasoning `ultra` (DeepSeek-API `max`). Modell und Endpunkt bleiben über Installerargumente überschreibbar; die CLI-Vorgaben sind als tatsächliche neue Konfiguration getestet.
 - Source-ZIP mit SHA-256, Wheel und Source-Distribution; keine lokalen Secrets, Daten oder QA-Umgebungen im Archiv. Eigenständiges privates GitHub-Repository `888nikush888/aqla-agent` mit Qualitätspipeline.
 
 ## Geprüft

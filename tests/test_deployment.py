@@ -1,4 +1,5 @@
 from pathlib import Path
+from sys import argv
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,9 @@ def test_deployment_is_separate_and_has_native_hermes_transport(tmp_path):
     project = Path(__file__).resolve().parents[1]
     target = prepare(project, tmp_path / "new-vps", "12345", "test-model", "https://example.invalid/v1")
     config = yaml.safe_load((target / "hermes-home" / "config.yaml").read_text())
+    assert config["model"]["default"] == "test-model"
+    assert config["model"]["base_url"] == "https://example.invalid/v1"
+    assert config["agent"]["reasoning_effort"] == "ultra"
     assert config["plugins"]["entries"]["aqla-events"]["settings"]["owner_id"] == "12345"
     assert config["mcp_servers"]["aqla"]["command"].startswith(str(target))
     assert config["mcp_servers"]["sheets"]["args"][1] == "aqla_sheets_mcp"
@@ -23,6 +27,18 @@ def test_deployment_is_separate_and_has_native_hermes_transport(tmp_path):
     assert not list(target.rglob("*.db"))
     with pytest.raises(ValueError, match="new and empty"):
         prepare(project, target, "12345", "test-model", "https://example.invalid/v1")
+
+
+def test_cli_new_install_defaults_to_deepseek_flash_ultra(tmp_path, monkeypatch):
+    target = tmp_path / "default-vps"
+    monkeypatch.setattr("sys.argv", [argv[0], "--destination", str(target), "--owner-id", "12345", "--prepare-only"])
+    install.main()
+    config = yaml.safe_load((target / "hermes-home" / "config.yaml").read_text())
+    assert config["model"]["default"] == "deepseek-v4.1-flash"
+    assert config["model"]["base_url"] == "https://opencode.ai/zen/go/v1"
+    assert config["agent"]["reasoning_effort"] == "ultra"
+    assert config["model"]["api_key"] == "${HERMES_MODEL_API_KEY}"
+    assert (target / "src" / "aqla_sheets_mcp" / "parameters.py").is_file()
 
 
 def test_linux_install_uses_separate_managed_interpreters_and_pinned_hermes(tmp_path, monkeypatch):
