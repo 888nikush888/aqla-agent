@@ -20,6 +20,13 @@ side und jedes Preisfeld mit einem echten Zitat und dessen source_id; einzelne
 Preise heißen entry_prices.0, stop_loss, take_profits.0 usw. Kontextuelle Wörter
 wie „kaufen“ dürfen die Richtung belegen, ohne kanalspezifische Regex.
 
+Erfasse einen eindeutigen Signalhebel als leverage und belege ihn über das
+Evidencefeld leverage mit Originalzitat (z. B. „20x“, „x20“ oder „Hebel 20“).
+Fehlende, mehrdeutige oder nicht ganzzahlige Hebelangaben bleiben null; erfinde
+keinen Ersatz. Bei leverage_mode=signal übernimmt Python den Signalhebel bis zum
+Börsenmaximum. Bei fixed gilt der feste Nutzerhebel. Der Tradeplan nennt
+signal_leverage und effective_leverage; melde eine Deckelung mit diesen Werten.
+
 Für ein vollständiges Setup verwende trade_preview, danach trade_execute mit
 genau dessen plan_id. Python berechnet Mengen, Rundung, Margin und Grenzen.
 Zulässige automatische Trades brauchen keine weitere Nutzerfreigabe. Speichere

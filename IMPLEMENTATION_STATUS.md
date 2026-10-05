@@ -1,6 +1,6 @@
 # aqla Agent — Auslieferungsstand
 
-Stand: 03.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Quellpaket. Die bestehende Hermes-Installation des Nutzers wurde weder verändert noch angebunden. Kein TSX-Code oder alter Handelszustand wurde übernommen.
+Stand: 05.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Quellpaket. Die bestehende Hermes-Installation des Nutzers wurde weder verändert noch angebunden. Kein TSX-Code oder alter Handelszustand wurde übernommen.
 
 ## Inhalt
 
@@ -9,6 +9,7 @@ Stand: 03.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Qu
 - Kurzer durch Hermes bearbeitbarer Master; Python prüft Nutzerregeln, Zahlen, Mengen, Marktpräzision, Budgets und Operationsidentitäten.
 - Zweiter eigener Google-Sheets-MCP mit automatischem Journal, Queue im vorhandenen State, stabilen Zeilen-IDs, Statushistorie und lesenden Auswertungen. Quellenleser und Wakeups laufen unabhängig vom Google-Task. Die Konfiguration benötigt auf dem VPS eine eigene Tabelle und einen Servicekonto-Zugang; technische Order-/Nonce-Sicherung bleibt lokal.
 - Automatischer Perpetual-Signalhandel mit Entry/SL, anteiligen Limit-TPs, Updates, Einstand, Reduktion, Schließen und Wiederanlauf. Spot liegt im vollständigen MCP; die automatische Signalstrecke lehnt Spot vor einer Order ab.
+- Hebelmodus `fixed` oder `signal`: Signalhebel werden belegt, am Marktmaximum gedeckelt und als effektiver Hebel unveränderlich im Plan gespeichert. Marginprüfung, Börsenauftrag und Recovery verwenden denselben Wert; alte feste Regeln und Pläne bleiben lesbar.
 - Eigener vollständiger HyperCore-MCP: 59 Info-Verträge, 40 dokumentierte Exchange-Aktionstypen, 52 öffentliche SDK-Operationen einschließlich der gesonderten Approval-/Multisig-Pfade, 24 WebSocket-Abonnements, HIP-3/HIP-4 und Deployeraktionen. Siehe docs/api-coverage.md. API-Snapshot: 02.10.2026; keine Behauptung unbekannter zukünftiger API-Erweiterungen.
 - Atomarer JSON-Handelszustand und JSONL-Gesprächsverlauf. Keine Datenbank. SQLite-Zugriffe und ungenutzte Hermes-Hintergrundprodukte sind im separaten VPS-Profil deaktiviert. Native Hermes-Telegram-Befehle sind verfügbar.
 - Installer mit eigenem Hermes-Checkout/Home und systemd-Unit; Aqla Python 3.12, Hermes Python 3.14, beide im Zielordner verwaltet. Gepinnter Hermes-Commit: 1a4508e2aff2db5f50409893a2115be777bd5643.
@@ -19,6 +20,8 @@ Stand: 03.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Qu
 
 Alle 32 bestätigten Befunde der Voll-, Nach- und Abschlussprüfung sind korrigiert und durch gezielte Regressionstests beziehungsweise Paket-/CI-Prüfungen abgesichert. Die Zuordnung steht in `docs/quality-review.md`. Die Abnahme nach der VPS-Startkorrektur, vor der Handelsparameter-Erweiterung, bestand lokal 498 Tests einschließlich der lokalen WebSocket-Prüfungen, mit 80,74 Prozent Branch-Coverage. Die Parameterseite ist zusätzlich durch drei Regressionstests für vollständige Feldabdeckung, unverbindliche Standardwerte, authentifizierte Regeländerungen, veraltete Bestätigungen und Erhalt vorhandener Tabellen abgesichert. Native Hermes-Smokes prüfen zusätzlich echte Text-/Foto-/Queue-Batchpfade, rekursive Folgeturns mit wiederverwendetem Agenten, Workerautorität, Befehlsabbruch, Adapterwechsel, deaktivierte Cron-/Housekeeping-Factory und beide MCPs. Beide Abhängigkeitsgraphen melden zum Prüfzeitpunkt keine bekannten Advisories.
 
+Aktueller lokaler Gesamtlauf nach der Signalhebel-Erweiterung: **528 Tests bestanden, 81,51 Prozent Branch-Coverage**. 26 Fälle prüfen Signalhebel, symbolabhängige Deckelung, fehlende/ungültige Werte, Originalzitate, unveränderte Risikogrenzen, tatsächliche `updateLeverage`-Payloads, frische Marginprüfung, gesunkenes Marktmaximum, idempotenten Wiederanlauf und alte feste Pläne/Interpretationen.
+
 Ruff; eingefrorene Installation; Paketbuild; separate Wheel-Installation und Offline-Installer; regel- und zustandsbezogene Tests einschließlich Crash vor TP-Versand, verlorenen Antworten, echten Teilfills, beendeter eigener Position mit fremdem Wiedereröffnen, frischer Equity bei Recovery und verlorener niedriger Telegram-ID.
 
 Mit dem tatsächlichen gepinnten Hermes: Gesprächswiederherstellung ohne DB, Gateway-Konstruktion ohne Session-DB, native AIAgent-Hooks und stdio-MCP. Ein lokales geskriptetes Modell prüfte Owner-Regeländerung, Master-Patch, Größenbegrenzung und die Abwehr von Kontrollaufrufen aus einer echten nativen Weiterleitung. Native Boot-Anbindung startet ohne neue Owner-Nachricht; geänderte Skills leeren den nativen Agentencache vor dem nächsten Turn.
@@ -27,6 +30,6 @@ Ein echter lokaler WebSocket-Server prüfte Reconnect, Unsubscribe und einen ang
 
 ## Prüfgrenzen und Einrichtung
 
-Die anschließende VPS-Installation auf ausdrücklichen Nutzerauftrag ist in `docs/vps-deployment.md` dokumentiert: Dienst läuft, echter Modellaufruf funktioniert, Telegram-Bot antwortet und der Kanal-Leser ist per QR angemeldet. Hyperliquid-Testnet-Kontobindung wurde lesend geprüft; keine Exchange-Mutationen. Google Sheets ist aktiv; acht Journal-Tabs, verifizierte Regelzeile, 25 aktuelle Parameterzeilen und leere Zustellungsqueue wurden tatsächlich geprüft. Handelsregeln und Quellen wählt der Nutzer über den Bot.
+Die anschließende VPS-Installation auf ausdrücklichen Nutzerauftrag ist in `docs/vps-deployment.md` dokumentiert: Dienst läuft, echter Modellaufruf funktioniert, Telegram-Bot antwortet und der Kanal-Leser ist per QR angemeldet. Hyperliquid-Testnet-Kontobindung wurde lesend geprüft; keine Exchange-Mutationen. Google Sheets ist aktiv; acht Journal-Tabs, verifizierte Regelzeile, 26 aktuelle Parameterzeilen und leere Zustellungsqueue wurden tatsächlich geprüft. Handelsregeln und Quellen wählt der Nutzer über den Bot.
 
 Geskriptete Modellprüfungen beweisen Integration und Befugnisse, keine allgemeine sprachliche Erkennungsqualität. Für das gewünschte echte Modell liegen 30 Kontextfälle und ein ausdrücklich auszuführender Eval-Runner ohne Handels-/Telegram-Werkzeuge bei. Text und Captions werden verarbeitet; reine Bildsignale nicht. Native Stop-Ausführung ist kein garantierter maximaler tatsächlicher Verlust.

@@ -78,6 +78,7 @@ Voraussetzungen: Linux mit systemd, Git und uv. Der Installer richtet eigene Pyt
 
 - „Lies auch `@mein_signal_channel`.“
 - „Risiko pro Trade 0,5 Prozent, Hebel 2, maximal drei offene Trades.“
+- „Übernimm den Hebel 1:1 aus dem Signal, gedeckelt am Börsenmaximum des jeweiligen Markts.“
 - „Bei fehlendem Entry zum Marktpreis; maximal 0,3 Prozent Entry-Slippage.“
 - „Verteile auf alle TPs gleichmäßig. Nach vollständig gefülltem TP1 den Stop auf Einstand.“
 - „Pausiere neue Trades.“ / „Setze neue Trades fort.“
@@ -89,6 +90,8 @@ Hermes übersetzt diese Wünsche in validierte MCP-Aufträge und nennt die wirks
 Ein neuer Trade braucht Markt, Richtung, SL und mindestens einen TP. Zusammengehörige Nachrichten/Replies können die Angaben vervollständigen. Updates wie „SL auf Einstand“ benötigen diese Felder nicht erneut. Berichte, mehrdeutige Zuordnungen und nicht auflösbare Märkte erzeugen keinen neuen Trade. Zahlen werden anhand der echten Quelltexte belegt; keine Pflichtregex je Kanal. V1 liest Text und Captions; reine Bildsignale werden nicht als erkannt ausgegeben.
 
 Der automatische Signalhandel verwendet Perpetuals mit nativem Reduce-only-Schutz. Spot-Funktionen sind im vollständigen MCP verfügbar; die automatische Signalstrecke verweigert Spot, bevor eine Order entsteht.
+
+Der Hebel ist wählbar: `leverage_mode: fixed` verwendet weiterhin den festen Nutzerwert `leverage`; ein Wert über dem Marktmaximum wird abgelehnt. `leverage_mode: signal` übernimmt den mit Originalzitat belegten Signalhebel und deckelt ihn ausschließlich am Marktmaximum aus der Hyperliquid-Metadatenabfrage. Ein Signal mit 50× wird bei einem Marktlimit von 20× mit 20× geplant. Ohne eindeutigen positiven ganzzahligen Signalhebel entsteht in diesem Modus kein neuer Trade; der feste Wert dient nicht als Ersatz. Der Plan speichert `signal_leverage` und `effective_leverage`, und derselbe effektive Wert gilt für Marginprüfung, Börsenauftrag und Wiederanlauf. Die Risiko- und Positionswertgrenzen bleiben wirksam.
 
 ## MCP und Zustand
 

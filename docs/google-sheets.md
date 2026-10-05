@@ -12,7 +12,7 @@ aqla enthält einen zweiten Python-MCP für Google Sheets. Der native Hermes-Gat
 | `aqla Fills` | Eigene tatsächlich beobachtete Ausführungen, Zeit, Menge, Preis und Gebühren-Token |
 | `aqla Vorgänge` | Dauerhafte Ausführungs-ID, Nonce, Phase, Request und Ergebnis, einschließlich unklarer/abgelehnter Aufträge |
 | `aqla Regeln` | Konto, Netzwerk, wirksame Nutzerregeln, Quellen und Pause |
-| `aqla Handelsparameter` | Alle 19 Handelsregeln einzeln mit aktuellem Wert, Einheit, zulässigen Werten, Standard bei Regelerstellung und Erklärung; zusätzlich Netzwerk, Handelskonto, Pause, Quellen und Regelstand |
+| `aqla Handelsparameter` | Alle 20 Handelsregeln einzeln mit aktuellem Wert, Einheit, zulässigen Werten, Standard bei Regelerstellung und Erklärung; zusätzlich Netzwerk, Handelskonto, Pause, Quellen und Regelstand |
 | `aqla Ereignisse` | Zustandsänderungen mit Zeitpunkt, Sequenz und Vorher-/Nachher-Fakten |
 
 Die automatisch erzeugten Tabs haben Filter und eine feste Kopfzeile. Die internen ID-/Versionsprüfungen verwenden versteckte Metadaten-Spalten. Eigene zusätzliche Tabs bleiben unberührt. Originaltexte mit `=` werden als Text geschrieben und nicht als Sheets-Formeln ausgeführt. Sehr große einzelne Felder werden mit sichtbarem Hinweis gekürzt; der technische Originalzustand bleibt lokal erhalten.
@@ -20,6 +20,8 @@ Die automatisch erzeugten Tabs haben Filter und eine feste Kopfzeile. Die intern
 Für eigene Sortierungen Filteransichten oder zusätzliche Analyse-Tabs verwenden. Generierte Datenzellen, Kopfzeilen und Metadatenspalten während der Synchronisierung nicht manuell verschieben, überschreiben oder löschen. Die Tabelle dient der Auswertung; Änderungen dort steuern keine Trades.
 
 `aqla Handelsparameter` zeigt eine Zeile je Einstellung in verständlichem Deutsch. Solange keine Policy festgelegt ist, steht bei allen Handelsregeln **Nicht festgelegt**. Die getrennte Standardspalte beschreibt ausschließlich Modellvorgaben bei einer späteren Regelerstellung; sie aktiviert keine Regeln. Änderungen über Telegram/Hermes werden automatisch gespiegelt und im Ereignisblatt nachvollziehbar. Bestehende Tabellen erhalten das zusätzliche Blatt beim nächsten Neustart und Abgleich, ohne Änderungen an den bisherigen Blättern.
+
+`Hebelmodus` unterscheidet **Fest** und **Aus Signal, am Börsenmaximum gedeckelt**. Im Signalmodus zeigt die Zeile `Fester Hebel` ausdrücklich **Nicht verwendet (Signalmodus)**. Der tatsächliche Hebel jedes Trades steht im unveränderlichen Tradeplan sowie im Request des `updateLeverage`-Vorgangs; die übrigen Journalspalten werden für die Erweiterung nicht verschoben.
 
 ## Warum bleibt state.json?
 

@@ -35,7 +35,10 @@ class Policy(Model):
     risk_percent: Positive = Field(default=Decimal("0.5"), le=100)
     fixed_notional_usdc: Positive | None = None
     max_notional_usdc: Positive = Decimal("500")
-    leverage: int = Field(default=2, ge=1, le=100)
+    leverage_mode: Literal["fixed", "signal"] = Field(default="fixed",
+        description="fixed uses the user's leverage value; signal copies evidenced signal leverage capped at the market maximum")
+    leverage: int = Field(default=2, ge=1, le=100,
+        description="Used only in fixed mode; never a fallback for missing signal leverage")
     margin_mode: Literal["cross", "isolated"] = "isolated"
     max_open_trades: int = Field(default=3, ge=1, le=100)
     max_total_risk_percent: Positive = Field(default=Decimal("1.5"), le=100)
@@ -56,7 +59,7 @@ class Policy(Model):
             raise ValueError("fixed_notional_usdc is required for fixed_notional sizing")
         if self.take_profit_allocation == "custom" and sum(self.take_profit_weights) != 100:
             raise ValueError("Custom TP weights must total exactly 100")
-        if self.product == "spot" and self.leverage != 1:
+        if self.product == "spot" and (self.leverage != 1 or self.leverage_mode != "fixed"):
             raise ValueError("Spot does not use leverage")
         return self
 
@@ -152,6 +155,8 @@ class Interpretation(Model):
     source_refs: list[str] = Field(min_length=1, max_length=20)
     symbol: str | None = Field(default=None, max_length=100)
     side: Literal["long", "short"] | None = None
+    leverage: int | None = Field(default=None, ge=1, strict=True,
+        description="Explicit positive integer signal leverage; null if missing or ambiguous. Quote evidence under field leverage.")
     entry: Literal["market", "limit", "range", "unspecified"] = "unspecified"
     entry_prices: list[Positive] = Field(default_factory=list, max_length=2)
     stop_loss: Positive | None = None
@@ -207,6 +212,8 @@ class TradePlan(Model):
     source_revisions: dict[str, str] = Field(default_factory=dict)
     policy_revision: int
     policy: Policy
+    signal_leverage: int | None = Field(default=None, ge=1)
+    effective_leverage: int | None = Field(default=None, ge=1)
     network: str
     account: str
     principal: str | None = None
@@ -222,6 +229,21 @@ class TradePlan(Model):
     risk_usdc: Positive
     deadline_at: int
     created_at: int
+
+    @model_validator(mode="after")
+    def leverage_consistent(self):
+        if self.policy.leverage_mode == "signal":
+            if self.signal_leverage is None:
+                raise ValueError("Signal leverage is required for a signal-mode plan")
+            expected = min(self.signal_leverage, self.market.max_leverage)
+        else:
+            expected = self.policy.leverage
+        # Legacy plans contain only policy.leverage. Preserve their IDs and execution identities.
+        if self.effective_leverage is None and self.policy.leverage_mode == "fixed":
+            object.__setattr__(self, "effective_leverage", expected)
+        if self.effective_leverage != expected:
+            raise ValueError("Effective leverage differs from the immutable plan's leverage rule")
+        return self
 
 
 class AqlaError(ToolError, ValueError):

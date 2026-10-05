@@ -10,7 +10,8 @@ PARAMETERS = {
     "risk_percent": ("Risiko", "Risiko je Trade", "% Kontoequity", "> 0 bis 100", "Obergrenze für das berechnete SL-Risiko einschließlich Kostenreserve; auch bei festem Positionswert."),
     "fixed_notional_usdc": ("Positionsgröße", "Fester Positionswert", "USDC", "> 0 oder nicht gesetzt", "Nur bei festem Positionswert erforderlich. Risiko- und Margin-Grenzen können die Menge weiter begrenzen."),
     "max_notional_usdc": ("Positionsgröße", "Maximaler Positionswert", "USDC", "> 0", "Obergrenze für den Positionswert eines neuen Trades, unabhängig vom Hebel."),
-    "leverage": ("Margin", "Hebel", "fach", "1 bis 100; zusätzlich Börsenlimit", "Fester Nutzerhebel. Übersteigt er das Marktlimit, wird der Trade abgelehnt. Der Signalhebel wird nicht übernommen."),
+    "leverage_mode": ("Margin", "Hebelmodus", "", "Fest / Aus Signal, am Börsenmaximum gedeckelt", "Aus Signal: übernimmt den belegten Signalhebel bis zum aktuellen Marktmaximum. Ohne eindeutigen Signalhebel kein neuer Trade."),
+    "leverage": ("Margin", "Fester Hebel", "fach", "1 bis 100; zusätzlich Börsenlimit", "Nur im festen Modus verwendet. Übersteigt dieser Wert das Marktlimit, wird der Trade abgelehnt. Im Signalmodus ist er kein Ersatzwert."),
     "margin_mode": ("Margin", "Margin-Modus", "", "Isolated / Cross", "Legt fest, ob die Börse isolierte oder gemeinsame Margin für den Markt verwendet."),
     "max_open_trades": ("Risiko", "Maximal offene Trades", "Trades", "1 bis 100", "Begrenzt gleichzeitig aktive Aqla-Trades einschließlich noch ausstehender Entries."),
     "max_total_risk_percent": ("Risiko", "Maximales Gesamtrisiko", "% Kontoequity", "> 0 bis 100", "Begrenzt die Summe des reservierten berechneten Risikos aller aktiven Aqla-Trades."),
@@ -27,6 +28,7 @@ PARAMETERS = {
 }
 
 VALUE_LABELS = {
+    "fixed": "Fest", "signal": "Aus Signal, am Börsenmaximum gedeckelt",
     "perp": "USDC-Perpetuals", "spot": "Spot (automatisch nicht unterstützt)",
     "risk_percent": "Nach Risiko", "fixed_notional": "Fester Positionswert",
     "cross": "Cross", "isolated": "Isolated", "source": "Signalpreis erforderlich",
@@ -66,4 +68,6 @@ def parameter_values(data):
     defaults = Policy().model_dump()
     for field, (category, label, unit, allowed, description) in PARAMETERS.items():
         value = display(current[field], field) if current is not None else "Nicht festgelegt"
+        if field == "leverage" and current is not None and current["leverage_mode"] == "signal":
+            value = "Nicht verwendet (Signalmodus)"
         yield field, category, label, value, unit, allowed, display(defaults[field], field), description

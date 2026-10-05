@@ -53,6 +53,24 @@ def quoted_numbers(quote):
             continue
 
 
+def quoted_leverage_numbers(quote):
+    # General multiplier notation, not channel patterns. Keep price evidence parsing unchanged.
+    numeric = r"\d+(?:[.,]\d+)*"
+    quote = re.sub(rf"(?<![\w.])[x×]\s*({numeric})(?![\w.])", r"\1", quote, flags=re.I)
+    quote = re.sub(rf"(?<![\w.])({numeric})\s*(?:[x×]|fach)(?!\w)", r"\1", quote, flags=re.I)
+    return quoted_numbers(quote)
+
+
+def effective_leverage(signal: Interpretation, market: Market, policy: Policy):
+    if policy.leverage_mode == "signal":
+        if signal.leverage is None:
+            raise AqlaError("Signal leverage is missing; signal mode never guesses a leverage")
+        return min(signal.leverage, market.max_leverage)
+    if policy.leverage > market.max_leverage:
+        raise AqlaError("Configured leverage exceeds this market's limit")
+    return policy.leverage
+
+
 def latest_sources(events: dict, refs=None):
     latest = {}
     revisions = {}
@@ -98,6 +116,9 @@ def verify_evidence(signal: Interpretation, events: dict):
     for field, value in numeric.items():
         if value is not None and not any(value in set(quoted_numbers(quote)) for quote in fields.get(field, [])):
             raise AqlaError(f"Price not supported by source evidence: {field}")
+    if signal.leverage is not None and not any(
+            signal.leverage in set(quoted_leverage_numbers(quote)) for quote in fields.get("leverage", [])):
+        raise AqlaError("Signal leverage is not supported by source evidence")
 
 
 def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, policy: Policy,
@@ -113,8 +134,7 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
             raise AqlaError("Signal deadline expired; it is never renewed")
         if stamp - account.observed_at > 10000:
             raise AqlaError("Account observation is stale")
-        if policy.leverage > market.max_leverage:
-            raise AqlaError("Configured leverage exceeds this market's limit")
+        leverage = effective_leverage(signal, market, policy)
         if market.product == "spot" and signal.side == "short":
             raise AqlaError("Spot short signals are unsupported")
         long = signal.side == "long"
@@ -144,7 +164,7 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         cost = limit * policy.cost_reserve_bps / 10000
         distance = abs(limit - stop) + cost
         maximum = min(budget / distance, policy.max_notional_usdc / limit,
-                      account.available_margin * policy.leverage / limit)
+                      account.available_margin * leverage / limit)
         if policy.sizing_mode == "fixed_notional":
             maximum = min(maximum, policy.fixed_notional_usdc / limit)
         quantity = quantity_grid(maximum, market)
@@ -155,6 +175,7 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
             raise AqlaError("A TP leg is below the exchange notional minimum")
         trade_id = digest([*binding, sorted(signal.source_refs)])[:32]
         values = dict(trade_id=trade_id, source_refs=signal.source_refs, policy_revision=revision, policy=policy,
+                      signal_leverage=signal.leverage, effective_leverage=leverage,
                       network=binding[0], account=binding[1], principal=principal, market=market, side=signal.side, entry_kind=kind,
                       entry_price=entry, entry_limit=limit, stop_loss=stop, take_profits=targets, quantity=quantity,
                       tp_quantities=tp_sizes, risk_usdc=quantity * distance,

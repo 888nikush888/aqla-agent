@@ -114,6 +114,8 @@ class Trading:
         verify_evidence(interpretation, snapshot["events"])
         previous = row.get("interpretation")
         if row["status"] in ("executed", "updated"):
+            if previous is not None:
+                previous = Interpretation.model_validate(previous).model_dump(mode="json")
             if previous != interpretation.model_dump(mode="json"):
                 raise AqlaError("An executed revision is immutable; interpret the edit as a new update revision")
             return row
@@ -206,7 +208,7 @@ class Trading:
                 raise AqlaError("Current exchange exposure has no free logical owner; no additional entry")
             if (plan.risk_usdc + reserved > account.equity * plan.policy.max_total_risk_percent / 100
                     or plan.risk_usdc > account.equity * plan.policy.risk_percent / 100
-                    or plan.quantity * plan.entry_limit / plan.policy.leverage > account.available_margin):
+                    or plan.quantity * plan.entry_limit / plan.effective_leverage > account.available_margin):
                 raise AqlaError("Current equity/margin no longer permits this exact plan")
 
     async def positions(self, market):
@@ -254,6 +256,8 @@ class Trading:
             current_market = await self.exchange.market(plan.market.symbol, plan.market.product)
             if (current_market.asset_id, current_market.size_decimals, current_market.quote_token) != (plan.market.asset_id, plan.market.size_decimals, plan.market.quote_token):
                 raise AqlaError("Exchange market metadata changed after preview")
+            if plan.effective_leverage > current_market.max_leverage:
+                raise AqlaError("Exchange leverage limit decreased after preview; create a new unsent plan")
             account = await self.exchange.account_snapshot(plan.market)
             trade = {"trade_id": plan.trade_id, "chat_id": snapshot["events"][saved["event_id"]]["source"]["chat_id"],
                      "plan": plan.model_dump(mode="json"), "event_id": saved["event_id"], "status": "preparing",
@@ -277,7 +281,7 @@ class Trading:
         if plan.market.product == "perp":
             leverage = await self.exchange.mutate("leverage:" + plan.trade_id,
                                                  {"type": "updateLeverage", "asset": plan.market.asset_id,
-                                                  "isCross": plan.policy.margin_mode == "cross", "leverage": plan.policy.leverage}, deadline=plan.deadline_at,
+                                                  "isCross": plan.policy.margin_mode == "cross", "leverage": plan.effective_leverage}, deadline=plan.deadline_at,
                                                   prepare_guard=lambda data: self.validate_admission(data, plan, owned=True))
             if leverage["phase"] != "acknowledged":
                 self._patch(plan.trade_id, status="unknown" if leverage["phase"] == "unknown" else "rejected")
@@ -309,6 +313,8 @@ class Trading:
             market = await self.exchange.market(plan.market.symbol, plan.market.product)
             if (market.asset_id, market.size_decimals, market.quote_token) != (plan.market.asset_id, plan.market.size_decimals, plan.market.quote_token):
                 raise AqlaError("Exchange market metadata changed after preview")
+            if plan.effective_leverage > market.max_leverage:
+                raise AqlaError("Exchange leverage limit decreased after preview; create a new unsent plan")
             if self.position_size(await self.positions(plan.market), plan.market) != 0:
                 raise AqlaError("Unsent entry cannot resume against an existing foreign position")
             account = await self.exchange.account_snapshot(plan.market)
