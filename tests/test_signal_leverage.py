@@ -71,7 +71,8 @@ def test_signal_leverage_must_be_a_positive_integer(value):
         Interpretation(kind="new_signal", source_refs=["source"], leverage=value)
 
 
-@pytest.mark.parametrize("quote", ["20x", "x20", "20×", "×20", "Hebel: 20", "20fach", "Leverage 20 x"])
+@pytest.mark.parametrize("quote", ["20x", "x20", "20×", "×20", "Hebel: 20", "20fach", "Leverage 20 x",
+    "Hebel: 20x.", "Hebel x20.", "Hebel 20fach."])
 def test_multiplier_evidence_is_supported_without_loosening_price_evidence(quote):
     assert Decimal(20) in set(quoted_leverage_numbers(quote))
     if quote in ("20x", "x20", "20fach"):

@@ -41,6 +41,13 @@ def test_general_decimal_numbers_have_no_channel_role_patterns():
     assert set(quoted_numbers("0,001")) == {Decimal("0.001")}
 
 
+@pytest.mark.parametrize("quote,expected", [("Stop Loss 90.", "90"), ("Entry 100.5.", "100.5"),
+    ('Ziel "1.234,56."', "1234.56")])
+def test_quote_evidence_accepts_sentence_periods_without_changing_decimal_values(quote, expected):
+    assert Decimal(expected) in set(quoted_numbers(quote))
+    assert set(quoted_numbers("100.BTC")) == set()
+
+
 def test_user_policy_does_not_accept_extra_autonomy_fields():
     with pytest.raises(ValueError):
         Policy.model_validate({"risk_percent": "0.5", "autonomous_risk_increase": True})

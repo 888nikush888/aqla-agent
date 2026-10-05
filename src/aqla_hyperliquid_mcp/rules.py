@@ -36,6 +36,8 @@ def split_targets(quantity: Decimal, count: int, policy: Policy, market: Market)
 def quoted_numbers(quote):
     # General decimal notation only; no channel-specific syntax or field-role regex.
     normalized = quote.replace("\u00a0", " ").replace("\u202f", " ")
+    # A sentence-ending period is punctuation; decimal/thousands dots stay untouched.
+    normalized = re.sub(r"(?<=\d)\.(?=$|[\s\"'»”);,!?\]])", " ", normalized)
     normalized = re.sub(r"(?<=\d) (?=\d{3}(?:\b|[.,]))", "", normalized)
     for token in re.findall(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])", normalized):
         if "." in token and "," in token:
@@ -56,8 +58,8 @@ def quoted_numbers(quote):
 def quoted_leverage_numbers(quote):
     # General multiplier notation, not channel patterns. Keep price evidence parsing unchanged.
     numeric = r"\d+(?:[.,]\d+)*"
-    quote = re.sub(rf"(?<![\w.])[x×]\s*({numeric})(?![\w.])", r"\1", quote, flags=re.I)
-    quote = re.sub(rf"(?<![\w.])({numeric})\s*(?:[x×]|fach)(?!\w)", r"\1", quote, flags=re.I)
+    quote = re.sub(rf"(?<![\w.])[x×]\s*({numeric})(?!\w)", r" \1 ", quote, flags=re.I)
+    quote = re.sub(rf"(?<![\w.])({numeric})\s*(?:[x×]|fach)(?!\w)", r" \1 ", quote, flags=re.I)
     return quoted_numbers(quote)
 
 
