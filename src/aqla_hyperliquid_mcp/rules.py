@@ -30,8 +30,24 @@ def price_grid(value: Decimal, market: Market, up=False):
     return value.quantize(Decimal(1).scaleb(exponent), rounding=ROUND_UP if up else ROUND_DOWN)
 
 
+def selected_targets(prices, policy):
+    maximum = 5 if policy.take_profit_allocation == "adaptive" else 1 if policy.take_profit_allocation == "first_target" else 20
+    return list(prices[:maximum])
+
+
 def split_targets(quantity: Decimal, count: int, policy: Policy, market: Market):
-    if policy.take_profit_allocation == "custom":
+    if not 1 <= count <= 20:
+        raise AqlaError("TP distribution requires 1–20 targets")
+    if policy.take_profit_allocation == "adaptive":
+        if count > 5:
+            raise AqlaError("Adaptive distribution uses at most five targets")
+        weights = [Decimal(value) for value in ("50", "25", "12.5", "7.5")[:count - 1]]
+        weights += [100 - sum(weights)]
+    elif policy.take_profit_allocation == "first_target":
+        if count != 1:
+            raise AqlaError("First-target distribution uses exactly one target")
+        weights = [Decimal(100)]
+    elif policy.take_profit_allocation == "custom":
         weights = policy.take_profit_weights
         if len(weights) != count:
             raise AqlaError("TP weight count differs from signal target count")
@@ -171,7 +187,7 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
             entry = market.mid
             limit = slippage_price(entry, policy.max_slippage_percent, market, buy=long)
         stop = price_grid(signal.stop_loss, market, up=not long)
-        targets = [price_grid(value, market, up=not long) for value in signal.take_profits]
+        targets = [price_grid(value, market, up=not long) for value in selected_targets(signal.take_profits, policy)]
         ordered = sorted(set(targets), reverse=not long)
         if targets != ordered or not (stop < min(entry, limit) and all(t > max(entry, limit) for t in targets) if long else stop > max(entry, limit) and all(t < min(entry, limit) for t in targets)):
             raise AqlaError("SL, entry and TPs have invalid direction/ordering after rounding")
@@ -201,6 +217,7 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
                       signal_leverage=signal.leverage, effective_leverage=leverage,
                       network=binding[0], account=binding[1], principal=principal, market=market, side=signal.side, entry_kind=kind,
                       entry_price=entry, entry_limit=limit, stop_loss=stop, take_profits=targets, quantity=quantity,
+                      source_take_profit_count=len(signal.take_profits),
                       tp_quantities=tp_sizes, risk_usdc=quantity * distance,
                       deadline_at=source_time + policy.max_signal_age_seconds * 1000, created_at=stamp)
         return TradePlan(plan_id=digest(values), **values)

@@ -46,9 +46,10 @@ class Policy(Model):
     entry_range_choice: Literal["near", "far", "midpoint"] = "midpoint"
     max_slippage_percent: Positive = Field(default=Decimal("0.3"), le=10)
     max_signal_age_seconds: int = Field(default=300, ge=1, le=86400)
-    take_profit_allocation: Literal["equal", "halving", "custom"] = "equal"
+    take_profit_allocation: Literal["equal", "halving", "custom", "adaptive", "first_target"] = "equal"
     take_profit_weights: list[Positive] = Field(default_factory=list, max_length=20)
     break_even_after_tp: int | None = Field(default=None, ge=1, le=20)
+    stop_management: Literal["break_even", "tp_ladder"] = "break_even"
     allowed_updates: list[Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"]] = Field(default_factory=lambda: ["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"])
     allow_stop_widening: bool = False
     cost_reserve_bps: Nonnegative = Field(default=Decimal("10"), le=1000)
@@ -261,6 +262,7 @@ class TradePlan(Model):
     entry_limit: Positive
     stop_loss: Positive
     take_profits: list[Positive]
+    source_take_profit_count: int | None = Field(default=None, ge=1, le=20)
     quantity: Positive
     tp_quantities: list[Positive]
     risk_usdc: Positive

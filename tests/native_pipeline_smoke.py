@@ -78,7 +78,8 @@ def main():
     ]
     if args.mode == "owner":
         expected = [("status", {}), ("journal_status", {}), ("control", {"action": "set_policy", "expected_revision": 0,
-                    "policy": {"risk_percent": "0.75", "leverage": 2, "max_open_trades": 3}}),
+                    "policy": {"risk_percent": "0.75", "leverage": 2, "max_open_trades": 3,
+                               "take_profit_allocation": "adaptive", "stop_management": "tp_ladder"}}),
                     ("skill_manage", {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.", "new_string": "x" * 8193}),
                     ("skill_manage", {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.", "new_string": "Du bist aqla Agent. Prüfe Replies besonders sorgfältig."})]
     if args.mode == "lifecycle":
@@ -164,7 +165,7 @@ def main():
         adapter.set_message_handler = lambda replacement: setattr(adapter, "_message_handler", replacement)
         gateway = SimpleNamespace(_delivery_adapter_for=lambda _: adapter, session_store=store)
         extension.boot(gateway)
-        event = MessageEvent(text="Setze Risiko auf 0,75 Prozent, Hebel 2, maximal drei Trades. Passe den Master für sorgfältige Reply-Zuordnung an." if args.mode == "owner" else original.text,
+        event = MessageEvent(text="Setze Risiko auf 0,75 Prozent, Hebel 2, maximal drei Trades, adaptive TP-Verteilung und TP-Stop-Leiter. Passe den Master für sorgfältige Reply-Zuordnung an." if args.mode == "owner" else original.text,
                              source=source, message_type=MessageType.TEXT, message_id="42",
                              metadata={}, raw_message=None if args.mode == "owner" else {"forward_origin": True, "date": datetime.fromtimestamp(original.sent_at / 1000, UTC)})
         assert extension.inbound(event, gateway) is None
@@ -182,6 +183,7 @@ def main():
         assert data["paused"] is False
         if args.mode == "owner":
             assert data["policy"]["risk_percent"] == "0.75"
+            assert data["policy"]["take_profit_allocation"] == "adaptive" and data["policy"]["stop_management"] == "tp_ladder"
             master = destination / "hermes-home" / "skills" / "aqla-master" / "SKILL.md"
             assert "Prüfe Replies besonders sorgfältig." not in master.read_text(encoding="utf-8")
             from tools.write_approval import SKILLS, list_pending

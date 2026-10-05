@@ -20,6 +20,7 @@ from aqla_hyperliquid_mcp.rules import (
     make_plan,
     price_grid,
     quantity_grid,
+    selected_targets,
     slippage_price,
     split_targets,
     verify_evidence,
@@ -412,8 +413,15 @@ class Trading:
         total = sum((Decimal(row["sz"]) for row in entry_fills), Decimal(0))
         cost = sum((Decimal(row["sz"]) * Decimal(row["px"]) for row in entry_fills), Decimal(0))
         target_fills = [sum((Decimal(row["sz"]) for row in owned.values() if row["kind"] == "tp" and row["index"] == index), Decimal(0)) for index in range(len(plan.take_profits))]
+        completed_prices = dict(trade.get("completed_target_prices", {}))
+        if plan.policy.stop_management == "tp_ladder":
+            # Freeze the effective target price before later source updates can change it.
+            for index, budget in enumerate(trade.get("target_budgets", [])):
+                if budget is not None and Decimal(budget) > 0 and target_fills[index] >= Decimal(budget):
+                    completed_prices.setdefault(str(index), trade.get("targets", plan.take_profits)[index])
         self._patch(trade_id, fill_events=owned, filled_quantity=str(total), tp_filled=[str(size) for size in target_fills],
-                    entry_vwap=str(cost / total) if total else trade["entry_vwap"])
+                    entry_vwap=str(cost / total) if total else trade["entry_vwap"],
+                    **({"completed_target_prices": completed_prices} if plan.policy.stop_management == "tp_ladder" else {}))
         self.observe_orders(trade_id, observed)
         return total, cost
 
@@ -534,6 +542,9 @@ class Trading:
                 self._patch(trade_id, status="protecting")
                 return
         self._patch(trade_id, status="open")
+        if plan.policy.stop_management == "tp_ladder":
+            await self.advance_stop_ladder(trade_id)
+            return
         stage = plan.policy.break_even_after_tp
         if stage is not None:
             current = self.state.snapshot()["trades"][trade_id]
@@ -544,6 +555,41 @@ class Trading:
                 tighter = entry > Decimal(trade["stop_price"]) if plan.side == "long" else entry < Decimal(trade["stop_price"])
                 if tighter:
                     await self.replace_stop(trade_id, entry, "break-even:" + trade_id + ":" + str(stage))
+
+    async def advance_stop_ladder(self, trade_id):
+        trade = self.state.snapshot()["trades"][trade_id]
+        plan = TradePlan.model_validate(trade["plan"])
+        budgets = [Decimal(value) if value is not None else Decimal(0) for value in trade.get("target_budgets", [])]
+        fills = [Decimal(value) for value in trade["tp_filled"]]
+        reached = [stage for stage in (1, 3, 4) if stage <= len(budgets) and all(
+            budgets[index] > 0 and fills[index] >= budgets[index] for index in range(stage))]
+        if not reached:
+            return
+        confirmed = trade.get("stop_ladder_stage", 0)
+        intents = trade.get("stop_ladder_intents", {})
+        pending = sorted(int(stage) for stage in intents if int(stage) > confirmed)
+        stage = pending[0] if pending else max(reached)
+        if stage <= confirmed:
+            return
+        if str(stage) in intents:
+            price = Decimal(intents[str(stage)])
+        elif stage == 1:
+            price = Decimal(trade["entry_vwap"])
+        else:
+            index = 0 if stage == 3 else 1
+            reference = trade.get("completed_target_prices", {}).get(str(index))
+            if reference is None:
+                raise AqlaError("Completed TP reference is not proved; preserve existing stop")
+            price = Decimal(reference)
+        if str(stage) not in intents:
+            self.state.update(lambda data: data["trades"][trade_id].setdefault("stop_ladder_intents", {}).__setitem__(str(stage), str(price)))
+        tighter = price > Decimal(trade["stop_price"]) if plan.side == "long" else price < Decimal(trade["stop_price"])
+        if tighter:
+            await self.replace_stop(trade_id, price, "tp-ladder:" + trade_id + ":" + str(stage))
+        current = self.state.snapshot()["trades"][trade_id]
+        effective = Decimal(current["stop_price"]) >= price if plan.side == "long" else Decimal(current["stop_price"]) <= price
+        if current["status"] == "open" and effective:
+            self._patch(trade_id, stop_ladder_stage=stage)
 
     @staticmethod
     def _stop_matches(status, plan, size, stop):
@@ -814,6 +860,7 @@ class Trading:
 
     @staticmethod
     def validate_targets(trade, plan, prices):
+        prices = selected_targets(prices, plan.policy)
         if not prices or len(prices) != len(plan.take_profits):
             raise AqlaError("Replace targets with the same target count")
         target_prices = [price_grid(price, plan.market, up=plan.side == "short") for price in prices]

@@ -32,6 +32,13 @@ side und jedes Preisfeld mit einem echten Zitat und dessen source_id; einzelne
 Preise heißen entry_prices.0, stop_loss, take_profits.0 usw. Kontextuelle Wörter
 wie „kaufen“ dürfen die Richtung belegen, ohne kanalspezifische Regex.
 
+TP-Verteilung je Profil: adaptive nutzt maximal fünf Signalziele mit
+50/25/12,5/7,5/5 % der Position; bei weniger Zielen erhält das letzte den Rest.
+first_target schließt 100 % an TP1. Erhalte alle Quellziele in der Interpretation;
+Python wählt die gehandelten Ziele. stop_management=tp_ladder setzt nach eigenen
+vollständigen TP-Fills den Stop: TP1→Entry-VWAP, TP3→TP1, TP4→TP2. Sonst gilt
+break_even_after_tp. Erfinde keine Ziele; Kanalbehauptungen sind keine Fills.
+
 Erfasse einen eindeutigen Signalhebel als leverage und belege ihn über das
 Evidencefeld leverage mit Originalzitat (z. B. „20x“, „x20“ oder „Hebel 20“).
 Fehlende, mehrdeutige oder nicht ganzzahlige Hebelangaben bleiben null; erfinde

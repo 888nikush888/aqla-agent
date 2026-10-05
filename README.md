@@ -87,6 +87,8 @@ Die bestehenden Hyperliquid-Werkzeuge und `set_policy` bleiben kompatibel; `set_
 - „Übernimm den Hebel 1:1 aus dem Signal, gedeckelt am Börsenmaximum des jeweiligen Markts.“
 - „Bei fehlendem Entry zum Marktpreis; maximal 0,3 Prozent Entry-Slippage.“
 - „Verteile auf alle TPs gleichmäßig. Nach vollständig gefülltem TP1 den Stop auf Einstand.“
+- „Adaptive TP-Verteilung und TP-Stop-Leiter: maximal fünf Ziele; nach TP1 Einstand, nach TP3 TP1, nach TP4 TP2.“ Siehe [adaptive TPs](docs/adaptive-tps.md).
+- „100 Prozent an TP1.“
 - „Pausiere neue Trades.“ / „Setze neue Trades fort.“
 - „Schließe den SOL-Trade.“
 - „Passe den Master-Skill so an, dass Replies deutlicher berücksichtigt werden.“

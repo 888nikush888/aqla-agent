@@ -19,9 +19,10 @@ PARAMETERS = {
     "entry_range_choice": ("Einstieg", "Preis aus Entry-Zone", "", "Nah / Fern / Mitte", "Mitte: Zonenmittelpunkt. Nah: Long obere, Short untere Grenze. Fern: jeweils umgekehrt."),
     "max_slippage_percent": ("Ausführung", "Maximale Slippage", "% Referenzpreis", "> 0 bis 10", "Preisgrenze für Marktorders relativ zum Referenzpreis. Eine vollständige Ausführung wird dadurch nicht garantiert."),
     "max_signal_age_seconds": ("Einstieg", "Maximales Signalalter", "Sekunden", "1 bis 86400", "Gültigkeitsdauer ab ursprünglichem Signalzeitpunkt. Die Frist wird durch Wiederholung nicht verlängert."),
-    "take_profit_allocation": ("Take Profit", "TP-Verteilung", "", "Gleichmäßig / Halbieren / Eigene Gewichte", "Gleichmäßig auf alle Ziele oder jeweils halbieren; beim Halbieren erhält das letzte Ziel den Rest."),
+    "take_profit_allocation": ("Take Profit", "TP-Verteilung", "", "Gleichmäßig / Halbieren / Eigene Gewichte / Adaptiv / 100 % an TP1", "Adaptiv: maximal fünf Signalziele, 50/25/12,5/7,5/5 %. Bei weniger Zielen erhält das letzte den Rest. 100 % an TP1 nutzt nur das erste Ziel."),
     "take_profit_weights": ("Take Profit", "Eigene TP-Gewichte", "% je TP", "Bis 20 Werte > 0; Summe 100", "Nur für eigene Gewichte. Anzahl muss den TPs des Signals entsprechen; minimale Börsengrößen gelten weiterhin."),
     "break_even_after_tp": ("Stop Loss", "Einstand nach TP", "TP-Nummer", "1 bis 20 oder deaktiviert", "Verschiebt den Stop nach vollständiger Ausführung des ausgewählten TP auf den tatsächlichen Einstand."),
+    "stop_management": ("Stop Loss", "Stop-Verwaltung", "", "Einstand nach gewähltem TP / TP-Leiter", "TP-Leiter: nach bestätigtem TP1 auf Entry-VWAP, nach TP3 auf TP1, nach TP4 auf TP2. Vorhandene engere Stops bleiben erhalten."),
     "allowed_updates": ("Updates", "Erlaubte Signal-Updates", "", "Stop ändern / Einstand / TPs ersetzen / Reduzieren / Schließen / Entry stornieren", "Legt fest, welche Update-Arten aus Quellen automatisch umgesetzt werden dürfen."),
     "allow_stop_widening": ("Stop Loss", "Stop-Ausweitung erlauben", "", "Ja / Nein", "Erlaubt weiter entfernte Stops nur innerhalb der weiterhin geprüften Risikogrenzen."),
     "cost_reserve_bps": ("Risiko", "Kostenreserve", "Basispunkte", "0 bis 1000", "Puffer in der Risikoberechnung. 1 Basispunkt = 0,01 % des Preises; keine tatsächliche Gebührenabrechnung."),
@@ -34,6 +35,7 @@ VALUE_LABELS = {
     "cross": "Cross", "isolated": "Isolated", "source": "Signalpreis erforderlich",
     "source_or_market": "Sonst Marktpreis", "near": "Nah", "far": "Fern", "midpoint": "Mitte",
     "equal": "Gleichmäßig", "halving": "Halbieren", "custom": "Eigene Gewichte",
+    "adaptive": "Adaptiv (maximal fünf Ziele)", "first_target": "100 % an TP1", "tp_ladder": "TP-Leiter: TP1→Entry, TP3→TP1, TP4→TP2",
     "move_stop": "Stop ändern", "break_even": "Einstand", "replace_targets": "TPs ersetzen",
     "reduce": "Reduzieren", "close": "Schließen", "cancel_entry": "Entry stornieren",
 }
@@ -70,6 +72,10 @@ def parameter_values(data):
         value = display(current[field], field) if current is not None else "Nicht festgelegt"
         if field == "leverage" and current is not None and current["leverage_mode"] == "signal":
             value = "Nicht verwendet (Signalmodus)"
+        if field == "break_even_after_tp" and current is not None and current["stop_management"] == "tp_ladder":
+            value = "Nicht verwendet (TP-Leiter)"
+        if field == "take_profit_weights" and current is not None and current["take_profit_allocation"] != "custom":
+            value = "Nicht verwendet"
         yield field, category, label, value, unit, allowed, display(defaults[field], field), description, "standard", "hyperliquid", "USDC", data.get("profiles", {}).get("standard", {}).get("revision", data["policy_revision"])
     for identity, profile in data.get("profiles", {}).items():
         if identity == "standard" or profile.get("parameters") is None:
