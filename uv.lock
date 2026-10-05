@@ -170,7 +170,7 @@ name = "aqla-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "coincurve" },
+    { name = "coincurve", marker = "python_full_version < '3.14'" },
     { name = "httpx" },
     { name = "hyperliquid-python-sdk" },
     { name = "mcp" },
@@ -199,7 +199,7 @@ sources = [
 
 [package.metadata]
 requires-dist = [
-    { name = "coincurve", specifier = "==21.0.0" },
+    { name = "coincurve", marker = "python_full_version < '3.14'", specifier = "==21.0.0" },
     { name = "google-auth", extras = ["requests"], marker = "extra == 'sheets'", specifier = ">=2.38,<3" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "hyperliquid-python-sdk", specifier = "==0.24.0" },

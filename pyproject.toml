@@ -15,7 +15,7 @@ dependencies = [
   "portalocker>=3,<5",
   "PyYAML>=6,<7",
   "websockets>=15,<18",
-  "coincurve==21.0.0",
+  "coincurve==21.0.0; python_version < '3.14'",
 ]
 
 [project.optional-dependencies]
