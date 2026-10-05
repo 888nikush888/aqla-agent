@@ -339,16 +339,14 @@ class HermesExtension:
                 return {"action": "block", "message": "An authenticated operator request is required"}
             return {"action": "modify", "args": {"context_auth": self.authority.sign(*origin)}}
         if tool_name == "skill_manage":
-            if not origin or origin[0] != "operator" or args.get("name") != "aqla-master" or args.get("action") not in ("patch", "edit") or args.get("operations") or args.get("file_path"):
-                return {"action": "block", "message": "Only owner-requested edits to aqla-master are allowed"}
-            content = args.get("content")
-            if args.get("action") == "patch":
-                from tools.fuzzy_match import fuzzy_find_and_replace
-                content, _, _, error = fuzzy_find_and_replace(self.master_path.read_text(encoding="utf-8-sig"), args.get("old_string", ""), args.get("new_string", ""), args.get("replace_all", False))
-                if error:
-                    return {"action": "block", "message": "Master patch did not match; read the current skill first"}
-            if not isinstance(content, str) or len(content.encode()) > 8192:
-                return {"action": "block", "message": "Keep aqla-master within 8 KiB"}
+            from .skill_review import master_content, native_background_review
+
+            if not (origin and origin[0] == "operator") and not native_background_review():
+                return {"action": "block", "message": "Only owner requests or native background skill proposals are allowed"}
+            try:
+                master_content(args, self.master_path)
+            except (ValueError, OSError) as error:
+                return {"action": "block", "message": str(error)}
         return None
 
     def ended(self, **_):

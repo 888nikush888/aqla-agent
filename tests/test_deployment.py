@@ -16,6 +16,9 @@ def test_deployment_is_separate_and_has_native_hermes_transport(tmp_path):
     assert config["model"]["default"] == "test-model"
     assert config["model"]["base_url"] == "https://example.invalid/v1"
     assert config["agent"]["reasoning_effort"] == "ultra"
+    assert config["skills"]["write_approval"] is True
+    assert config["skills"]["creation_nudge_interval"] == 10
+    assert config["auxiliary"]["background_review"]["enabled"] is True
     assert config["plugins"]["entries"]["aqla-events"]["settings"]["owner_id"] == "12345"
     assert config["mcp_servers"]["aqla"]["command"].startswith(str(target))
     assert config["mcp_servers"]["sheets"]["args"][1] == "aqla_sheets_mcp"

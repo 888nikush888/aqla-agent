@@ -49,6 +49,7 @@ def install_strict_profile():
         run_native_turn,
         stamp_native_event,
     )
+    from .skill_review import install_skill_review
 
     native_turn = GatewayTurnMixin._run_agent
     native_followup = GatewayTurnMixin._run_agent_queued_followup
@@ -142,6 +143,7 @@ def install_strict_profile():
     replace(GatewayStartupMixin, "_start_post_connect_services", trading_services_only)
     replace(GatewayStartupMixin, "_PRE_RECONNECT_WATCHERS", ("_session_housekeeping_watcher", "_session_stall_watcher"))
     replace(GatewayStartupMixin, "_POST_RECONNECT_WATCHERS", ("_loop_wakeup_watcher",))
+    install_skill_review(replace)
 
     def undo():
         for target, name, original in reversed(originals):

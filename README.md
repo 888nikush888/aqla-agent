@@ -87,6 +87,8 @@ Voraussetzungen: Linux mit systemd, Git und uv. Der Installer richtet eigene Pyt
 
 Hermes übersetzt diese Wünsche in validierte MCP-Aufträge und nennt die wirksamen Werte. Die Erstkonfiguration enthält keine automatisch ausgewählten Handelsregeln. Nicht genannte Werte bestehender Regeln sollen erhalten bleiben; unklare Erstvorgaben werden geklärt.
 
+Hermes darf `aqla-master` selbst verbessern und erweitern, speichert Änderungen aber immer zuerst als Entwurf. Es fragt dich im Telegram-Chat vor der Übernahme: `/skills diff <id>` zeigt die Änderung, `/skills approve <id>` übernimmt sie, `/skills reject <id>` verwirft sie. Ohne Zustimmung bleibt der aktive Skill unverändert. Das gilt auch für ausdrücklich angeforderte Skilländerungen. Es gibt höchstens einen offenen Entwurf; andere Skills, zusätzliche Dateien und Änderungen über 8 KiB sind gesperrt. Bei zwischenzeitlich verändertem Master muss ein neuer Entwurf erstellt werden. Diese Freigabe ist im Aqla-Profil verpflichtend.
+
 Ein neuer Trade braucht Markt, Richtung, SL und mindestens einen TP. Zusammengehörige Nachrichten/Replies können die Angaben vervollständigen. Updates wie „SL auf Einstand“ benötigen diese Felder nicht erneut. Berichte, mehrdeutige Zuordnungen und nicht auflösbare Märkte erzeugen keinen neuen Trade. Zahlen werden anhand der echten Quelltexte belegt; keine Pflichtregex je Kanal. V1 liest Text und Captions; reine Bildsignale werden nicht als erkannt ausgegeben.
 
 Der automatische Signalhandel verwendet Perpetuals mit nativem Reduce-only-Schutz. Spot-Funktionen sind im vollständigen MCP verfügbar; die automatische Signalstrecke verweigert Spot, bevor eine Order entsteht.

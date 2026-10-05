@@ -182,7 +182,13 @@ def main():
         assert data["paused"] is False
         if args.mode == "owner":
             assert data["policy"]["risk_percent"] == "0.75"
-            assert "Prüfe Replies besonders sorgfältig." in (destination / "hermes-home" / "skills" / "aqla-master" / "SKILL.md").read_text(encoding="utf-8")
+            master = destination / "hermes-home" / "skills" / "aqla-master" / "SKILL.md"
+            assert "Prüfe Replies besonders sorgfältig." not in master.read_text(encoding="utf-8")
+            from tools.write_approval import SKILLS, list_pending
+
+            pending = list_pending(SKILLS)
+            assert len(pending) == 1
+            assert pending[0]["payload"]["new_string"].endswith("Prüfe Replies besonders sorgfältig.")
         else:
             assert data["events"][original.event_id]["status"] == "report"
         if args.mode == "lifecycle":

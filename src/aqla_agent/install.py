@@ -49,7 +49,8 @@ def prepare(project: Path, destination: Path, owner: str,
     python = str(destination / ".venv" / "bin" / "python")
     hermes_config = {
         "model": {"default": model, "provider": "custom", "base_url": model_url, "api_key": "${HERMES_MODEL_API_KEY}"},
-        "skills": {"auto_load": ["aqla-master"]},
+        "skills": {"auto_load": ["aqla-master"], "write_approval": True, "creation_nudge_interval": 10},
+        "auxiliary": {"background_review": {"enabled": True}},
         "agent": {"max_turns": 30, "reasoning_effort": "ultra"},
         "display": {"busy_input_mode": "queue", "interim_assistant_messages": False, "tool_progress": "log"},
         "platform_toolsets": {"telegram": ["skills", "mcp-aqla", "mcp-sheets"], "cli": ["skills", "no_mcp"], "cron": ["skills", "no_mcp"]},

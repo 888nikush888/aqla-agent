@@ -198,6 +198,19 @@ def test_master_edits_reject_batches_supporting_files_and_oversize(extension):
     assert extension.before_tool("skill_manage", base) is None
 
 
+def test_master_proposals_allow_native_background_but_not_untrusted_source(extension, monkeypatch):
+    extension, _ = extension
+    args = {"operations": [{"name": "aqla-master", "action": "patch", "content": "small"}]}
+    extension.active_context = ("source", "source-message")
+    assert extension.before_tool("skill_manage", args)["action"] == "block"
+    extension.ended()
+    assert extension.before_tool("skill_manage", args)["action"] == "block"
+    monkeypatch.setattr("aqla_agent.skill_review.native_background_review", lambda: True)
+    assert extension.before_tool("skill_manage", args) is None
+    args["operations"][0]["name"] = "another-skill"
+    assert extension.before_tool("skill_manage", args)["action"] == "block"
+
+
 @pytest.mark.asyncio
 async def test_sheets_delivery_acknowledges_only_after_success_and_isolates_outage(extension, setup, tmp_path):
     from aqla_hyperliquid_mcp.models import GoogleSheetsSettings
