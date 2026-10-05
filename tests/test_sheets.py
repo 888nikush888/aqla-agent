@@ -70,7 +70,16 @@ class Google:
                 elif "updateCells" in operation:
                     update = operation["updateCells"]
                     title = next(title for title, props in self.properties.items() if props["sheetId"] == update["start"]["sheetId"])
-                    self.tables[title] = [[cell["userEnteredValue"]["stringValue"] for cell in update["rows"][0]["values"]]]
+                    if not self.tables[title]:
+                        self.tables[title].append([])
+                    self.tables[title][0] = [cell["userEnteredValue"]["stringValue"] for cell in update["rows"][0]["values"]]
+                elif "insertDimension" in operation:
+                    dimensions = operation["insertDimension"]["range"]
+                    title = next(title for title, props in self.properties.items() if props["sheetId"] == dimensions["sheetId"])
+                    extra = dimensions["endIndex"] - dimensions["startIndex"]
+                    for row in self.tables[title]:
+                        row[dimensions["startIndex"]:dimensions["startIndex"]] = [""] * extra
+                    self.properties[title]["gridProperties"]["columnCount"] += extra
                 elif "updateSheetProperties" in operation:
                     update = operation["updateSheetProperties"]["properties"]
                     props = next(props for props in self.properties.values() if props["sheetId"] == update["sheetId"])
@@ -321,7 +330,7 @@ def test_parameter_page_covers_every_rule_without_activating_defaults(setup):
     original = copy.deepcopy(data)
     rows = {row["record_id"]: row for row in project(data).values() if row["table"] == "Handelsparameter"}
     assert set(PARAMETERS) == set(Policy.model_fields)
-    assert len(rows) == len(Policy.model_fields) + 6
+    assert len(rows) == len(Policy.model_fields) + 6 + 2 * len(data["venue_limits"])
     assert all(rows[name]["values"][3] == "Nicht festgelegt" for name in Policy.model_fields)
     assert rows["risk_percent"]["values"][6] == 0.5
     assert rows["policy_selected"]["values"][3] == "Nein"
@@ -392,4 +401,4 @@ def test_parameter_page_migrates_existing_journal_without_overwriting_other_tabs
     parameters = [row for row in records if row["table"] == "Handelsparameter"]
     assert len(client.sync(parameters)["accepted"]) == len(parameters)
     assert all(google.tables[title] == values for title, values in original.items())
-    assert client.read("Handelsparameter")["total"] == len(Policy.model_fields) + 6
+    assert client.read("Handelsparameter")["total"] == len(Policy.model_fields) + 6 + 2 * len(state.snapshot()["venue_limits"])

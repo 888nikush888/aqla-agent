@@ -2,7 +2,7 @@
 
 [![Quality](https://github.com/888nikush888/aqla-agent/actions/workflows/quality.yml/badge.svg)](https://github.com/888nikush888/aqla-agent/actions/workflows/quality.yml)
 
-Telegram-Quellen → Hermes versteht Signal/Update im Kontext → Python prüft deine Regeln → Hyperliquid führt aus → Hermes meldet das Ergebnis in seinem Telegram-Bot.
+Telegram-Quellen → Hermes versteht Signal/Update im Kontext → Python prüft Profile und Pipelines → Hyperliquid, Aster und/oder Lighter führen unabhängig aus → Hermes meldet das Ergebnis je Börse in Telegram.
 
 Eigenständiges Python-Projekt. Ein eigener Hyperliquid-MCP, ein kurzer bearbeitbarer Master-Skill und ein read-only Telegram-Quellenleser für abonnierte Kanäle. Keine eigene Bot-Anbindung, MiniApp, Datenbank, Kanalbewertungen oder autonome Strategieoptimierung. Manuell an den Hermes-Bot weitergeleitete Signale werden ebenfalls als Quellen erfasst.
 
@@ -13,7 +13,7 @@ Voraussetzungen: Linux mit systemd, Git und uv. Der Installer richtet eigene Pyt
 1. Quellpaket in einen separaten Ordner entpacken, beispielsweise `/opt/aqla-source`. Im Quellordner:
 
    ```sh
-   uv sync --frozen --extra sources --extra sheets
+   uv sync --frozen --extra sources --extra sheets --extra exchanges
    uv run aqla-install-hermes --destination /opt/aqla --owner-id DEINE_TELEGRAM_USER_ID
    ```
 
@@ -75,6 +75,12 @@ Voraussetzungen: Linux mit systemd, Git und uv. Der Installer richtet eigene Pyt
 6. Dem Bot einmal eine normale Nachricht senden, beispielsweise „Hallo“. Regeln und Quellen über Hermes festlegen. Neue zulässige Signale benötigen anschließend keine Freigabe pro Trade.
 
 ## Bedienung
+
+Profile sind wiederverwendbare Handelsparameter; Pipelines verbinden abonnierte Quellen mit Börse und Profil. Beispiel: „Erstelle Profil A mit meinen bisherigen Handelsparametern und Profil B mit 0,25 Prozent Risiko. Nutze Quelle 1 auf Hyperliquid mit A und auf Aster mit B.“ Hermes liest vorher die aktuellen Profile und erhält ungenannte Werte. Kontolimits werden gemeinsam je Börse gesetzt, etwa „Auf Aster höchstens zwei offene Trades und ein Prozent Gesamtrisiko“. Aster und Lighter sind für Mainnet vorbereitet, bleiben aber bis zu eingerichteten API-Zugängen, expliziten Limits und deinem Aktivierungsauftrag deaktiviert.
+
+Eine explizite aktive Pipeline ersetzt für ihre Quelle die migrierte Hyperliquid-Standardroute; andere Quellen behalten ihr bisheriges Verhalten. Ein Signal wird einmal interpretiert und erzeugt je Ziel einen eigenen unveränderlichen Plan. Fehler stoppen nur das betroffene Ziel. Prozentwerte beziehen sich auf das Konto der jeweiligen Börse; feste Beträge `_quote` werden in der Abrechnungswährung des jeweiligen Markts gerechnet. USDT, USDC und verschiedene Handelsnetzwerke werden in der Auswertung getrennt. Pro Börse und Markt ist ein eigener Trade gleichzeitig erlaubt. Ohne bestätigten SL versucht Aqla, die eigene Position zu schließen, pausiert weitere Entries dieser Börse und meldet den Vorfall.
+
+Die bestehenden Hyperliquid-Werkzeuge und `set_policy` bleiben kompatibel; `set_policy` pflegt Profil „Standard“ und die Hyperliquid-Kontolimits. Neue Steueraktionen heißen `set_profile`, `set_pipeline`, `delete_profile`, `delete_pipeline`, `set_exchange_limits` und `set_exchange_enabled`; sie verwenden `configuration_revision`. `trade_preview` liefert `targets` mit je eigener `plan_id`, `trade_execute` akzeptiert alternativ mehrere `plan_ids`. Quellenupdates werden auf die entstandenen Trades derselben Setupfamilie angewendet. Profiländerungen gelten für neue Trades. Native Skills benötigen weiterhin deine Freigabe vor einer Übernahme.
 
 - „Lies auch `@mein_signal_channel`.“
 - „Risiko pro Trade 0,5 Prozent, Hebel 2, maximal drei offene Trades.“

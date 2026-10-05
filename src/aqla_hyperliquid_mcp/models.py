@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import time
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -96,6 +96,7 @@ class Settings(Model):
     telegram_api_hash_file: Path | None = None
     telegram_owner_id: str | None = None
     google_sheets: GoogleSheetsSettings = Field(default_factory=GoogleSheetsSettings)
+    venues: dict[Literal["aster", "lighter"], VenueSettings] = Field(default_factory=dict)
 
     @property
     def base_url(self):
@@ -118,7 +119,23 @@ class Settings(Model):
         if sheets.get("credentials_file"):
             sheets["credentials_file"] = str((path.parent / sheets["credentials_file"]).resolve())
             raw["google_sheets"] = sheets
+        for venue in raw.get("venues", {}).values():
+            for key in ("private_key_file",):
+                if venue.get(key):
+                    venue[key] = str((path.parent / venue[key]).resolve())
         return cls.model_validate(raw)
+
+
+class VenueSettings(Model):
+    network: Literal["mainnet", "testnet"] = "mainnet"
+    account: Address | None = None
+    signer: Address | None = None
+    account_index: int | None = Field(default=None, ge=0)
+    api_key_index: int | None = Field(default=None, ge=4, le=254)
+    private_key_file: Path | None = None
+
+
+Settings.model_rebuild()
 
 
 class SourceEvent(Model):
@@ -184,11 +201,17 @@ TERMINAL_ORDER = {"filled", "canceled", "rejected", "marginCanceled", "vaultWith
                   "oracleRejected", "perpMaxPositionRejected"}
 
 
+class LeverageTier(Model):
+    notional_floor: Nonnegative
+    notional_cap: Positive
+    max_leverage: int = Field(ge=1)
+
+
 class Market(Model):
     symbol: str
     asset_id: int = Field(ge=0)
     product: Literal["perp", "spot"]
-    size_decimals: int = Field(ge=0, le=8)
+    size_decimals: int = Field(ge=0, le=18)
     mid: Positive
     max_leverage: int = Field(default=1, ge=1)
     dex: str = ""
@@ -196,6 +219,20 @@ class Market(Model):
     base_token: str | None = None
     quote_token: str = "USDC"
     collateral_token: int | None = Field(default=None, ge=0)
+    native_symbol: str | None = None
+    price_tick: Positive | None = None
+    quantity_step: Positive | None = None
+    min_quantity: Nonnegative = Decimal(0)
+    max_quantity: Positive | None = None
+    margin_leverage_scale: int | None = Field(default=None, ge=1)
+    leverage_tiers: list[LeverageTier] = Field(default_factory=list, max_length=100)
+
+
+def margin_leverage(leverage, market):
+    if market.margin_leverage_scale is None:
+        return Decimal(leverage)
+    scale = Decimal(market.margin_leverage_scale)
+    return scale / (scale / Decimal(leverage)).to_integral_value(rounding=ROUND_CEILING)
 
 
 class AccountSnapshot(Model):
@@ -229,6 +266,11 @@ class TradePlan(Model):
     risk_usdc: Positive
     deadline_at: int
     created_at: int
+    exchange: Literal["hyperliquid", "aster", "lighter"] = "hyperliquid"
+    pipeline_id: str | None = None
+    profile_id: str | None = None
+    profile_revision: int | None = None
+    pipeline_revision: int | None = None
 
     @model_validator(mode="after")
     def leverage_consistent(self):

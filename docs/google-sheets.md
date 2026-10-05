@@ -13,6 +13,7 @@ aqla enthält einen zweiten Python-MCP für Google Sheets. Der native Hermes-Gat
 | `aqla Vorgänge` | Dauerhafte Ausführungs-ID, Nonce, Phase, Request und Ergebnis, einschließlich unklarer/abgelehnter Aufträge |
 | `aqla Regeln` | Konto, Netzwerk, wirksame Nutzerregeln, Quellen und Pause |
 | `aqla Handelsparameter` | Alle 20 Handelsregeln einzeln mit aktuellem Wert, Einheit, zulässigen Werten, Standard bei Regelerstellung und Erklärung; zusätzlich Netzwerk, Handelskonto, Pause, Quellen und Regelstand |
+| `aqla Pipelines` | Quellen, Börsenziele, Profile, Aktivierung und Revision der Zuordnungen |
 | `aqla Ereignisse` | Zustandsänderungen mit Zeitpunkt, Sequenz und Vorher-/Nachher-Fakten |
 
 Die automatisch erzeugten Tabs haben Filter und eine feste Kopfzeile. Die internen ID-/Versionsprüfungen verwenden versteckte Metadaten-Spalten. Eigene zusätzliche Tabs bleiben unberührt. Originaltexte mit `=` werden als Text geschrieben und nicht als Sheets-Formeln ausgeführt. Sehr große einzelne Felder werden mit sichtbarem Hinweis gekürzt; der technische Originalzustand bleibt lokal erhalten.
@@ -53,7 +54,7 @@ Die Übertragung erfolgt mindestens einmal mit stabilen Zeilen-IDs. Nach verlore
    sudo systemctl restart aqla-agent
    ```
 
-   Beim ersten Abgleich entstehen die acht Journal-Tabs automatisch; vorhandene Handelsdaten werden mit aufgenommen. Der Einstiegspunkt für einen separaten MCP-Client lautet `aqla-google-sheets-mcp --config config.yaml`.
+   Beim ersten Abgleich entstehen die neun Journal-Tabs automatisch; vorhandene Handelsdaten werden mit aufgenommen. Der Einstiegspunkt für einen separaten MCP-Client lautet `aqla-google-sheets-mcp --config config.yaml`.
 
 Die Schlüsseldatei gehört nicht nach GitHub, ins Sheet, in Telegram oder in den Master-Skill. Der CI-Lauf braucht keine echten Google-Zugangsdaten.
 

@@ -3,14 +3,28 @@ from __future__ import annotations
 import re
 from decimal import ROUND_DOWN, ROUND_UP, Decimal, localcontext
 
-from .models import AccountSnapshot, AqlaError, Interpretation, Market, Policy, TradePlan, digest, now_ms
+from .models import (
+    AccountSnapshot,
+    AqlaError,
+    Interpretation,
+    Market,
+    Policy,
+    TradePlan,
+    digest,
+    margin_leverage,
+    now_ms,
+)
 
 
 def quantity_grid(value: Decimal, market: Market):
+    if market.quantity_step is not None:
+        return (value / market.quantity_step).to_integral_value(rounding=ROUND_DOWN) * market.quantity_step
     return value.quantize(Decimal(1).scaleb(-market.size_decimals), rounding=ROUND_DOWN)
 
 
 def price_grid(value: Decimal, market: Market, up=False):
+    if market.price_tick is not None:
+        return (value / market.price_tick).to_integral_value(rounding=ROUND_UP if up else ROUND_DOWN) * market.price_tick
     decimals = (6 if market.product == "perp" else 8) - market.size_decimals
     exponent = max(-decimals, value.adjusted() - 4) if value < 100000 else 0
     return value.quantize(Decimal(1).scaleb(exponent), rounding=ROUND_UP if up else ROUND_DOWN)
@@ -166,14 +180,21 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         cost = limit * policy.cost_reserve_bps / 10000
         distance = abs(limit - stop) + cost
         maximum = min(budget / distance, policy.max_notional_usdc / limit,
-                      account.available_margin * leverage / limit)
+                      account.available_margin * margin_leverage(leverage, market) / limit)
         if policy.sizing_mode == "fixed_notional":
             maximum = min(maximum, policy.fixed_notional_usdc / limit)
-        quantity = quantity_grid(maximum, market)
-        if quantity <= 0 or quantity * limit < market.min_notional:
+        quantity = quantity_grid(min(maximum, market.max_quantity) if market.max_quantity else maximum, market)
+        if market.leverage_tiers:
+            tier = next((tier for tier in market.leverage_tiers if tier.notional_floor <= quantity * limit < tier.notional_cap), None)
+            if tier is None:
+                raise AqlaError("Planned notional is outside the supported leverage brackets")
+            market = market.model_copy(update={"max_leverage": min(market.max_leverage, tier.max_leverage)})
+            leverage = effective_leverage(signal, market, policy)
+            quantity = quantity_grid(min(quantity, account.available_margin * margin_leverage(leverage, market) / limit), market)
+        if quantity <= 0 or quantity < market.min_quantity or quantity * limit < market.min_notional:
             raise AqlaError("Insufficient risk/margin budget or exchange minimum notional")
         tp_sizes = split_targets(quantity, len(targets), policy, market)
-        if any(size * price < market.min_notional for size, price in zip(tp_sizes, targets, strict=True)):
+        if any(size < market.min_quantity or size * price < market.min_notional for size, price in zip(tp_sizes, targets, strict=True)):
             raise AqlaError("A TP leg is below the exchange notional minimum")
         trade_id = digest([*binding, sorted(signal.source_refs)])[:32]
         values = dict(trade_id=trade_id, source_refs=signal.source_refs, policy_revision=revision, policy=policy,

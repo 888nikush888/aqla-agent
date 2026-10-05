@@ -29,7 +29,7 @@ PARAMETERS = {
 
 VALUE_LABELS = {
     "fixed": "Fest", "signal": "Aus Signal, am Börsenmaximum gedeckelt",
-    "perp": "USDC-Perpetuals", "spot": "Spot (automatisch nicht unterstützt)",
+    "perp": "Perpetuals", "spot": "Spot (automatisch nicht unterstützt)",
     "risk_percent": "Nach Risiko", "fixed_notional": "Fester Positionswert",
     "cross": "Cross", "isolated": "Isolated", "source": "Signalpreis erforderlich",
     "source_or_market": "Sonst Marktpreis", "near": "Nah", "far": "Fern", "midpoint": "Mitte",
@@ -70,4 +70,15 @@ def parameter_values(data):
         value = display(current[field], field) if current is not None else "Nicht festgelegt"
         if field == "leverage" and current is not None and current["leverage_mode"] == "signal":
             value = "Nicht verwendet (Signalmodus)"
-        yield field, category, label, value, unit, allowed, display(defaults[field], field), description
+        yield field, category, label, value, unit, allowed, display(defaults[field], field), description, "standard", "hyperliquid", "USDC", data.get("profiles", {}).get("standard", {}).get("revision", data["policy_revision"])
+    for identity, profile in data.get("profiles", {}).items():
+        if identity == "standard" or profile.get("parameters") is None:
+            continue
+        for field, value in profile["parameters"].items():
+            legacy = {"fixed_notional_quote": "fixed_notional_usdc", "max_notional_quote": "max_notional_usdc"}.get(field, field)
+            category, label, unit, allowed, description = PARAMETERS[legacy]
+            yield "profile:" + identity + ":" + field, category, label, display(value, legacy), "Abrechnungswährung" if field.endswith("_quote") else unit, allowed, "", description, identity, "", "Je Börsenziel", profile["revision"]
+    for venue, limits in data.get("venue_limits", {}).items():
+        for field in ("max_open_trades", "max_total_risk_percent"):
+            category, label, unit, allowed, description = PARAMETERS[field]
+            yield "limits:" + venue + ":" + field, "Börsenlimits", label, display(limits[field]) if limits else "Nicht festgelegt", unit, allowed, "", "Gemeinsam für alle Pipelines auf diesem Börsenkonto.", "", venue, "", data.get("configuration_revision", 0)

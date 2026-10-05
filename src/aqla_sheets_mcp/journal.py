@@ -22,8 +22,14 @@ HEADERS = {
     "Handelsparameter": ["ID", "Bereich", "Parameter", "Aktueller Wert", "Einheit", "Zulässige Werte", "Standard bei Regelerstellung", "Bedeutung"],
     "Ereignisse": ["ID", "Zeit (UTC)", "Sequenz", "Tabelle", "Datensatz-ID", "Vorher", "Nachher"],
 }
+LEGACY_HEADERS = {table: list(headers) for table, headers in HEADERS.items()}
+TARGET_COLUMNS = ["Börse", "Netzwerk", "Konto", "Pipeline", "Profil", "Profilrevision", "Währung"]
+for _table in ("Trades", "Orders", "Fills", "Vorgänge"):
+    HEADERS[_table] += TARGET_COLUMNS
+HEADERS["Handelsparameter"] += ["Profil", "Börse", "Währung", "Revision"]
+HEADERS["Pipelines"] = ["ID", "Name", "Quellen", "Börse", "Profil", "Aktiv", "Börse aktiv", "Revision"]
 TABLES = tuple(HEADERS)
-Table = Literal["Trades", "Signale", "Orders", "Fills", "Vorgänge", "Regeln", "Handelsparameter", "Ereignisse"]
+Table = Literal["Trades", "Signale", "Orders", "Fills", "Vorgänge", "Regeln", "Handelsparameter", "Ereignisse", "Pipelines"]
 
 
 class JournalRecord(Model):
@@ -66,6 +72,10 @@ def fingerprint(values):
 
 def record(table, identity, *values):
     cells = [fit_cell(value if value is not None else "") for value in [identity, *values]]
+    if table in LEGACY_HEADERS and len(cells) == len(LEGACY_HEADERS[table]):
+        cells += [""] * (len(HEADERS[table]) - len(cells))
+        if table in ("Trades", "Orders", "Fills", "Vorgänge"):
+            cells[-7:] = ["hyperliquid", "", "", "legacy", "standard", "", "USDC"]
     if table not in HEADERS or len(cells) != len(HEADERS[table]):
         raise AqlaError("Journal row does not match its fixed table schema")
     return {"table": table, "record_id": identity, "values": cells, "fingerprint": fingerprint(cells)}
@@ -92,7 +102,7 @@ def project(data):
         gross = sum((Decimal(fill["sz"]) * (Decimal(fill["px"]) - entry) * (1 if plan["side"] == "long" else -1) for fill in exits), Decimal(0)) if entry is not None else None
         quote = plan["market"].get("quote_token", "USDC")
         fees_known = all(fill.get("fee") is not None and fill.get("feeToken") in (None, quote) for fill in fills.values())
-        fees = sum((Decimal(fill["fee"]) for fill in fills.values()), Decimal(0)) if fees_known and quote == "USDC" else None
+        fees = sum((Decimal(fill["fee"]) for fill in fills.values()), Decimal(0)) if fees_known else None
         net = gross - fees if gross is not None and fees is not None else None
         add(record("Trades", identity, aliases.get(trade["chat_id"], trade["chat_id"]), plan["market"]["symbol"], plan["side"], trade["status"], timestamp(plan["created_at"]), number(plan["entry_price"]), number(entry), number(plan["quantity"]), number(trade["filled_quantity"]), number(trade["remaining_quantity"]), number(trade["stop_price"]), text(trade.get("targets", plan["take_profits"])), number(plan["risk_usdc"]), number(trade["reserved_risk"]), number(gross), number(fees), number(net), text(plan["source_refs"])))
         entry_order = {"kind": "entry", "cloid": trade["entry_cloid"], "quantity": plan["quantity"], "price": plan["entry_limit"]}
@@ -107,6 +117,23 @@ def project(data):
     add(record("Regeln", "aktuell", data["network"], data["account"], data["policy_revision"], data["paused"], text(data["sources"]), text(data["policy"])))
     for values in parameter_values(data):
         add(record("Handelsparameter", *values))
+    for identity, pipeline in data.get("pipelines", {}).items():
+        for target in pipeline["targets"]:
+            add(record("Pipelines", identity + ":" + target["exchange"], pipeline["name"], text(pipeline["sources"]), target["exchange"],
+                       target["profile_id"], pipeline["enabled"], data["venue_enabled"].get(target["exchange"], False), pipeline["revision"]))
+    for row in rows.values():
+        table, identity = row["table"], row["record_id"]
+        if table not in ("Trades", "Orders", "Fills", "Vorgänge"):
+            continue
+        trade = data["trades"].get(identity if table == "Trades" else row["values"][1])
+        plan = trade["plan"] if trade else {}
+        operation = data["operations"].get(identity, {}) if table == "Vorgänge" else {}
+        venue = plan.get("exchange", operation.get("exchange", "hyperliquid"))
+        binding = data.get("venue_accounts", {}).get(venue, {})
+        row["values"][-7:] = [venue, plan.get("network", binding.get("network", data["network"])), plan.get("account", binding.get("account", data["account"])),
+                              plan.get("pipeline_id") or operation.get("pipeline_id") or "legacy", plan.get("profile_id") or operation.get("profile_id") or "standard",
+                              plan.get("profile_revision") or operation.get("profile_revision") or "", plan.get("market", {}).get("quote_token", "USDT" if venue == "aster" else "USDC")]
+        row["fingerprint"] = fingerprint(row["values"])
     for row in data.get("journal_history", {}).values():
         add(row)
     return rows

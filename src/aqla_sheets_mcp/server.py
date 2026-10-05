@@ -50,7 +50,7 @@ def create_server(settings, *, client=None):
         return await asyncio.to_thread(client.read, table, offset, limit, filters)
 
     @server.tool(annotations=read)
-    async def journal_statistics(group_by: Literal["gesamt", "Quelle", "Symbol", "Richtung"] = "gesamt") -> dict:
+    async def journal_statistics(group_by: Literal["gesamt", "Quelle", "Symbol", "Richtung", "Börse", "Pipeline", "Profil", "Währung"] = "gesamt") -> dict:
         """Analyze verified closed trades by source, market or side; include explicit PnL/funding limitations."""
         configured()
         return await asyncio.to_thread(client.statistics, group_by)

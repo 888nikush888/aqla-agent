@@ -4,6 +4,9 @@ Stand: 05.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Qu
 
 ## Inhalt
 
+- Gemeinsamer Handelskern für Hyperliquid, Aster V3 und Lighter; benannte Profile, Quellenpipelines, gemeinsame Börsenlimits und unabhängige Ziele. Schema-2-Migration erhält vorhandene Hyperliquid-Ausführungsidentitäten. Aster/Lighter sind für Mainnet vorbereitet und zunächst deaktiviert. Native SL-Ausfälle lösen Schließungsversuch und Börsensperre aus. Siehe `docs/multi-venue.md` für Verträge, Zugangsdaten und Prüfgrenzen.
+- Neunte Journal-Seite `aqla Pipelines`; zusätzliche Ziel-/Währungszuordnung in Trades, Orders, Fills und Vorgängen sowie Profile/Kontolimits unter Handelsparameter. Bestehende Spalten und Zeilen werden erweitert, nicht gelöscht. Unterschiedliche Währungen und Netzwerke werden nicht zusammengefasst.
+
 - Native Hermes-Telegram-Kommunikation; eigene schmale Erweiterung für Quellenaufnahme, Wakeups, Herkunft und Skill-Neuladen. Kein eigener Bottransport oder Agentenhost.
 - Read-only Telethon-Kanalleser mit StringSession, Kontext, Replies, Edits, periodischem Backfill und serieller Aufnahme vor Cursorfortschritt. Native Owner-Weiterleitungen werden ebenfalls gespeichert.
 - Kurzer durch Hermes bearbeitbarer Master; Python prüft Nutzerregeln, Zahlen, Mengen, Marktpräzision, Budgets und Operationsidentitäten.

@@ -27,7 +27,7 @@ class State:
         try:
             if self.path.exists():
                 self.data = json.loads(self.path.read_text(encoding="utf-8"))
-                if self.data.get("schema") != 1 or self.data.get("network") != settings.network or self.data.get("account", "").lower() != settings.account.lower():
+                if self.data.get("schema") not in (1, 2) or self.data.get("network") != settings.network or self.data.get("account", "").lower() != settings.account.lower():
                     raise AqlaError("State version, account or network differs; use a separate state")
                 for key in ("events", "trades", "operations", "nonces", "plans", "bindings", "sources"):
                     if key not in self.data:
@@ -54,10 +54,18 @@ class State:
             self.assert_binding(settings)
             for row in [*self.data["plans"].values(), *self.data["trades"].values()]:
                 plan = row["plan"]
+                if plan.get("exchange", "hyperliquid") != "hyperliquid":
+                    continue
                 if plan["account"].lower() != target or plan["network"] != settings.network or plan.get("principal") not in (None, settings.account.lower()):
                     raise AqlaError("Saved plan belongs to another trading target or network")
             for row in self.data["operations"].values():
-                self.assert_operation_binding(settings, row)
+                if row.get("exchange", "hyperliquid") == "hyperliquid":
+                    self.assert_operation_binding(settings, row)
+            from aqla_agent.pipelines import migrate
+
+            migrated = migrate(self.data)
+            if migrated:
+                self._write(self.data)
             if legacy:
                 self._write(self.data)
             if self.journal_enabled:

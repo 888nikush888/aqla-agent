@@ -3,11 +3,20 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from contextlib import asynccontextmanager
-from decimal import Decimal
 from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
+
+from aqla_agent.pipelines import (
+    AccountLimits,
+    Pipeline,
+    TradingProfile,
+    Venue,
+    route_control,
+    sync_legacy_policy,
+)
+from aqla_agent.router import Router
 
 from . import __version__
 from .actions import NATIVE_MODELS, NativeRequest
@@ -19,13 +28,13 @@ from .models import Address, AqlaError, Interpretation, Policy, Settings, Source
 from .multisig import Signature
 from .state import State
 from .streams import SUBSCRIPTION_MODELS, Streams, Subscription
-from .trades import OPEN, UNFINISHED, Trading
+from .trades import OPEN, UNFINISHED
 
 
 def create_server(settings: Settings, *, profile="agent", exchange=None, state=None):
     state = state or State(settings)
     exchange = exchange or Hyperliquid(settings, state)
-    trading = Trading(exchange, state)
+    trading = Router(settings, state, exchange)
     streams = Streams(settings.base_url, timeout=settings.timeout_seconds)
     authority = Authority.from_file(settings.integration_key_file) if settings.integration_key_file else None
 
@@ -58,7 +67,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-            await exchange.close()
+            await trading.close()
             await streams.close()
             state.close()
 
@@ -74,6 +83,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "account": exchange.account, "writes_configured": exchange.wallet is not None,
                 "state": "atomic_json_single_writer", "source_images": False,
                 "automatic_source_products": ["perp"],
+                "automatic_source_exchanges": trading.ready(), "pipeline_execution": "independent_targets",
                 "info_types": sorted(INFO_MODELS), "sdk_exchange_operations": sorted(SDK_MODELS),
                 "native_action_types": sorted(NATIVE_MODELS),
                 "subscriptions": sorted(SUBSCRIPTION_MODELS),
@@ -88,8 +98,10 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "policy": snapshot["policy"], "policy_revision": snapshot["policy_revision"], "sources": snapshot["sources"],
                 "pending": [row["event_id"] for row in snapshot["events"].values() if row["status"] in UNFINISHED],
                 "trades": [row for row in snapshot["trades"].values() if row["status"] in OPEN],
-                "unresolved_operations": [row for row in snapshot["operations"].values() if row["phase"] in ("prepared", "sending", "unknown")],
+                "unresolved_operations": [trading.public_operation(row) for row in snapshot["operations"].values() if row["phase"] in ("prepared", "sending", "unknown")],
                 "notifications": snapshot["notifications"],
+                "configuration_revision": snapshot["configuration_revision"], "profiles": snapshot["profiles"],
+                "pipelines": snapshot["pipelines"], "exchanges": trading.ready(),
                 "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})), "last_synced_at": snapshot.get("journal_synced_at")}}
 
     @server.tool(annotations=read)
@@ -118,9 +130,15 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             raise
 
     @server.tool(annotations=write)
-    async def trade_execute(plan_id: str, context_auth: str = "") -> dict:
+    async def trade_execute(plan_id: str | None = None, context_auth: str = "", plan_ids: list[str] | None = None) -> dict:
         """Execute exactly the saved plan once; repeated IDs never dispatch a second entry."""
         authorize(context_auth)
+        if plan_ids is not None:
+            if plan_id is not None:
+                raise AqlaError("Supply either plan_id or plan_ids")
+            return await trading.execute_many(plan_ids)
+        if plan_id is None:
+            raise AqlaError("Supply a saved plan ID")
         return await trading.execute(plan_id)
 
     @server.tool(annotations=write)
@@ -135,13 +153,13 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         row = state.snapshot()["operations"].get(operation_id)
         if row is None:
             raise AqlaError("Unknown operation")
-        return row
+        return trading.public_operation(row)
 
     @server.tool(annotations=write)
     async def operation_reconcile(operation_id: str, context_auth: str = "") -> dict:
         """Read exact order identities and update evidence; never resubmit an exchange action."""
         authorize(context_auth)
-        return await exchange.reconcile(operation_id)
+        return await trading.reconcile(operation_id)
 
     @server.tool(annotations=write)
     async def notifications_ack(notification_ids: list[str], context_auth: str = "") -> dict:
@@ -156,16 +174,24 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.update(acknowledge)
 
     @server.tool(annotations=write)
-    async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "close_trade", "clear_notification"],
+    async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "close_trade", "clear_notification", "set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled"],
                       expected_revision: int | None = None, policy: Policy | None = None, sources: list[str] | None = None,
-                      trade_id: str | None = None, notification_id: str | None = None, context_auth: str = "") -> dict:
+                      trade_id: str | None = None, notification_id: str | None = None, context_auth: str = "",
+                      profile: TradingProfile | None = None, pipeline: Pipeline | None = None, exchange_id: Venue | None = None,
+                      limits: AccountLimits | None = None, enabled: bool | None = None, identity: str | None = None) -> dict:
         """Apply an authenticated natural-language user request. Source turns cannot change rules."""
         claims = authorize(context_auth, operator=True)
         if action == "close_trade":
             if trade_id is None:
                 raise AqlaError("trade_id is required")
-            async with trading.lock:
-                return await trading.close_position(trade_id, Decimal(100), "operator-close:" + claims["request_id"])
+            return await trading.close_trade(trade_id, claims["request_id"])
+        if action == "set_exchange_enabled" and enabled is True:
+            if expected_revision != state.snapshot()["configuration_revision"]:
+                raise AqlaError("Read the current configuration revision before activation")
+            await trading.activate(exchange_id)
+        if action in ("set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled"):
+            return state.update(lambda data: route_control(data, action, expected_revision=expected_revision, profile=profile, pipeline=pipeline,
+                                                          exchange=exchange_id, limits=limits, enabled=enabled, identity=identity))
 
         def apply(data):
             if action == "set_policy":
@@ -173,6 +199,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                     raise AqlaError("Read current rule revision and supply a complete validated policy")
                 data["policy"] = policy.model_dump(mode="json")
                 data["policy_revision"] += 1
+                sync_legacy_policy(data)
             elif action in ("pause", "resume"):
                 data["paused"] = action == "pause"
             elif action == "set_sources":
@@ -317,6 +344,6 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
 
 async def close_server(server):
     with contextlib.suppress(Exception):
-        await server.aqla_exchange.close()
+        await server.aqla_trading.close()
         await server.aqla_streams.close()
     server.aqla_state.close()

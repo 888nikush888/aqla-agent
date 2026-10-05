@@ -8,7 +8,7 @@ from collections import defaultdict
 
 from aqla_hyperliquid_mcp.models import AqlaError
 
-from .journal import HEADERS, JournalRecord, fingerprint, record_key
+from .journal import HEADERS, LEGACY_HEADERS, JournalRecord, fingerprint, record_key
 from .parameters import OPERATING_PARAMETERS, PARAMETERS
 
 BASE = "https://sheets.googleapis.com/v4/spreadsheets/"
@@ -19,7 +19,7 @@ MAX_INDEX_REQUESTS = 12
 BODY_CHUNK_ROWS = 100
 TEXT_CHUNK_ROWS = 10
 MAX_BODY_REQUESTS = 12
-TEXT_TABLES = {"Signale", "Vorgänge", "Regeln", "Handelsparameter", "Ereignisse"}
+TEXT_TABLES = {"Signale", "Vorgänge", "Regeln", "Handelsparameter", "Ereignisse", "Pipelines"}
 
 
 def column(index):
@@ -74,6 +74,19 @@ class SheetsClient:
         for table, headers in HEADERS.items():
             title = PREFIX + table
             if title in properties:
+                if create and table in LEGACY_HEADERS and len(headers) != len(LEGACY_HEADERS[table]):
+                    cells = self.values([f"'{title}'!A1:{column(len(headers) + 2)}1"])
+                    old = [*LEGACY_HEADERS[table], *META_HEADERS]
+                    if cells and cells[0] and cells[0][0] == old:
+                        identity = properties[title]["sheetId"]
+                        start = len(LEGACY_HEADERS[table])
+                        extra = len(headers) - start
+                        requests.extend([
+                            {"insertDimension": {"range": {"sheetId": identity, "dimension": "COLUMNS", "startIndex": start, "endIndex": start + extra}, "inheritFromBefore": True}},
+                            {"updateCells": {"start": {"sheetId": identity, "rowIndex": 0, "columnIndex": 0}, "rows": [{"values": [{"userEnteredValue": {"stringValue": label}} for label in [*headers, *META_HEADERS]]}], "fields": "userEnteredValue"}},
+                            {"updateDimensionProperties": {"range": {"sheetId": identity, "dimension": "COLUMNS", "startIndex": len(headers), "endIndex": len(headers) + 2}, "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}},
+                        ])
+                        properties[title]["gridProperties"]["columnCount"] += extra
                 continue
             if not create:
                 raise AqlaError("Google Sheets journal is incomplete; wait for its automatic synchronization")
@@ -313,6 +326,8 @@ class SheetsClient:
             headers = HEADERS["Trades"]
             groups = defaultdict(lambda: {"trades": 0, "closed": 0, "wins": 0, "losses": 0, "break_even": 0, "net_before_funding_usd": 0.0, "incomplete_pnl": 0})
             unverified = 0
+            scopes = {(str(dict(zip(headers, cells[:len(headers)], strict=True)).get("Währung") or "UNKNOWN"),
+                       str(dict(zip(headers, cells[:len(headers)], strict=True)).get("Netzwerk") or "UNKNOWN")) for cells in loaded.values()}
             for identity, (index, _) in found.items():
                 cells = loaded.get(index)
                 if cells is None:
@@ -323,7 +338,12 @@ class SheetsClient:
                     unverified += 1
                     continue
                 row = dict(zip(headers, cells[:len(headers)], strict=True))
-                group = groups[str(row[group_by]) if group_by != "gesamt" else "gesamt"]
+                label = str(row[group_by]) if group_by != "gesamt" else "gesamt"
+                # Keep per-currency groups; no USDT/USDC conversion or cross-network aggregation.
+                scope = (row.get("Währung") or "UNKNOWN", row.get("Netzwerk") or "UNKNOWN")
+                label = label if len(scopes) == 1 else label + " · " + " · ".join(scope)
+                group = groups[label]
+                group["currency"], group["network"] = scope
                 group["trades"] += 1
                 if row["Status"] == "closed":
                     group["closed"] += 1

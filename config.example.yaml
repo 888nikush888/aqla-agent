@@ -8,6 +8,17 @@ integration_key_file: secrets/integration.secret
 sources: []
 # Rules are set by you through Hermes; none are silently selected for you.
 policy: null
+venues:
+  aster:
+    network: mainnet
+    account: null
+    signer: null
+    private_key_file: secrets/aster.secret
+  lighter:
+    network: mainnet
+    account_index: null
+    api_key_index: null
+    private_key_file: secrets/lighter.secret
 telegram_session_file: secrets/telegram-session.secret
 telegram_api_id: null
 telegram_api_hash_file: secrets/telegram-api-hash.secret
