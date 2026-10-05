@@ -109,8 +109,17 @@ class Boundary:
                 if values["kind"] == "order":
                     self.order(values)
                 elif values["kind"] == "group":
+                    parent = None
                     for item in values["orders"]:
+                        if item["Type"] == 2:
+                            assert item["BaseAmount"] == item["ClientOrderIndex"] == 0
+                            item["BaseAmount"] = values["orders"][0]["BaseAmount"]
                         self.order(item)
+                        created = self.orders[item["ClientOrderIndex"]]
+                        if parent is None:
+                            parent = created
+                        else:
+                            created["parent_order_index"] = parent["order_index"]
                 elif values["kind"] == "cancel":
                     row = next(row for row in self.orders.values() if row["order_index"] == values["order_index"])
                     row["status"] = "canceled"
@@ -182,3 +191,22 @@ def test_lighter_integer_conversion_never_rounds_or_overflows():
         integer_amount("0.123456", "0.00001")
     with pytest.raises(AqlaError, match="range"):
         integer_amount(2**64, 1)
+
+
+@pytest.mark.asyncio
+async def test_actual_native_sdk_signs_oto_parent_with_nil_child_quantity_and_id():
+    from lighter import SignerClient
+    from lighter.signer_client import CreateOrderTxReq, create_api_key
+
+    key, _, error = create_api_key()
+    assert error is None
+    signer = SignerClient(url="https://testnet.zklighter.elliot.ai", account_index=42, api_private_keys={4: key})
+    try:
+        parent = CreateOrderTxReq(MarketIndex=1, ClientOrderIndex=12345, BaseAmount=10000, Price=100000, IsAsk=0, Type=0, TimeInForce=0, ReduceOnly=0, TriggerPrice=0, OrderExpiry=0)
+        stop = CreateOrderTxReq(MarketIndex=1, ClientOrderIndex=0, BaseAmount=0, Price=85000, IsAsk=1, Type=2, TimeInForce=0, ReduceOnly=1, TriggerPrice=90000, OrderExpiry=-1)
+        result = signer.sign_create_grouped_orders(1, [parent, stop], nonce=1, api_key_index=4)
+        assert result[3] is None and result[1] and result[2]
+        body = json.loads(result[1])
+        assert body["AccountIndex"] == 42 and body["ApiKeyIndex"] == 4 and body["Nonce"] == 1
+    finally:
+        await signer.close()

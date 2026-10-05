@@ -125,8 +125,8 @@ class Lighter(VenueAdapter):
             for item in action["orders"]:
                 market = self.native_market(item["a"])
                 trigger = item["t"].get("trigger")
-                orders.append(self.grouped_order_type(MarketIndex=market.asset_id, ClientOrderIndex=self.client_index(item["c"]),
-                    BaseAmount=integer_amount(item["s"], market.quantity_step), Price=integer_price(item["p"], market.price_tick),
+                orders.append(self.grouped_order_type(MarketIndex=market.asset_id, ClientOrderIndex=0 if trigger else self.client_index(item["c"]),
+                    BaseAmount=0 if trigger else integer_amount(item["s"], market.quantity_step), Price=integer_price(item["p"], market.price_tick),
                     IsAsk=int(not item["b"]), Type=sdk.ORDER_TYPE_STOP_LOSS if trigger else sdk.ORDER_TYPE_LIMIT,
                     TimeInForce=sdk.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL if trigger or item["t"]["limit"]["tif"] == "Ioc" else sdk.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
                     ReduceOnly=int(item["r"]), TriggerPrice=integer_price(trigger["triggerPx"], market.price_tick) if trigger else 0,
@@ -211,11 +211,24 @@ class Lighter(VenueAdapter):
 
     async def order_status(self, identity, user=None):
         index = self.client_index(identity) if isinstance(identity, str) else identity
+        group = next((row["wire_action"] for row in self.state.snapshot()["operations"].values()
+                      if row["wire_action"].get("grouping") == "normalTpsl" and any(order.get("c") == identity for order in row["wire_action"].get("orders", [])[1:])), None)
+        parent_oid = None
+        if group:
+            parent = await self.order_status(group["orders"][0]["c"])
+            if parent.get("status") != "order":
+                return {"status": "unknownOid"}
+            parent_oid = parent["order"]["order"]["oid"]
+            child = next(order for order in group["orders"][1:] if order["c"] == identity)
         active = await self.read("accountActiveOrders", {"account_index": self.account}, private=True)
         rows = active.get("orders", [])
         cursor = None
         for page in range(64):
-            row = next((row for row in rows if row["client_order_index"] == index or row["order_index"] == identity), None)
+            if group:
+                row = next((row for row in rows if row.get("parent_order_index") == parent_oid and row["market_index"] == child["a"]
+                            and Decimal(row.get("trigger_price", "0")) == Decimal(child["t"]["trigger"]["triggerPx"]) and row.get("reduce_only") is True), None)
+            else:
+                row = next((row for row in rows if row["client_order_index"] == index or row["order_index"] == identity), None)
             if row:
                 break
             if page and not cursor:
@@ -225,6 +238,8 @@ class Lighter(VenueAdapter):
         else:
             raise AqlaError("Lighter order history exceeded the bounded cursor budget")
         market = self.native_market(row["market_index"])
+        if str(row.get("owner_account_index")) != self.account:
+            raise AqlaError("Lighter order belongs to another account")
         status = {"open": "open", "pending": "open", "filled": "filled", "canceled": "canceled", "cancelled": "canceled", "expired": "canceled", "rejected": "rejected"}.get(row["status"])
         if status is None:
             raise AqlaError("Unrecognized Lighter order status")
