@@ -128,6 +128,8 @@ class HermesExtension:
         result = await asyncio.to_thread(self.ctx.call_mcp, server, tool, args)
         if not result.get("ok"):
             raise AqlaError("Native MCP integration call failed")
+        if result.get("truncated"):
+            raise AqlaError("Native MCP integration result was truncated; do not acknowledge partial journal data")
         value = result.get("structuredContent", result.get("result"))
         for _ in range(4):
             if isinstance(value, str):

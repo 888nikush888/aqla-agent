@@ -58,6 +58,16 @@ def test_tool_claim_comes_from_native_metadata_not_text(extension):
 
 
 @pytest.mark.asyncio
+async def test_truncated_internal_result_is_never_parsed_or_acknowledged(extension):
+    from aqla_hyperliquid_mcp.models import AqlaError
+
+    ext, ctx = extension
+    ctx.call_mcp = lambda *_: {"ok": True, "result": '{"partial', "truncated": True}
+    with pytest.raises(AqlaError, match="truncated"):
+        await ext.mcp_call("sheets", "sync_internal", {})
+
+
+@pytest.mark.asyncio
 async def test_native_handler_context_is_task_local_for_concurrent_commands(extension):
     extension, ctx = extension
     began = asyncio.Event()

@@ -176,7 +176,7 @@ def batch(data, limit=100):
             continue
         row = {**records[key], "revision": data["sequence"]}
         extra = len(text(row).encode("utf-8"))
-        if len(selected) >= limit or size + extra > 1_400_000:
+        if len(selected) >= limit or size + extra > 600_000:
             break
         selected.append(row)
         size += extra

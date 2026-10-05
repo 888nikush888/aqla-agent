@@ -151,6 +151,11 @@ def main():
     from aqla_agent.hermes_runtime import install_strict_profile
     command_methods = {name: getattr(TelegramAdapter, name) for name in ("_register_command_menu", "_handle_command", "_handle_inline_query", "_ensure_forum_commands")}
     undo = install_strict_profile()
+    from hermes_cli.plugins import PluginContext
+
+    large = json.dumps({"result": json.dumps({"records": [{"text": "X" * 150000}]})})
+    assert PluginContext._mcp_envelope(large).get("truncated") is not True
+    assert PluginContext._mcp_envelope("X" * 2000001)["truncated"] is True
     from gateway.config import GatewayConfig, Platform
     from gateway.run import GatewayRunner
     from gateway.session import SessionSource, SessionStore

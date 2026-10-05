@@ -143,6 +143,12 @@ def install_strict_profile():
     replace(GatewayStartupMixin, "_start_post_connect_services", trading_services_only)
     replace(GatewayStartupMixin, "_PRE_RECONNECT_WATCHERS", ("_session_housekeeping_watcher", "_session_stall_watcher"))
     replace(GatewayStartupMixin, "_POST_RECONNECT_WATCHERS", ("_loop_wakeup_watcher",))
+    from hermes_cli.plugins import PluginContext
+
+    # The isolated profile grants only Aqla's own two MCP servers to its plugin.
+    # Journal snapshots are internal data, not model context. Keep the host's
+    # native 2 MB flood limit; bounded journal batches stay below it after wrapping.
+    replace(PluginContext, "_MCP_RESULT_CHAR_CAP", 2_000_000)
     install_skill_review(replace)
 
     def undo():
