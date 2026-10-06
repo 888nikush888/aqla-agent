@@ -124,8 +124,9 @@ def main():
         assert "Prüfe Replies besonders sorgfältig." in master.read_text(encoding="utf-8")
         assert not approval.list_pending(approval.SKILLS)
         assert hashlib.sha256(master.read_bytes()).digest() != hashlib.sha256(original).digest()
-        assert not list(destination.rglob("*.db"))
-        assert not (destination / "data" / "state.json").exists()
+        # Native Hermes may open its session DB; no trading state is created by
+        # drafting, approving or rejecting a skill.
+        assert not (destination / "data" / "state.sqlite3").exists()
         print(json.dumps({"background_proposal": True, "native_telegram_approval": True, "rejection": True,
                           "stale_proposal_blocked": True, "source_approval_blocked": True, "always_ask": True,
                           "native_approval_question": True, "exchange_actions": 0, "model_calls": 0}))

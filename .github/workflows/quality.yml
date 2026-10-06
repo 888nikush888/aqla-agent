@@ -100,8 +100,10 @@ jobs:
           uv run --no-sync python scripts/install_hermes_dependencies.py --source .cache/hermes-source --python .cache/hermes-venv/bin/python
       - name: Audit the actually installed native Hermes environment
         run: python scripts/audit_hermes_runtime.py --python .cache/hermes-venv/bin/python
-      - name: Native sessions, database exclusion and Telegram commands
+      - name: Native SQLite sessions, search and Telegram commands
         run: .cache/hermes-venv/bin/python tests/native_hermes_smoke.py --hermes-source .cache/hermes-source --home .cache/native-home
+      - name: Operator questions, planning and legacy history migration
+        run: .cache/hermes-venv/bin/python tests/native_interaction_smoke.py --hermes-source .cache/hermes-source --home .cache/interaction-home
       - name: Untrusted source, native agent hooks and stdio MCP
         run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/source-pipeline --mcp-python .venv/bin/python --mode source
       - name: Owner rules and bounded master-skill edits

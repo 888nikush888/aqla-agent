@@ -16,6 +16,8 @@ def test_deployment_is_separate_and_has_native_hermes_transport(tmp_path):
     assert config["model"]["default"] == "test-model"
     assert config["model"]["base_url"] == "https://example.invalid/v1"
     assert config["agent"]["reasoning_effort"] == "ultra"
+    assert config['agent']['clarify_timeout'] == 60
+    assert {'clarify','todo','session_search'} <= set(config['platform_toolsets']['telegram'])
     assert config["skills"]["write_approval"] is True
     assert config["skills"]["creation_nudge_interval"] == 10
     assert config["auxiliary"]["background_review"]["enabled"] is True

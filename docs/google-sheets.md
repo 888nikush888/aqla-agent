@@ -24,9 +24,9 @@ Für eigene Sortierungen Filteransichten oder zusätzliche Analyse-Tabs verwende
 
 `Hebelmodus` unterscheidet **Fest** und **Aus Signal, am Börsenmaximum gedeckelt**. Im Signalmodus zeigt die Zeile `Fester Hebel` ausdrücklich **Nicht verwendet (Signalmodus)**. Der tatsächliche Hebel jedes Trades steht im unveränderlichen Tradeplan sowie im Request des `updateLeverage`-Vorgangs; die übrigen Journalspalten werden für die Erweiterung nicht verschoben.
 
-## Warum bleibt state.json?
+## Warum bleibt ein lokaler SQLite-Zustand?
 
-`data/state.json` sichert Order-IDs, Nonces, Regeln, Bindungen, Wiederanlauf und noch nicht bestätigte Journalübertragungen atomar. Sheets übernimmt die lesbare Analyse und Historie. Ein Google-Ausfall verzögert die Tabelle, ohne den Quellenleser, die Hermes-Wakeups oder den Börsenschutz anzuhalten. Es gibt keine zweite Analyse-Datei und keine Datenbank.
+`data/state.sqlite3` sichert Order-IDs, Nonces, Regeln, Bindungen, Wiederanlauf und noch nicht bestätigte Journalübertragungen atomar. Sheets übernimmt die lesbare Analyse und Historie. Ein Google-Ausfall verzögert die Tabelle, ohne den Quellenleser, die Hermes-Wakeups oder den Börsenschutz anzuhalten. SQLite ist die verbindliche Ausführungsquelle; die alte JSON-Datei bleibt nach ihrer einmaligen Migration als Sicherung erhalten.
 
 Die Übertragung erfolgt mindestens einmal mit stabilen Zeilen-IDs. Nach verlorener Antwort werden vorhandene IDs erneut gelesen, damit kein zweiter Datensatz angehängt wird. Bestätigungen beziehen sich auf den exakten Datenstand; spätere lokale Änderungen bleiben ausstehend. Noch nicht exportierte Signale werden nicht durch die lokale Aufbewahrungsgrenze gelöscht. Sheets-Zellen liefern keine Handelsberechtigung und verändern keine Regeln, Mengen oder Aufträge.
 

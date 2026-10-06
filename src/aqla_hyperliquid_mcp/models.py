@@ -84,7 +84,7 @@ class Settings(Model):
     account: Address
     vault_address: Address | None = None
     signer_role: Literal["api_wallet", "master"] = "api_wallet"
-    state_path: Path = Path("data/state.json")
+    state_path: Path = Path("data/state.sqlite3")
     private_key_file: Path | None = None
     integration_key_file: Path | None = None
     sources: list[str] = Field(default_factory=list)

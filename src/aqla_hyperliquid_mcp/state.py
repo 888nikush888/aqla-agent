@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import threading
-from pathlib import Path
 
 import portalocker
 
 from .models import AqlaError, Settings
+from .storage import SQLiteStore, database_path, read_snapshot
 
 
 class State:
-    """One writer, atomically replaced JSON. No database or second source of truth."""
+    """One writer and one transactional SQLite state, with legacy JSON import."""
 
     def __init__(self, settings: Settings):
-        self.path = Path(settings.state_path)
+        self.path = database_path(settings.state_path)
+        self._store = None
         self.journal_enabled = settings.google_sheets.enabled
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._thread_lock = threading.RLock()
@@ -25,9 +25,13 @@ class State:
         except portalocker.LockException as error:
             raise AqlaError("Another aqla process already owns this state") from error
         try:
-            if self.path.exists():
-                self.data = json.loads(self.path.read_text(encoding="utf-8"))
-                if self.data.get("schema") not in (1, 2) or self.data.get("network") != settings.network or self.data.get("account", "").lower() != settings.account.lower():
+            existing = self.path.exists()
+            legacy_path = self.path.with_suffix(".json")
+            if not existing and self.path.with_suffix(self.path.suffix + ".initialized").exists():
+                raise AqlaError("Previously initialized SQLite state is missing; explicit recovery is required")
+            if existing or legacy_path.exists():
+                self.data = read_snapshot(self.path) if existing else json.loads(legacy_path.read_text(encoding="utf-8"))
+                if not isinstance(self.data, dict) or self.data.get("schema") not in (1, 2) or self.data.get("network") != settings.network or self.data.get("account", "").lower() != settings.account.lower():
                     raise AqlaError("State version, account or network differs; use a separate state")
                 for key in ("events", "trades", "operations", "nonces", "plans", "bindings", "sources"):
                     if key not in self.data:
@@ -38,7 +42,6 @@ class State:
                              "policy_revision": 1 if settings.policy else 0, "paused": False,
                              "sources": settings.sources, "source_aliases": {}, "events": {}, "trades": {}, "plans": {},
                              "bindings": {}, "operations": {}, "nonces": {}, "cursors": {}, "notifications": {}, "event_tombstones": {}}
-                self._write(self.data)
             target = (settings.vault_address or settings.account).lower()
             legacy = "trading_account" not in self.data
             if legacy:
@@ -64,15 +67,16 @@ class State:
             from aqla_agent.pipelines import migrate
 
             migrated = migrate(self.data)
-            if migrated:
-                self._write(self.data)
-            if legacy:
-                self._write(self.data)
             if self.journal_enabled:
                 from aqla_sheets_mcp.journal import seed
                 seed(self.data)
+            self._store = SQLiteStore(self.path, create=not existing)
+            if not existing or migrated or legacy or self.journal_enabled:
                 self._write(self.data)
+            self._store.seal()
         except BaseException:
+            if self._store is not None:
+                self._store.close()
             self._lock.release()
             raise
 
@@ -103,21 +107,7 @@ class State:
                 raise AqlaError("Saved SDK operation has mismatched principal or signing scope")
 
     def _write(self, data):
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        try:
-            with temporary.open("w", encoding="utf-8") as output:
-                json.dump(data, output, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, self.path)
-            if os.name != "nt":
-                descriptor = os.open(self.path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-                try:
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-        except OSError as error:
-            raise AqlaError("Durable state write failed; no exchange action may be sent") from error
+        self._store.save(data)
 
     def snapshot(self):
         with self._thread_lock:
@@ -137,7 +127,11 @@ class State:
             return copy.deepcopy(result)
 
     def close(self):
-        self._lock.release()
+        with self._thread_lock:
+            if self._store is not None:
+                self._store.close()
+                self._store = None
+            self._lock.release()
 
     def __enter__(self):
         return self

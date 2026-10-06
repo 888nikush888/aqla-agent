@@ -1,32 +1,22 @@
 """Launch native Hermes for the isolated VPS. No custom bot or agent loop."""
 import os
-import sqlite3
 import sys
 import threading
 from pathlib import Path
 
 
 def install_strict_profile():
-    """Use file-based session storage in the isolated native Hermes process.
-
-    Applied only inside the new VPS process, before native gateway startup. The
-    SQLite guard fails closed if a future host feature attempts another database.
-    Native transport, polling, delivery and agent execution are not replaced.
-    """
+    """Keep Aqla authority boundaries while using native SQLite session storage."""
     originals = []
 
     def replace(target, name, value):
         originals.append((target, name, getattr(target, name)))
         setattr(target, name, value)
 
-    def no_database(*_, **__):
-        raise sqlite3.OperationalError("SQLite is disabled in the aqla VPS profile")
-
-    replace(sqlite3, "connect", no_database)
     import gateway.run as native_gateway
 
     # This factory runs outside GatewayStartupMixin, after adapters connect.
-    # Its cron and housekeeping products attempt their own SQLite stores.
+    # Cron/housekeeping products are outside the three requested operator tools.
     # Native async session/transport watchdogs remain enabled below.
     replace(native_gateway, "_start_gateway_start_cron_and_housekeeping",
             lambda runner: (threading.Event(), None, None, None))
@@ -35,16 +25,14 @@ def install_strict_profile():
     from gateway.run_adapters import GatewayAdapterLifecycleMixin
     from gateway.run_startup import GatewayStartupMixin
     from gateway.run_turn import GatewayTurnMixin
-    from gateway.session import SessionStore
-    from gateway.session_persistence import SessionPersistenceMixin
-    from hermes_state_registry import __name__ as registry_name
+    from gateway.run_turn_runner import TurnRunner
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
-    from .conversation import Conversations
     from .events import (
         gateway_ready,
         ingress_identity,
         rebind_native_adapter,
+        record_clarify_outcome,
         run_native_followup,
         run_native_turn,
         stamp_native_event,
@@ -69,6 +57,18 @@ def install_strict_profile():
     replace(GatewayTurnMixin, "_run_agent", run_agent)
     replace(GatewayTurnMixin, "_run_agent_queued_followup", queued_followup)
     replace(GatewayAdapterLifecycleMixin, "_install_reconnected_adapter", install_reconnected_adapter)
+    original_clarify = TurnRunner._clarify_callback_sync
+
+    def clarify_callback(self, questions):
+        try:
+            result = original_clarify(self, questions)
+        except BaseException:
+            record_clarify_outcome({"outcome": "undelivered", "answers": {}})
+            raise
+        record_clarify_outcome(result)
+        return result
+
+    replace(TurnRunner, "_clarify_callback_sync", clarify_callback)
 
     # Classify native Telegram events before any text, photo or busy-queue merge.
     # The transport and normal owner command handlers remain entirely native.
@@ -107,25 +107,6 @@ def install_strict_profile():
     replace(TelegramAdapter, "_queue_media_group_event", queue_media_group)
     replace(BasePlatformAdapter, "_can_merge_text_debounce_events", can_merge_text)
     replace(GatewayRunner, "_SECURITY_METADATA_KEYS", (*GatewayRunner._SECURITY_METADATA_KEYS, "aqla_origin", "aqla_source_message_id"))
-
-    # This is the host's explicitly supported fallback, not a new storage engine.
-    replace(SessionPersistenceMixin, "_open_session_db_for_active_scope", lambda *args, **kwargs: None)
-    replace(sys.modules[registry_name], "acquire", lambda *args, **kwargs: None)
-    replace(GatewayRunner, "_open_session_db_for_active_scope", lambda *args, **kwargs: None)
-    original_init = SessionStore.__init__
-
-    def init_store(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        self._db = None
-        self._aqla_conversations = Conversations(self.sessions_dir / "transcripts")
-
-    replace(SessionStore, "__init__", init_store)
-    replace(SessionStore, "_append_transcript_message", lambda self, session_id, message: self._aqla_conversations.append(session_id, message))
-    replace(SessionStore, "load_transcript", lambda self, session_id: self._aqla_conversations.load(session_id))
-    replace(SessionStore, "rewrite_transcript", lambda self, session_id, messages, **kwargs: self._aqla_conversations.rewrite(session_id, messages))
-    replace(SessionStore, "has_input_owner", lambda self, session_id, owner: self._aqla_conversations.has_owner(session_id, owner))
-    replace(SessionStore, "has_platform_message_id", lambda self, session_id, message_id: self._aqla_conversations.has_message(session_id, message_id))
-    replace(SessionStore, "transcript_tail_role", lambda self, session_id: (self._aqla_conversations.load(session_id) or [{}])[-1].get("role"))
 
     original_wiring = GatewayStartupMixin._start_finish_wiring
 
@@ -166,6 +147,8 @@ def main():
     sys.path.insert(0, str(source))
     os.environ["HERMES_SKIP_CONFIG_MIGRATION"] = "1"
     os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
+    from .session_history import migrate_session_history
+    migrate_session_history(Path(os.environ["HERMES_HOME"]))
     install_strict_profile()
     sys.argv = ["hermes", "gateway", "run"]
     from hermes_cli.main import main as hermes_main

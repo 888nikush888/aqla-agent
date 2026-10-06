@@ -1,4 +1,4 @@
-"""Profiles, routing and per-venue views over the one authoritative JSON writer."""
+"""Profiles, routing and per-venue views over the one authoritative state writer."""
 from __future__ import annotations
 
 import copy

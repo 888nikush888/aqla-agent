@@ -12,7 +12,7 @@ Stand: 03.10.2026. Tatsächliche Installation auf Debian 13 x86_64, getrennt unt
 - Telegram-Kanalleser über QR authentifiziert; angemeldete Nutzer-ID entspricht dem konfigurierten Betreiber. StringSession als geschützte Datei, keine SQLite-Sitzung.
 - Hyperliquid-API-Wallet an das konfigurierte **Testnet**-Hauptkonto gebunden; Konto und Marktmetadaten lesbar, Standardkonto-Abstraktion unterstützt.
 - Keine Exchange-Mutationen während Einrichtung. Eine bereits im Konto vorhandene Position wurde nicht als eigener Aqla-Trade importiert oder verändert.
-- Dienst läuft; keine Datenbankdateien in Aqla-Daten oder Hermes-Home, öffentlich lauscht nur der vorhandene SSH-Port.
+- Dienst läuft; Handelszustand und native Hermes-Gespräche werden seit der SQLite-Erweiterung in getrennten Datenbanken gespeichert. Öffentlich lauscht nur der vorhandene SSH-Port.
 
 Beim Live-Start erkannte ungenutzte native Cron-/Housekeeping-Factory wurde im Aqla-Profil deaktiviert und als nativer Regressioncheck abgesichert. systemd Stop-Frist beträgt 90 Sekunden, `KillMode=mixed` erhält MCP-Kinder bis zur geordneten Gatewayabschaltung. Native Lazy-Installationen ändern die vom Installer geprüfte Laufzeit nicht mehr.
 

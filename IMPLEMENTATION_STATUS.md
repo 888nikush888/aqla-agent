@@ -1,6 +1,6 @@
 # aqla Agent — Auslieferungsstand
 
-Stand: 05.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Quellpaket. Die bestehende Hermes-Installation des Nutzers wurde weder verändert noch angebunden. Kein TSX-Code oder alter Handelszustand wurde übernommen.
+Stand: 06.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Quellpaket. Die bestehende Hermes-Installation des Nutzers wurde weder verändert noch angebunden. Kein TSX-Code oder alter Handelszustand wurde übernommen.
 
 ## Inhalt
 
@@ -15,12 +15,14 @@ Stand: 05.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Qu
 - Automatischer Perpetual-Signalhandel mit Entry/SL, anteiligen Limit-TPs, Updates, Einstand, Reduktion, Schließen und Wiederanlauf. Spot liegt im vollständigen MCP; die automatische Signalstrecke lehnt Spot vor einer Order ab.
 - Hebelmodus `fixed` oder `signal`: Signalhebel werden belegt, am Marktmaximum gedeckelt und als effektiver Hebel unveränderlich im Plan gespeichert. Marginprüfung, Börsenauftrag und Recovery verwenden denselben Wert; alte feste Regeln und Pläne bleiben lesbar.
 - Eigener vollständiger HyperCore-MCP: 59 Info-Verträge, 40 dokumentierte Exchange-Aktionstypen, 52 öffentliche SDK-Operationen einschließlich der gesonderten Approval-/Multisig-Pfade, 24 WebSocket-Abonnements, HIP-3/HIP-4 und Deployeraktionen. Siehe docs/api-coverage.md. API-Snapshot: 02.10.2026; keine Behauptung unbekannter zukünftiger API-Erweiterungen.
-- Atomarer JSON-Handelszustand und JSONL-Gesprächsverlauf. Keine Datenbank. SQLite-Zugriffe und ungenutzte Hermes-Hintergrundprodukte sind im separaten VPS-Profil deaktiviert. Native Hermes-Telegram-Befehle sind verfügbar.
+- Transaktionaler SQLite-Handelszustand mit genau einem Schreibprozess; native Hermes-Sitzungsdatenbank mit Volltextsuche. Alte JSON-/JSONL-Daten werden unter Erhalt der Originale importiert. Fehlende oder beschädigte initialisierte Handelsdatenbanken blockieren die Ausführung. Native Rückfragen, Aufgabenplanung und Sitzungssuche sind für authentifizierte Betreiber aktiviert; ausbleibende Antworten erlauben keine Änderungen. Kanaltext erhält keine Betreiberwerkzeuge. Ungenutzte Hintergrundprodukte bleiben deaktiviert.
 - Installer mit eigenem Hermes-Checkout/Home und systemd-Unit; Aqla Python 3.12, Hermes Python 3.14, beide im Zielordner verwaltet. Gepinnter Hermes-Commit: 1a4508e2aff2db5f50409893a2115be777bd5643.
 - Neuinstallationen verwenden standardmäßig DeepSeek V4.1 Flash über OpenCode Go und Hermes-Reasoning `ultra` (DeepSeek-API `max`). Modell und Endpunkt bleiben über Installerargumente überschreibbar; die CLI-Vorgaben sind als tatsächliche neue Konfiguration getestet.
 - Source-ZIP mit SHA-256, Wheel und Source-Distribution; keine lokalen Secrets, Daten oder QA-Umgebungen im Archiv. Eigenständiges privates GitHub-Repository `888nikush888/aqla-agent` mit Qualitätspipeline.
 
 ## Geprüft
+
+SQLite-/Werkzeug-Erweiterung: lokal **612 Tests bestanden, ein plattformabhängiger Test übersprungen, 79,10 Prozent Coverage**. Echte native Hermes-Prüfungen bestätigen importierte Volltextsuche, transaktionalen Import mit Fehler-Rollback, persistierte Aufgabenlisten, Telegram-Rückfragekarten und Quellen-Abwehr. Die Handelszustandsprüfungen decken JSON-Migration, unveränderte Sicherung, exklusive Schreibsperre über beide Pfadformen, abgebrochene SQLite-Transaktion und fehlende/beschädigte Datenbanken ab. Die SQLite-Views erlauben lesende Kontrolle ohne zweiten Writer.
 
 Alle 32 bestätigten Befunde der Voll-, Nach- und Abschlussprüfung sind korrigiert und durch gezielte Regressionstests beziehungsweise Paket-/CI-Prüfungen abgesichert. Die Zuordnung steht in `docs/quality-review.md`. Die Abnahme nach der VPS-Startkorrektur, vor der Handelsparameter-Erweiterung, bestand lokal 498 Tests einschließlich der lokalen WebSocket-Prüfungen, mit 80,74 Prozent Branch-Coverage. Die Parameterseite ist zusätzlich durch drei Regressionstests für vollständige Feldabdeckung, unverbindliche Standardwerte, authentifizierte Regeländerungen, veraltete Bestätigungen und Erhalt vorhandener Tabellen abgesichert. Native Hermes-Smokes prüfen zusätzlich echte Text-/Foto-/Queue-Batchpfade, rekursive Folgeturns mit wiederverwendetem Agenten, Workerautorität, Befehlsabbruch, Adapterwechsel, deaktivierte Cron-/Housekeeping-Factory und beide MCPs. Beide Abhängigkeitsgraphen melden zum Prüfzeitpunkt keine bekannten Advisories.
 
@@ -28,7 +30,7 @@ Initialer lokaler Gesamtlauf nach der Signalhebel-Erweiterung: **528 Tests besta
 
 Ruff; eingefrorene Installation; Paketbuild; separate Wheel-Installation und Offline-Installer; regel- und zustandsbezogene Tests einschließlich Crash vor TP-Versand, verlorenen Antworten, echten Teilfills, beendeter eigener Position mit fremdem Wiedereröffnen, frischer Equity bei Recovery und verlorener niedriger Telegram-ID.
 
-Mit dem tatsächlichen gepinnten Hermes: Gesprächswiederherstellung ohne DB, Gateway-Konstruktion ohne Session-DB, native AIAgent-Hooks und stdio-MCP. Ein lokales geskriptetes Modell prüfte Owner-Regeländerung, Master-Patch, Größenbegrenzung und die Abwehr von Kontrollaufrufen aus einer echten nativen Weiterleitung. Native Boot-Anbindung startet ohne neue Owner-Nachricht; geänderte Skills leeren den nativen Agentencache vor dem nächsten Turn.
+Mit dem tatsächlichen gepinnten Hermes: SQLite-Import und Volltextsuche, Aufgabenwiederherstellung, Telegram-Rückfragekarten, Timeout ohne Änderungsfreigabe und Unterbrechung einer wartenden Rückfrage für Handelsarbeit; außerdem native AIAgent-Hooks und stdio-MCP. Ein lokales geskriptetes Modell prüfte Owner-Regeländerung, Master-Patch, Größenbegrenzung und die Abwehr von Kontrollaufrufen aus einer echten nativen Weiterleitung. Native Boot-Anbindung startet ohne neue Owner-Nachricht; geänderte Skills leeren den nativen Agentencache vor dem nächsten Turn.
 
 Ein echter lokaler WebSocket-Server prüfte Reconnect, Unsubscribe und einen angenommenen Auftrag mit verlorener Antwort: kein erneuter Versand.
 

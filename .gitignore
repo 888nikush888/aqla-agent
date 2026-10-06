@@ -21,3 +21,9 @@ reports/
 config.yaml
 *.session
 *.secret
+*.db
+*.sqlite
+*.sqlite3
+*-wal
+*-shm
+*.sqlite3.initialized

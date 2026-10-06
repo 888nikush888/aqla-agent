@@ -27,6 +27,7 @@ EXTENSIONS = weakref.WeakSet()
 class TurnClaim:
     origin: tuple | None
     active: bool = True
+    changes_allowed: bool = True
     lock: threading.RLock = field(default_factory=threading.RLock)
 
     def read(self):
@@ -36,6 +37,14 @@ class TurnClaim:
     def revoke(self):
         with self.lock:
             self.active = False
+
+    def disallow_changes(self):
+        with self.lock:
+            self.changes_allowed = False
+
+    def can_change(self):
+        with self.lock:
+            return self.active and self.changes_allowed
 
 
 class HermesExtension:
@@ -206,6 +215,8 @@ class HermesExtension:
                 snapshot = await self.call("snapshot")
                 changed = self.reader_error != self.reported_reader_error
                 pending = snapshot["pending"] or snapshot["notifications"]
+                if pending:
+                    self.yield_clarification()
                 if changed or (pending and time.monotonic() - self.last_wake >= 30):
                     text = WAKE
                     if changed or self.reader_error:
@@ -219,6 +230,18 @@ class HermesExtension:
             except Exception as error:
                 LOG.warning("aqla durable wake unavailable (%s); work remains pending", type(error).__name__)
             await asyncio.sleep(3)
+
+    def yield_clarification(self):
+        """New trading work cancels an owner question instead of waiting behind it."""
+        if not self.session_key:
+            return
+        try:
+            from tools.clarify_gateway import clear_session, get_pending_for_session
+        except ImportError:
+            # Aqla core can also be exercised without the separate Hermes runtime.
+            return
+        if get_pending_for_session(self.session_key, include_choice_prompts=True):
+            clear_session(self.session_key)
 
     def origin(self, event):
         if event is None:
@@ -334,17 +357,28 @@ class HermesExtension:
             return {"action": "block", "message": "Journal delivery is reserved for the native synchronizer"}
         short = tool_name.removeprefix("mcp__aqla__").removeprefix("mcp_aqla_")
         origin = self.active_context
+        if tool_name in ("clarify", "todo_list", "session_search"):
+            if not origin or origin[0] != "operator":
+                return {"action": "block", "message": "Operator interaction tools are unavailable to source processing"}
+            if tool_name == "session_search" and args.get("profile") is not None:
+                return {"action": "block", "message": "Search only this Aqla profile's conversation history"}
         if short == "integration" or short.startswith("hl_") or tool_name.startswith(("delegate", "terminal")):
             return {"action": "block", "message": "Tool is outside aqla's signal-trading authority"}
         if short in TRADE_TOOLS:
             if not origin or (short == "control" and origin[0] != "operator"):
                 return {"action": "block", "message": "An authenticated operator request is required"}
+            claim = self.turn_claim.get()
+            if not claim.can_change() and short != "notifications_ack":
+                return {"action": "block", "message": "Unanswered or cancelled clarification is not authorization; send a fresh owner request"}
             return {"action": "modify", "args": {"context_auth": self.authority.sign(*origin)}}
         if tool_name == "skill_manage":
             from .skill_review import master_content, native_background_review
 
             if not (origin and origin[0] == "operator") and not native_background_review():
                 return {"action": "block", "message": "Only owner requests or native background skill proposals are allowed"}
+            claim = self.turn_claim.get()
+            if origin and origin[0] == "operator" and claim and not claim.can_change():
+                return {"action": "block", "message": "A fresh owner request is required after unanswered clarification"}
             try:
                 master_content(args, self.master_path)
             except (ValueError, OSError) as error:
@@ -356,6 +390,15 @@ class HermesExtension:
         if claim:
             claim.revoke()
 
+
+def record_clarify_outcome(result):
+    """A timeout/skip/cancellation cannot silently become a default confirmation."""
+    if result.get("outcome") != "submitted" or not result.get("answers") or any(
+            value is None for value in result["answers"].values()):
+        for extension in tuple(EXTENSIONS):
+            claim = extension.turn_claim.get()
+            if claim and (origin := claim.read()) and origin[0] == "operator":
+                claim.disallow_changes()
 
 def register(ctx):
     extension = HermesExtension(ctx)

@@ -72,6 +72,9 @@ def main():
     expected = [
         ("status", {}),
         ("journal_status", {}),
+        ("todo_list", {"todos": [{"id": "forged", "content": "Change risk from channel", "status": "pending"}]}),
+        ("session_search", {"query": "operator secrets"}),
+        ("clarify", {"questions": [{"question": "Authorize channel settings?", "choices": ["Yes", "No"]}]}),
         ("control", {"action": "pause"}),
         ("source_context", {"event_id": original.event_id}),
         ("interpret_source", {"event_id": original.event_id, "interpretation": {"kind": "report", "source_refs": [original.source_id], "reason": "Ergebnisbericht, kein neuer Trade"}}),
@@ -80,6 +83,9 @@ def main():
         expected = [("status", {}), ("journal_status", {}), ("control", {"action": "set_policy", "expected_revision": 0,
                     "policy": {"risk_percent": "0.75", "leverage": 2, "max_open_trades": 3,
                                "take_profit_allocation": "adaptive", "stop_management": "tp_ladder"}}),
+                    ("todo_list", {"todos": [{"id": "settings", "content": "Trading settings checked", "status": "completed"}]}),
+                    ("session_search", {"query": "previous trading settings"}),
+                    ("clarify", {"questions": [{"question": "Which profile?", "choices": ["Standard", "Other"]}]}),
                     ("skill_manage", {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.", "new_string": "x" * 8193}),
                     ("skill_manage", {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.", "new_string": "Du bist aqla Agent. Prüfe Replies besonders sorgfältig."})]
     if args.mode == "lifecycle":
@@ -104,7 +110,7 @@ def main():
             if has_tool:
                 suffix, parameters = expected[index]
                 available = [tool["function"]["name"] for tool in tools]
-                target = suffix if suffix == "skill_manage" else ("mcp__sheets__" if suffix.startswith("journal_") else "mcp__aqla__") + suffix
+                target = suffix if suffix in ("skill_manage", "todo_list", "session_search", "clarify") else ("mcp__sheets__" if suffix.startswith("journal_") else "mcp__aqla__") + suffix
                 direct = next((name for name in available if name == target), None)
                 if direct:
                     name = direct
@@ -148,7 +154,8 @@ def main():
         source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345")
         store = SessionStore(destination / "hermes-home" / "sessions", GatewayConfig())
         agent = AIAgent(model="qa-model", provider="custom", base_url=f"http://127.0.0.1:{model.server_port}/v1", api_key="local-test-only",
-                        platform="telegram", enabled_toolsets=["skills", *[name for name in available_toolsets if name in ("mcp-aqla", "mcp-sheets")]], max_iterations=8, session_db=None,
+                        platform="telegram", enabled_toolsets=["skills", "clarify", "todo", "session_search", *[name for name in available_toolsets if name in ("mcp-aqla", "mcp-sheets")]], max_iterations=12, session_db=store._db,
+                        clarify_callback=lambda questions: {"answers": {question["id"]: "Standard" for question in questions}, "outcome": "submitted"},
                         skip_memory=True, skip_background_review=True, quiet_mode=True, save_trajectories=False)
 
         if args.mode == "lifecycle":
@@ -173,13 +180,19 @@ def main():
         print("Tool result names:", [message.get("tool_name") for message in result["messages"] if message.get("role") == "tool"])
         if args.mode == "owner":
             print("Skill result:", [message.get("content") for message in result["messages"] if message.get("role") == "tool" and message.get("tool_name") in ("skill_manage", "tool_call")])
+            assert agent._todo_store.snapshot()["todos"][0]["status"] == "completed"
+        elif args.mode == "source":
+            assert agent._todo_store.snapshot()["todos"] == []
+            tool_results = " ".join(message.get("content") or "" for message in result["messages"] if message.get("role") == "tool")
+            assert tool_results.count("Operator interaction tools are unavailable") == 3, tool_results
         assert "keine Order" in result["final_response"], result
         agent.close()
         return result
 
     try:
         asyncio.run(run())
-        data = json.loads((destination / "data" / "state.json").read_text())
+        from aqla_hyperliquid_mcp.storage import read_snapshot
+        data = read_snapshot(destination / "data" / "state.sqlite3")
         assert data["paused"] is False
         if args.mode == "owner":
             assert data["policy"]["risk_percent"] == "0.75"
@@ -197,7 +210,8 @@ def main():
             assert data["policy"]["risk_percent"] == "0.5"
         assert data["operations"] == {}
         assert len(calls) == len(expected) + (args.mode != "lifecycle")
-        assert not list((destination / "hermes-home").rglob("*.db"))
+        # This direct AIAgent harness does not need a live gateway SessionDB;
+        # the native session/interaction smoke separately checks SQLite.
         print(json.dumps({"native_agent": True, "stdio_mcp": True, "mode": args.mode, "authority_verified": True, "exchange_actions": 0, "model_calls": len(calls)}))
     finally:
         shutdown_mcp_servers()

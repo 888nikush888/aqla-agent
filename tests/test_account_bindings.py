@@ -1,4 +1,3 @@
-import json
 
 import pytest
 
@@ -16,8 +15,8 @@ def write_legacy(state):
     data.pop("trading_account")
     for row in [*data["plans"].values(), *data["trades"].values()]:
         row["plan"].pop("principal", None)
+    state._write(data)
     state.close()
-    state.path.write_text(json.dumps(data), encoding="utf-8")
 
 
 def test_persisted_state_rejects_vault_change_without_rewriting(setup):
@@ -93,8 +92,8 @@ async def test_saved_execution_records_must_match_persisted_binding(setup, signa
         data["plans"][plan["plan_id"]]["plan"]["account" if change == "plan_target" else "principal"] = OTHER
     else:
         data["operations"]["leverage"]["request"]["account" if change == "operation_target" else "network"] = OTHER if change == "operation_target" else "mainnet"
+    state._write(data)
     state.close()
-    state.path.write_text(json.dumps(data), encoding="utf-8")
     original = state.path.read_bytes()
     with pytest.raises(AqlaError, match="Saved .* another trading target"):
         State(settings)

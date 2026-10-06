@@ -94,8 +94,8 @@ async def test_forged_sdk_scope_is_rejected_on_reopen_without_rewriting(setup, t
             record["wire_vault_address"] = VAULT
         else:
             record["request"]["account"] = OTHER
+        state._write(data)
         state.close()
-        state.path.write_text(json.dumps(data), encoding="utf-8")
         original = state.path.read_bytes()
         with pytest.raises(AqlaError, match="Saved"):
             State(settings)
@@ -117,8 +117,8 @@ async def test_legacy_sdk_records_preserve_valid_scope_and_refuse_ambiguous_vaul
         record["request"].pop("signing_scope")
         record.pop("wire_vault_address")
         record["request_hash"] = digest(record["request"])
+        state._write(data)
         state.close()
-        state.path.write_text(json.dumps(data), encoding="utf-8")
         if vault and operation == "set_referrer":
             original = state.path.read_bytes()
             with pytest.raises(AqlaError, match="ambiguous vault signing scope"):

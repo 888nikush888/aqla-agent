@@ -4,7 +4,7 @@
 
 Telegram-Quellen → Hermes versteht Signal/Update im Kontext → Python prüft Profile und Pipelines → Hyperliquid, Aster und/oder Lighter führen unabhängig aus → Hermes meldet das Ergebnis je Börse in Telegram.
 
-Eigenständiges Python-Projekt. Ein eigener Hyperliquid-MCP, ein kurzer bearbeitbarer Master-Skill und ein read-only Telegram-Quellenleser für abonnierte Kanäle. Keine eigene Bot-Anbindung, MiniApp, Datenbank, Kanalbewertungen oder autonome Strategieoptimierung. Manuell an den Hermes-Bot weitergeleitete Signale werden ebenfalls als Quellen erfasst.
+Eigenständiges Python-Projekt. Ein eigener Hyperliquid-MCP, ein kurzer bearbeitbarer Master-Skill und ein read-only Telegram-Quellenleser für abonnierte Kanäle. SQLite speichert Handelszustand und Hermes-Gespräche. Keine eigene Bot-Anbindung, MiniApp, Kanalbewertungen oder autonome Strategieoptimierung. Manuell an den Hermes-Bot weitergeleitete Signale werden ebenfalls als Quellen erfasst.
 
 ## Unabhängig auf einem VPS installieren
 
@@ -105,7 +105,7 @@ Der Hebel ist wählbar: `leverage_mode: fixed` verwendet weiterhin den festen Nu
 
 ## MCP und Zustand
 
-Ein zweiter eigener Python-MCP führt das [Google-Sheets-Journal](docs/google-sheets.md): Signale, Trade-Updates, Orders, Fills, Gebühren, Ergebnisse, Regeln, einzeln lesbare Handelsparameter und Statushistorie werden automatisch übertragen. Hermes kann die Tabelle lesen und nach Quelle, Symbol oder Richtung auswerten. `state.json` bleibt für sichere Ausführung und noch ausstehende Übertragungen erhalten; eine zusätzliche Analysedatei entfällt. Tabellen-ID und Servicekonto werden einmalig auf dem VPS gesetzt.
+Ein zweiter eigener Python-MCP führt das [Google-Sheets-Journal](docs/google-sheets.md): Signale, Trade-Updates, Orders, Fills, Gebühren, Ergebnisse, Regeln, einzeln lesbare Handelsparameter und Statushistorie werden automatisch übertragen. Hermes kann die Tabelle lesen und nach Quelle, Symbol oder Richtung auswerten. `state.sqlite3` hält die sichere Ausführung und noch ausstehende Übertragungen; eine zusätzliche Analysedatei entfällt. Tabellen-ID und Servicekonto werden einmalig auf dem VPS gesetzt.
 
 ```sh
 uv run aqla-hyperliquid-mcp --config config.yaml
@@ -116,13 +116,13 @@ uv run --extra sheets aqla-google-sheets-mcp --config config.yaml
 
 Das Agentenprofil enthält nur den regelgeprüften Handelspfad. Das vollständige Profil bietet die typisierten öffentlichen HyperCore-Info-/Exchange-/WebSocket-Verträge, einschließlich Spot, HIP-3/HIP-4, Transfers, Kontofunktionen, Deployeraktionen und Multisig. Die [Abdeckungsmatrix](docs/api-coverage.md) dokumentiert Handler, Prüfdateien und Quellen. Rollen- und Testnet-Grenzen werden ausdrücklich geprüft; ein API-Wallet wird nicht als Masterwallet ausgegeben. HyperEVM-Contract-/Validatorbetrieb ist kein Teil dieses Exchange-MCP.
 
-`data/state.json` enthält Regeln, Quellen, Cursor, Bindungen, eigene Trades, Fills, Operationsidentitäten und Nonces. Nur ein Prozess darf schreiben. Vor einem Exchange-Aufruf wird die Absicht dauerhaft gespeichert. Ein unklarer Ausgang wird anhand exakter Orderidentitäten abgeglichen; nie automatisch unter einer neuen ID erneut gesendet. Entry-Pause unterbricht Schutz und Exits nicht. Gefüllte TP-Budgets werden nicht aufgefüllt, und ein alter Stop wird erst nach bestätigtem Ersatzschutz entfernt. Widersprüchliche Positions-/Fill-Abfragen halten den bisherigen Schutz; Abweichungen werden nicht als bewiesene manuelle Reduktion verbucht. Nach einem Exit bleibt der Markt reserviert, bis alte eigene Orders nachweislich beendet sind.
+`data/state.sqlite3` enthält Regeln, Quellen, Cursor, Bindungen, eigene Trades, Fills, Operationsidentitäten und Nonces. Transaktionen und genau ein Schreibprozess sichern den Zustand. Vorhandene JSON-Dateien werden einmalig importiert und als Sicherung erhalten. Eine beschädigte oder nach Initialisierung fehlende Datenbank blockiert die Ausführung. Vor einem Exchange-Aufruf wird die Absicht dauerhaft gespeichert. Ein unklarer Ausgang wird anhand exakter Orderidentitäten abgeglichen; nie automatisch unter einer neuen ID erneut gesendet. Entry-Pause unterbricht Schutz und Exits nicht. Gefüllte TP-Budgets werden nicht aufgefüllt, und ein alter Stop wird erst nach bestätigtem Ersatzschutz entfernt. Widersprüchliche Positions-/Fill-Abfragen halten den bisherigen Schutz; Abweichungen werden nicht als bewiesene manuelle Reduktion verbucht. Nach einem Exit bleibt der Markt reserviert, bis alte eigene Orders nachweislich beendet sind.
 
 Der State bindet Hauptkonto, effektives Handelskonto/Vault und Netzwerk dauerhaft. Für ein anderes Zielkonto einen neuen separaten State verwenden. Pause, Regeln, Quellenfreigabe und Nachrichtenrevision werden unmittelbar vor einem noch ungesendeten Entry erneut geprüft. Das Entfernen einer Quelle stoppt ihre neuen Entries; bestehende Trades werden weiter geschützt. Gespeicherte Close-/Reduktionsabsichten behalten ihre exakte Aktion über einen Neustart hinweg.
 
 Eine Absage eines nachweislich noch ungesendeten Entries bleibt nach Neustart wirksam. Neue Handelsaktionen brauchen die aktuelle auslösende Live-Nachricht; historische Angaben können sie ergänzen. Die frische Kontoantwort muss Positionsfreiheit bestätigen. Für automatische HIP-3-Trades muss das Collateral nachweislich USDC sein. Der vollständige MCP bleibt für andere Collateralverträge verfügbar. Seine Kontoaktionen unterscheiden Principal- und Vault-Scope ausdrücklich; uneindeutige alte Principal-Vault-Vorgänge werden konservativ abgewiesen.
 
-Der native Hermes-Gateway wird im separaten VPS-Prozess auf Dateiverlauf eingestellt; SQLite-Zugriffe sind in diesem Profil deaktiviert. Native Nachrichtenübertragung, Befehle und Agentenlauf bleiben bei Hermes. Kleine lokale JSON/JSONL-Dateien ersetzen keine Börsenbelege.
+Hermes speichert Gespräche separat in `hermes-home/state.db` mit Volltextsuche; frühere JSONL-Verläufe werden importiert. Native Rückfragen, Aufgabenlisten und Gesprächssuche unterstützen Betreiberaufträge. Aktuelle Handelsregeln stammen weiterhin aus `status`. Native Nachrichtenübertragung, Befehle und Agentenlauf bleiben bei Hermes. Details: [Hermes-Werkzeuge und SQLite](docs/hermes-tools-and-storage.md).
 
 Für einen vollständigen Snapshot den Dienst anhalten und den **gesamten Zielordner inklusive Secrets und State** geschützt sichern. Nach Wiederherstellung zuerst Konto, offene Orders, Fills und unklare Operationen abgleichen. Einen alten State nicht zum Freischalten einer unklaren Order zurückspielen. Ein dediziertes API-Wallet je Instanz verwenden.
 

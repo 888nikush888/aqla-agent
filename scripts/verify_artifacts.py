@@ -29,7 +29,7 @@ def main():
             raise SystemExit("VPS archive integrity failed")
         names = archive.namelist()
         verify_names(names)
-        for required in ("README.md", "uv.lock", "config.example.yaml", "hermes-runtime-overrides.txt", "src/aqla_agent/install.py", "src/aqla_sheets_mcp/server.py", "src/aqla_sheets_mcp/parameters.py", "docs/google-sheets.md", "skills/aqla-master/SKILL.md", "hermes_plugin/aqla-events/plugin.yaml", "scripts/verify_artifacts.py", "tests/native_pipeline_smoke.py", "tests/native_lifecycle_smoke.py"):
+        for required in ("README.md", "uv.lock", "config.example.yaml", "hermes-runtime-overrides.txt", "src/aqla_agent/install.py", "src/aqla_agent/session_history.py", "src/aqla_hyperliquid_mcp/storage.py", "src/aqla_sheets_mcp/server.py", "src/aqla_sheets_mcp/parameters.py", "docs/google-sheets.md", "docs/hermes-tools-and-storage.md", "skills/aqla-master/SKILL.md", "hermes_plugin/aqla-events/plugin.yaml", "scripts/verify_artifacts.py", "tests/native_pipeline_smoke.py", "tests/native_lifecycle_smoke.py", "tests/native_interaction_smoke.py"):
             if "aqla-agent/" + required not in names:
                 raise SystemExit("Missing VPS asset: " + required)
         if len(archive.read("aqla-agent/skills/aqla-master/SKILL.md")) > 8192:

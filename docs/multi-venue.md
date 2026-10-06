@@ -1,6 +1,6 @@
 # Profile, Pipelines und Börsen
 
-Der gemeinsame Python-Handelskern läuft mit je einem Konto auf Hyperliquid, Aster und Lighter. Der native Hermes-Bot ist der einzige Bedienweg. Es gibt keine neue Bot-Anbindung, Datenbank oder unabhängige Ausführungsschleife. Das vorhandene JSON bleibt der einzige Writer; jede Börse erhält darin eine gefilterte Sicht auf ihre Trades, Bindungen, Operationen und Nonces.
+Der gemeinsame Python-Handelskern läuft mit je einem Konto auf Hyperliquid, Aster und Lighter. Der native Hermes-Bot ist der einzige Bedienweg. Es gibt keine neue Bot-Anbindung oder unabhängige Ausführungsschleife. SQLite hält den gemeinsamen Zustand mit genau einem Schreibprozess; jede Börse erhält darin eine gefilterte Sicht auf ihre Trades, Bindungen, Operationen und Nonces.
 
 ## Bedienung
 

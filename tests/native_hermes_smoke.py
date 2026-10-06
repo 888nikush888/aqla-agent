@@ -163,7 +163,7 @@ def main():
 
     configuration = GatewayConfig()
     runner = GatewayRunner(configuration)
-    assert runner._session_db is None
+    assert runner._session_db is not None
     from gateway.run import _await_thread_exit, _start_gateway_start_cron_and_housekeeping
     stop, provider, cron_thread, housekeeping_thread = _start_gateway_start_cron_and_housekeeping(runner)
     assert provider is None and cron_thread is None and housekeeping_thread is None
@@ -175,11 +175,12 @@ def main():
     entry = store.get_or_create_session(source)
     message = {"role": "user", "content": "Hallo", "message_id": "1", "display_metadata": {"gateway_input_owner": "native-input"}}
     store.append_to_transcript(entry.session_id, message)
-    assert store.load_transcript(entry.session_id)[-1] == message
+    loaded = store.load_transcript(entry.session_id)[-1]
+    assert loaded['content'] == message['content'] and loaded['message_id'] == '1'
     assert store.has_input_owner(entry.session_id, "native-input")
     assert store.transcript_tail_role(entry.session_id) == "user"
     restored = SessionStore(home / "sessions", configuration)
-    assert restored.load_transcript(entry.session_id)[-1] == message
+    assert restored.load_transcript(entry.session_id)[-1]['content'] == message['content']
 
     class Bot:
         def __init__(self):
@@ -196,10 +197,12 @@ def main():
     assert len(adapter._bot.registered) == 3
     assert all(commands for commands, _ in adapter._bot.registered)
     asyncio.run(verify_native_ingress(home, runner))
-    assert not list(home.rglob("*.db"))
-    assert not list(home.rglob("*-wal"))
+    assert (home / "state.db").is_file()
+    from tools.session_search_tool import session_search
+    result = json.loads(session_search(query="Hallo", db=store._db))
+    assert result.get('success') is not False, result
     undo()
-    print(json.dumps({"native_session": True, "restart_history": True, "database_files": 0, "native_commands_preserved": True, "command_scopes_registered": 3, "native_ingress_batches_isolated": True}))
+    print(json.dumps({"native_session": True, "restart_history": True, "native_sqlite_search": True, "native_commands_preserved": True, "command_scopes_registered": 3, "native_ingress_batches_isolated": True}))
 
 
 if __name__ == "__main__":

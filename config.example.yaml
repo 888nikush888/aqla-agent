@@ -2,7 +2,7 @@
 network: testnet
 account: "0x0000000000000000000000000000000000000000"
 signer_role: api_wallet
-state_path: data/state.json
+state_path: data/state.sqlite3
 private_key_file: secrets/hyperliquid.secret
 integration_key_file: secrets/integration.secret
 sources: []
