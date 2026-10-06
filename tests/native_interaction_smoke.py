@@ -40,6 +40,7 @@ def main():
     from aqla_hyperliquid_mcp.models import Settings
 
     legacy=Conversations(home/'sessions/transcripts')
+    legacy.append('legacy_owner',{'role':'session_meta','model':'original-model','platform':'telegram','timestamp':'2026-10-03T18:15:00Z','tools':['todo_list']})
     legacy.append('legacy_owner',{'role':'user','content':'KriteriumCrossMargin war eine bewusste Einstellung.','message_id':'42','display_metadata':{'gateway_input_owner':'legacy-owner'}})
     original=legacy.path('legacy_owner').read_bytes()
     assert migrate_session_history(home)=={'imported':1,'skipped':0,'messages':1}
@@ -50,6 +51,9 @@ def main():
     try:
         found=json.loads(session_search(query='KriteriumCrossMargin',db=db))
         assert 'legacy_owner' in json.dumps(found),found
+        assert db.get_session('legacy_owner')['model']=='original-model'
+        imported_header=db._read_one('SELECT source_metadata FROM aqla_jsonl_imports WHERE session_id=?',('legacy_owner',))
+        assert json.loads(imported_header[0])['tools']==['todo_list']
         db.create_session('planning','telegram')
         todo=TodoStore()
         planned=todo_tool(todos=[{'id':'profile-a','content':'Profil A anlegen','status':'in_progress'},{'id':'pipeline','content':'Pipeline prüfen','status':'pending'}],store=todo)

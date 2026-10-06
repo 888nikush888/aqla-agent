@@ -20,7 +20,10 @@ def migrate_session_history(home: Path, *, db=None):
         db = SessionDB(db_path=home / "state.db")
     try:
         db._execute_write(lambda connection: connection.execute(
-            "CREATE TABLE IF NOT EXISTS aqla_jsonl_imports (session_id TEXT PRIMARY KEY, source_sha256 TEXT NOT NULL, imported_messages INTEGER NOT NULL)"))
+            "CREATE TABLE IF NOT EXISTS aqla_jsonl_imports (session_id TEXT PRIMARY KEY, source_sha256 TEXT NOT NULL, imported_messages INTEGER NOT NULL, source_metadata TEXT NOT NULL DEFAULT '{}')"))
+        if "source_metadata" not in {row[1] for row in db._read_all("PRAGMA table_info(aqla_jsonl_imports)")}:
+            db._execute_write(lambda connection: connection.execute(
+                "ALTER TABLE aqla_jsonl_imports ADD COLUMN source_metadata TEXT NOT NULL DEFAULT '{}'"))
         routing_path = home / "sessions" / "sessions.json"
         routing = json.loads(routing_path.read_text(encoding="utf-8")) if routing_path.is_file() else {}
         entries = {value["session_id"]: value for value in routing.values()
@@ -35,6 +38,11 @@ def migrate_session_history(home: Path, *, db=None):
                 result["skipped"] += 1
                 continue
             rows = reader.load(session_id)
+            header = {}
+            if rows and isinstance(rows[0], dict) and rows[0].get("role") == "session_meta":
+                header = rows.pop(0)
+                if set(header) - {"role", "tools", "model", "platform", "timestamp"}:
+                    raise ValueError("Unknown legacy session metadata; original file is preserved")
             for row in rows:
                 if not isinstance(row, dict) or row.get("role") not in ("user", "assistant", "tool", "system"):
                     raise ValueError("Invalid legacy transcript; original file is preserved")
@@ -42,29 +50,30 @@ def migrate_session_history(home: Path, *, db=None):
                     row["platform_message_id"] = str(row["message_id"])
             entry = entries.get(session_id, {})
             source = entry.get("source") or {}
-            started = entry.get("created_at")
+            started = entry.get("created_at") or header.get("timestamp")
             if isinstance(started, str):
                 started = datetime.fromisoformat(started).timestamp()
-            payload = {"id": session_id, "source": source.get("platform", "telegram"),
+            payload = {"id": session_id, "source": source.get("platform") or header.get("platform") or "telegram",
                        "started_at": started, "chat_id": str(source.get("chat_id", "")),
                        "user_id": str(source.get("user_id", "")), "title": "Aqla Telegram-Verlauf",
-                       "messages": rows}
+                       "model": header.get("model"), "messages": rows}
             normalized, errors = db._validate_import_payload([payload])
             if errors:
                 raise ValueError("Legacy history failed native import validation; original file is preserved")
             item = normalized[0]
             fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
             count = len(rows)
+            metadata = json.dumps(header, ensure_ascii=False, allow_nan=False)
 
-            def import_one(connection, session_id=session_id, item=item, fingerprint=fingerprint, count=count):
+            def import_one(connection, session_id=session_id, item=item, fingerprint=fingerprint, count=count, metadata=metadata):
                 if connection.execute("SELECT 1 FROM aqla_jsonl_imports WHERE session_id = ?", (session_id,)).fetchone():
                     return False
                 exists = connection.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone()
                 if not exists:
                     db._import_session_row(connection, item["session"], item["messages"], session_id)
                 # Same transaction as message import; also prevents resurrection after user deletion.
-                connection.execute("INSERT INTO aqla_jsonl_imports VALUES (?, ?, ?)",
-                                   (session_id, fingerprint, count if not exists else 0))
+                connection.execute("INSERT INTO aqla_jsonl_imports (session_id,source_sha256,imported_messages,source_metadata) VALUES (?, ?, ?, ?)",
+                                   (session_id, fingerprint, count if not exists else 0, metadata))
                 return not exists
 
             imported = db._execute_write(import_one)
