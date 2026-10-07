@@ -19,7 +19,12 @@ async def opened(setup, signal):
     state.update(lambda data:data['source_names'].update({'channel':'VIP Gold'}))
     plan=await trading.preview(source.event_id,value)
     await trading.execute(plan['plan_id'])
-    return state.snapshot()
+    result = state.snapshot()
+    # Existing status-card coverage uses legacy notifications; immutable lifecycle
+    # cards have separate rapid-entry/exit tests.
+    trade = next(iter(result['trades'].values()))
+    result['notifications'] = {'legacy-open': {'trade_id': trade['trade_id'], 'change': {'status': 'open'}, 'previous': {'status': 'opening'}}}
+    return result
 
 
 def test_view_is_pure_and_opening_has_only_confirmed_values(opened):

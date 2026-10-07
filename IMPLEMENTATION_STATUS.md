@@ -1,5 +1,12 @@
 # aqla Agent — Auslieferungsstand
 
+## Verzögerte Einstiege und getrennte Ereignisse (07.10.2026)
+
+- Belegpflichtiges `entry_timing=deferred` und `source_exchange`; lokale, dauerhaft gespeicherte Entry-Reservierungen mit Annäherungsrichtung, Ablauf, Pause und Wiederanlauf. Ein zukünftiger SL wird erst beim tatsächlichen Einstieg gegen die Zielbörse geprüft.
+- Frische Bid-/Ask-/Triggerreferenz-Snapshots für Hyperliquid, Aster und Lighter. Erneute Preis-/Konto-/Budgetprüfung vor Versand sowie tatsächliche Entry-Prüfung nach Fills; belegte Abbrüche vor Versand bleiben `not_sent` statt einer unbekannten Ausführung.
+- Unveränderliche Entry-/Schließungsereignisse und chronologische Telegram-Karten, auch bei einem sofortigen SL-Exit. Schutzbestätigung prüft die tatsächliche Reduce-only-Triggerorder. Lesendes `trade_diagnostics` liefert Original, Wire-Orderart, Fills, Preisprüfungen und Schließungsgrund.
+- Regressionen für den LINK-Vorfall, Long/Short, Kurslücken, Teilfills, Preisalter, Datenfehler, verlorene Antworten und unabhängige Pipelineziele. Alte IDs, Historie und abgeschlossene Signale werden nicht erneut ausgeführt oder ungefragt nachgemeldet.
+
 ## Monatsberichte mit ROE (07.10.2026)
 
 - Lesendes `monthly_report` mit begrenzten Seiten, vollständigen Summen, Ausschluss unvollständiger Ergebnisse und separaten offenen/undatierten Trades. Aqla-Mainnet-Abschlüsse werden einmal im belegten Schließmonat ausgewertet.

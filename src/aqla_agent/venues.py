@@ -53,7 +53,7 @@ class VenueAdapter:
             raise AqlaError("Resolve the immutable native market before signing")
         return row
 
-    async def mutate(self, operation_id, action, *, deadline=None, prepare_guard=None):
+    async def mutate(self, operation_id, action, *, deadline=None, prepare_guard=None, async_prepare_guard=None):
         async with self.mutations:
             request = {"network": self.settings.network, "account": self.account, "action": action, "deadline": deadline}
             existing = self.state.snapshot()["operations"].get(operation_id)
@@ -64,6 +64,8 @@ class VenueAdapter:
             if deadline is not None and now_ms() >= deadline:
                 raise AqlaError("Entry deadline expired before signing")
             await self.verify_signer()
+            if async_prepare_guard:
+                await async_prepare_guard()
             signed = await self.build_requests(action, deadline)
             record = {"operation_id": operation_id, "exchange": self.settings.venue, "request": request, "request_hash": digest(request),
                       "wire_action": copy.deepcopy(action), "nonce": signed[0]["nonce"] if signed else 0,
@@ -77,7 +79,28 @@ class VenueAdapter:
                 self.state.assert_operation_binding(self.settings, record)
                 data["operations"][operation_id] = record
             self.state.update(prepare)
-            self.state.update(lambda data: data["operations"][operation_id].update(phase="sending"))
+            if async_prepare_guard:
+                try:
+                    await async_prepare_guard()
+                except BaseException as error:
+                    message = str(error) if isinstance(error, AqlaError) else "Entry guard failed before any exchange send"
+                    self.state.update(lambda data: data["operations"][operation_id].update(phase="rejected", outcome="not_sent", result={"error": message}))
+                    if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                        raise
+                    return self.state.snapshot()["operations"][operation_id]
+            try:
+                def begin_send(data):
+                    self.state.assert_operation_binding(self.settings, record)
+                    if prepare_guard:
+                        prepare_guard(data)
+                    if deadline is not None and now_ms() >= deadline:
+                        raise AqlaError("Entry deadline expired before exchange send")
+                    data["operations"][operation_id].update(phase="sending")
+                self.state.update(begin_send)
+            except AqlaError as error:
+                message = str(error)
+                self.state.update(lambda data: data["operations"][operation_id].update(phase="rejected", outcome="not_sent", result={"error": message}))
+                return self.state.snapshot()["operations"][operation_id]
             try:
                 responses = []
                 for item in signed:

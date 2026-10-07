@@ -48,6 +48,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
 
     async def maintenance():
         while True:
+            started = asyncio.get_running_loop().time()
             try:
                 async with trading.lock:
                     reports = await trading.recover()
@@ -59,7 +60,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 # Native logging only; no second Telegram sender and no resubmission.
                 import logging
                 logging.getLogger(__name__).warning("Trade reconciliation unavailable; new entries remain gated")
-            await asyncio.sleep(10)
+            await asyncio.sleep(max(0.1, 10 - (asyncio.get_running_loop().time() - started)))
 
     @asynccontextmanager
     async def lifespan(_):
@@ -132,6 +133,35 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         totals = {key: len(report[key]) for key in ("rows", "open_trades", "undated_closed_trades")}
         return {**report, **{key: report[key][offset:offset + limit] for key in totals},
                 "page": {"offset": offset, "limit": limit, "totals": totals}}
+
+    @server.tool(annotations=read)
+    async def trade_diagnostics(trade_id: str | None = None, symbol: str | None = None) -> dict:
+        """Read source, exact sent order type, own fills, price checks and proved closure reason, including closed trades."""
+        from aqla_agent.lifecycle import close_reason
+        snapshot = state.snapshot()
+        if trade_id is None:
+            if not symbol:
+                raise AqlaError("Supply an Aqla trade ID or a market symbol")
+            candidates = [row for row in snapshot["trades"].values() if row["plan"]["market"]["symbol"].casefold() == symbol.casefold()]
+            candidates.sort(key=lambda row: (row.get("closed_at", row["plan"]["created_at"]), row["trade_id"]), reverse=True)
+            if len(candidates) != 1:
+                return {"candidates": [{"trade_id": row["trade_id"], "market": row["plan"]["market"]["symbol"], "status": row["status"], "created_at": row["plan"]["created_at"], "closed_at": row.get("closed_at")} for row in candidates[:20]],
+                        "selection_required": True}
+            trade_id = candidates[0]["trade_id"]
+        trade = snapshot["trades"].get(trade_id)
+        if trade is None:
+            raise AqlaError("Unknown Aqla trade ID")
+        operations = [trading.public_operation(row) for row in snapshot["operations"].values()
+                      if trade_id in row["operation_id"]]
+        return {"trade_id": trade_id, "status": trade["status"], "plan": trade["plan"],
+                "sources": [row["source"] for row in snapshot["events"].values() if row["source_id"] in trade["plan"]["source_refs"]],
+                "source_names": snapshot.get("source_names", {}), "orders": trade["orders"], "exit_orders": trade.get("exit_orders", []),
+                "order_observations": trade.get("order_observations", {}), "fill_events": trade.get("fill_events", {}),
+                "entry_vwap": trade.get("entry_vwap"), "entry_accounting": trade.get("entry_accounting"),
+                "price_checks": trade.get("price_checks", []), "waiting_snapshot": trade.get("waiting_snapshot"),
+                "waiting_error": trade.get("waiting_error"), "unsent_reason": trade.get("unsent_reason"),
+                "close_reason": trade.get("close_reason", close_reason(trade)), "lifecycle_events": trade.get("lifecycle_events", {}),
+                "operations": operations, "historical_missing_quotes_are_not_inferred": True}
 
     @server.tool(annotations=read)
     async def source_context(event_id: str) -> dict:

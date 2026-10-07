@@ -7,7 +7,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 import httpx
 
-from aqla_hyperliquid_mcp.models import AqlaError, Market
+from aqla_hyperliquid_mcp.models import AqlaError, Market, now_ms
 
 from .venues import VenueAdapter
 
@@ -31,6 +31,45 @@ def integer_price(value, step):
 
 
 class Lighter(VenueAdapter):
+    async def price_snapshot(self, market):
+        from .entry import PriceSnapshot
+        started = now_ms()
+        # Explicitly timestamped REST responses can be used; missing mark price or
+        # timestamps require the exchange's fresh public WebSocket snapshots.
+        raw = await self.read("orderBookDetails", {"market_id": market.asset_id})
+        row = next((row for row in raw.get("order_book_details", []) if row["market_id"] == market.asset_id), None)
+        if row and all(row.get(key) is not None for key in ("mark_price", "timestamp", "best_bid", "best_ask")):
+            bid, ask = Decimal(row["best_bid"]), Decimal(row["best_ask"])
+            return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
+                                 stop_reference=row["mark_price"], stop_reference_kind="mark", exchange_time=row["timestamp"],
+                                 started_at=started, observed_at=now_ms()).fresh()
+        import websockets
+        url = BASE_URLS[self.settings.network].replace("https://", "wss://") + "/stream"
+        async with asyncio.timeout(2):
+            async with websockets.connect(url, open_timeout=2, max_size=1_000_000) as socket:
+                for channel in ("market_stats", "order_book"):
+                    await socket.send(json.dumps({"type": "subscribe", "channel": f"{channel}/{market.asset_id}"}))
+                frames = {}
+                for _ in range(20):
+                    frame = json.loads(await socket.recv())
+                    if frame.get("type") == "ping":
+                        await socket.send(json.dumps({"type": "pong"}))
+                        continue
+                    kind = frame.get("type", "").removeprefix("subscribed/")
+                    if kind in ("market_stats", "order_book") and frame.get("channel") in (f"{kind}:{market.asset_id}", f"{kind}/{market.asset_id}"):
+                        frames[kind] = frame
+                    if set(frames) == {"market_stats", "order_book"}:
+                        stats = frames["market_stats"]["market_stats"]
+                        stats = stats.get(str(market.asset_id), stats)
+                        book = frames["order_book"]["order_book"]
+                        bid, ask = Decimal(book["bids"][0]["price"]), Decimal(book["asks"][0]["price"])
+                        timestamp = min(frames["order_book"]["timestamp"], frames["market_stats"]["timestamp"])
+                        timestamp = timestamp * 1000 if timestamp < 10**12 else timestamp
+                        return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
+                                             stop_reference=stats["mark_price"], stop_reference_kind="mark", exchange_time=timestamp,
+                                             started_at=started, observed_at=now_ms()).fresh()
+        raise AqlaError("Lighter has no fresh timestamped mark-price/order-book pair")
+
     async def funding_payments(self, market, start, end):
         from .funding import lighter_funding
         return await lighter_funding(self, market, start, end)

@@ -47,7 +47,9 @@ class AsterBoundary:
         elif path == "leverageBracket":
             result = [{"brackets": [{"initialLeverage": 20}]}]
         elif path == "price":
-            result = {"price": "100"}
+            result = {"symbol": "BTCUSDT", "price": "100", "time": time.time_ns() // 1_000_000}
+        elif path == "bookTicker":
+            result = {"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "100", "time": time.time_ns() // 1_000_000}
         elif path == "leverage":
             self.leverage = int(parameters["leverage"])
             result = {"leverage": self.leverage, "symbol": "BTCUSDT"}

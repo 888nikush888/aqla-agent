@@ -52,6 +52,21 @@ def wire_number(value) -> str:
 
 
 class Hyperliquid:
+    async def price_snapshot(self, market):
+        from aqla_agent.entry import PriceSnapshot
+        started = now_ms()
+        raw = await self.info("metaAndAssetCtxs", **({"dex": market.dex} if market.dex else {}))
+        context = next((context for item, context in zip(raw[0]["universe"], raw[1], strict=True) if item["name"] == market.symbol), None)
+        if context is None:
+            raise AqlaError("Target market has no verified mark-price context")
+        book = await self.info("l2Book", coin=market.symbol)
+        if book.get("coin") != market.symbol or not all(book.get("levels", [])):
+            raise AqlaError("Target market has no executable order book")
+        bid, ask = Decimal(book["levels"][0][0]["px"]), Decimal(book["levels"][1][0]["px"])
+        return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
+                             stop_reference=context["markPx"], stop_reference_kind="mark", exchange_time=book["time"],
+                             started_at=started, observed_at=now_ms()).fresh()
+
     async def funding_payments(self, market, start, end):
         from aqla_agent.funding import hyperliquid_funding
         return await hyperliquid_funding(self, market, start, end)
@@ -346,7 +361,28 @@ class Hyperliquid:
                     raise AqlaError("Operation deadline has expired before preparation")
                 state["operations"][operation_id] = record
             self.state.update(prepare)
-            self.state.update(lambda state: state["operations"][operation_id].update(phase="sending"))
+            if async_prepare_guard is not None:
+                try:
+                    await async_prepare_guard()
+                except BaseException as error:
+                    message = str(error) if isinstance(error, AqlaError) else "Entry guard failed before any exchange send"
+                    self.state.update(lambda state: state["operations"][operation_id].update(phase="rejected", outcome="not_sent", result={"error": message}))
+                    if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                        raise
+                    return self.state.snapshot()["operations"][operation_id]
+            try:
+                def begin_send(state):
+                    self.state.assert_operation_binding(self.settings, record)
+                    if prepare_guard is not None:
+                        prepare_guard(state)
+                    if deadline is not None and now_ms() >= deadline:
+                        raise AqlaError("Entry deadline expired before exchange send")
+                    state["operations"][operation_id].update(phase="sending")
+                self.state.update(begin_send)
+            except AqlaError as error:
+                message = str(error)
+                self.state.update(lambda state: state["operations"][operation_id].update(phase="rejected", outcome="not_sent", result={"error": message}))
+                return self.state.snapshot()["operations"][operation_id]
             try:
                 if sender is None:
                     response = await self.client.post("/exchange", json=payload)

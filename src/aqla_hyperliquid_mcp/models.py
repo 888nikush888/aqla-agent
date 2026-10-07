@@ -10,7 +10,15 @@ from typing import Annotated, Literal
 
 import yaml
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 Positive = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 Nonnegative = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
@@ -189,6 +197,8 @@ class Interpretation(Model):
     leverage: Annotated[Decimal, Field(ge=1, allow_inf_nan=False)] | None = Field(default=None,
         description="Original evidenced signal leverage, including decimals. Python floors then caps it. Null only when absent; never round before quoting evidence.")
     entry: Literal["market", "limit", "range", "unspecified"] = "unspecified"
+    entry_timing: Literal["standard", "deferred"] = Field(default="standard", description="Explicitly delayed/not-now entry intent requires entry_timing evidence and a source price; Python waits, never substitute an immediate GTC order.")
+    source_exchange: str | None = Field(default=None, min_length=1, max_length=100, description="Evidenced exchange named by the source. Metadata only; the operator pipeline chooses the execution exchange.")
     entry_prices: list[Positive] = Field(default_factory=list, max_length=2)
     stop_loss: Positive | None = None
     take_profits: list[Positive] = Field(default_factory=list, max_length=20)
@@ -197,6 +207,21 @@ class Interpretation(Model):
     bound_trade_id: str | None = None
     evidence: list[Evidence] = Field(default_factory=list, max_length=60)
     reason: str = Field(default="", max_length=2000)
+
+    @model_serializer(mode="wrap")
+    def compatible_entry_fields(self, handler):
+        result = handler(self)
+        if self.entry_timing == "standard":
+            result.pop("entry_timing", None)
+        if self.source_exchange is None:
+            result.pop("source_exchange", None)
+        return result
+
+    @model_validator(mode="after")
+    def deferred_has_price(self):
+        if self.entry_timing == "deferred" and (self.entry not in ("limit", "range") or not self.entry_prices):
+            raise ValueError("Deferred entry requires an explicit source limit or range")
+        return self
 
     @field_validator("leverage", mode="before")
     @classmethod
@@ -306,6 +331,9 @@ class TradePlan(Model):
     market: Market
     side: Literal["long", "short"]
     entry_kind: Literal["market", "limit"]
+    entry_timing: Literal["standard", "deferred"] = "standard"
+    source_exchange: str | None = None
+    entry_gate: dict | None = None
     entry_price: Positive
     entry_limit: Positive
     stop_loss: Positive
@@ -321,6 +349,17 @@ class TradePlan(Model):
     profile_id: str | None = None
     profile_revision: int | None = None
     pipeline_revision: int | None = None
+
+    @model_serializer(mode="wrap")
+    def compatible_entry_fields(self, handler):
+        result = handler(self)
+        if self.entry_timing == "standard":
+            result.pop("entry_timing", None)
+        if self.source_exchange is None:
+            result.pop("source_exchange", None)
+        if self.entry_gate is None:
+            result.pop("entry_gate", None)
+        return result
 
     @model_validator(mode="after")
     def leverage_consistent(self):

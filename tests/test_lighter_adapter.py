@@ -91,7 +91,8 @@ class Boundary:
         elif path == "orderBookDetails":
             result = {"code": 200, "order_book_details": [{"symbol": "BTC", "market_id": 1, "status": "active", "market_type": "perp", "multiplier": "1.000000000000000000",
                                                            "supported_size_decimals": 2, "supported_price_decimals": 1, "min_base_amount": "0.01", "min_quote_amount": "10",
-                                                           "mark_price": "100", "last_trade_price": "100", "min_initial_margin_fraction": 500}]}
+                                                           "mark_price": "100", "last_trade_price": "100", "min_initial_margin_fraction": 500,
+                                                           "timestamp": time.time_ns() // 1_000_000, "best_bid": "100", "best_ask": "100"}]}
         elif path == "account":
             result = {"code": 200, "accounts": [{"index": 42, "total_asset_value": "10000", "available_balance": "10000", "positions": [{"symbol": "BTC", "position": str(abs(self.position)), "sign": 1 if self.position >= 0 else -1, "avg_entry_price": "100"}]}]}
         elif path in ("sendTx", "sendTxBatch"):

@@ -12,6 +12,8 @@ Eigenständiges Python-Projekt. Ein eigener Hyperliquid-MCP, ein kurzer bearbeit
 
 Telegram-Handelsmeldungen verwenden kompakte, aus gespeicherten Fakten erzeugte Vorlagen mit getrennten Börsenergebnissen, bestätigten Preisen und klaren Statusüberschriften. [Nachrichtenansichten](docs/telegram-messages.md).
 
+Ausdrücklich verzögerte Entries warten im lokalen Zustand auf ihren belegten Einstieg. Frische ausführbare Kurse und die native SL-Triggerreferenz werden vor Versand und nach Fills geprüft. Einstieg und Schließung bleiben als getrennte Ereignisse sichtbar; `trade_diagnostics` erklärt auch geschlossene Trades anhand ihrer tatsächlichen Orders und Fills. [Verzögerte Entries und Diagnose](docs/deferred-entries.md).
+
 Monatsberichte zeigen jeden vollständig geschlossenen Aqla-Mainnet-Trade, belegten Netto-PnL einschließlich Gebühren/Funding und ROE auf die berechnete Anfangsmargin. Vollständige Trade-ROEs werden arithmetisch addiert, Geldbeträge je Währung getrennt. Die Tabelle liegt in Sheets, die Zusammenfassung kommt am Folgemonatsersten um 09:00 Europe/Berlin über Hermes. Erster regulärer Bericht: Oktober 2026. [Berechnung, Datenlücken und Bedienung](docs/monthly-reports.md).
 
 ## Unabhängig auf einem VPS installieren

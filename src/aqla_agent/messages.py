@@ -116,6 +116,8 @@ def trade_block(data, trade, notices):
         title = "⏳ **Schließung wird abgeglichen**"
     elif stage in ("closed", "cancelled", "rejected"):
         title = {"closed": "🏁 **Trade geschlossen**", "cancelled": "⚪ **Entry storniert**", "rejected": "⚠️ **Trade abgelehnt**"}[stage]
+    elif stage == "waiting_entry":
+        title = "🕓 **Warte auf Einstieg**"
     elif filled == 0:
         title = "🕓 **Entry wartet**"
     elif planned and filled < planned:
@@ -165,6 +167,8 @@ def trade_block(data, trade, notices):
         if "remaining_quantity" in changes and filled:
             lines.append(f"**Position verbleibend:** {number((decimal(trade.get('remaining_quantity')) or 0) / filled * 100)} %")
     if stage == "closed":
+        from .lifecycle import close_reason
+        lines.append("**Grund:** " + literal(trade.get("close_reason", close_reason(trade))["label"]))
         result = pnl(trade)
         if result is not None:
             lines.append(f"**Netto vor Funding:** {number(result)} {quote}")
@@ -174,6 +178,36 @@ def trade_block(data, trade, notices):
         lines.append("**Grund:** " + literal(ERRORS.get(trade["unsent_reason"], trade["unsent_reason"])))
     if trade.get("external_conflict"):
         lines.append("**Verwaltung angehalten:** " + literal(trade['external_conflict']))
+    return "\n\n".join(lines)
+
+
+def lifecycle_block(data, event):
+    trade = event["facts"]
+    plan = trade["plan"]
+    if event["kind"] == "closed":
+        return trade_block(data, trade, [{"change": {"status": "closed"}}])
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    time = datetime.fromtimestamp(event["time"] / 1000, ZoneInfo("Europe/Berlin")).strftime("%d.%m.%Y %H:%M:%S")
+    title = literal(plan["market"]["symbol"]) + " " + ("LONG" if plan["side"] == "long" else "SHORT")
+    quote = literal(plan["market"].get("quote_token", "USDC"))
+    protected = trade.get("entry_stop_confirmed", False)
+    planned = decimal(plan["quantity"])
+    partial = planned and decimal(trade["filled_quantity"]) < planned
+    lines = ["✅ **Einstieg ausgeführt** · " + title, context(data, plan), "**Ausführung:** " + time + " · Berlin",
+             "**Entry realisiert:** " + number(trade["entry_vwap"]) + " " + quote + " · **Hebel:** " + number(plan["effective_leverage"]) + "×",
+             "**Menge:** " + number(trade["filled_quantity"]) + (" · Teilfill" if partial else ""),
+             "**SL vorgesehen:** " + number(trade["stop_price"]) + " " + quote,
+             "**Schutz:** " + ("bestätigt" if protected else "zum Belegzeitpunkt nicht bestätigt")]
+    if plan.get("source_exchange"):
+        lines.append("**Signalbörse:** " + literal(plan["source_exchange"]))
+    targets = trade.get("targets", plan.get("take_profits", []))
+    budgets = trade.get("target_budgets") or plan.get("tp_quantities", [])
+    total = sum((decimal(value) or Decimal(0) for value in budgets), Decimal(0))
+    if targets:
+        lines.append("**Ziele vorgesehen · Positionsanteil**\n" + "\n".join(
+            f"TP{index + 1}: {number(price)} {quote}" + (" · " + number((decimal(budgets[index]) or 0) / total * 100) + " %" if total and index < len(budgets) else "")
+            for index, price in enumerate(targets)))
     return "\n\n".join(lines)
 
 
@@ -223,7 +257,9 @@ def monthly_message(report):
 def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
     notifications = data.get("notifications", {})
     # Urgent protection notices are independent of signal batching.
-    chosen = [identity for _, identity in sorted(enumerate(notifications), key=lambda item: (not item[1].startswith("protection:"), item[0]))][:MAX_NOTIFICATIONS]
+    chosen = [identity for _, identity in sorted(enumerate(notifications), key=lambda item: (
+        not item[1].startswith("protection:"), notifications[item[1]].get("lifecycle", {}).get("time", notifications[item[1]].get("observed_at", 0)),
+        notifications[item[1]].get("lifecycle", {}).get("kind") == "closed", item[0]))][:MAX_NOTIFICATIONS]
     groups = {}
     for identity in chosen:
         notice = notifications[identity]
@@ -233,6 +269,8 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
             key = ("monthly", identity)
         elif identity.startswith("protection:"):
             key = ("urgent", identity)
+        elif notice.get("lifecycle"):
+            key = ("lifecycle", notice["lifecycle"]["kind"], tuple(sorted(trade["plan"].get("source_refs", [trade["trade_id"]]))))
         elif trade:
             key = ("signal", tuple(sorted(trade["plan"].get("source_refs", [trade["trade_id"]]))))
         else:
@@ -245,6 +283,11 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
     messages = []
     for key, items in groups.items():
         ids = [row[0] for row in items]
+        if key[0] == "lifecycle":
+            blocks = ["**Quelle:** " + source_name(data, items[0][2]["chat_id"])]
+            blocks += [lifecycle_block(data, row[1]["lifecycle"]) for row in items]
+            messages.append({"notification_ids": ids, "severity": "normal", "texts": split_blocks("\n\n".join(blocks))})
+            continue
         if key[0] == "monthly":
             messages.append({"notification_ids": ids, "severity": "normal", "texts": split_blocks(monthly_message(items[0][1]["monthly_report"]))})
             continue

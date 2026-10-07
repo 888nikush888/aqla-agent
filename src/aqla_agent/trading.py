@@ -31,8 +31,9 @@ from aqla_hyperliquid_mcp.rules import (
 from aqla_hyperliquid_mcp.state import State
 
 from .accounting import foreign_entry_orders, occupied_markets
+from .entry import execution_limit, gate_state, validate_entry_prices
 
-OPEN = {"preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
+OPEN = {"waiting_entry", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
 UNFINISHED = {"pending", "interpreted", "needs_reconciliation"}
 
 
@@ -187,6 +188,12 @@ class Trading:
                          principal=self.exchange.settings.account.lower(), backup=backup,
                          backup_revision=backup_profile["revision"] if backup_profile else None)
         plan.source_revisions = self.source_revisions(snapshot, interpretation.source_refs)
+        quote = await self.exchange.price_snapshot(market)
+        if plan.entry_timing == "deferred":
+            plan.entry_gate.update(origin_mid=str(quote.mid), direction="down" if quote.mid > plan.entry_price else "up" if quote.mid < plan.entry_price else "at_entry",
+                                   origin_snapshot=quote.model_dump(mode="json"))
+        else:
+            validate_entry_prices(plan, quote)
         if hasattr(self.state, "stamp_plan"):
             self.state.stamp_plan(plan)
         plan.plan_id = digest(plan.model_dump(mode="json", exclude={"plan_id"}))
@@ -207,7 +214,7 @@ class Trading:
                 or plan.principal not in (None, self.exchange.settings.account.lower())):
             raise AqlaError("Saved plan belongs to another trading target or network")
 
-    def validate_admission(self, snapshot, plan, account=None, *, owned=False):
+    def validate_admission(self, snapshot, plan, account=None, *, owned=False, allowed_prepared=()):
         self.assert_plan_binding(snapshot, plan)
         if plan.backup_fields and snapshot["profiles"]["backup"]["revision"] != plan.backup_profile_revision:
             raise AqlaError("Backup profile changed; create a new unsent plan")
@@ -235,7 +242,8 @@ class Trading:
             binding = snapshot["bindings"].get(ref)
             if binding and (not owned or binding["trade_id"] != plan.trade_id):
                 raise AqlaError("Source has already been consumed")
-        if any(row["phase"] in ("prepared", "sending", "unknown") for row in snapshot["operations"].values()):
+        if any(row["phase"] in ("prepared", "sending", "unknown") and not (identity in allowed_prepared and row["phase"] == "prepared")
+               for identity, row in snapshot["operations"].items()):
             raise AqlaError("Unresolved exchange operations must be reconciled before new exposure")
         if account is not None:
             reserved = sum(Decimal(trade["reserved_risk"]) for trade in active)
@@ -303,8 +311,12 @@ class Trading:
             if plan.effective_leverage > current_market.max_leverage:
                 raise AqlaError("Exchange leverage limit decreased after preview; create a new unsent plan")
             account = await self.exchange.account_snapshot(plan.market)
+            quote = await self.exchange.price_snapshot(plan.market)
+            if plan.entry_timing == "standard":
+                validate_entry_prices(plan, quote)
             trade = {"trade_id": plan.trade_id, "chat_id": snapshot["events"][saved["event_id"]]["source"]["chat_id"],
-                     "plan": plan.model_dump(mode="json"), "event_id": saved["event_id"], "status": "preparing",
+                     "plan": plan.model_dump(mode="json"), "event_id": saved["event_id"], "status": "waiting_entry" if plan.entry_timing == "deferred" else "preparing",
+                     "lifecycle_version": 1, "lifecycle_events": {}, "price_checks": [{"phase": "admission", "snapshot": quote.model_dump(mode="json")}],
                      "reserved_risk": str(plan.risk_usdc), "entry_operation_id": "entry:" + plan.trade_id,
                      "entry_cloid": self.exchange.cloid("entry:" + plan.trade_id), "orders": [],
                      "filled_quantity": "0", "remaining_quantity": "0", "entry_vwap": None,
@@ -319,33 +331,127 @@ class Trading:
                 state["events"][saved["event_id"]]["status"] = "executed"
 
             self.state.update(admit)
-            return await self._entry_steps(plan, trade)
+            if plan.entry_timing == "deferred":
+                self.state.update(lambda data: data["notifications"].setdefault("entry-waiting:" + plan.trade_id,
+                                  {"trade_id": plan.trade_id, "change": {"status": "waiting_entry"}, "observed_at": now_ms()}))
+                return await self.check_waiting_entry(plan.trade_id)
+            return await self.guarded_entry_steps(plan, trade)
 
-    async def _entry_steps(self, plan, trade):
-        async def live_guard():
+    async def check_waiting_entry(self, trade_id):
+        trade = self.state.snapshot()["trades"][trade_id]
+        plan = TradePlan.model_validate(trade["plan"])
+        snapshot = self.state.snapshot()
+        if now_ms() >= plan.deadline_at or self.source_revisions(snapshot, plan.source_refs) != plan.source_revisions:
+            self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Waiting entry expired or its source changed")
+            return self.state.snapshot()["trades"][trade_id]
+        configuration = self.state.root.snapshot() if hasattr(self.state, "root") else snapshot
+        changed = (plan.profile_id is not None and configuration["profiles"].get(plan.profile_id, {}).get("revision") != plan.profile_revision
+                   or plan.pipeline_id is not None and configuration["pipelines"].get(plan.pipeline_id, {}).get("revision") != plan.pipeline_revision
+                   or plan.profile_id is None and snapshot["policy_revision"] != plan.policy_revision
+                   or plan.backup_fields and configuration["profiles"]["backup"]["revision"] != plan.backup_profile_revision)
+        if changed:
+            self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Waiting entry configuration changed")
+            return self.state.snapshot()["trades"][trade_id]
+        if snapshot["paused"] or hasattr(self.state, "root") and not self.state.root.snapshot()["venue_enabled"].get(self.state.exchange):
+            return trade
+        try:
+            self.validate_admission(snapshot, plan, owned=True)
+        except AqlaError as error:
+            self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason=str(error))
+            return self.state.snapshot()["trades"][trade_id]
+        try:
+            quote = await self.exchange.price_snapshot(plan.market)
+            state = gate_state(plan, quote)
+        except Exception as error:
+            reason = str(error) if isinstance(error, AqlaError) else "Fresh target prices are unavailable"
+            self._patch(trade_id, waiting_error=reason)
+            return self.state.snapshot()["trades"][trade_id]
+        self._patch(trade_id, waiting_error=None, waiting_snapshot=quote.model_dump(mode="json"))
+        if state == "waiting":
+            return self.state.snapshot()["trades"][trade_id]
+        if state == "missed":
+            self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Deferred entry was missed outside the source slippage tolerance")
+            return self.state.snapshot()["trades"][trade_id]
+        try:
             account = await self.exchange.account_snapshot(plan.market)
             self.validate_admission(self.state.snapshot(), plan, account, owned=True)
-        guards = {"async_prepare_guard": live_guard} if isinstance(self.exchange, Hyperliquid) and self.exchange.settings.shared_account else {}
+            quote = await self.exchange.price_snapshot(plan.market)
+            validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=trade["targets"])
+            self._patch(trade_id, status="preparing", gate_activated_at=now_ms())
+            return await self.guarded_entry_steps(plan, self.state.snapshot()["trades"][trade_id])
+        except AqlaError as error:
+            if self.state.snapshot()["trades"][trade_id]["entry_operation_id"] not in self.state.snapshot()["operations"]:
+                self._patch(trade_id, status="rejected", reserved_risk="0", unsent_reason=str(error))
+                return self.state.snapshot()["trades"][trade_id]
+            raise
+
+    async def live_entry_guard(self, plan):
+        account = await self.exchange.account_snapshot(plan.market)
+        snapshot = self.state.snapshot()
+        allowed = ("leverage:" + plan.trade_id, snapshot["trades"][plan.trade_id]["entry_operation_id"])
+        self.validate_admission(snapshot, plan, account, owned=True, allowed_prepared=allowed)
+        quote = await self.exchange.price_snapshot(plan.market)
+        trade = self.state.snapshot()["trades"][plan.trade_id]
+        try:
+            result = validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=trade["targets"])
+        except AqlaError as error:
+            message = str(error)
+            self.state.update(lambda data: data["trades"][plan.trade_id].setdefault("price_checks", []).append({"phase": "before_send", "snapshot": quote.model_dump(mode="json"), "error": message}))
+            raise
+        self.state.update(lambda data: data["trades"][plan.trade_id].setdefault("price_checks", []).append({"phase": "before_send", "snapshot": quote.model_dump(mode="json"), "result": result}))
+        quote.fresh()
+        return account, quote
+
+    async def guarded_entry_steps(self, plan, trade):
+        try:
+            return await self._entry_steps(plan, trade)
+        except AqlaError as error:
+            operations = self.state.snapshot()["operations"]
+            if trade["entry_operation_id"] in operations or any(row["phase"] in ("prepared", "sending", "unknown") for row in operations.values()):
+                raise
+            if self.state.snapshot()["trades"][plan.trade_id]["status"] not in OPEN:
+                raise
+            self._patch(plan.trade_id, status="rejected", reserved_risk="0", orders=[], unsent_reason=str(error))
+            raise
+
+    async def _entry_steps(self, plan, trade):
+        latest_account, latest_quote = None, None
+        async def live_guard():
+            nonlocal latest_account, latest_quote
+            latest_account, latest_quote = await self.live_entry_guard(plan)
+        def final_guard(data, operation_id):
+            latest_quote.fresh()
+            self.validate_admission(data, plan, latest_account, owned=True, allowed_prepared=(operation_id,))
+        await live_guard()
+        guards = {"async_prepare_guard": live_guard}
         if plan.market.product == "perp":
             leverage = await self.exchange.mutate("leverage:" + plan.trade_id,
                                                  {"type": "updateLeverage", "asset": plan.market.asset_id,
                                                   "isCross": plan.policy.margin_mode == "cross", "leverage": plan.effective_leverage}, deadline=plan.deadline_at,
-                                                  prepare_guard=lambda data: self.validate_admission(data, plan, owned=True), **guards)
+                                                  prepare_guard=lambda data: final_guard(data, "leverage:" + plan.trade_id), **guards)
             if leverage["phase"] not in ("acknowledged", "reconciled"):
-                self._patch(plan.trade_id, status="unknown" if leverage["phase"] == "unknown" else "rejected")
+                self._patch(plan.trade_id, status="unknown" if leverage["phase"] == "unknown" else "rejected",
+                            **({"reserved_risk": "0", "unsent_reason": leverage.get("result", {}).get("error", "Leverage configuration was rejected")} if leverage["phase"] == "rejected" else {}))
                 return self.state.snapshot()["trades"][plan.trade_id]
         account = await self.exchange.account_snapshot(plan.market)
         self.validate_admission(self.state.snapshot(), plan, account, owned=True)
-        entry = self.order(plan, plan.quantity, plan.entry_limit, cloid=trade["entry_cloid"])
-        initial_stop = self.order(plan, plan.quantity, plan.stop_loss * (Decimal("0.95") if plan.side == "long" else Decimal("1.05")),
-                                  reduce=True, trigger=("sl", plan.stop_loss), cloid=self.exchange.cloid(trade["entry_operation_id"], 1))
+        current = self.state.snapshot()["trades"][plan.trade_id]
+        stop = Decimal(current["stop_price"])
+        entry = self.order(plan, plan.quantity, execution_limit(plan), cloid=trade["entry_cloid"])
+        if plan.entry_timing == "deferred":
+            entry["t"] = {"limit": {"tif": "Ioc"}}
+        initial_stop = self.order(plan, plan.quantity, stop * (Decimal("0.95") if plan.side == "long" else Decimal("1.05")),
+                                  reduce=True, trigger=("sl", stop), cloid=self.exchange.cloid(trade["entry_operation_id"], 1))
         initial_stop["p"] = wire_number(price_grid(Decimal(initial_stop["p"]), plan.market, up=plan.side == "short"))
         action = {"type": "order", "orders": [entry, initial_stop], "grouping": "normalTpsl"}
-        self._patch(plan.trade_id, status="opening", orders=[{"kind": "sl", "cloid": initial_stop["c"], "quantity": str(plan.quantity), "price": str(plan.stop_loss)}])
+        self._patch(plan.trade_id, status="opening", orders=[{"kind": "sl", "cloid": initial_stop["c"], "quantity": str(plan.quantity), "price": str(stop)}])
         result = await self.exchange.mutate(trade["entry_operation_id"], action, deadline=plan.deadline_at,
-                                            prepare_guard=lambda data: self.validate_admission(data, plan, account, owned=True), **guards)
+                                            prepare_guard=lambda data: final_guard(data, trade["entry_operation_id"]), **guards)
         if result["phase"] == "unknown":
             self._patch(plan.trade_id, status="unknown")
+        if result.get("outcome") == "not_sent":
+            self._patch(plan.trade_id, status="rejected", reserved_risk="0", unsent_reason=result["result"]["error"], orders=[])
+            return self.state.snapshot()["trades"][plan.trade_id]
         try:
             await self.refresh_trade(plan.trade_id)
         except ExternalInterference as error:
@@ -360,6 +466,8 @@ class Trading:
     async def resume_unsent_entry(self, trade_id):
         snapshot = self.state.snapshot()
         trade = snapshot["trades"][trade_id]
+        if trade["status"] == "waiting_entry":
+            return await self.check_waiting_entry(trade_id)
         plan = TradePlan.model_validate(trade["plan"])
         if trade["entry_operation_id"] in snapshot["operations"]:
             return await self.refresh_trade(trade_id)
@@ -380,7 +488,7 @@ class Trading:
                 raise
             self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason=str(error))
             return self.state.snapshot()["trades"][trade_id]
-        return await self._entry_steps(plan, trade)
+        return await self.guarded_entry_steps(plan, trade)
 
     def _patch(self, trade_id, **values):
         old = self.state.snapshot()["trades"][trade_id]
@@ -392,6 +500,14 @@ class Trading:
             row = state["trades"][trade_id]
             row.update(changed)
             important = {key: value for key, value in changed.items() if key in ("status", "filled_quantity", "remaining_quantity", "stop_price", "tp_filled")}
+            if row.get("lifecycle_version") and row["status"] == "closed":
+                from .lifecycle import record_lifecycle
+                record_lifecycle(state, trade_id, "closed")
+                return
+            if row.get("lifecycle_version") and old["status"] in ("preparing", "opening") and row["status"] == "protecting":
+                important = {}
+            if row.get("lifecycle_version") and row["status"] == "open" and old["status"] == "protecting":
+                important = {key: value for key, value in important.items() if key != "status"}
             if important and row["status"] not in ("preparing", "opening"):
                 identity = digest([trade_id, important])[:32]
                 chat = state["trades"][trade_id]["chat_id"]
@@ -464,6 +580,14 @@ class Trading:
                     entry_vwap=str(cost / total) if total else trade["entry_vwap"],
                     **({"completed_target_prices": completed_prices} if plan.policy.stop_management == "tp_ladder" else {}))
         self.observe_orders(trade_id, observed)
+        confirmed_stop = any(order["kind"] == "sl" and observed.get(order["cloid"], {}).get("order", {}).get("status") == "open"
+                             and self._stop_matches(observed[order["cloid"]], plan, total, Decimal(trade["stop_price"]))
+                             for order in trade["orders"]) if total else False
+        if total:
+            self._patch(trade_id, entry_stop_confirmed=confirmed_stop)
+        from .lifecycle import record_lifecycle
+        if total and self.state.snapshot()["trades"][trade_id].get("lifecycle_version") and "entry_fill" not in self.state.snapshot()["trades"][trade_id].get("lifecycle_events", {}):
+            self.state.update(lambda data: record_lifecycle(data, trade_id, "entry_fill"))
         from .monthly import accounting_facts, entry_quantity_evidence
         confirmed_quantity = entry_quantity_evidence(entry_status)
         if confirmed_quantity is not None:
@@ -524,6 +648,9 @@ class Trading:
             self._patch(trade_id, filled_quantity=str(total), remaining_quantity=str(remaining), entry_vwap=str(cost / total),
                         status="open" if trade["status"] == "open" else "protecting")
             try:
+                if not await self.finalize_backup(trade_id):
+                    return self.state.snapshot()["trades"][trade_id]
+                await self.validate_actual_entry(trade_id)
                 await self.ensure_protection(trade_id)
                 current = self.state.snapshot()["trades"][trade_id]
                 covered = not getattr(self.exchange, "fail_closed_protection", False)
@@ -545,7 +672,11 @@ class Trading:
                 else:
                     self.state.update(lambda data: data.update(paused=True))
                 return await self.close_position(trade_id, Decimal(100), "protection-failure:" + trade_id)
+        elif stage == "filled" and not total:
+            self._patch(trade_id, status="unknown", fill_evidence_pending=True)
         elif stage in TERMINAL_ORDER and not remaining:
+            if not total:
+                self._patch(trade_id, unsent_reason="Entry order terminated without any confirmed fill")
             self.begin_cleanup(trade_id, "closed" if total else "rejected")
             await self.finish_cleanup(trade_id)
         elif remaining and not total:
@@ -555,6 +686,38 @@ class Trading:
             await self.cancel_entry(trade_id)
             return await self.refresh_trade(trade_id)
         return self.state.snapshot()["trades"][trade_id]
+
+    async def validate_actual_entry(self, trade_id):
+        trade = self.state.snapshot()["trades"][trade_id]
+        if not trade.get("lifecycle_version"):
+            return
+        entries = {key: row for key, row in trade["fill_events"].items() if row["kind"] == "entry"}
+        fingerprint = digest(entries)
+        if trade.get("entry_validated_fingerprint") == fingerprint:
+            return
+        plan = TradePlan.model_validate(trade["plan"])
+        entry, size, stop = Decimal(trade["entry_vwap"]), Decimal(trade["filled_quantity"]), Decimal(trade["stop_price"])
+        targets = [Decimal(price) for price in trade["targets"]]
+        account = await self.exchange.account_snapshot(plan.market)
+        quote = await self.exchange.price_snapshot(plan.market)
+        safe = (stop < min(entry, quote.stop_reference) and all(price > entry for price in targets) if plan.side == "long"
+                else stop > max(entry, quote.stop_reference) and all(price < entry for price in targets))
+        notional = entry * size
+        risk = size * (abs(entry - stop) + entry * plan.policy.cost_reserve_bps / 10000)
+        active = [row for identity, row in self.state.snapshot()["trades"].items() if identity != trade_id and row["status"] in OPEN]
+        other_risk = sum((Decimal(row["reserved_risk"]) for row in active), Decimal(0))
+        limits = self.state.limits(plan) if hasattr(self.state, "limits") else plan.policy
+        within_entry_band = (plan.entry_timing != "deferred" or
+                             plan.entry_price * (1 - plan.policy.max_slippage_percent / 100) <= entry <= plan.entry_price * (1 + plan.policy.max_slippage_percent / 100))
+        permitted = (safe and within_entry_band and notional <= plan.policy.max_notional_usdc and risk <= plan.risk_usdc
+                     and risk <= account.equity * plan.policy.risk_percent / 100
+                     and risk + other_risk <= account.equity * limits.max_total_risk_percent / 100)
+        check = {"phase": "after_fill", "snapshot": quote.model_dump(mode="json"), "entry_vwap": str(entry),
+                 "notional": str(notional), "risk": str(risk), "permitted": bool(permitted)}
+        self.state.update(lambda data: data["trades"][trade_id].setdefault("price_checks", []).append(check))
+        if not permitted:
+            raise AqlaError("Confirmed entry violates price structure, position value or SL risk limits")
+        self._patch(trade_id, entry_validated_fingerprint=fingerprint)
 
     async def ensure_protection(self, trade_id):
         trade = self.state.snapshot()["trades"][trade_id]
@@ -715,6 +878,9 @@ class Trading:
 
     async def cancel_entry(self, trade_id):
         trade = self.state.snapshot()["trades"][trade_id]
+        if trade["status"] == "waiting_entry":
+            self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Waiting entry cancelled by request")
+            return {"cancelled_waiting_entry": True}
         plan = TradePlan.model_validate(trade["plan"])
         self.assert_plan_binding(self.state.snapshot(), plan)
         if trade["entry_operation_id"] not in self.state.snapshot()["operations"]:
@@ -818,6 +984,8 @@ class Trading:
     async def close_position(self, trade_id, percent=Decimal(100), operation_id=None):
         snapshot = self.state.snapshot()
         trade = snapshot["trades"][trade_id]
+        if trade["status"] == "waiting_entry":
+            return await self.cancel_entry(trade_id)
         plan = TradePlan.model_validate(trade["plan"])
         self.assert_plan_binding(snapshot, plan)
         if trade["status"] == "conflicted":
@@ -850,7 +1018,8 @@ class Trading:
             self.assert_plan_binding(data, plan)
             row = data["trades"][trade_id]
             row.setdefault("close_intents", {})[operation_id] = intent
-            row.setdefault("exit_orders", []).append({"kind": "close", "cloid": order["c"], "quantity": order["s"], "price": order["p"]})
+            reason = "source_close" if operation_id.startswith("update:") else "operator_close" if operation_id.startswith(("operator:", "operator-close:")) else "protection_failure" if operation_id.startswith(("protection-failure:", "stop-crossed:", "emergency:")) else "unconfirmed"
+            row.setdefault("exit_orders", []).append({"kind": "close", "reason": reason, "cloid": order["c"], "quantity": order["s"], "price": order["p"]})
             row.update(status="closing", management_revision=row["management_revision"] + 1)
         self.state.update(stage)
         return await self.dispatch_close_intent(trade_id, intent)
@@ -965,9 +1134,24 @@ class Trading:
                     raise AqlaError("Stop widening is not permitted")
             if signal.update_action == "replace_targets":
                 self.validate_targets(trade, plan, signal.take_profits)
+            if trade["status"] == "waiting_entry" and signal.update_action in ("break_even", "reduce"):
+                raise AqlaError("Waiting entry has no filled position for this update")
             if not previous:
                 self.state.update(lambda state: state["bindings"].__setitem__("update:" + event_id, binding))
             operation = "update:" + event_id
+            if trade["status"] == "waiting_entry":
+                if signal.update_action in ("close", "cancel_entry"):
+                    result = await self.cancel_entry(trade["trade_id"])
+                elif signal.update_action == "move_stop":
+                    stop = price_grid(signal.stop_loss, plan.market, up=plan.side == "long")
+                    self._patch(trade["trade_id"], stop_price=str(stop), management_revision=trade["management_revision"] + 1)
+                    result = {"waiting_stop_updated": True}
+                else:
+                    targets = self.validate_targets(trade, plan, signal.take_profits)
+                    self._patch(trade["trade_id"], targets=[str(price) for price in targets], management_revision=trade["management_revision"] + 1)
+                    result = {"waiting_targets_updated": True}
+                self.state.update(lambda data: data["events"][event_id].update(status="updated"))
+                return {"trade_id": trade["trade_id"], "result": result}
             if signal.update_action == "cancel_entry":
                 result = await self.cancel_entry(trade["trade_id"])
             elif signal.update_action in ("close", "reduce"):
@@ -1086,6 +1270,8 @@ class Trading:
                 try:
                     if trade["status"] == "cleanup":
                         reports.append(await self.finish_cleanup(trade_id))
+                    elif trade["status"] == "waiting_entry":
+                        await self.check_waiting_entry(trade_id)
                     elif trade["entry_operation_id"] not in self.state.snapshot()["operations"]:
                         reports.append(await self.resume_unsent_entry(trade_id))
                     else:

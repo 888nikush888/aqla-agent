@@ -166,6 +166,10 @@ def verify_evidence(signal: Interpretation, events: dict):
     if signal.leverage is not None and not any(
             signal.leverage in set(quoted_leverage_numbers(quote)) for quote in fields.get("leverage", [])):
         raise AqlaError("Signal leverage is not supported by source evidence")
+    if signal.entry_timing == "deferred" and not fields.get("entry_timing"):
+        raise AqlaError("Deferred entry timing needs contextual source evidence")
+    if signal.source_exchange is not None and not any(signal.source_exchange.casefold() in value.casefold() for value in fields.get("source_exchange", [])):
+        raise AqlaError("Source exchange needs contextual source evidence")
 
 
 def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, policy: Policy,
@@ -216,6 +220,8 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         else:
             entry = market.mid
             limit = slippage_price(entry, policy.max_slippage_percent, market, buy=long)
+        if signal.entry_timing == "deferred":
+            limit = slippage_price(entry, policy.max_slippage_percent, market, buy=long)
         derived_stop, derived_targets = backup_prices(entry, signal.side, market,
             backup.fallback_stop_loss_percent if "stop_loss" in fields else None,
             selected_targets(backup.fallback_take_profit_percentages, policy) if "take_profits" in fields else ())
@@ -228,10 +234,13 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
                      account.equity * policy.max_total_risk_percent / 100 - reserved_risk)
         cost = limit * policy.cost_reserve_bps / 10000
         distance = abs(limit - stop) + cost
-        maximum = min(budget / distance, policy.max_notional_usdc / limit,
-                      account.available_margin * margin_leverage(leverage, market) / limit)
+        position_price = max(entry, limit, market.mid if kind == "limit" else entry)
+        if signal.entry_timing == "deferred":
+            position_price = max(position_price, entry * (1 + policy.max_slippage_percent / 100))
+        maximum = min(budget / distance, policy.max_notional_usdc / position_price,
+                      account.available_margin * margin_leverage(leverage, market) / position_price)
         if policy.sizing_mode == "fixed_notional":
-            maximum = min(maximum, policy.fixed_notional_usdc / limit)
+            maximum = min(maximum, policy.fixed_notional_usdc / position_price)
         quantity = quantity_grid(min(maximum, market.max_quantity) if market.max_quantity else maximum, market)
         if market.leverage_tiers:
             tier = next((tier for tier in market.leverage_tiers if tier.notional_floor <= quantity * limit < tier.notional_cap), None)
@@ -255,4 +264,9 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
                       source_take_profit_count=len(signal.take_profits),
                       tp_quantities=tp_sizes, risk_usdc=quantity * distance,
                       deadline_at=source_time + policy.max_signal_age_seconds * 1000, created_at=stamp)
+        if signal.entry_timing == "deferred":
+            values.update(entry_timing="deferred", entry_gate={"origin_mid": str(market.mid),
+                          "direction": "down" if market.mid > entry else "up" if market.mid < entry else "at_entry"})
+        if signal.source_exchange is not None:
+            values["source_exchange"] = signal.source_exchange
         return TradePlan(plan_id=digest(values), **values)

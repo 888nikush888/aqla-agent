@@ -9,7 +9,7 @@ import httpx
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
-from aqla_hyperliquid_mcp.models import AqlaError, Market, digest
+from aqla_hyperliquid_mcp.models import AqlaError, Market, digest, now_ms
 
 from .venues import VenueAdapter
 
@@ -26,6 +26,18 @@ def sign_parameters(wallet, parameters):
 
 
 class Aster(VenueAdapter):
+    async def price_snapshot(self, market):
+        from .entry import PriceSnapshot
+        started = now_ms()
+        contract = await self.read("ticker/price", {"symbol": market.native_symbol})
+        book = await self.read("ticker/bookTicker", {"symbol": market.native_symbol})
+        if any(row.get("symbol") != market.native_symbol for row in (contract, book)):
+            raise AqlaError("Aster price snapshot belongs to another market")
+        bid, ask = Decimal(book["bidPrice"]), Decimal(book["askPrice"])
+        return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
+                             stop_reference=contract["price"], stop_reference_kind="contract", exchange_time=min(contract["time"], book["time"]),
+                             started_at=started, observed_at=now_ms()).fresh()
+
     async def funding_payments(self, market, start, end):
         from .funding import aster_funding
         return await aster_funding(self, market, start, end)

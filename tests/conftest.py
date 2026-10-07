@@ -49,6 +49,10 @@ class FakeExchange:
                 data = {"assetPositions": positions, "marginSummary": {"accountValue": "10000"}, "withdrawable": "10000"}
             elif kind == "userFillsByTime":
                 data = self.fills
+            elif kind == "metaAndAssetCtxs":
+                data = [{"universe": [{"name": "BTC"}]}, [{"markPx": self.mid}]]
+            elif kind == "l2Book":
+                data = {"coin": payload["coin"], "time": now_ms(), "levels": [[{"px": self.mid, "sz": "1000000"}], [{"px": self.mid, "sz": "1000000"}]]}
             elif kind == "orderStatus":
                 row = self.orders.get(payload["oid"])
                 if row is None and isinstance(payload["oid"], int):

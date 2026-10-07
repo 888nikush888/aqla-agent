@@ -24,7 +24,7 @@ def main():
     from plugins.platforms.telegram.adapter import TelegramAdapter
     from telegram.constants import ParseMode
 
-    from aqla_agent.messages import monthly_message, telegram_view
+    from aqla_agent.messages import lifecycle_block, monthly_message, telegram_view
 
     trade = {'trade_id': 'trade', 'event_id': 'event', 'chat_id': '-100123', 'status': 'open',
              'filled_quantity': '2', 'remaining_quantity': '2', 'entry_vwap': '100', 'stop_price': '99',
@@ -41,6 +41,8 @@ def main():
     monthly = monthly_message({'month': '2026-10', 'summary': {'trades': 2, 'complete': 1, 'excluded': 1,
         'wins': 1, 'losses': 0, 'win_rate_percent': '100', 'roe_sum_percent': '12.5', 'net_by_currency': {'USDC': '3.75'}},
         'open_trades': [], 'undated_closed_trades': [], 'url': 'https://docs.google.com/spreadsheets/d/ci/edit#gid=1'})
+    entry_card = lifecycle_block(data, {'kind': 'entry_fill', 'time': 1791397511739, 'facts': {**trade, 'entry_stop_confirmed': False}})
+    closed_card = lifecycle_block(data, {'kind': 'closed', 'time': 1791397512420, 'facts': {**trade, 'status': 'closed', 'fill_events': {}}})
     adapter = TelegramAdapter(PlatformConfig(extra={'allow_from': ['12345']}))
     delivered = []
     class Bot:
@@ -58,6 +60,10 @@ def main():
         assert '\\[' not in delivered[0]['text'].split('**Quelle**')[0]  # Name is native inline code.
         sent = await adapter.send('12345', monthly, metadata={'notify': True})
         assert sent.success and '*Monatsbericht' in delivered[-1]['text'] and 'gid=1' in delivered[-1]['text']
+        for message in (entry_card, closed_card):
+            sent = await adapter.send('12345', message, metadata={'notify': True})
+            assert sent.success
+        assert '*Einstieg ausgeführt*' in delivered[-2]['text'] and '*Trade geschlossen*' in delivered[-1]['text']
         before = len(delivered)
         long = '\n\n'.join(card for _ in range(15))
         result = await adapter.send('12345', long, metadata={'notify': True})
@@ -71,6 +77,8 @@ def main():
         assert db.get_messages_as_conversation('message-view')[-1]['content'] == card
         db.append_messages_batch('message-view', [{'role': 'assistant', 'content': monthly}])
         assert db.get_messages_as_conversation('message-view')[-1]['content'] == monthly
+        db.append_messages_batch('message-view', [{'role': 'assistant', 'content': entry_card}, {'role': 'assistant', 'content': closed_card}])
+        assert [row['content'] for row in db.get_messages_as_conversation('message-view')[-2:]] == [entry_card, closed_card]
     finally:
         db.close()
     print(json.dumps({'native_markdown_send': True, 'native_split': True, 'saved_reply_matches': True,
