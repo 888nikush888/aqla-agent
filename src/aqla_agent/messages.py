@@ -127,6 +127,8 @@ def trade_block(data, trade, notices):
     else:
         title = "✅ **Trade eröffnet**" if opening else "🔄 **Trade aktualisiert**"
     lines = [f"{title} · {market} {direction}", context(data, plan)]
+    if stage == "waiting_entry":
+        lines.append("**Status:** lokaler Wartezustand · noch keine Börsenorder")
     quote = literal(plan["market"].get("quote_token", "USDC"))
     full = opening or filled == 0 or stage in ("unknown", "protecting")
     if full:
@@ -135,7 +137,7 @@ def trade_block(data, trade, notices):
         lines.append(f"**{label}:** {number(entry)} {quote} · **Hebel:** {number(plan.get('effective_leverage', plan.get('policy', {}).get('leverage')))}×")
         if filled and planned and filled < planned:
             lines.append(f"**Gefüllt:** {number(filled / planned * 100)} % der geplanten Menge")
-        lines.append(f"**SL:** {number(trade.get('stop_price', plan.get('stop_loss')))} {quote}" + (" · Bestätigung ausstehend" if stage in ("unknown", "protecting", "opening") else ""))
+        lines.append(f"**SL:** {number(trade.get('stop_price', plan.get('stop_loss')))} {quote}" + (" · vorgesehen" if stage == "waiting_entry" else " · Bestätigung ausstehend" if stage in ("unknown", "protecting", "opening") else ""))
         targets = trade.get("targets", plan.get("take_profits", []))
         budgets = trade.get("target_budgets") or plan.get("tp_quantities", [])
         total = sum((decimal(value) or Decimal(0) for value in budgets), Decimal(0))
@@ -184,11 +186,17 @@ def trade_block(data, trade, notices):
 def lifecycle_block(data, event):
     trade = event["facts"]
     plan = trade["plan"]
-    if event["kind"] == "closed":
-        return trade_block(data, trade, [{"change": {"status": "closed"}}])
     from datetime import datetime
     from zoneinfo import ZoneInfo
     time = datetime.fromtimestamp(event["time"] / 1000, ZoneInfo("Europe/Berlin")).strftime("%d.%m.%Y %H:%M:%S")
+    if event["kind"] == "closed":
+        result = trade_block(data, trade, [{"change": {"status": "closed"}}]) + "\n\n**Schließung:** " + time + " · Berlin"
+        exits = [row for row in trade.get("fill_events", {}).values() if row["kind"] != "entry"]
+        size = sum((decimal(row["sz"]) for row in exits), Decimal(0))
+        if size:
+            exit_price = sum((decimal(row["sz"]) * decimal(row["px"]) for row in exits), Decimal(0)) / size
+            result += "\n\n**Exit realisiert:** " + number(exit_price) + " " + literal(plan["market"].get("quote_token", "USDC"))
+        return result
     title = literal(plan["market"]["symbol"]) + " " + ("LONG" if plan["side"] == "long" else "SHORT")
     quote = literal(plan["market"].get("quote_token", "USDC"))
     protected = trade.get("entry_stop_confirmed", False)
