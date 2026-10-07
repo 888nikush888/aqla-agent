@@ -110,6 +110,8 @@ jobs:
         run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/source-pipeline --mcp-python .venv/bin/python --mode source
       - name: Owner rules and bounded master-skill edits
         run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/owner-pipeline --mcp-python .venv/bin/python --mode owner
+      - name: Native deferred-entry schema, evidence and read-only diagnosis
+        run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/deferred-pipeline --mcp-python .venv/bin/python --mode deferred
       - name: Native skill proposals require Telegram owner approval
         run: .cache/hermes-venv/bin/python tests/native_skill_review_smoke.py --hermes-source .cache/hermes-source --destination .cache/skill-review-pipeline
       - name: Native queued turns, cancellation and adapter reconnect

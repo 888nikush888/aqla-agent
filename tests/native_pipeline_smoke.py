@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--hermes-source", required=True)
     parser.add_argument("--destination", required=True)
     parser.add_argument("--mcp-python", required=True)
-    parser.add_argument("--mode", choices=("source", "owner", "lifecycle"), default="source")
+    parser.add_argument("--mode", choices=("source", "owner", "lifecycle", "deferred"), default="source")
     args = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
     destination = Path(args.destination).resolve()
@@ -102,6 +102,15 @@ def main():
                     ("control", {"action": "pause"}), report, None,
                     ("control", {"action": "set_policy", "expected_revision": 1, "policy": {"risk_percent": "0.5", "leverage": 2, "max_open_trades": 2}}), None,
                     ("control", {"action": "pause"}), report, None]
+    if args.mode == "deferred":
+        original = SourceEvent(chat_id="12345", message_id=42, sent_at=now_ms(), text="BTC SHORT. Deferred entry, not now. Entry 100. SL 110. TP 90. Exchange Bybit.")
+        proofs = [{"field": field, "source_id": original.source_id, "quote": quote} for field, quote in (
+            ("symbol", "BTC"), ("side", "SHORT"), ("entry_timing", "Deferred entry, not now"), ("entry_prices.0", "Entry 100"),
+            ("stop_loss", "SL 110"), ("take_profits.0", "TP 90"), ("source_exchange", "Exchange Bybit"))]
+        expected = [("status", {}), ("trade_diagnostics", {"symbol": "BTC"}), ("source_context", {"event_id": original.event_id}),
+                    ("interpret_source", {"event_id": original.event_id, "interpretation": {"kind": "new_signal", "symbol": "BTC", "side": "short",
+                        "entry": "limit", "entry_timing": "deferred", "entry_prices": ["100"], "stop_loss": "110", "take_profits": ["90"],
+                        "source_exchange": "Bybit", "source_refs": [original.source_id], "evidence": proofs}})]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -215,6 +224,10 @@ def main():
             pending = list_pending(SKILLS)
             assert len(pending) == 1
             assert pending[0]["payload"]["new_string"].endswith("Prüfe Replies besonders sorgfältig.")
+        elif args.mode == "deferred":
+            row = data["events"][original.event_id]
+            assert row["status"] == "interpreted" and row["interpretation"]["entry_timing"] == "deferred"
+            assert row["interpretation"]["source_exchange"] == "Bybit"
         else:
             assert data["events"][original.event_id]["status"] == "report"
             if args.mode == "source":
