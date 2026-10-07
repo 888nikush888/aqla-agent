@@ -104,6 +104,8 @@ jobs:
         run: .cache/hermes-venv/bin/python tests/native_hermes_smoke.py --hermes-source .cache/hermes-source --home .cache/native-home
       - name: Operator questions, planning and legacy history migration
         run: .cache/hermes-venv/bin/python tests/native_interaction_smoke.py --hermes-source .cache/hermes-source --home .cache/interaction-home
+      - name: Native Telegram message formatting, splitting and persistence
+        run: .cache/hermes-venv/bin/python tests/native_message_smoke.py --hermes-source .cache/hermes-source --home .cache/message-view-home
       - name: Untrusted source, native agent hooks and stdio MCP
         run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/source-pipeline --mcp-python .venv/bin/python --mode source
       - name: Owner rules and bounded master-skill edits

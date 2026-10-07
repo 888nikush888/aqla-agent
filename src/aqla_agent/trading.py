@@ -328,7 +328,12 @@ class Trading:
         if result["phase"] == "unknown":
             self._patch(plan.trade_id, status="unknown")
         await self.refresh_trade(plan.trade_id)
-        return self.state.snapshot()["trades"][plan.trade_id]
+        current = self.state.snapshot()["trades"][plan.trade_id]
+        if current["status"] == "opening" and Decimal(current["filled_quantity"]) == 0 and result["phase"] in ("acknowledged", "reconciled"):
+            self.state.update(lambda data: data["notifications"].setdefault("entry-waiting:" + plan.trade_id,
+                {"trade_id": plan.trade_id, "change": {"status": "opening"}, "previous": {"status": "preparing"}, "observed_at": now_ms(),
+                 "source_id": current["chat_id"], "source_name": data.get("source_names", {}).get(current["chat_id"])}))
+        return current
 
     async def resume_unsent_entry(self, trade_id):
         snapshot = self.state.snapshot()
@@ -364,11 +369,12 @@ class Trading:
         def patch(state):
             row = state["trades"][trade_id]
             row.update(changed)
-            important = {key: value for key, value in changed.items() if key in ("status", "filled_quantity", "remaining_quantity", "stop_price")}
+            important = {key: value for key, value in changed.items() if key in ("status", "filled_quantity", "remaining_quantity", "stop_price", "tp_filled")}
             if important and row["status"] not in ("preparing", "opening"):
                 identity = digest([trade_id, important])[:32]
                 chat = state["trades"][trade_id]["chat_id"]
                 state["notifications"].setdefault(identity, {"trade_id": trade_id, "change": important, "observed_at": now_ms(),
+                    "previous": {key: old.get(key) for key in important},
                     "source_id": chat, "source_name": state.get("source_names", {}).get(chat)})
 
         self.state.update(patch)

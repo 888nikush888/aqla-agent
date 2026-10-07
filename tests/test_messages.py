@@ -1,0 +1,154 @@
+import copy
+from decimal import Decimal
+
+import pytest
+
+from aqla_agent.messages import MAX_NOTIFICATIONS, literal, number, split_blocks, telegram_view
+
+READY = {'hyperliquid': {'configured': True, 'enabled': True, 'network': 'testnet'}}
+
+
+def text(view):
+    return '\n\n'.join(chunk for row in view['messages'] for chunk in row['texts'])
+
+
+@pytest.fixture
+async def opened(setup, signal):
+    _,state,_,_,trading=setup
+    source,value=signal
+    state.update(lambda data:data['source_names'].update({'channel':'VIP Gold'}))
+    plan=await trading.preview(source.event_id,value)
+    await trading.execute(plan['plan_id'])
+    return state.snapshot()
+
+
+def test_view_is_pure_and_opening_has_only_confirmed_values(opened):
+    before=copy.deepcopy(opened)
+    result=telegram_view(opened,READY)
+    rendered=text(result)
+    assert 'Trade eröffnet' in rendered and 'VIP Gold' in rendered
+    assert 'Entry realisiert' in rendered and '100 USDC' in rendered
+    assert 'Testnet' in rendered and 'Standard' in rendered
+    assert '50 %' in rendered and 'Positionsanteil' in rendered
+    assert 'channel' not in rendered
+    assert opened==before
+    assert set(result['messages'][0]['notification_ids'])==set(opened['notifications'])
+
+
+@pytest.mark.parametrize('value,expected',[('86032.125','86.032,125'),('0.0000123','0,0000123'),('-1234.5','−1.234,5'),('1.000','1'),('NaN','nicht bestätigt')])
+def test_german_numbers_keep_precision(value,expected):
+    assert number(value)==expected
+
+
+@pytest.mark.parametrize('phase,label',[('opening','Entry wartet'),('unknown','Ausführung ungeklärt'),('protecting','Schutz wird abgeglichen')])
+def test_pending_and_unknown_entries_are_not_reported_as_open(opened,phase,label):
+    trade=next(iter(opened['trades'].values()))
+    trade['status']=phase
+    if phase=='opening':
+        trade.update(filled_quantity='0',entry_vwap=None)
+    result=text(telegram_view(opened,READY))
+    assert label in result and 'Trade eröffnet' not in result
+    if phase=='opening':
+        assert 'Entry geplant' in result and 'Entry realisiert' not in result
+
+
+def test_partial_entry_is_explicit(opened):
+    trade=next(iter(opened['trades'].values()))
+    trade['filled_quantity']=str(Decimal(trade['plan']['quantity'])/2)
+    result=text(telegram_view(opened,READY))
+    assert 'Entry teilweise ausgeführt' in result and '50 % der geplanten Menge' in result
+
+
+def test_sl_and_tp_updates_are_bundled_without_repeating_opening(opened):
+    identity,trade=next(iter(opened['trades'].items()))
+    trade.update(stop_price='100',tp_filled=['1','0'],target_budgets=['1','1'],remaining_quantity='1',filled_quantity='2')
+    opened['notifications']={'sl':{'trade_id':identity,'change':{'stop_price':'100'},'previous':{'stop_price':'99'}},
+                             'tp':{'trade_id':identity,'change':{'tp_filled':['1','0'],'remaining_quantity':'1'},'previous':{'tp_filled':['0','0']}}}
+    result=text(telegram_view(opened,READY))
+    assert 'Trade aktualisiert' in result and '99 → 100' in result and 'Einstand' in result
+    assert 'TP1' in result and 'vollständig ausgeführt' in result and 'Position verbleibend' in result
+    assert 'Entry realisiert' not in result
+
+
+def test_mixed_venue_results_share_one_signal_message(opened):
+    trade=next(iter(opened['trades'].values()))
+    event=opened['events'][trade['event_id']]
+    opened['notifications']['rejection']={'event_id':trade['event_id'],'targets':[{'exchange':'aster','profile_id':'standard','error':'Signal SL is missing and Backup SL percentage is not configured'}]}
+    view=telegram_view(opened,READY)
+    assert len(view['messages'])==1
+    result=text(view)
+    assert 'Trade eröffnet' in result and 'Signal abgelehnt' in result and 'Aster' in result
+    assert 'SL fehlt' in result
+    assert event['interpretation']['source_refs']==trade['plan']['source_refs']
+
+
+def test_protection_alert_has_priority_and_never_waits_for_siblings(opened):
+    opened['notifications']['protection:aster']={'exchange':'aster','error':'SL nicht bestätigt'}
+    first=telegram_view(opened,READY)['messages'][0]
+    assert first['severity']=='urgent' and first['notification_ids']==['protection:aster']
+    assert 'Entries:** gesperrt' in first['texts'][0]
+
+
+def test_closed_pnl_is_only_shown_with_known_fees(opened):
+    identity,trade=next(iter(opened['trades'].items()))
+    trade.update(status='closed',remaining_quantity='0',fill_events={'entry':{'kind':'entry','sz':'1','px':'100','fee':'0.1','feeToken':'USDC'},
+                                                                  'exit':{'kind':'tp','sz':'1','px':'110','fee':'0.1','feeToken':'USDC'}})
+    opened['notifications']={'closed':{'trade_id':identity,'change':{'status':'closed'}}}
+    assert 'Netto vor Funding:** 9,8 USDC' in text(telegram_view(opened,READY))
+    trade['fill_events']['exit']['fee']=None
+    assert 'PnL nicht vollständig bestätigt' in text(telegram_view(opened,READY))
+
+
+def test_leverage_and_backup_provenance(opened):
+    trade=next(iter(opened['trades'].values()))
+    trade['plan'].update(signal_leverage_original='12.78',signal_leverage=12,effective_leverage=10,backup_fields=['stop_loss'])
+    result=text(telegram_view(opened,READY))
+    assert '12,78× → abgerundet 12× → wirksam 10×' in result
+    assert 'Backup verwendet:** SL' in result and 'vorläufig' in result
+
+
+def test_unsafe_names_are_literal_not_links_or_instructions():
+    assert literal('[VIP](https://invalid)')=='`[VIP](https://invalid)`'
+    assert '\n' not in literal('VIP\n**test**')
+    assert '`' not in literal('foo`bar')[1:-1]
+
+
+def test_long_messages_split_without_loss_or_broken_lines():
+    blocks=['**Block '+str(index)+'**\n'+('Wert 123,45\n'*40).strip() for index in range(20)]
+    parts=split_blocks('\n\n'.join(blocks))
+    assert all(len(part.encode('utf-16-le'))//2<=3000 for part in parts)
+    assert '\n\n'.join(parts)=='\n\n'.join(blocks)
+
+
+def test_empty_background_has_no_message_and_disabled_sheets_is_explicit(setup):
+    _,state,*_=setup
+    view=telegram_view(state.snapshot(),READY,sheets_enabled=False)
+    assert view['messages']==[]
+    assert 'Sheets:** deaktiviert' in '\n'.join(view['status'])
+
+
+def test_notification_limit_exposes_unprocessed_ids(setup):
+    _,state,*_=setup
+    data=state.snapshot()
+    data['notifications']={str(index):{'error':'saved fact'} for index in range(MAX_NOTIFICATIONS+2)}
+    view=telegram_view(data,READY)
+    delivered={identity for item in view['messages'] for identity in item['notification_ids']}
+    assert len(delivered)==MAX_NOTIFICATIONS
+    assert delivered.isdisjoint(view['remaining_notification_ids'])
+    assert delivered|set(view['remaining_notification_ids'])==set(data['notifications'])
+
+
+def test_unknown_target_is_not_a_rejection(setup,signal):
+    _,state,*_=setup
+    source,_=signal
+    data=state.snapshot()
+    data['notifications']={'one':{'event_id':source.event_id,'targets':[{'exchange':'aster','profile_id':'standard','status':'unknown','error':'Antwort fehlt'}]}}
+    result=text(telegram_view(data,READY))
+    assert 'Börsenziel ungeklärt' in result and 'Signal abgelehnt' not in result
+
+
+def test_incomplete_exit_fills_do_not_produce_pnl(opened):
+    identity,trade=next(iter(opened['trades'].items()))
+    trade.update(status='closed',fill_events={'entry':{'kind':'entry','sz':'1','px':'100','fee':'0.1'}})
+    opened['notifications']={'closed':{'trade_id':identity,'change':{'status':'closed'}}}
+    assert 'PnL nicht vollständig bestätigt' in text(telegram_view(opened,READY))

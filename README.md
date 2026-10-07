@@ -8,6 +8,8 @@ Gold/XAU wird auf Hyperliquid als `xyz:GOLD` erkannt; Dezimalhebel werden abgeru
 
 Eigenständiges Python-Projekt. Ein eigener Hyperliquid-MCP, ein kurzer bearbeitbarer Master-Skill und ein read-only Telegram-Quellenleser für abonnierte Kanäle. SQLite speichert Handelszustand und Hermes-Gespräche. Keine eigene Bot-Anbindung, MiniApp, Kanalbewertungen oder autonome Strategieoptimierung. Manuell an den Hermes-Bot weitergeleitete Signale werden ebenfalls als Quellen erfasst.
 
+Telegram-Handelsmeldungen verwenden kompakte, aus gespeicherten Fakten erzeugte Vorlagen mit getrennten Börsenergebnissen, bestätigten Preisen und klaren Statusüberschriften. [Nachrichtenansichten](docs/telegram-messages.md).
+
 ## Unabhängig auf einem VPS installieren
 
 Voraussetzungen: Linux mit systemd, Git und uv. Der Installer richtet eigene Python-Laufzeiten im Zielordner ein: 3.12 für Aqla, 3.14 für den exakt gepinnten Hermes-Stand. Eine vorhandene Hermes-Installation wird nicht angebunden oder verändert.

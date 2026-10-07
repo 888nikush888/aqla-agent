@@ -34,6 +34,9 @@ def main():
                 raise SystemExit("Missing VPS asset: " + required)
         if len(archive.read("aqla-agent/skills/aqla-master/SKILL.md")) > 8192:
             raise SystemExit("Master skill exceeds its size budget")
+        for required in ("src/aqla_agent/messages.py", "tests/native_message_smoke.py", "docs/telegram-messages.md"):
+            if "aqla-agent/" + required not in names:
+                raise SystemExit("Missing Telegram view asset: " + required)
         if len(json.loads(archive.read("aqla-agent/tests/fixtures/context_cases.json"))) != 30:
             raise SystemExit("Context evaluation fixtures are missing")
         with TemporaryDirectory() as target:

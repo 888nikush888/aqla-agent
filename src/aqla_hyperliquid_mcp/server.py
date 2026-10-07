@@ -8,6 +8,7 @@ from typing import Literal
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
+from aqla_agent.messages import telegram_view
 from aqla_agent.pipelines import (
     AccountLimits,
     Pipeline,
@@ -94,6 +95,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     async def status() -> dict:
         """Read effective user rules, sources, pending work, owned trades and unresolved operations."""
         snapshot = state.snapshot()
+        ready = trading.ready()
         return {"network": settings.network, "account": exchange.account, "paused": snapshot["paused"],
                 "policy": snapshot["policy"], "policy_revision": snapshot["policy_revision"], "sources": snapshot["sources"],
                 "source_names": snapshot.get("source_names", {}), "source_names_revision": snapshot.get("source_names_revision", 0),
@@ -102,7 +104,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "unresolved_operations": [trading.public_operation(row) for row in snapshot["operations"].values() if row["phase"] in ("prepared", "sending", "unknown")],
                 "notifications": snapshot["notifications"],
                 "configuration_revision": snapshot["configuration_revision"], "profiles": snapshot["profiles"],
-                "pipelines": snapshot["pipelines"], "exchanges": trading.ready(),
+                "pipelines": snapshot["pipelines"], "exchanges": ready,
+                "telegram_view": telegram_view(snapshot, ready, sheets_enabled=settings.google_sheets.enabled),
                 "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})), "last_synced_at": snapshot.get("journal_synced_at")}}
 
     @server.tool(annotations=read)

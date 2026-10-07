@@ -4,6 +4,8 @@ Stand: 07.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Qu
 
 ## Inhalt
 
+- Additive `status.telegram_view` mit reinem Python-Formatter für kompakte Telegram-Meldungen. Vorlagen unterscheiden Entry-Warten, Teilfill, Eröffnung, Update, Ablehnung, ungeklärten Ausgang, Schutzvorfall und Schließen. Setupfamilien bündeln Börsenergebnisse; Schutzvorfälle haben Vorrang. Native Hermes-Konvertierung, Zustellung und gespeicherte Antworten bleiben erhalten. Siehe `docs/telegram-messages.md`.
+
 - Gold/XAU-Aliase verwenden den geprüften Hyperliquid-Namensraum `xyz:GOLD` im konfigurierten Netzwerk. Dezimalhebel werden mit Originalbeleg gespeichert, abgerundet und am Marktmaximum gedeckelt. Frei wählbare Kanalnamen dienen der Telegram-Bedienung und Anzeige; IDs und Leserauflösung bleiben erhalten.
 - Das globale Profil `backup` ergänzt fehlende Signalwerte mit festem Hebel 2, Markt-Entry und optionalen Prozent-SL/TPs. Prozentfelder starten leer. Schutzpreise werden aus realem Entry-VWAP einmalig finalisiert und vor Versand dauerhaft gespeichert; Wiederanlauf und Änderungen verwenden die gespeicherten Werte. Risiko, Verteilung und Kontolimits bleiben beim Hauptprofil. Siehe `docs/gold-backup-and-names.md`.
 
@@ -24,6 +26,8 @@ Stand: 07.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Qu
 - Source-ZIP mit SHA-256, Wheel und Source-Distribution; keine lokalen Secrets, Daten oder QA-Umgebungen im Archiv. Eigenständiges privates GitHub-Repository `888nikush888/aqla-agent` mit Qualitätspipeline.
 
 ## Geprüft
+
+Telegram-Ansichten: **677 Tests bestanden, ein plattformabhängiger Test übersprungen, 80,16 Prozent Coverage** im initialen Gesamtlauf. Weitere gezielte Fälle prüfen ungeklärte Ziele und unvollständige Exit-Fills. Der native Telegram-Test bestätigt MarkdownV2, Sonderzeichen, Nachrichtenteilung und dieselben gespeicherten Antworttexte ohne reale Telegram- oder Börsenaufrufe.
 
 Gold/Backup/Kanalnamen: **657 Tests bestanden, ein plattformabhängiger Test übersprungen, 79,60 Prozent Coverage** im lokalen Gesamtlauf. Weitere 82 gezielte Fälle nach zusätzlicher Absicherung des endgültigen Fill-Referenzwerts bestanden. Native Hermes-Smokes prüfen Betreiberänderungen an Backup und Kanalnamen sowie die Abwehr derselben Aufträge aus Quellen. Alle drei Adapter-Verträge prüfen die Prozent-Schutzstrecke; verlorene Antworten, Teilfills, Neustart, unveränderte Referenzwerte und Schließen bei TP-Ablehnung sind abgesichert.
 
