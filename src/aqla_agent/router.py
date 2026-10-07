@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from aqla_hyperliquid_mcp.models import AqlaError, Market, digest, now_ms
 
+from .accounting import inventory_view
 from .pipelines import VenueState
 from .trading import OPEN, Trading
 from .venues import VenueAdapter, adapter_settings
@@ -66,6 +67,17 @@ class Router:
                        "network": self.engines[name].exchange.settings.network if name in self.engines else "mainnet",
                        "account": self.engines[name].exchange.account if name in self.engines else None,
                        "limits": data["venue_limits"].get(name), "reason": self.errors.get(name)} for name in ("hyperliquid", "aster", "lighter")}
+
+    async def inventory_status(self):
+        engine = self.engines.get("hyperliquid")
+        if engine is None or not engine.exchange.settings.shared_account:
+            return {}
+        try:
+            account = await engine.exchange.account_inventory()
+            data = engine.state.snapshot()
+            return {"hyperliquid": {"available": True, **inventory_view(data, account, engine.state.limits().max_open_trades)}}
+        except Exception as error:
+            return {"hyperliquid": {"available": False, "reason": str(error) if isinstance(error, AqlaError) else "Complete account inventory is unavailable"}}
 
     def selected_targets(self, row, data):
         source = row["source"]["chat_id"]

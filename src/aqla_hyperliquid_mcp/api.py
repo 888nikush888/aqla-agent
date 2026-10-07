@@ -62,6 +62,7 @@ class Hyperliquid:
         except Exception as error:
             raise AqlaError("Invalid configured signing key") from error
         self.market_cache: dict[str, Market] = {}
+        self.last_inventory = None
 
     @property
     def account(self):
@@ -95,7 +96,7 @@ class Hyperliquid:
                 index = next((i for i, item in enumerate(dexes) if item and item["name"] == dex), None)
                 if index is None:
                     raise AqlaError("Unknown Hyperliquid DEX namespace")
-                offset = 100000 + (index - 1) * 10000
+                offset = 100000 + index * 10000
             for index, row in enumerate(meta["universe"]):
                 if row.get("isDelisted") or row["name"] not in mids:
                     continue
@@ -150,6 +151,8 @@ class Hyperliquid:
         return market
 
     async def account_snapshot(self, market: Market):
+        if self.settings.shared_account and market.product == "perp":
+            return await self.account_inventory(market)
         if market.product == "spot":
             raw = await self.info("spotClearinghouseState", user=self.account)
             balance = next((row for row in raw["balances"] if row["coin"] == "USDC"), None)
@@ -174,6 +177,81 @@ class Hyperliquid:
                 raise AqlaError("Account position observation is ambiguous")
             size = Decimal(matching[0]["szi"]) if matching else Decimal(0)
         return AccountSnapshot(equity=raw["marginSummary"]["accountValue"], available_margin=raw["withdrawable"], position_size=size)
+
+    async def account_inventory(self, market: Market | None = None):
+        """Complete bounded REST observation; entry calls never use a cached budget."""
+        stamp = now_ms()
+        mode = await self.info("userAbstraction", user=self.account)
+        if mode not in ("disabled", None, "unifiedAccount"):
+            raise AqlaError("Shared account entries require Standard or Unified Account mode; portfolio margin is unsupported")
+        dexes = await self.info("perpDexs")
+        metas = await self.info("allPerpMetas")
+        if not isinstance(dexes, list) or not dexes or dexes[0] is not None or len(dexes) > 64:
+            raise AqlaError("Complete DEX inventory is unavailable")
+        names = [""] + [row["name"] for row in dexes[1:] if isinstance(row, dict) and isinstance(row.get("name"), str)]
+        if len(names) != len(dexes) or len(set(names)) != len(names):
+            raise AqlaError("DEX inventory is incomplete or ambiguous")
+        if not isinstance(metas, list) or len(metas) != len(dexes) or any(not isinstance(meta, dict) or not isinstance(meta.get('universe'), list) for meta in metas):
+            raise AqlaError("Complete perpetual market inventory is unavailable")
+        perp_markets = {row['name'] for meta in metas for row in meta['universe'] if isinstance(row, dict) and isinstance(row.get('name'), str)}
+        limiter = asyncio.Semaphore(3)
+        async def observe(dex):
+            async with limiter:
+                fields = {"dex": dex} if dex else {}
+                raw, orders = await asyncio.gather(self.info("clearinghouseState", user=self.account, **fields),
+                                                 self.info("frontendOpenOrders", user=self.account, **fields))
+                if not isinstance(raw, dict) or not isinstance(raw.get("assetPositions"), list) or not isinstance(orders, list):
+                    raise AqlaError("Account positions or orders are incomplete")
+                return dex, raw, orders
+        observations = await asyncio.gather(*(observe(dex) for dex in names))
+        positions, entries, seen_positions = {}, [], set()
+        states = {}
+        for dex, raw, orders in observations:
+            states[dex] = raw
+            for row in raw["assetPositions"]:
+                position = row.get("position", {}) if isinstance(row, dict) else {}
+                coin = position.get("coin")
+                if not isinstance(coin, str) or "szi" not in position or (dex and not coin.startswith(dex + ":")):
+                    raise AqlaError("Account position observation is malformed")
+                size = Decimal(str(position["szi"]))
+                if not size.is_finite() or coin in seen_positions or coin not in perp_markets:
+                    raise AqlaError("Account position observation is ambiguous")
+                seen_positions.add(coin)
+                if size:
+                    positions[coin] = size
+            for order in orders:
+                if not isinstance(order, dict) or not isinstance(order.get("coin"), str):
+                    raise AqlaError("Account order observation is malformed")
+                # Spot orders still consume the exchange-reported USDC hold,
+                # but do not reserve a perpetual trading slot.
+                if order["coin"] not in perp_markets:
+                    continue
+                if type(order.get("reduceOnly")) is not bool:
+                    raise AqlaError("Order reduction scope is unknown")
+                if not order["reduceOnly"]:
+                    entries.append({"market": order["coin"], "oid": order.get("oid"), "cloid": order.get("cloid")})
+        if mode == "unifiedAccount":
+            spot = await self.info("spotClearinghouseState", user=self.account)
+            balances = [row for row in spot.get("balances", []) if row.get("token") == 0 and row.get("coin") == "USDC"]
+            if len(balances) != 1:
+                raise AqlaError("Unified USDC balance is unavailable or ambiguous")
+            equity, hold = Decimal(balances[0]["total"]), Decimal(balances[0]["hold"])
+            available = equity - hold
+            # This exchange ceiling includes cross/isolated maintenance. It is
+            # an additional ceiling, never a replacement for initial holds.
+            ceilings = [Decimal(value) for token, value in spot.get("tokenToAvailableAfterMaintenance", []) if token == 0]
+            if len(ceilings) != 1 or hold < 0 or available < 0:
+                raise AqlaError("Unified USDC availability is not completely proved")
+            available = min(available, max(Decimal(0), ceilings[0]))
+        else:
+            raw = states.get(market.dex if market else "")
+            equity, available = Decimal(raw["marginSummary"]["accountValue"]), Decimal(raw["withdrawable"])
+        if now_ms() - stamp > 10000:
+            raise AqlaError("Complete account observation is stale")
+        snapshot = AccountSnapshot(equity=equity, available_margin=available, position_size=positions.get(market.symbol, Decimal(0)) if market else None,
+                                   observed_at=stamp, account_mode=mode or "disabled", positions=positions, entry_orders=entries)
+        self.last_inventory = snapshot
+        return snapshot
 
     async def verify_signer(self):
         if self.wallet is None:
@@ -204,7 +282,7 @@ class Hyperliquid:
 
         return self.state.update(advance)
 
-    async def mutate(self, operation_id: str, action: dict, *, deadline=None, sign_method="l1", signer=None, prepare_guard=None):
+    async def mutate(self, operation_id: str, action: dict, *, deadline=None, sign_method="l1", signer=None, prepare_guard=None, async_prepare_guard=None):
         """Durable request binding, no automatic retries, per-leg result preservation."""
         request = {"network": self.settings.network, "account": self.account.lower(), "action": action,
                    "deadline": deadline, "sign_method": sign_method}
@@ -226,9 +304,9 @@ class Hyperliquid:
                 payload["vaultAddress"] = self.settings.vault_address
             return payload
 
-        return await self._dispatch(operation_id, request, build, deadline, prepare_guard=prepare_guard)
+        return await self._dispatch(operation_id, request, build, deadline, prepare_guard=prepare_guard, async_prepare_guard=async_prepare_guard)
 
-    async def _dispatch(self, operation_id, request, build, deadline=None, sender=None, nonce_override=None, allow_existing_nonce=False, prepare_guard=None):
+    async def _dispatch(self, operation_id, request, build, deadline=None, sender=None, nonce_override=None, allow_existing_nonce=False, prepare_guard=None, async_prepare_guard=None):
         if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 160:
             raise AqlaError("Operation identity must contain 1..160 characters")
         self.state.assert_binding(self.settings)
@@ -247,6 +325,8 @@ class Hyperliquid:
             if deadline is not None and now_ms() >= deadline:
                 raise AqlaError("Operation deadline has expired")
             await self.verify_signer()
+            if async_prepare_guard is not None:
+                await async_prepare_guard()
             nonce = self._nonce(nonce_override, allow_existing=allow_existing_nonce)
             expires = min(now_ms() + 30000, deadline) if deadline is not None else now_ms() + 30000
             payload = json.loads(json.dumps(build(nonce, expires), allow_nan=False))

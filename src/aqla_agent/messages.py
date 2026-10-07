@@ -5,7 +5,7 @@ import re
 from decimal import Decimal, InvalidOperation
 
 VENUES = {"hyperliquid": "Hyperliquid", "aster": "Aster", "lighter": "Lighter"}
-OPEN = {"preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup"}
+OPEN = {"preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
 ERRORS = {
     "SL, entry and TPs have invalid direction/ordering after rounding": "Preisordnung nach Rundung unzulässig; auch die Slippage-Ordergrenze wird geprüft.",
     "Existing exchange exposure has no free logical owner; no additional entry": "Bereits vorhandene Börsenposition; Aqla eröffnet keinen zusätzlichen Trade.",
@@ -108,7 +108,9 @@ def trade_block(data, trade, notices):
                   or (decimal(notice.get("previous", {}).get("filled_quantity")) == 0 and (decimal(notice.get("change", {}).get("filled_quantity")) or 0) > 0) for notice in notices)
     filled = decimal(trade.get("filled_quantity")) or Decimal(0)
     planned = decimal(plan.get("quantity"))
-    if stage == "unknown":
+    if stage == "conflicted":
+        title = "⚠️ **Manueller Marktkonflikt**"
+    elif stage == "unknown":
         title = "⏳ **Ausführung ungeklärt**"
     elif stage in ("closing", "cleanup"):
         title = "⏳ **Schließung wird abgeglichen**"
@@ -170,10 +172,12 @@ def trade_block(data, trade, notices):
             lines.append("**Ergebnis:** PnL nicht vollständig bestätigt")
     if trade.get("unsent_reason"):
         lines.append("**Grund:** " + literal(ERRORS.get(trade["unsent_reason"], trade["unsent_reason"])))
+    if trade.get("external_conflict"):
+        lines.append("**Verwaltung angehalten:** " + literal(trade['external_conflict']))
     return "\n\n".join(lines)
 
 
-def status_text(data, exchanges, sheets_enabled):
+def status_text(data, exchanges, sheets_enabled, inventory):
     active = [row for row in data["trades"].values() if row["status"] in OPEN]
     pending = sum(row["status"] in ("pending", "interpreted", "needs_reconciliation") for row in data["events"].values())
     unknown = sum(row["phase"] in ("prepared", "sending", "unknown") for row in data["operations"].values())
@@ -183,13 +187,22 @@ def status_text(data, exchanges, sheets_enabled):
     lines.append(f"**Offene Trades:** {len(active)} · **Ausstehende Quellen:** {pending}\n**Ungeklärte Vorgänge:** {unknown}")
     queue = len(data.get("journal_pending", {}))
     lines.append("**Sheets:** " + ("deaktiviert" if not sheets_enabled else f"{queue} Übertragungen ausstehend" if queue else "Journal synchronisiert"))
+    for venue, row in inventory.items():
+        if not row.get('available'):
+            lines.append(f"**{VENUES.get(venue, venue)}-Konto:** vollständige Übersicht nicht verfügbar")
+            continue
+        lines.append(f"**Kontoplätze:** {row['occupied_count']} / {row['limit']} · **Frei:** {row['free_slots']}\n"
+                     f"**Manuell:** {len(row['manual_markets'])} · **Aqla:** {len(row['aqla_markets'])} · **Reserviert:** {len(row['reserved_markets'])}\n"
+                     f"**Freie Margin:** {number(row['available_margin_usdc'])} USDC")
+        if row['conflicted_markets']:
+            lines.append("**Marktkonflikte:** " + ', '.join(literal(value) for value in row['conflicted_markets']))
     for trade in active:
         plan = trade["plan"]
         lines.append(f"• {literal(plan['market']['symbol'])} {plan['side'].upper()} · {VENUES.get(plan.get('exchange', 'hyperliquid'), literal(plan.get('exchange')))} · {literal(trade['status'])}")
     return "\n\n".join(lines)
 
 
-def telegram_view(data, exchanges, *, sheets_enabled=True):
+def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
     notifications = data.get("notifications", {})
     # Urgent protection notices are independent of signal batching.
     chosen = [identity for _, identity in sorted(enumerate(notifications), key=lambda item: (not item[1].startswith("protection:"), item[0]))][:MAX_NOTIFICATIONS]
@@ -238,5 +251,5 @@ def telegram_view(data, exchanges, *, sheets_enabled=True):
             notice = items[0][1]
             blocks.append("ℹ️ **Systemmeldung**\n" + literal(notice.get("error") or "Gespeichertes Ereignis ohne vollständige Trade-Zuordnung"))
         messages.append({"notification_ids": ids, "severity": "normal", "texts": split_blocks("\n\n".join(blocks))})
-    return {"status": split_blocks(status_text(data, exchanges, sheets_enabled)), "messages": messages,
+    return {"status": split_blocks(status_text(data, exchanges, sheets_enabled, inventory or {})), "messages": messages,
             "remaining_notification_ids": [identity for identity in notifications if identity not in chosen]}

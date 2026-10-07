@@ -4,6 +4,8 @@
 
 Telegram-Quellen → Hermes versteht Signal/Update im Kontext → Python prüft Profile und Pipelines → Hyperliquid, Aster und/oder Lighter führen unabhängig aus → Hermes meldet das Ergebnis je Börse in Telegram.
 
+Hyperliquid-Mainnet unterstützt manuelle Positionen neben Aqla auf freien Märkten. Gemeinsame Plätze und Unified-Account-Margin werden berücksichtigt; eigene Trades und fremde Orders bleiben getrennt verwaltet. [Mainnet und Parallelhandel](docs/mainnet-shared-account.md).
+
 Gold/XAU wird auf Hyperliquid als `xyz:GOLD` erkannt; Dezimalhebel werden abgerundet und gedeckelt. Eigene Kanalnamen vereinfachen die Bedienung. Ein globales Profil „Backup“ ergänzt fehlende Signalangaben: anfangs Hebel 2 und Markt-Entry; SL-/TP-Prozentfelder bleiben bis zu deiner Konfiguration leer. [Bedienung und Ausführungsregeln](docs/gold-backup-and-names.md).
 
 Eigenständiges Python-Projekt. Ein eigener Hyperliquid-MCP, ein kurzer bearbeitbarer Master-Skill und ein read-only Telegram-Quellenleser für abonnierte Kanäle. SQLite speichert Handelszustand und Hermes-Gespräche. Keine eigene Bot-Anbindung, MiniApp, Kanalbewertungen oder autonome Strategieoptimierung. Manuell an den Hermes-Bot weitergeleitete Signale werden ebenfalls als Quellen erfasst.

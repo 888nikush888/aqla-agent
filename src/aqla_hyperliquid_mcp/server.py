@@ -96,6 +96,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         """Read effective user rules, sources, pending work, owned trades and unresolved operations."""
         snapshot = state.snapshot()
         ready = trading.ready()
+        inventory = await trading.inventory_status()
         return {"network": settings.network, "account": exchange.account, "paused": snapshot["paused"],
                 "policy": snapshot["policy"], "policy_revision": snapshot["policy_revision"], "sources": snapshot["sources"],
                 "source_names": snapshot.get("source_names", {}), "source_names_revision": snapshot.get("source_names_revision", 0),
@@ -105,7 +106,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "notifications": snapshot["notifications"],
                 "configuration_revision": snapshot["configuration_revision"], "profiles": snapshot["profiles"],
                 "pipelines": snapshot["pipelines"], "exchanges": ready,
-                "telegram_view": telegram_view(snapshot, ready, sheets_enabled=settings.google_sheets.enabled),
+                "account_inventory": inventory,
+                "telegram_view": telegram_view(snapshot, ready, sheets_enabled=settings.google_sheets.enabled, inventory=inventory),
                 "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})), "last_synced_at": snapshot.get("journal_synced_at")}}
 
     @server.tool(annotations=read)

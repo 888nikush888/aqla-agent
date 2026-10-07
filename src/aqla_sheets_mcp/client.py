@@ -33,6 +33,9 @@ def column(index):
 class SheetsClient:
     def __init__(self, settings, *, session=None, timeout=15, scope=None):
         self.settings, self.timeout = settings, timeout
+        namespace = getattr(settings, "tab_namespace", "legacy")
+        self.prefix = PREFIX if namespace == "legacy" else "aqla " + namespace.capitalize() + " "
+        self.scope_key = "aqla.scope" if namespace == "legacy" else "aqla.scope." + namespace
         self.scope = scope
         self.session = session
         self.lock = threading.RLock()
@@ -63,16 +66,16 @@ class SheetsClient:
         properties = {sheet["properties"]["title"]: sheet["properties"] for sheet in raw.get("sheets", [])}
         used = {item["sheetId"] for item in properties.values()}
         requests = []
-        scopes = [item["metadataValue"] for item in raw.get("developerMetadata", []) if item.get("metadataKey") == "aqla.scope"]
+        scopes = [item["metadataValue"] for item in raw.get("developerMetadata", []) if item.get("metadataKey") == self.scope_key]
         if self.scope:
             if scopes and scopes != [self.scope]:
                 raise AqlaError("This Google spreadsheet belongs to a different aqla account/network")
             if not scopes:
                 if not create:
                     raise AqlaError("Google Sheets journal has not been initialized by the synchronizer yet")
-                requests.append({"createDeveloperMetadata": {"developerMetadata": {"metadataKey": "aqla.scope", "metadataValue": self.scope, "visibility": "DOCUMENT", "location": {"spreadsheet": True}}}})
+                requests.append({"createDeveloperMetadata": {"developerMetadata": {"metadataKey": self.scope_key, "metadataValue": self.scope, "visibility": "DOCUMENT", "location": {"spreadsheet": True}}}})
         for table, headers in HEADERS.items():
-            title = PREFIX + table
+            title = self.prefix + table
             if title in properties:
                 if create and table in LEGACY_HEADERS and len(headers) != len(LEGACY_HEADERS[table]):
                     cells = self.values([f"'{title}'!A1:{column(len(headers) + 2)}1"])
@@ -129,14 +132,14 @@ class SheetsClient:
 
     def existing(self, tables, properties):
         """Read bounded ID/version indexes, never historical record bodies."""
-        headers = self.values([f"'{PREFIX + table}'!A1:{column(len(HEADERS[table]) + 2)}1" for table in tables])
+        headers = self.values([f"'{self.prefix + table}'!A1:{column(len(HEADERS[table]) + 2)}1" for table in tables])
         result = {}
         for table, values in zip(tables, headers, strict=True):
             expected = [*HEADERS[table], *META_HEADERS]
             if not values or values[0][:len(expected)] != expected:
                 raise AqlaError("Google Sheets journal headers changed; restore the generated schema")
             result[table] = ({}, 1)
-        capacities = {table: properties[PREFIX + table]["gridProperties"]["rowCount"] for table in tables}
+        capacities = {table: properties[self.prefix + table]["gridProperties"]["rowCount"] for table in tables}
         start = 2
         for _ in range(MAX_INDEX_REQUESTS):
             active = [table for table in tables if start <= capacities[table]]
@@ -145,8 +148,8 @@ class SheetsClient:
             ranges = []
             for table in active:
                 end = min(capacities[table], start + INDEX_CHUNK_ROWS - 1)
-                ranges.extend([f"'{PREFIX + table}'!A{start}:A{end}",
-                               f"'{PREFIX + table}'!{column(len(HEADERS[table]) + 1)}{start}:{column(len(HEADERS[table]) + 2)}{end}"])
+                ranges.extend([f"'{self.prefix + table}'!A{start}:A{end}",
+                               f"'{self.prefix + table}'!{column(len(HEADERS[table]) + 1)}{start}:{column(len(HEADERS[table]) + 2)}{end}"])
             values = self.values(ranges)
             for position, table in enumerate(active):
                 identities, metadata = values[position * 2:position * 2 + 2]
@@ -187,7 +190,7 @@ class SheetsClient:
                 deferred = [index for group in groups[20:] for index in group]
                 indices = deferred + indices
                 groups = groups[:20]
-            ranges = [f"'{PREFIX + table}'!A{group[0]}:{column(width)}{group[-1]}" for group in groups]
+            ranges = [f"'{self.prefix + table}'!A{group[0]}:{column(width)}{group[-1]}" for group in groups]
             values = self.values(ranges)
             budget[0] -= 1
             for group, rows in zip(groups, values, strict=True):
@@ -215,7 +218,7 @@ class SheetsClient:
             budget, loaded = [MAX_BODY_REQUESTS], {}
             for table in tables:
                 found, count = existing[table]
-                capacity = properties[PREFIX + table]["gridProperties"]["rowCount"]
+                capacity = properties[self.prefix + table]["gridProperties"]["rowCount"]
                 targets, next_append = [], count + 1
                 # Inspect append slots to avoid overwriting a trailing row whose ID was removed.
                 for row in validated:
@@ -247,21 +250,21 @@ class SheetsClient:
                         if cells[size] == row["fingerprint"] and revision == maximum:
                             accepted[record_key(row)] = row["fingerprint"]
                             continue
-                        update = {"range": f"'{PREFIX + table}'!{column(size + 1)}{index}:{column(size + 2)}{index}", "values": [[row["fingerprint"], maximum]]}
+                        update = {"range": f"'{self.prefix + table}'!{column(size + 1)}{index}:{column(size + 2)}{index}", "values": [[row["fingerprint"], maximum]]}
                     elif revision is not None and revision > row["revision"]:
                         continue
                     else:
-                        update = {"range": f"'{PREFIX + table}'!A{index}:{column(size + 2)}{index}", "values": [[*row["values"], row["fingerprint"], row["revision"]]]}
+                        update = {"range": f"'{self.prefix + table}'!A{index}:{column(size + 2)}{index}", "values": [[*row["values"], row["fingerprint"], row["revision"]]]}
                 else:
                     index = count + 1
-                    capacity = properties[PREFIX + table]["gridProperties"]["rowCount"]
+                    capacity = properties[self.prefix + table]["gridProperties"]["rowCount"]
                     if index <= capacity:
                         cells = loaded[table].get(index)
                         if cells is None:
                             break
                         if any(value != "" for value in cells):
                             raise AqlaError("Journal append row contains data without an ID; restore the generated schema")
-                    update = {"range": f"'{PREFIX + table}'!A{index}:{column(len(HEADERS[table]) + 2)}{index}", "values": [[*row["values"], row["fingerprint"], row["revision"]]]}
+                    update = {"range": f"'{self.prefix + table}'!A{index}:{column(len(HEADERS[table]) + 2)}{index}", "values": [[*row["values"], row["fingerprint"], row["revision"]]]}
                 if len(json.dumps([*updates, update], ensure_ascii=True).encode()) > 1_500_000:
                     break
                 updates.append(update)
@@ -271,7 +274,7 @@ class SheetsClient:
                 accepted[record_key(row)] = row["fingerprint"]
             growth = []
             for table, count in needed.items():
-                props = properties[PREFIX + table]
+                props = properties[self.prefix + table]
                 capacity = props.get("gridProperties", {}).get("rowCount", 1000)
                 if count > capacity:
                     growth.append({"updateSheetProperties": {"properties": {"sheetId": props["sheetId"], "gridProperties": {"rowCount": max(count, capacity * 2)}}, "fields": "gridProperties.rowCount"}})
@@ -282,7 +285,7 @@ class SheetsClient:
                 self.request("POST", "/values:batchUpdate", json={"valueInputOption": "RAW", "data": updates})
             if any(key.startswith("Handelsparameter:") for key in accepted):
                 self.request("POST", ":batchUpdate", json={"requests": [{"autoResizeDimensions": {"dimensions": {
-                    "sheetId": properties[PREFIX + "Handelsparameter"]["sheetId"], "dimension": "ROWS",
+                    "sheetId": properties[self.prefix + "Handelsparameter"]["sheetId"], "dimension": "ROWS",
                     "startIndex": 0, "endIndex": existing["Handelsparameter"][1]}}}]})
             return {"accepted": accepted, "synced": len(accepted)}
 

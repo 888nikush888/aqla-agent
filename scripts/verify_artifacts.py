@@ -37,6 +37,9 @@ def main():
         for required in ("src/aqla_agent/messages.py", "tests/native_message_smoke.py", "docs/telegram-messages.md"):
             if "aqla-agent/" + required not in names:
                 raise SystemExit("Missing Telegram view asset: " + required)
+        for required in ("src/aqla_agent/accounting.py", "src/aqla_agent/network_transition.py", "docs/mainnet-shared-account.md", "tests/test_shared_account.py"):
+            if "aqla-agent/" + required not in names:
+                raise SystemExit("Missing shared-account asset: " + required)
         if len(json.loads(archive.read("aqla-agent/tests/fixtures/context_cases.json"))) != 30:
             raise SystemExit("Context evaluation fixtures are missing")
         with TemporaryDirectory() as target:

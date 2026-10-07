@@ -186,7 +186,7 @@ async def test_hip3_collateral_identity_controls_auto_route_but_full_sdk_stays_a
 
         await exchange.sdk_action("full-hip3", {"operation": "market_open", "name": "xyz:LOW", "is_buy": True,
                                                "sz": 1000.0}, sender=capture)
-        assert payloads[0]["action"]["orders"][0]["a"] == 100000
+        assert payloads[0]["action"]["orders"][0]["a"] == 110000
         assert len(state.snapshot()["operations"]) == 1
     finally:
         await exchange.close()

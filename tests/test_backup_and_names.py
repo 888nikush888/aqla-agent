@@ -61,7 +61,7 @@ async def test_gold_alias_uses_only_xyz_dex(setup,symbol,network):
     exchange.settings.network=network
     exchange.info=info
     market=await exchange.market(symbol)
-    assert market.symbol=='xyz:GOLD' and market.dex=='xyz' and market.asset_id==110000
+    assert market.symbol=='xyz:GOLD' and market.dex=='xyz' and market.asset_id==120000
     assert market.quote_token=='USDC'
     assert all(params.get('dex')=='xyz' for kind,params in seen if kind in ('meta','allMids'))
 

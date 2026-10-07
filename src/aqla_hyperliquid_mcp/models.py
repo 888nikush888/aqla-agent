@@ -76,6 +76,7 @@ class GoogleSheetsSettings(Model):
     credentials_file: Path | None = None
     sync_interval_seconds: int = Field(default=30, ge=10, le=3600)
     batch_size: int = Field(default=100, ge=1, le=500)
+    tab_namespace: Literal["legacy", "mainnet", "testnet"] = "legacy"
 
     @model_validator(mode="after")
     def configured(self):
@@ -97,12 +98,19 @@ class Settings(Model):
     timeout_seconds: float = Field(default=15, gt=0, le=120)
     max_context_messages: int = Field(default=20, ge=1, le=200)
     max_events: int = Field(default=5000, ge=100, le=100000)
+    shared_account: bool = False
     telegram_session_file: Path | None = None
     telegram_api_id: int | None = None
     telegram_api_hash_file: Path | None = None
     telegram_owner_id: str | None = None
     google_sheets: GoogleSheetsSettings = Field(default_factory=GoogleSheetsSettings)
     venues: dict[Literal["aster", "lighter"], VenueSettings] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def journal_network(self):
+        if self.google_sheets.tab_namespace not in ("legacy", self.network):
+            raise ValueError("Journal namespace must match its execution network")
+        return self
 
     @property
     def base_url(self):
@@ -260,6 +268,9 @@ class AccountSnapshot(Model):
     available_margin: Nonnegative
     position_size: Decimal | None = None
     observed_at: int = Field(default_factory=now_ms)
+    account_mode: str = "disabled"
+    positions: dict[str, Decimal] | None = None
+    entry_orders: list[dict] = Field(default_factory=list)
 
 
 class BackupValues(Model):
@@ -335,3 +346,7 @@ class TradePlan(Model):
 
 class AqlaError(ToolError, ValueError):
     """A safe, human-readable domain error; never contains credentials."""
+
+
+class ExternalInterference(AqlaError):
+    """The observed position no longer matches proved own fills."""

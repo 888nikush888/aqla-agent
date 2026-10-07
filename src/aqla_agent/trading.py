@@ -8,6 +8,7 @@ from aqla_hyperliquid_mcp.models import (
     TERMINAL_ORDER,
     AqlaError,
     BackupValues,
+    ExternalInterference,
     Interpretation,
     Policy,
     SourceEvent,
@@ -29,7 +30,9 @@ from aqla_hyperliquid_mcp.rules import (
 )
 from aqla_hyperliquid_mcp.state import State
 
-OPEN = {"preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup"}
+from .accounting import foreign_entry_orders, occupied_markets
+
+OPEN = {"preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
 UNFINISHED = {"pending", "interpreted", "needs_reconciliation"}
 
 
@@ -41,6 +44,8 @@ class Trading:
 
     def ingest(self, source: SourceEvent, *, native_forward=False):
         snapshot = self.state.snapshot()
+        if source.sent_at < snapshot.get("sources_live_after", 0):
+            source = source.model_copy(update={"historical": True})
         trusted_forward = native_forward and self.exchange.settings.telegram_owner_id and source.chat_id == self.exchange.settings.telegram_owner_id
         if not trusted_forward and source.chat_id not in {*snapshot["sources"], *snapshot.get("source_aliases", {}).values()}:
             raise AqlaError("Source is not subscribed")
@@ -168,6 +173,11 @@ class Trading:
         if self.position_size(positions, market) != 0:
             raise AqlaError("Existing exchange exposure has no free logical owner; no additional entry")
         account = await self.exchange.account_snapshot(market)
+        if account.positions is not None:
+            if len(occupied_markets(snapshot, account)) >= policy.max_open_trades:
+                raise AqlaError("Combined manual/Aqla market limit reached")
+            if foreign_entry_orders(snapshot, account, market.symbol):
+                raise AqlaError("Manual entry orders already reserve this market")
         refs = [item["source"]["sent_at"] for item in latest_sources(snapshot["events"], interpretation.source_refs).values()]
         risk = sum(Decimal(trade["reserved_risk"]) for trade in active)
         backup_profile = snapshot.get("profiles", {}).get("backup")
@@ -235,6 +245,11 @@ class Trading:
                 raise AqlaError("Current exchange position is unknown; no new exposure")
             if account.position_size != 0:
                 raise AqlaError("Current exchange exposure has no free logical owner; no additional entry")
+            if account.positions is not None:
+                if len(occupied_markets(snapshot, account, exclude_trade=plan.trade_id if owned else None)) >= limits.max_open_trades:
+                    raise AqlaError("Combined manual/Aqla market limit changed before entry")
+                if foreign_entry_orders(snapshot, account, plan.market.symbol):
+                    raise AqlaError("Manual entry orders now reserve this market")
             if (plan.risk_usdc + reserved > account.equity * limits.max_total_risk_percent / 100
                     or plan.risk_usdc > account.equity * plan.policy.risk_percent / 100
                     or plan.quantity * plan.entry_limit / margin_leverage(plan.effective_leverage, plan.market) > account.available_margin):
@@ -307,11 +322,15 @@ class Trading:
             return await self._entry_steps(plan, trade)
 
     async def _entry_steps(self, plan, trade):
+        async def live_guard():
+            account = await self.exchange.account_snapshot(plan.market)
+            self.validate_admission(self.state.snapshot(), plan, account, owned=True)
+        guards = {"async_prepare_guard": live_guard} if isinstance(self.exchange, Hyperliquid) and self.exchange.settings.shared_account else {}
         if plan.market.product == "perp":
             leverage = await self.exchange.mutate("leverage:" + plan.trade_id,
                                                  {"type": "updateLeverage", "asset": plan.market.asset_id,
                                                   "isCross": plan.policy.margin_mode == "cross", "leverage": plan.effective_leverage}, deadline=plan.deadline_at,
-                                                  prepare_guard=lambda data: self.validate_admission(data, plan, owned=True))
+                                                  prepare_guard=lambda data: self.validate_admission(data, plan, owned=True), **guards)
             if leverage["phase"] not in ("acknowledged", "reconciled"):
                 self._patch(plan.trade_id, status="unknown" if leverage["phase"] == "unknown" else "rejected")
                 return self.state.snapshot()["trades"][plan.trade_id]
@@ -324,10 +343,13 @@ class Trading:
         action = {"type": "order", "orders": [entry, initial_stop], "grouping": "normalTpsl"}
         self._patch(plan.trade_id, status="opening", orders=[{"kind": "sl", "cloid": initial_stop["c"], "quantity": str(plan.quantity), "price": str(plan.stop_loss)}])
         result = await self.exchange.mutate(trade["entry_operation_id"], action, deadline=plan.deadline_at,
-                                            prepare_guard=lambda data: self.validate_admission(data, plan, account, owned=True))
+                                            prepare_guard=lambda data: self.validate_admission(data, plan, account, owned=True), **guards)
         if result["phase"] == "unknown":
             self._patch(plan.trade_id, status="unknown")
-        await self.refresh_trade(plan.trade_id)
+        try:
+            await self.refresh_trade(plan.trade_id)
+        except ExternalInterference as error:
+            self._patch(plan.trade_id, status="conflicted", external_conflict=str(error))
         current = self.state.snapshot()["trades"][plan.trade_id]
         if current["status"] == "opening" and Decimal(current["filled_quantity"]) == 0 and result["phase"] in ("acknowledged", "reconciled"):
             self.state.update(lambda data: data["notifications"].setdefault("entry-waiting:" + plan.trade_id,
@@ -468,8 +490,12 @@ class Trading:
         if owned == 0 and entered:
             return Decimal(0)
         if observed > owned or (signed < 0 and plan.side == "long") or (signed > 0 and plan.side == "short" and plan.market.product == "perp"):
+            if getattr(self.exchange.settings, "shared_account", False):
+                raise ExternalInterference("Manual intervention changed this market; Aqla does not manage the mixed position")
             raise AqlaError("Exchange exposure differs from remaining owned fills; no automatic management")
         if observed < owned:
+            if getattr(self.exchange.settings, "shared_account", False):
+                raise ExternalInterference("Observed position is smaller than proved own fills; manual intervention requires review")
             raise AqlaError("Position and owned fills are inconsistent; preserve protection until fresh reconciliation")
         return observed
 
@@ -503,6 +529,8 @@ class Trading:
                             covered |= observed.get("order", {}).get("status") == "open" and self._stop_matches(observed, plan, remaining, Decimal(current["stop_price"]))
                 if not covered and current["status"] not in ("closing", "cleanup", "closed"):
                     raise AqlaError("No confirmed effective stop loss")
+            except ExternalInterference:
+                raise
             except Exception as error:
                 if not getattr(self.exchange, "fail_closed_protection", False) and not set(plan.backup_fields) & {"stop_loss", "take_profits"}:
                     raise
@@ -711,6 +739,8 @@ class Trading:
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
         self.assert_plan_binding(self.state.snapshot(), plan)
+        if trade["status"] == "conflicted":
+            raise AqlaError("Manual market conflict requires review; existing orders are preserved")
         if trade["status"] not in OPEN:
             return {"already_closed": True}
         remaining = Decimal(trade["remaining_quantity"])
@@ -785,6 +815,8 @@ class Trading:
         trade = snapshot["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
         self.assert_plan_binding(snapshot, plan)
+        if trade["status"] == "conflicted":
+            raise AqlaError("Manual market conflict requires review; no mixed position is closed")
         if trade["status"] not in OPEN or trade["status"] == "cleanup":
             return {"already_closed": True}
         operation_id = operation_id or "close:" + trade_id + ":" + str(trade["management_revision"])
@@ -903,6 +935,8 @@ class Trading:
             if len(candidates) != 1 or signal.bound_trade_id not in (None, candidates[0]["trade_id"]):
                 raise AqlaError("Trade update cannot be bound unambiguously")
             trade = candidates[0]
+            if trade["status"] == "conflicted":
+                raise AqlaError("Manual market conflict requires review; no automatic source update")
             if trade["status"] == "cleanup":
                 raise AqlaError("Exit cleanup must finish before further trade updates")
             plan = TradePlan.model_validate(trade["plan"])
@@ -1040,6 +1074,9 @@ class Trading:
             if trade["status"] in ("closed", "rejected") and trade["orders"] and not trade.get("cleanup_complete"):
                 self.begin_cleanup(trade_id, trade["status"])
                 trade = self.state.snapshot()["trades"][trade_id]
+            if trade["status"] == "conflicted":
+                reports.append({"trade_id": trade_id, "market_conflict": True, "market": trade['plan']['market']['symbol']})
+                continue
             if trade["status"] in OPEN:
                 try:
                     if trade["status"] == "cleanup":
@@ -1051,6 +1088,9 @@ class Trading:
                             if identity not in self.state.snapshot()["operations"]:
                                 reports.append(await self.dispatch_close_intent(trade_id, intent))
                         reports.append(await self.refresh_trade(trade_id))
+                except ExternalInterference as error:
+                    self._patch(trade_id, status="conflicted", external_conflict=str(error))
+                    reports.append({"trade_id": trade_id, "market_conflict": True, "market": trade['plan']['market']['symbol']})
                 except Exception as error:
                     reports.append({"trade_id": trade_id, "error": str(error) if isinstance(error, AqlaError) else "Trade reconciliation is unavailable"})
         self.recovery_checked = not any(row.get("error") for row in reports)

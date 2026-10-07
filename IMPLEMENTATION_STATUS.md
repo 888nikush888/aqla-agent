@@ -4,6 +4,8 @@ Stand: 07.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Qu
 
 ## Inhalt
 
+- Hyperliquid unterstützt als gemeinsames Konto manuelle Positionen auf anderen Märkten. Kontoübersichten zählen Positionen, fremde Entry-Reservierungen und Aqla-Plätze; Unified Account verwendet gemeinsame USDC-Balances und Holds. Markt-Konflikte sind lokal, fremde Orders bleiben erhalten. Die HIP-3-Asset-ID-Berechnung entspricht nun dem offiziellen SDK. Mainnet-Zustand, Journal-Tabs und Cutover-Cursor bleiben vom Testnet getrennt. Siehe `docs/mainnet-shared-account.md`.
+
 - Additive `status.telegram_view` mit reinem Python-Formatter für kompakte Telegram-Meldungen. Vorlagen unterscheiden Entry-Warten, Teilfill, Eröffnung, Update, Ablehnung, ungeklärten Ausgang, Schutzvorfall und Schließen. Setupfamilien bündeln Börsenergebnisse; Schutzvorfälle haben Vorrang. Native Hermes-Konvertierung, Zustellung und gespeicherte Antworten bleiben erhalten. Siehe `docs/telegram-messages.md`.
 
 - Gold/XAU-Aliase verwenden den geprüften Hyperliquid-Namensraum `xyz:GOLD` im konfigurierten Netzwerk. Dezimalhebel werden mit Originalbeleg gespeichert, abgerundet und am Marktmaximum gedeckelt. Frei wählbare Kanalnamen dienen der Telegram-Bedienung und Anzeige; IDs und Leserauflösung bleiben erhalten.
@@ -26,6 +28,8 @@ Stand: 07.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Qu
 - Source-ZIP mit SHA-256, Wheel und Source-Distribution; keine lokalen Secrets, Daten oder QA-Umgebungen im Archiv. Eigenständiges privates GitHub-Repository `888nikush888/aqla-agent` mit Qualitätspipeline.
 
 ## Geprüft
+
+Mainnet/Parallelhandel: initial **690 Tests bestanden, ein plattformabhängiger Test übersprungen, 77,98 Prozent Coverage**. Zusätzliche Journal-Namespace- und Inventarprüfungen bestanden. Die echte Mainnet-API-Wallet wurde lesend bestätigt; Unified Account, manuelle Positionen und freie USDC-Margin wurden über die vollständige Kontoübersicht geprüft. Kein künstlicher Mainnet-Auftrag wurde gesendet.
 
 Telegram-Ansichten: **677 Tests bestanden, ein plattformabhängiger Test übersprungen, 80,16 Prozent Coverage** im initialen Gesamtlauf. Weitere gezielte Fälle prüfen ungeklärte Ziele und unvollständige Exit-Fills. Der native Telegram-Test bestätigt MarkdownV2, Sonderzeichen, Nachrichtenteilung und dieselben gespeicherten Antworttexte ohne reale Telegram- oder Börsenaufrufe.
 
