@@ -202,6 +202,24 @@ def status_text(data, exchanges, sheets_enabled, inventory):
     return "\n\n".join(lines)
 
 
+def monthly_message(report):
+    summary = report["summary"]
+    lines = ["📊 **Monatsbericht · " + report["month"] + "**",
+             f'**Geschlossene Trades:** {summary["trades"]} · **Vollständig:** {summary["complete"]}',
+             f'**Gewinne / Verluste:** {summary["wins"]} / {summary["losses"]} · **Gewinnquote:** ' + (number(summary["win_rate_percent"]) + " %" if summary["win_rate_percent"] is not None else "nicht berechenbar"),
+             "**Summe der Trade-Renditen — keine Kontorendite:** " + number(summary["roe_sum_percent"]) + " %"]
+    lines.extend("**Netto-PnL:** " + number(amount) + " " + currency for currency, amount in sorted(summary["net_by_currency"].items()))
+    opened = report.get("open_trade_count", len(report.get("open_trades", [])))
+    undated = report.get("undated_closed_count", len(report.get("undated_closed_trades", [])))
+    lines += [f'**Ausgeschlossen:** {summary["excluded"]} unvollständige Ergebnisse · **Offen am Monatsende:** {opened}']
+    if undated:
+        lines.append(f'**Ohne belegten Schließmonat:** {undated} · keiner Summe zugeordnet')
+    lines += ["ROE auf berechnete Anfangsmargin, einschließlich belegter Gebühren und Funding."]
+    if report.get("url"):
+        lines.append("[Vollständige Trade-Tabelle](" + report["url"] + ")")
+    return "\n\n".join(lines)
+
+
 def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
     notifications = data.get("notifications", {})
     # Urgent protection notices are independent of signal batching.
@@ -211,7 +229,9 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
         notice = notifications[identity]
         trade = data["trades"].get(notice.get("trade_id"))
         event = data["events"].get(notice.get("event_id") or (trade or {}).get("event_id"))
-        if identity.startswith("protection:"):
+        if notice.get("monthly_report"):
+            key = ("monthly", identity)
+        elif identity.startswith("protection:"):
             key = ("urgent", identity)
         elif trade:
             key = ("signal", tuple(sorted(trade["plan"].get("source_refs", [trade["trade_id"]]))))
@@ -225,6 +245,9 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
     messages = []
     for key, items in groups.items():
         ids = [row[0] for row in items]
+        if key[0] == "monthly":
+            messages.append({"notification_ids": ids, "severity": "normal", "texts": split_blocks(monthly_message(items[0][1]["monthly_report"]))})
+            continue
         if key[0] == "urgent":
             notice = items[0][1]
             text = "🚨 **Schutzvorfall**\n\n**Börse:** " + VENUES.get(notice.get("exchange"), literal(notice.get("exchange", "nicht zugeordnet"))) + "\n**Entries:** gesperrt\n\n**Grund:** " + literal(ERRORS.get(notice.get("error"), notice.get("error", "Schutz nicht bestätigt")))

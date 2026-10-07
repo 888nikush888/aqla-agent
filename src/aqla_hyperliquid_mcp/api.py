@@ -52,6 +52,10 @@ def wire_number(value) -> str:
 
 
 class Hyperliquid:
+    async def funding_payments(self, market, start, end):
+        from aqla_agent.funding import hyperliquid_funding
+        return await hyperliquid_funding(self, market, start, end)
+
     def __init__(self, settings: Settings, state: State, client=None):
         self.settings, self.state = settings, state
         self.client = client or httpx.AsyncClient(base_url=settings.base_url, timeout=settings.timeout_seconds)

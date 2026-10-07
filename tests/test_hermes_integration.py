@@ -55,6 +55,44 @@ def test_tool_claim_comes_from_native_metadata_not_text(extension):
     assert extension.origin(message(owner="intruder")) is None
     assert extension.origin(message(injection=True, plugin_id="different-plugin")) is None
     assert extension.before_tool("mcp__sheets__sync_internal", {})["action"] == "block"
+    assert extension.before_tool("mcp__sheets__publish_monthly_internal", {})["action"] == "block"
+    assert extension.before_tool("mcp__aqla__monthly_report", {"month": "2026-09"}) is None
+
+
+@pytest.mark.asyncio
+async def test_monthly_sheets_failure_never_acknowledges_publication(extension):
+    ext, _ = extension
+    ext.settings.google_sheets.spreadsheet_id = "ci" + "0" * 25
+    ext.settings.google_sheets.credentials_file = "ci-only.secret"
+    ext.settings.google_sheets.enabled = True
+    calls = []
+    async def failed(server, tool, args):
+        calls.append((server, tool, args))
+        if args.get("action") == "monthly_job":
+            return {"report": {"month": "2026-09"}}
+        raise OSError("lost Sheets result")
+    ext.mcp_call = failed
+    await ext.sync_monthly()
+    assert not any(row[2].get("action") == "monthly_ack" for row in calls)
+    ext.last_monthly_sync = 0
+    async def accepted(server, tool, args):
+        calls.append((server, tool, args))
+        return {"report": {"month": "2026-09"}} if args.get("action") == "monthly_job" else {"url": "confirmed"}
+    ext.mcp_call = accepted
+    await ext.sync_monthly()
+    assert calls[-1][2]["action"] == "monthly_ack"
+
+
+def test_only_actual_owner_monthly_requests_trigger_internal_publication(extension):
+    ext, ctx = extension
+    calls = []
+    ctx.call_mcp = lambda *args: calls.append(args) or {"ok": True}
+    ext.active_context = ("source", "message")
+    assert ext.before_tool("mcp__aqla__monthly_report", {"month": "2026-09"}) is None
+    assert not calls
+    ext.active_context = ("operator", "owner-request")
+    assert ext.before_tool("mcp__aqla__monthly_report", {"month": "2026-09"}) is None
+    assert calls[0][2]["action"] == "monthly_request"
 
 
 @pytest.mark.asyncio

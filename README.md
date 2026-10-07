@@ -12,6 +12,8 @@ Eigenständiges Python-Projekt. Ein eigener Hyperliquid-MCP, ein kurzer bearbeit
 
 Telegram-Handelsmeldungen verwenden kompakte, aus gespeicherten Fakten erzeugte Vorlagen mit getrennten Börsenergebnissen, bestätigten Preisen und klaren Statusüberschriften. [Nachrichtenansichten](docs/telegram-messages.md).
 
+Monatsberichte zeigen jeden vollständig geschlossenen Aqla-Mainnet-Trade, belegten Netto-PnL einschließlich Gebühren/Funding und ROE auf die berechnete Anfangsmargin. Vollständige Trade-ROEs werden arithmetisch addiert, Geldbeträge je Währung getrennt. Die Tabelle liegt in Sheets, die Zusammenfassung kommt am Folgemonatsersten um 09:00 Europe/Berlin über Hermes. Erster regulärer Bericht: Oktober 2026. [Berechnung, Datenlücken und Bedienung](docs/monthly-reports.md).
+
 ## Unabhängig auf einem VPS installieren
 
 Voraussetzungen: Linux mit systemd, Git und uv. Der Installer richtet eigene Python-Laufzeiten im Zielordner ein: 3.12 für Aqla, 3.14 für den exakt gepinnten Hermes-Stand. Eine vorhandene Hermes-Installation wird nicht angebunden oder verändert.

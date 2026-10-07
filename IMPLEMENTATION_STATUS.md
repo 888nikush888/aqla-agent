@@ -1,5 +1,13 @@
 # aqla Agent — Auslieferungsstand
 
+## Monatsberichte mit ROE (07.10.2026)
+
+- Lesendes `monthly_report` mit begrenzten Seiten, vollständigen Summen, Ausschluss unvollständiger Ergebnisse und separaten offenen/undatierten Trades. Aqla-Mainnet-Abschlüsse werden einmal im belegten Schließmonat ausgewertet.
+- Festgeschriebener tatsächlicher Entry-Positionswert und berechnete Anfangsmargin nach bestätigter Entry-Endmenge. Native Margin-Hebelrundung und Teil-Entries/Exits werden berücksichtigt. SL-/TP-Preise ändern sich bei Hebeldeckelung nicht.
+- Lesende Funding-Zahlungshistorie für Hyperliquid, Aster und Lighter mit stabilen Identitäten, begrenzten Fenstern/Pagination und eigenem Fill-Abgleich. Manuelle/gemischte Verläufe bleiben unvollständig. Bestätigte Belege bleiben bei vorübergehenden Lesefehlern erhalten.
+- Idempotente Sheets-Monatstabellen, vollständige Rückleseprüfung vor Benachrichtigung, dauerhafte Revisions-/Versandmarken und Wiederanlauf. Startmonat Oktober 2026, erster Versand 01.11.2026 um 09:00 Europe/Berlin. Betreiberanfragen lösen intern die Veröffentlichung aus; Quellen erhalten keinen Publisher.
+- Native Hermes-/Telegram-Prüfungen mit simuliertem Versand, Monatsgrenzen/Sommerzeit, Gebühren/Funding, Quellenautorität, Wiederanlauf und verlorenen Antworten. Keine synthetischen Börsenaufträge zur Abnahme.
+
 Stand: 07.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Quellpaket. Die bestehende Hermes-Installation des Nutzers wurde weder verändert noch angebunden. Kein TSX-Code oder alter Handelszustand wurde übernommen.
 
 ## Inhalt

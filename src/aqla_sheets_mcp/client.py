@@ -31,6 +31,10 @@ def column(index):
 
 
 class SheetsClient:
+    def publish_monthly(self, report):
+        from .monthly import publish
+        return publish(self, report)
+
     def __init__(self, settings, *, session=None, timeout=15, scope=None):
         self.settings, self.timeout = settings, timeout
         namespace = getattr(settings, "tab_namespace", "legacy")

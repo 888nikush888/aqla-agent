@@ -17,6 +17,7 @@ from aqla_agent.pipelines import (
     route_control,
     sync_legacy_policy,
 )
+from aqla_agent.reporting import Reporting
 from aqla_agent.router import Router
 
 from . import __version__
@@ -36,6 +37,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     state = state or State(settings)
     exchange = exchange or Hyperliquid(settings, state)
     trading = Router(settings, state, exchange)
+    reporting = Reporting(state, trading)
     streams = Streams(settings.base_url, timeout=settings.timeout_seconds)
     authority = Authority.from_file(settings.integration_key_file) if settings.integration_key_file else None
 
@@ -63,11 +65,21 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     async def lifespan(_):
         await trading.recover()
         task = asyncio.create_task(maintenance(), name="aqla-protection")
+        async def report_evidence():
+            while True:
+                try:
+                    await reporting.tick()
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).warning("Monthly accounting evidence unavailable; completeness remains explicit")
+                await asyncio.sleep(60)
+        report_task = asyncio.create_task(report_evidence(), name="aqla-report-evidence")
         try:
             yield None
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            report_task.cancel()
+            await asyncio.gather(task, report_task, return_exceptions=True)
             await trading.close()
             await streams.close()
             state.close()
@@ -109,6 +121,17 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "account_inventory": inventory,
                 "telegram_view": telegram_view(snapshot, ready, sheets_enabled=settings.google_sheets.enabled, inventory=inventory),
                 "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})), "last_synced_at": snapshot.get("journal_synced_at")}}
+
+    @server.tool(annotations=read)
+    async def monthly_report(month: str, offset: int = 0, limit: int = 100) -> dict:
+        """Read Aqla Mainnet trades closed in YYYY-MM, fees/funding, initial-margin ROE and completeness. No exchange writes."""
+        from aqla_agent.monthly import monthly_report as calculate
+        if isinstance(offset, bool) or isinstance(limit, bool) or offset < 0 or not 1 <= limit <= 500:
+            raise AqlaError("Monthly page requires offset >= 0 and limit between 1 and 500")
+        report = calculate(state.snapshot(), month)
+        totals = {key: len(report[key]) for key in ("rows", "open_trades", "undated_closed_trades")}
+        return {**report, **{key: report[key][offset:offset + limit] for key in totals},
+                "page": {"offset": offset, "limit": limit, "totals": totals}}
 
     @server.tool(annotations=read)
     async def source_context(event_id: str) -> dict:
@@ -226,14 +249,44 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.update(apply)
 
     @server.tool(annotations=write)
-    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack"], token: str, source: SourceEvent | None = None,
+    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack", "monthly_job", "monthly_ack", "monthly_request"], token: str, source: SourceEvent | None = None,
                           aliases: dict[str, str] | None = None, cutoffs: dict[str, int] | None = None,
                           context_ids: dict[str, list[int]] | None = None,
-                          accepted: dict[str, str] | None = None) -> dict:
+                          accepted: dict[str, str] | None = None, month: str | None = None,
+                          publication: dict | None = None) -> dict:
         """Internal native-plugin access, filtered out of agent tools; token never enters model context."""
         if authority is None:
             raise AqlaError("Integration key is not configured")
         authority.internal(token)
+        if action == "monthly_job":
+            from aqla_agent.monthly import next_job
+            return next_job(state.snapshot())
+        if action == "monthly_request":
+            from datetime import datetime
+
+            from aqla_agent.monthly import BERLIN, month_bounds
+            month_bounds(month)
+            if month > datetime.now(BERLIN).strftime("%Y-%m"):
+                raise AqlaError("Zukünftige Monate haben noch keinen Monatsbericht")
+            def request_month(data):
+                from aqla_agent.monthly import monthly_report as calculate
+                if calculate(data, month)["published_current_revision"]:
+                    return {"requested_month": month, "already_published": True}
+                wanted = data.setdefault("monthly_requests", [])
+                if month not in wanted:
+                    wanted.append(month)
+                return {"requested_month": month}
+            return state.update(request_month)
+        if action == "monthly_ack":
+            from aqla_agent.monthly import acknowledge_publication
+            if not publication:
+                raise AqlaError("Confirmed Sheets publication is required")
+            import re
+            expected = settings.google_sheets.spreadsheet_id
+            if not re.fullmatch(r"https://docs\.google\.com/spreadsheets/d/" + re.escape(expected or "") + r"/edit#gid=\d+", publication.get("url", "")):
+                raise AqlaError("Monthly publication URL does not match the configured spreadsheet")
+            return state.update(lambda data: acknowledge_publication(data, month, publication["fingerprint"],
+                                publication["url"], publication["revision"]))
         if action == "journal_snapshot":
             from aqla_sheets_mcp.journal import batch
             return batch(state.snapshot(), settings.google_sheets.batch_size)

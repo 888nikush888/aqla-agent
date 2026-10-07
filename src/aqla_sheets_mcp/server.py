@@ -40,7 +40,7 @@ def create_server(settings, *, client=None):
         selected = settings.google_sheets
         return {"enabled": selected.enabled, "url": f"https://docs.google.com/spreadsheets/d/{selected.spreadsheet_id}/edit" if selected.spreadsheet_id else None,
                 "tables": HEADERS, "sync_interval_seconds": selected.sync_interval_seconds,
-                "execution_state": "local atomic JSON", "manual_trade_fact_writes": False}
+                "execution_state": "local transactional SQLite", "manual_trade_fact_writes": False}
 
     @server.tool(annotations=read)
     async def journal_read(table: Table, offset: Annotated[int, Field(ge=0)] = 0,
@@ -65,4 +65,13 @@ def create_server(settings, *, client=None):
         return await asyncio.to_thread(client.sync, [row.model_dump(mode="json") for row in records])
 
     server.aqla_sheets_client = client
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+    async def publish_monthly_internal(token: str, report: dict) -> dict:
+        """Internal verified monthly publication, excluded from Hermes model tools."""
+        if authority is None:
+            raise AqlaError("Journal integration authority is not configured")
+        authority.internal(token)
+        configured()
+        return await asyncio.to_thread(client.publish_monthly, report)
+
     return server

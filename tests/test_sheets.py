@@ -232,7 +232,7 @@ async def test_actual_sheets_mcp_registration_reading_and_internal_auth(setup, s
     selected, _, client = sheets
     settings.google_sheets = selected
     server = create_server(settings, client=client)
-    assert {tool.name for tool in await server.list_tools()} == {"journal_status", "journal_read", "journal_statistics", "sync_internal"}
+    assert {tool.name for tool in await server.list_tools()} == {"journal_status", "journal_read", "journal_statistics", "sync_internal", "publish_monthly_internal"}
     with pytest.raises(ToolError, match="denied"):
         await server.call_tool("sync_internal", {"token": "untrusted-source", "records": []})
     row = record("Regeln", "aktuell", "testnet", "ci-account", 1, False, "[]", "null")

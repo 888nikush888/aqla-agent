@@ -464,6 +464,11 @@ class Trading:
                     entry_vwap=str(cost / total) if total else trade["entry_vwap"],
                     **({"completed_target_prices": completed_prices} if plan.policy.stop_management == "tp_ladder" else {}))
         self.observe_orders(trade_id, observed)
+        from .monthly import accounting_facts, entry_quantity_evidence
+        confirmed_quantity = entry_quantity_evidence(entry_status)
+        if confirmed_quantity is not None:
+            self._patch(trade_id, entry_fill_quantity_confirmed=confirmed_quantity)
+        self._patch(trade_id, **accounting_facts(self.state.snapshot()["trades"][trade_id]))
         return total, cost
 
     def observe_orders(self, trade_id, observations):
@@ -883,7 +888,7 @@ class Trading:
             self.observe_orders(trade_id, dict(zip(trade["cleanup_cloids"], observations, strict=True)))
             if any(row.get("order", {}).get("status") not in TERMINAL_ORDER for row in observations):
                 raise AqlaError("Owned exit cancellation is unconfirmed; market ownership remains reserved")
-        self._patch(trade_id, status=trade["cleanup_target"], cleanup_complete=True, reserved_risk="0")
+        self._patch(trade_id, status=trade["cleanup_target"], cleanup_complete=True, reserved_risk="0", cleanup_observed_at=now_ms())
         return self.state.snapshot()["trades"][trade_id]
 
     def update_candidates(self, event_id, signal: Interpretation):

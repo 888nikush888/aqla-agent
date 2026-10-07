@@ -62,6 +62,8 @@ def main():
     tool_names = discover_mcp_tools()
     assert any(name.endswith("trade_preview") for name in tool_names), tool_names
     assert any(name == "mcp__sheets__journal_status" for name in tool_names), tool_names
+    assert "mcp__aqla__monthly_report" in tool_names
+    assert "mcp__sheets__publish_monthly_internal" not in tool_names
     from model_tools import get_available_toolsets
     available_toolsets = get_available_toolsets()
     print("MCP toolsets:", [name for name in available_toolsets if "mcp" in name or "aqla" in name])
@@ -93,6 +95,7 @@ def main():
                     ("clarify", {"questions": [{"question": "Which profile?", "choices": ["Standard", "Other"]}]}),
                     ("skill_manage", {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.", "new_string": "x" * 8193}),
                     ("skill_manage", {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.", "new_string": "Du bist aqla Agent. Prüfe Replies besonders sorgfältig."})]
+        expected.insert(2, ("monthly_report", {"month": "2026-10"}))
     if args.mode == "lifecycle":
         report = ("interpret_source", {"event_id": original.event_id, "interpretation": {"kind": "report", "source_refs": [original.source_id], "reason": "Ergebnisbericht"}})
         expected = [("control", {"action": "set_policy", "expected_revision": 0, "policy": {"risk_percent": "0.75", "leverage": 2, "max_open_trades": 3}}), None,
@@ -159,7 +162,7 @@ def main():
         source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345")
         store = SessionStore(destination / "hermes-home" / "sessions", GatewayConfig())
         agent = AIAgent(model="qa-model", provider="custom", base_url=f"http://127.0.0.1:{model.server_port}/v1", api_key="local-test-only",
-                        platform="telegram", enabled_toolsets=["skills", "clarify", "todo", "session_search", *[name for name in available_toolsets if name in ("mcp-aqla", "mcp-sheets")]], max_iterations=12, session_db=store._db,
+                        platform="telegram", enabled_toolsets=["skills", "clarify", "todo", "session_search", *[name for name in available_toolsets if name in ("mcp-aqla", "mcp-sheets")]], max_iterations=14, session_db=store._db,
                         clarify_callback=lambda questions: {"answers": {question["id"]: "Standard" for question in questions}, "outcome": "submitted"},
                         skip_memory=True, skip_background_review=True, quiet_mode=True, save_trajectories=False)
 
@@ -202,6 +205,7 @@ def main():
         if args.mode == "owner":
             assert data["policy"]["risk_percent"] == "0.75"
             assert data["source_names"] == {"-100123": "VIP Gold"}
+            assert data["monthly_requests"] == ["2026-10"]
             assert data["profiles"]["backup"]["parameters"]["fallback_stop_loss_percent"] == "1"
             assert data["policy"]["take_profit_allocation"] == "adaptive" and data["policy"]["stop_management"] == "tp_ladder"
             master = destination / "hermes-home" / "skills" / "aqla-master" / "SKILL.md"

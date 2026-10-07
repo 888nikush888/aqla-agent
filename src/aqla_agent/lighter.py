@@ -31,6 +31,10 @@ def integer_price(value, step):
 
 
 class Lighter(VenueAdapter):
+    async def funding_payments(self, market, start, end):
+        from .funding import lighter_funding
+        return await lighter_funding(self, market, start, end)
+
     def __init__(self, settings, state, client=None, signer=None):
         super().__init__(settings, state)
         if settings.api_key_index is None:

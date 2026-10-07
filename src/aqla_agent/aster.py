@@ -26,6 +26,10 @@ def sign_parameters(wallet, parameters):
 
 
 class Aster(VenueAdapter):
+    async def funding_payments(self, market, start, end):
+        from .funding import aster_funding
+        return await aster_funding(self, market, start, end)
+
     def __init__(self, settings, state, client=None):
         super().__init__(settings, state)
         if not settings.signer:

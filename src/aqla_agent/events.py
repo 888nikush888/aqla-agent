@@ -66,6 +66,7 @@ class HermesExtension:
         self.started = False
         self.last_wake = 0.0
         self.last_journal_sync = 0.0
+        self.last_monthly_sync = 0.0
         self.reader_error = None
         self.reported_reader_error = None
         self.master_path = Path(ctx.get_config("master_path", self.config_path.parent / "hermes-home" / "skills" / "aqla-master" / "SKILL.md"))
@@ -173,7 +174,22 @@ class HermesExtension:
     async def journal_worker(self):
         while True:
             await self.sync_journal()
+            await self.sync_monthly()
             await asyncio.sleep(3)
+
+    async def sync_monthly(self):
+        if not self.settings.google_sheets.enabled or time.monotonic() - self.last_monthly_sync < 60:
+            return
+        self.last_monthly_sync = time.monotonic()
+        try:
+            pending = await self.mcp_call(self.server, "integration", {"action": "monthly_job", "token": self.authority.key.decode()})
+            if not pending.get("report"):
+                return
+            published = await self.mcp_call("sheets", "publish_monthly_internal", {"token": self.authority.key.decode(), "report": pending["report"]})
+            await self.mcp_call(self.server, "integration", {"action": "monthly_ack", "token": self.authority.key.decode(),
+                                "month": pending["report"]["month"], "publication": published})
+        except Exception as error:
+            LOG.warning("aqla monthly publication unavailable (%s); report remains pending", type(error).__name__)
 
     async def reader_worker(self):
         try:
@@ -353,10 +369,22 @@ class HermesExtension:
         return None
 
     def before_tool(self, tool_name, args, **_):
-        if tool_name in ("mcp__sheets__sync_internal", "mcp_sheets_sync_internal"):
+        if tool_name in ("mcp__sheets__sync_internal", "mcp_sheets_sync_internal", "mcp__sheets__publish_monthly_internal", "mcp_sheets_publish_monthly_internal"):
             return {"action": "block", "message": "Journal delivery is reserved for the native synchronizer"}
         short = tool_name.removeprefix("mcp__aqla__").removeprefix("mcp_aqla_")
         origin = self.active_context
+        if short == "monthly_report" and origin and origin[0] == "operator":
+            # The read tool stays read-only. The native owner-request hook asks the
+            # internal publisher for an analysis tab, separately from model tools.
+            from .monthly import month_bounds
+            try:
+                month_bounds(args.get("month"))
+                result = self.ctx.call_mcp(self.server, "integration", {"action": "monthly_request",
+                                           "token": self.authority.key.decode(), "month": args["month"]})
+                if not result.get("ok"):
+                    return {"action": "block", "message": "Monthly publication request could not be recorded"}
+            except AqlaError as error:
+                return {"action": "block", "message": str(error)}
         if tool_name in ("clarify", "todo_list", "session_search"):
             if not origin or origin[0] != "operator":
                 return {"action": "block", "message": "Operator interaction tools are unavailable to source processing"}
