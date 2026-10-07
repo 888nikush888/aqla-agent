@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from aqla_hyperliquid_mcp.models import AqlaError
+from aqla_hyperliquid_mcp.models import AqlaError, now_ms
 
 
 def change_admission(state, trading, source, plan, change):
@@ -83,10 +83,20 @@ async def test_unsent_entry_rechecks_after_dispatch_signer_await(setup, signal, 
                 settings.vault_address = "0x" + "1" * 40
             elif change == "principal":
                 settings.account = "0x" + "2" * 40
-            elif change in ("stale", "deadline"):
+            elif change == "stale":
+                # Dispatch now re-reads the account after signing awaits. Supply
+                # an actually stale fresh-read result instead of aging a cached
+                # observation through a one-millisecond clock boundary.
+                observation = exchange.account_snapshot
+                async def stale_account(market):
+                    value = await observation(market)
+                    value.observed_at = now_ms() - 10001
+                    return value
+                monkeypatch.setattr(exchange, "account_snapshot", stale_account)
+            elif change == "deadline":
                 from aqla_hyperliquid_mcp import trades
                 stamp = trades.now_ms()
-                monkeypatch.setattr(trades, "now_ms", lambda: stamp + (10001 if change == "stale" else 300001))
+                monkeypatch.setattr(trades, "now_ms", lambda: stamp + 300001)
             else:
                 change_admission(state, trading, source, plan, change)
 
