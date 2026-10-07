@@ -150,7 +150,7 @@ def test_literal_source_text_and_malformed_rows_are_not_executed(sheets):
     _, google, client = sheets
     row = record("Signale", "signal", "channel", 1, "now", "", "", False, "pending", "", "", "", "", "", '=HYPERLINK("invalid")', "source")
     client.sync([row])
-    assert client.read("Signale")["rows"][0]["Text"] == row["values"][-2]
+    assert client.read("Signale")["rows"][0]["Text"] == row["values"][HEADERS["Signale"].index("Text")]
     assert client.read("Signale")["rows"][0]["_verified"] is True
     google.tables[PREFIX + "Signale"][1][7] = "edited-by-user"
     assert client.read("Signale")["unverified_rows"] == 1
@@ -330,7 +330,7 @@ def test_parameter_page_covers_every_rule_without_activating_defaults(setup):
     original = copy.deepcopy(data)
     rows = {row["record_id"]: row for row in project(data).values() if row["table"] == "Handelsparameter"}
     assert set(PARAMETERS) == set(Policy.model_fields)
-    assert len(rows) == len(Policy.model_fields) + 6 + 2 * len(data["venue_limits"])
+    assert len(rows) == len(Policy.model_fields) + 6 + 2 * len(data["venue_limits"]) + len(data["profiles"]["backup"]["parameters"])
     assert all(rows[name]["values"][3] == "Nicht festgelegt" for name in Policy.model_fields)
     assert rows["risk_percent"]["values"][6] == 0.5
     assert rows["policy_selected"]["values"][3] == "Nein"
@@ -401,4 +401,4 @@ def test_parameter_page_migrates_existing_journal_without_overwriting_other_tabs
     parameters = [row for row in records if row["table"] == "Handelsparameter"]
     assert len(client.sync(parameters)["accepted"]) == len(parameters)
     assert all(google.tables[title] == values for title, values in original.items())
-    assert client.read("Handelsparameter")["total"] == len(Policy.model_fields) + 6 + 2 * len(state.snapshot()["venue_limits"])
+    assert client.read("Handelsparameter")["total"] == len(parameters)

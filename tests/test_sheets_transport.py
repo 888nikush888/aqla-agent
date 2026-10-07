@@ -8,7 +8,7 @@ from test_sheets import Google
 from aqla_hyperliquid_mcp.models import AqlaError
 from aqla_sheets_mcp import client as adapter
 from aqla_sheets_mcp.client import PREFIX, SheetsClient
-from aqla_sheets_mcp.journal import fingerprint, record
+from aqla_sheets_mcp.journal import HEADERS, fingerprint, record
 
 
 @pytest.fixture
@@ -82,7 +82,7 @@ def test_one_row_upsert_and_page_do_not_download_historical_source_bodies(transp
     google.tables[PREFIX + "Signale"][1:] = list(reversed(google.tables[PREFIX + "Signale"][1:]))
     incoming = copy.deepcopy(records[123])
     incoming["revision"] = 2
-    incoming["values"][-2] = "=literal changed text"
+    incoming["values"][HEADERS["Signale"].index("Text")] = "=literal changed text"
     incoming["fingerprint"] = fingerprint(incoming["values"])
     assert client.sync([incoming])["accepted"]
     assert body_ranges(google) == [(PREFIX + "Signale", 1878, 1878)]

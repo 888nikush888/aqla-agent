@@ -4,13 +4,13 @@ import hashlib
 import json
 import os
 import time
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Annotated, Literal
 
 import yaml
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 Positive = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 Nonnegative = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
@@ -39,6 +39,8 @@ class Policy(Model):
         description="fixed uses the user's leverage value; signal copies evidenced signal leverage capped at the market maximum")
     leverage: int = Field(default=2, ge=1, le=100,
         description="Used only in fixed mode; never a fallback for missing signal leverage")
+    fallback_stop_loss_percent: Positive | None = Field(default=None, lt=100)
+    fallback_take_profit_percentages: list[Positive] = Field(default_factory=list, max_length=20)
     margin_mode: Literal["cross", "isolated"] = "isolated"
     max_open_trades: int = Field(default=3, ge=1, le=100)
     max_total_risk_percent: Positive = Field(default=Decimal("1.5"), le=100)
@@ -56,6 +58,9 @@ class Policy(Model):
 
     @model_validator(mode="after")
     def consistent(self):
+        if (any(value >= 100 for value in self.fallback_take_profit_percentages)
+                or self.fallback_take_profit_percentages != sorted(set(self.fallback_take_profit_percentages))):
+            raise ValueError("Backup TP percentages must be unique, ascending and between 0 and 100")
         if self.sizing_mode == "fixed_notional" and self.fixed_notional_usdc is None:
             raise ValueError("fixed_notional_usdc is required for fixed_notional sizing")
         if self.take_profit_allocation == "custom" and sum(self.take_profit_weights) != 100:
@@ -173,8 +178,8 @@ class Interpretation(Model):
     source_refs: list[str] = Field(min_length=1, max_length=20)
     symbol: str | None = Field(default=None, max_length=100)
     side: Literal["long", "short"] | None = None
-    leverage: int | None = Field(default=None, ge=1, strict=True,
-        description="Explicit positive integer signal leverage; null if missing or ambiguous. Quote evidence under field leverage.")
+    leverage: Annotated[Decimal, Field(ge=1, allow_inf_nan=False)] | None = Field(default=None,
+        description="Original evidenced signal leverage, including decimals. Python floors then caps it. Null only when absent; never round before quoting evidence.")
     entry: Literal["market", "limit", "range", "unspecified"] = "unspecified"
     entry_prices: list[Positive] = Field(default_factory=list, max_length=2)
     stop_loss: Positive | None = None
@@ -184,6 +189,20 @@ class Interpretation(Model):
     bound_trade_id: str | None = None
     evidence: list[Evidence] = Field(default_factory=list, max_length=60)
     reason: str = Field(default="", max_length=2000)
+
+    @field_validator("leverage", mode="before")
+    @classmethod
+    def original_leverage(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("Boolean values are not leverage")
+        return value.replace(",", ".") if isinstance(value, str) else value
+
+    @field_serializer("leverage", when_used="json")
+    def serialize_leverage(self, value):
+        if value is None:
+            return None
+        value = Decimal(value)
+        return int(value) if value == value.to_integral_value() else str(value)
 
     @field_validator("entry_prices")
     @classmethod
@@ -243,6 +262,19 @@ class AccountSnapshot(Model):
     observed_at: int = Field(default_factory=now_ms)
 
 
+class BackupValues(Model):
+    leverage: int = Field(ge=1, le=100)
+    entry_mode: Literal["source", "source_or_market"] = "source_or_market"
+    fallback_stop_loss_percent: Positive | None = Field(default=None, lt=100)
+    fallback_take_profit_percentages: list[Annotated[Decimal, Field(gt=0, lt=100)]] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def ordered(self):
+        if self.fallback_take_profit_percentages != sorted(set(self.fallback_take_profit_percentages)):
+            raise ValueError("Backup TP percentages must be unique and ascending")
+        return self
+
+
 class TradePlan(Model):
     plan_id: str
     trade_id: str
@@ -251,7 +283,12 @@ class TradePlan(Model):
     policy_revision: int
     policy: Policy
     signal_leverage: int | None = Field(default=None, ge=1)
+    signal_leverage_original: Annotated[Decimal, Field(ge=1)] | None = None
     effective_leverage: int | None = Field(default=None, ge=1)
+    source_symbol: str | None = None
+    backup_fields: list[Literal["leverage", "entry", "stop_loss", "take_profits"]] = Field(default_factory=list)
+    backup_values: BackupValues | None = None
+    backup_profile_revision: int | None = None
     network: str
     account: str
     principal: str | None = None
@@ -262,7 +299,7 @@ class TradePlan(Model):
     entry_limit: Positive
     stop_loss: Positive
     take_profits: list[Positive]
-    source_take_profit_count: int | None = Field(default=None, ge=1, le=20)
+    source_take_profit_count: int | None = Field(default=None, ge=0, le=20)
     quantity: Positive
     tp_quantities: list[Positive]
     risk_usdc: Positive
@@ -276,10 +313,16 @@ class TradePlan(Model):
 
     @model_validator(mode="after")
     def leverage_consistent(self):
+        if self.signal_leverage_original is not None and self.signal_leverage != int(self.signal_leverage_original.to_integral_value(rounding=ROUND_FLOOR)):
+            raise ValueError("Signal leverage differs from the original value rounded down")
         if self.policy.leverage_mode == "signal":
             if self.signal_leverage is None:
-                raise ValueError("Signal leverage is required for a signal-mode plan")
-            expected = min(self.signal_leverage, self.market.max_leverage)
+                if "leverage" not in self.backup_fields or self.backup_values is None:
+                    raise ValueError("Signal leverage or explicit backup leverage is required for a signal-mode plan")
+                selected = self.backup_values.leverage
+            else:
+                selected = self.signal_leverage
+            expected = min(selected, self.market.max_leverage)
         else:
             expected = self.policy.leverage
         # Legacy plans contain only policy.leverage. Preserve their IDs and execution identities.

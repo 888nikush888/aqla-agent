@@ -7,6 +7,7 @@ from aqla_hyperliquid_mcp.api import Hyperliquid, wire_number
 from aqla_hyperliquid_mcp.models import (
     TERMINAL_ORDER,
     AqlaError,
+    BackupValues,
     Interpretation,
     Policy,
     SourceEvent,
@@ -16,6 +17,7 @@ from aqla_hyperliquid_mcp.models import (
     now_ms,
 )
 from aqla_hyperliquid_mcp.rules import (
+    backup_prices,
     latest_sources,
     make_plan,
     price_grid,
@@ -105,6 +107,8 @@ class Trading:
             reply = parent["source"].get("reply_to_id")
         trades = [trade for trade in snapshot["trades"].values() if trade["status"] in OPEN and trade["chat_id"] == source["chat_id"]]
         return {"event": row, "messages": included, "trades": trades, "policy": snapshot["policy"],
+                "source_names": snapshot.get("source_names", {}), "source_name": snapshot.get("source_names", {}).get(source["chat_id"]),
+                "backup_profile": snapshot.get("profiles", {}).get("backup"),
                 "policy_revision": snapshot["policy_revision"], "context_truncated": len(included) < len(messages)}
 
     def record_interpretation(self, event_id, interpretation: Interpretation):
@@ -139,6 +143,8 @@ class Trading:
         row = self.record_interpretation(event_id, interpretation)
         if interpretation.kind != "new_signal":
             return row
+        if not interpretation.symbol or not interpretation.side:
+            raise AqlaError("New trade needs an evidenced market and direction")
         snapshot = self.state.snapshot()
         if snapshot["paused"]:
             raise AqlaError("New entries are paused; existing exits and protection continue")
@@ -164,9 +170,12 @@ class Trading:
         account = await self.exchange.account_snapshot(market)
         refs = [item["source"]["sent_at"] for item in latest_sources(snapshot["events"], interpretation.source_refs).values()]
         risk = sum(Decimal(trade["reserved_risk"]) for trade in active)
+        backup_profile = snapshot.get("profiles", {}).get("backup")
+        backup = BackupValues.model_validate({key: backup_profile["parameters"][key] for key in BackupValues.model_fields}) if backup_profile else None
         plan = make_plan(interpretation, market, account, policy, snapshot["policy_revision"], min(refs),
                          (self.exchange.settings.network, self.exchange.account.lower()), reserved_risk=risk,
-                         principal=self.exchange.settings.account.lower())
+                         principal=self.exchange.settings.account.lower(), backup=backup,
+                         backup_revision=backup_profile["revision"] if backup_profile else None)
         plan.source_revisions = self.source_revisions(snapshot, interpretation.source_refs)
         if hasattr(self.state, "stamp_plan"):
             self.state.stamp_plan(plan)
@@ -190,6 +199,8 @@ class Trading:
 
     def validate_admission(self, snapshot, plan, account=None, *, owned=False):
         self.assert_plan_binding(snapshot, plan)
+        if plan.backup_fields and snapshot["profiles"]["backup"]["revision"] != plan.backup_profile_revision:
+            raise AqlaError("Backup profile changed; create a new unsent plan")
         if owned and snapshot["trades"][plan.trade_id]["status"] not in OPEN:
             raise AqlaError("Entry was terminated; no unsent exposure may execute")
         if hasattr(self.state, "validate_route"):
@@ -356,7 +367,9 @@ class Trading:
             important = {key: value for key, value in changed.items() if key in ("status", "filled_quantity", "remaining_quantity", "stop_price")}
             if important and row["status"] not in ("preparing", "opening"):
                 identity = digest([trade_id, important])[:32]
-                state["notifications"].setdefault(identity, {"trade_id": trade_id, "change": important, "observed_at": now_ms()})
+                chat = state["trades"][trade_id]["chat_id"]
+                state["notifications"].setdefault(identity, {"trade_id": trade_id, "change": important, "observed_at": now_ms(),
+                    "source_id": chat, "source_name": state.get("source_names", {}).get(chat)})
 
         self.state.update(patch)
 
@@ -484,10 +497,14 @@ class Trading:
                             covered |= observed.get("order", {}).get("status") == "open" and self._stop_matches(observed, plan, remaining, Decimal(current["stop_price"]))
                 if not covered and current["status"] not in ("closing", "cleanup", "closed"):
                     raise AqlaError("No confirmed effective stop loss")
-            except Exception:
-                if not getattr(self.exchange, "fail_closed_protection", False):
+            except Exception as error:
+                if not getattr(self.exchange, "fail_closed_protection", False) and not set(plan.backup_fields) & {"stop_loss", "take_profits"}:
                     raise
-                self.state.pause_entries("Stop loss could not be confirmed; closing own exposure")
+                reason = "Protection could not be confirmed; closing own exposure: " + (str(error) if isinstance(error, AqlaError) else type(error).__name__)
+                if hasattr(self.state, "pause_entries"):
+                    self.state.pause_entries(reason)
+                else:
+                    self.state.update(lambda data: data.update(paused=True))
                 return await self.close_position(trade_id, Decimal(100), "protection-failure:" + trade_id)
         elif stage in TERMINAL_ORDER and not remaining:
             self.begin_cleanup(trade_id, "closed" if total else "rejected")
@@ -507,6 +524,9 @@ class Trading:
         remaining = Decimal(trade["remaining_quantity"])
         if remaining <= 0:
             return
+        if not await self.finalize_backup(trade_id):
+            return
+        trade = self.state.snapshot()["trades"][trade_id]
         status_rows = [(order, await self.exchange.order_status(order["cloid"])) for order in trade["orders"] if order["kind"] == "sl"]
         covered = any(row.get("order", {}).get("status") == "open" and self._stop_matches(row, plan, remaining, Decimal(trade["stop_price"])) for _, row in status_rows)
         if not covered:
@@ -522,7 +542,7 @@ class Trading:
             sizes = split_targets(Decimal(trade["filled_quantity"]), len(plan.take_profits), plan.policy, plan.market)
             operation = "targets:" + trade_id + ":0"
             orders = [self.order(plan, size, price, reduce=True, cloid=self.exchange.cloid(operation, i))
-                      for i, (size, price) in enumerate(zip(sizes, plan.take_profits, strict=True))]
+                      for i, (size, price) in enumerate(zip(sizes, trade.get("targets", plan.take_profits), strict=True))]
             def stage_initial(state):
                 row = state["trades"][trade_id]
                 row["orders"].extend({"kind": "tp", "cloid": order["c"], "quantity": order["s"], "price": order["p"], "index": i} for i, order in enumerate(orders))
@@ -532,12 +552,16 @@ class Trading:
         staged = self.state.snapshot()["trades"][trade_id].get("initial_targets")
         if staged and staged["operation_id"] not in self.state.snapshot()["operations"]:
             result = await self.exchange.mutate(staged["operation_id"], staged["action"])
+            if result["phase"] == "rejected" and "take_profits" in plan.backup_fields:
+                raise AqlaError("Backup TP order was rejected")
             if result["phase"] not in ("acknowledged", "reconciled"):
                 self._patch(trade_id, status="protecting")
                 return
         active_targets = [order for order in self.state.snapshot()["trades"][trade_id]["orders"] if order["kind"] == "tp" and not order.get("retired")]
         if active_targets:
             observations = [await self.exchange.order_status(order["cloid"]) for order in active_targets]
+            if "take_profits" in plan.backup_fields and any(row.get("order", {}).get("status") == "rejected" for row in observations):
+                raise AqlaError("Backup TP could not be installed")
             if any(row.get("order", {}).get("status") not in {"open", "filled", "triggered"} for row in observations):
                 self._patch(trade_id, status="protecting")
                 return
@@ -555,6 +579,57 @@ class Trading:
                 tighter = entry > Decimal(trade["stop_price"]) if plan.side == "long" else entry < Decimal(trade["stop_price"])
                 if tighter:
                     await self.replace_stop(trade_id, entry, "break-even:" + trade_id + ":" + str(stage))
+
+    async def finalize_backup(self, trade_id):
+        """One durable fill reference, before TP intent construction or SL replacement."""
+        trade = self.state.snapshot()["trades"][trade_id]
+        plan = TradePlan.model_validate(trade["plan"])
+        if not set(plan.backup_fields) & {"stop_loss", "take_profits"}:
+            return True
+        final = trade.get("backup_finalization")
+        if final and (Decimal(trade["filled_quantity"]) != Decimal(final["filled_quantity"])
+                      or Decimal(trade["entry_vwap"]) != Decimal(final["reference_entry"])):
+            raise AqlaError("Finalized Backup entry fills changed; closing instead of recalculating frozen prices")
+        if final and final["phase"] == "applied":
+            return True
+        if final is None:
+            await self.cancel_entry(trade_id)
+            await self.capture_fills(trade_id)
+            trade = self.state.snapshot()["trades"][trade_id]
+            reference = Decimal(trade["entry_vwap"])
+            remaining = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
+            if not remaining:
+                return False
+            stop, targets = backup_prices(reference, plan.side, plan.market,
+                plan.backup_values.fallback_stop_loss_percent if "stop_loss" in plan.backup_fields else None,
+                selected_targets(plan.backup_values.fallback_take_profit_percentages, plan.policy) if "take_profits" in plan.backup_fields else ())
+            stop = stop if stop is not None else Decimal(trade["stop_price"])
+            targets = targets if "take_profits" in plan.backup_fields else [Decimal(value) for value in trade["targets"]]
+            if not (stop < reference < min(targets) if plan.side == "long" else stop > reference > max(targets)):
+                raise AqlaError("Final Backup prices have invalid direction")
+            sizes = split_targets(Decimal(trade["filled_quantity"]), len(targets), plan.policy, plan.market)
+            if any(size < plan.market.min_quantity or size * price < plan.market.min_notional for size, price in zip(sizes, targets, strict=True)):
+                raise AqlaError("Final Backup TP is below the exchange minimum")
+            account = await self.exchange.account_snapshot(plan.market)
+            snapshot = self.state.snapshot()
+            limits = self.state.limits(plan) if hasattr(self.state, "limits") else plan.policy
+            others = sum(Decimal(row["reserved_risk"]) for identity, row in snapshot["trades"].items() if identity != trade_id and row["status"] in OPEN)
+            risk = remaining * (abs(reference - stop) + reference * plan.policy.cost_reserve_bps / 10000)
+            if (risk > plan.risk_usdc or risk > account.equity * plan.policy.risk_percent / 100
+                    or risk + others > account.equity * limits.max_total_risk_percent / 100
+                    or remaining * reference > plan.policy.max_notional_usdc or now_ms() - account.observed_at > 10000
+                    or account.position_size != (remaining if plan.side == "long" else -remaining)):
+                raise AqlaError("Final Backup protection exceeds the confirmed risk/notional budget")
+            final = {"phase": "prepared", "reference_entry": str(reference), "filled_quantity": trade["filled_quantity"], "stop_loss": str(stop),
+                     "take_profits": [str(value) for value in targets], "risk": str(risk), "stop_operation_id": "backup-stop:" + trade_id,
+                     "percentages": plan.backup_values.model_dump(mode="json")}
+            self._patch(trade_id, backup_finalization=final)
+        if "stop_loss" in plan.backup_fields:
+            result = await self.replace_stop(trade_id, Decimal(final["stop_loss"]), final["stop_operation_id"], initialize_backup=True)
+            if result.get("replacement_unconfirmed") or result.get("already_closed") or self.state.snapshot()["trades"][trade_id]["status"] in ("closing", "cleanup", "closed"):
+                return False
+        self._patch(trade_id, targets=final["take_profits"], reserved_risk=final["risk"], backup_finalization={**final, "phase": "applied"})
+        return True
 
     async def advance_stop_ladder(self, trade_id):
         trade = self.state.snapshot()["trades"][trade_id]
@@ -626,7 +701,7 @@ class Trading:
             raise AqlaError("Entry remainder termination is not proved; preserve existing protection")
         return result
 
-    async def replace_stop(self, trade_id, proposed: Decimal, operation_id=None):
+    async def replace_stop(self, trade_id, proposed: Decimal, operation_id=None, *, initialize_backup=False):
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
         self.assert_plan_binding(self.state.snapshot(), plan)
@@ -638,7 +713,12 @@ class Trading:
         stop = price_grid(proposed, plan.market, up=plan.side == "long")
         old_stop = Decimal(trade["stop_price"])
         widening = stop < old_stop if plan.side == "long" else stop > old_stop
-        if widening and not plan.policy.allow_stop_widening:
+        if initialize_backup:
+            final = trade.get("backup_finalization") or {}
+            if (final.get("phase") != "prepared" or "stop_loss" not in plan.backup_fields or str(proposed) != final.get("stop_loss")
+                    or operation_id != final.get("stop_operation_id") or any(order["kind"] == "tp" for order in trade["orders"])):
+                raise AqlaError("Only the durable initial Backup SL may be finalized")
+        if widening and not plan.policy.allow_stop_widening and not initialize_backup:
             raise AqlaError("Stop widening is not permitted")
         if widening and remaining * abs(Decimal(trade["entry_vwap"]) - stop) > Decimal(trade["reserved_risk"]):
             raise AqlaError("Stop widening exceeds the original loss budget")
@@ -779,7 +859,7 @@ class Trading:
             trades = [trade for trade in trades if trade["trade_id"] == binding["trade_id"]]
         if signal.symbol:
             def same_symbol(trade):
-                named = signal.symbol
+                named = Hyperliquid.canonical_symbol(signal.symbol) if trade["plan"].get("exchange", "hyperliquid") == "hyperliquid" else signal.symbol
                 if trade["plan"]["market"]["product"] == "perp" and ":" not in named:
                     named = named.upper()
                     for suffix in ("/USDT", "/USDC", "USDT", "USDC"):

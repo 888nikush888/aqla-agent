@@ -32,7 +32,8 @@ def test_statistics_do_not_sum_usdc_usdt_or_testnet_mainnet():
     rows = []
     for identity, currency, network in (("one", "USDC", "mainnet"), ("two", "USDT", "mainnet"), ("three", "USDC", "testnet")):
         row = record("Trades", identity, "channel", "BTC", "long", "closed", "now", 100, 100, 1, 1, 0, 90, "[]", 10, 0, 1, 0, 1, "[]")
-        row["values"][-7:] = ["aster" if currency == "USDT" else "hyperliquid", network, "account", "pipeline", "profile", 1, currency]
+        start = HEADERS["Trades"].index("Börse")
+        row["values"][start:start + 7] = ["aster" if currency == "USDT" else "hyperliquid", network, "account", "pipeline", "profile", 1, currency]
         row["fingerprint"] = fingerprint(row["values"])
         rows.append(row)
     client.sync(rows)

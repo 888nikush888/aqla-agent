@@ -65,8 +65,8 @@ def test_fixed_mode_ignores_reported_leverage_and_keeps_existing_limit_rejection
         make_plan(interpretation, market(), account, Policy(leverage=21), 1, now_ms(), ("testnet", "account"))
 
 
-@pytest.mark.parametrize("value", [0, -1, 1.5, True, "20"])
-def test_signal_leverage_must_be_a_positive_integer(value):
+@pytest.mark.parametrize("value", [0, -1, 0.78, True, "ambiguous", "NaN", "Infinity"])
+def test_signal_leverage_must_be_a_valid_number_at_least_one(value):
     with pytest.raises(ValueError):
         Interpretation(kind="new_signal", source_refs=["source"], leverage=value)
 

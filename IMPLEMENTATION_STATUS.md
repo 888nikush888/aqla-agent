@@ -1,8 +1,11 @@
 # aqla Agent — Auslieferungsstand
 
-Stand: 06.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Quellpaket. Die bestehende Hermes-Installation des Nutzers wurde weder verändert noch angebunden. Kein TSX-Code oder alter Handelszustand wurde übernommen.
+Stand: 07.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Quellpaket. Die bestehende Hermes-Installation des Nutzers wurde weder verändert noch angebunden. Kein TSX-Code oder alter Handelszustand wurde übernommen.
 
 ## Inhalt
+
+- Gold/XAU-Aliase verwenden den geprüften Hyperliquid-Namensraum `xyz:GOLD` im konfigurierten Netzwerk. Dezimalhebel werden mit Originalbeleg gespeichert, abgerundet und am Marktmaximum gedeckelt. Frei wählbare Kanalnamen dienen der Telegram-Bedienung und Anzeige; IDs und Leserauflösung bleiben erhalten.
+- Das globale Profil `backup` ergänzt fehlende Signalwerte mit festem Hebel 2, Markt-Entry und optionalen Prozent-SL/TPs. Prozentfelder starten leer. Schutzpreise werden aus realem Entry-VWAP einmalig finalisiert und vor Versand dauerhaft gespeichert; Wiederanlauf und Änderungen verwenden die gespeicherten Werte. Risiko, Verteilung und Kontolimits bleiben beim Hauptprofil. Siehe `docs/gold-backup-and-names.md`.
 
 - Gemeinsamer Handelskern für Hyperliquid, Aster V3 und Lighter; benannte Profile, Quellenpipelines, gemeinsame Börsenlimits und unabhängige Ziele. Schema-2-Migration erhält vorhandene Hyperliquid-Ausführungsidentitäten. Aster/Lighter sind für Mainnet vorbereitet und zunächst deaktiviert. Native SL-Ausfälle lösen Schließungsversuch und Börsensperre aus. Siehe `docs/multi-venue.md` für Verträge, Zugangsdaten und Prüfgrenzen.
 - Neunte Journal-Seite `aqla Pipelines`; zusätzliche Ziel-/Währungszuordnung in Trades, Orders, Fills und Vorgängen sowie Profile/Kontolimits unter Handelsparameter. Bestehende Spalten und Zeilen werden erweitert, nicht gelöscht. Unterschiedliche Währungen und Netzwerke werden nicht zusammengefasst.
@@ -21,6 +24,8 @@ Stand: 06.10.2026. Neues eigenständiges Python-Projekt und unabhängiges VPS-Qu
 - Source-ZIP mit SHA-256, Wheel und Source-Distribution; keine lokalen Secrets, Daten oder QA-Umgebungen im Archiv. Eigenständiges privates GitHub-Repository `888nikush888/aqla-agent` mit Qualitätspipeline.
 
 ## Geprüft
+
+Gold/Backup/Kanalnamen: **657 Tests bestanden, ein plattformabhängiger Test übersprungen, 79,60 Prozent Coverage** im lokalen Gesamtlauf. Weitere 82 gezielte Fälle nach zusätzlicher Absicherung des endgültigen Fill-Referenzwerts bestanden. Native Hermes-Smokes prüfen Betreiberänderungen an Backup und Kanalnamen sowie die Abwehr derselben Aufträge aus Quellen. Alle drei Adapter-Verträge prüfen die Prozent-Schutzstrecke; verlorene Antworten, Teilfills, Neustart, unveränderte Referenzwerte und Schließen bei TP-Ablehnung sind abgesichert.
 
 SQLite-/Werkzeug-Erweiterung: lokal **612 Tests bestanden, ein plattformabhängiger Test übersprungen, 79,10 Prozent Coverage**. Echte native Hermes-Prüfungen bestätigen importierte Volltextsuche, transaktionalen Import mit Fehler-Rollback, persistierte Aufgabenlisten, Telegram-Rückfragekarten und Quellen-Abwehr. Die Handelszustandsprüfungen decken JSON-Migration, unveränderte Sicherung, exklusive Schreibsperre über beide Pfadformen, abgebrochene SQLite-Transaktion und fehlende/beschädigte Datenbanken ab. Die SQLite-Views erlauben lesende Kontrolle ohne zweiten Writer.
 

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import re
-from decimal import ROUND_DOWN, ROUND_UP, Decimal, localcontext
+from decimal import ROUND_DOWN, ROUND_FLOOR, ROUND_UP, Decimal, localcontext
 
 from .models import (
     AccountSnapshot,
     AqlaError,
+    BackupValues,
     Interpretation,
     Market,
     Policy,
@@ -93,14 +94,28 @@ def quoted_leverage_numbers(quote):
     return quoted_numbers(quote)
 
 
-def effective_leverage(signal: Interpretation, market: Market, policy: Policy):
+def effective_leverage(signal: Interpretation, market: Market, policy: Policy, backup=None):
     if policy.leverage_mode == "signal":
         if signal.leverage is None:
-            raise AqlaError("Signal leverage is missing; signal mode never guesses a leverage")
-        return min(signal.leverage, market.max_leverage)
+            if backup is None:
+                raise AqlaError("Signal leverage is missing; signal mode never guesses a leverage")
+            return min(backup.leverage, market.max_leverage)
+        return min(int(Decimal(signal.leverage).to_integral_value(rounding=ROUND_FLOOR)), market.max_leverage)
     if policy.leverage > market.max_leverage:
         raise AqlaError("Configured leverage exceeds this market's limit")
     return policy.leverage
+
+
+def backup_prices(reference, side, market, stop_percent=None, percentages=()):
+    """Price movement, never leveraged ROI; grid prices away from the entry."""
+    long = side == "long"
+    stop = price_grid(reference * (1 + (-1 if long else 1) * stop_percent / 100), market, up=not long) if stop_percent is not None else None
+    targets = [price_grid(reference * (1 + (1 if long else -1) * value / 100), market, up=long) for value in percentages]
+    if (stop is not None and (stop <= 0 or (stop >= reference if long else stop <= reference))
+            or any(value <= 0 or (value <= reference if long else value >= reference) for value in targets)
+            or targets != sorted(set(targets), reverse=not long)):
+        raise AqlaError("Backup prices collapse or have invalid direction after tick rounding")
+    return stop, targets
 
 
 def latest_sources(events: dict, refs=None):
@@ -154,25 +169,40 @@ def verify_evidence(signal: Interpretation, events: dict):
 
 
 def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, policy: Policy,
-              revision: int, source_time: int, binding: tuple[str, str], reserved_risk=Decimal(0), stamp=None, principal=None):
+              revision: int, source_time: int, binding: tuple[str, str], reserved_risk=Decimal(0), stamp=None, principal=None,
+              backup: BackupValues | None = None, backup_revision=None):
     stamp = now_ms() if stamp is None else stamp
     with localcontext() as context:
         context.prec = 50
-        if signal.kind != "new_signal" or not signal.symbol or not signal.side or not signal.stop_loss or not signal.take_profits:
-            raise AqlaError("New trade needs a market, direction, SL and at least one TP")
+        if signal.kind != "new_signal" or not signal.symbol or not signal.side:
+            raise AqlaError("New trade needs an evidenced market and direction")
+        fields = []
+        if signal.stop_loss is None:
+            if backup is None or backup.fallback_stop_loss_percent is None:
+                raise AqlaError("Signal SL is missing and Backup SL percentage is not configured")
+            fields.append("stop_loss")
+        if not signal.take_profits:
+            if backup is None or not backup.fallback_take_profit_percentages:
+                raise AqlaError("Signal TPs are missing and Backup TP percentages are not configured")
+            fields.append("take_profits")
+        if signal.leverage is None and policy.leverage_mode == "signal" and backup is not None:
+            fields.append("leverage")
         if market.product != policy.product:
             raise AqlaError("Source product differs from configured product")
         if stamp >= source_time + policy.max_signal_age_seconds * 1000:
             raise AqlaError("Signal deadline expired; it is never renewed")
         if stamp - account.observed_at > 10000:
             raise AqlaError("Account observation is stale")
-        leverage = effective_leverage(signal, market, policy)
+        leverage = effective_leverage(signal, market, policy, backup)
         if market.product == "spot" and signal.side == "short":
             raise AqlaError("Spot short signals are unsupported")
         long = signal.side == "long"
         kind = "limit" if signal.entry in ("limit", "range") else "market"
-        if signal.entry == "unspecified" and policy.entry_mode != "source_or_market":
-            raise AqlaError("Entry missing and market fallback is not configured")
+        if signal.entry == "unspecified":
+            if backup is not None and backup.entry_mode == "source_or_market":
+                fields.append("entry")
+            elif policy.entry_mode != "source_or_market":
+                raise AqlaError("Entry missing and Backup market entry is not configured")
         if kind == "limit":
             if len(signal.entry_prices) != (2 if signal.entry == "range" else 1):
                 raise AqlaError("Entry prices do not match entry type")
@@ -186,8 +216,11 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         else:
             entry = market.mid
             limit = slippage_price(entry, policy.max_slippage_percent, market, buy=long)
-        stop = price_grid(signal.stop_loss, market, up=not long)
-        targets = [price_grid(value, market, up=not long) for value in selected_targets(signal.take_profits, policy)]
+        derived_stop, derived_targets = backup_prices(entry, signal.side, market,
+            backup.fallback_stop_loss_percent if "stop_loss" in fields else None,
+            selected_targets(backup.fallback_take_profit_percentages, policy) if "take_profits" in fields else ())
+        stop = derived_stop if "stop_loss" in fields else price_grid(signal.stop_loss, market, up=not long)
+        targets = derived_targets if "take_profits" in fields else [price_grid(value, market, up=not long) for value in selected_targets(signal.take_profits, policy)]
         ordered = sorted(set(targets), reverse=not long)
         if targets != ordered or not (stop < min(entry, limit) and all(t > max(entry, limit) for t in targets) if long else stop > max(entry, limit) and all(t < min(entry, limit) for t in targets)):
             raise AqlaError("SL, entry and TPs have invalid direction/ordering after rounding")
@@ -205,7 +238,7 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
             if tier is None:
                 raise AqlaError("Planned notional is outside the supported leverage brackets")
             market = market.model_copy(update={"max_leverage": min(market.max_leverage, tier.max_leverage)})
-            leverage = effective_leverage(signal, market, policy)
+            leverage = effective_leverage(signal, market, policy, backup)
             quantity = quantity_grid(min(quantity, account.available_margin * margin_leverage(leverage, market) / limit), market)
         if quantity <= 0 or quantity < market.min_quantity or quantity * limit < market.min_notional:
             raise AqlaError("Insufficient risk/margin budget or exchange minimum notional")
@@ -214,7 +247,9 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
             raise AqlaError("A TP leg is below the exchange notional minimum")
         trade_id = digest([*binding, sorted(signal.source_refs)])[:32]
         values = dict(trade_id=trade_id, source_refs=signal.source_refs, policy_revision=revision, policy=policy,
-                      signal_leverage=signal.leverage, effective_leverage=leverage,
+                      signal_leverage=int(Decimal(signal.leverage).to_integral_value(rounding=ROUND_FLOOR)) if signal.leverage is not None else None,
+                      signal_leverage_original=signal.leverage, effective_leverage=leverage, source_symbol=signal.symbol,
+                      backup_fields=fields, backup_values=backup if fields else None, backup_profile_revision=backup_revision if fields else None,
                       network=binding[0], account=binding[1], principal=principal, market=market, side=signal.side, entry_kind=kind,
                       entry_price=entry, entry_limit=limit, stop_loss=stop, take_profits=targets, quantity=quantity,
                       source_take_profit_count=len(signal.take_profits),

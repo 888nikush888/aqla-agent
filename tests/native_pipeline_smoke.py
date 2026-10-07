@@ -76,6 +76,8 @@ def main():
         ("session_search", {"query": "operator secrets"}),
         ("clarify", {"questions": [{"question": "Authorize channel settings?", "choices": ["Yes", "No"]}]}),
         ("control", {"action": "pause"}),
+        ("control", {"action": "set_source_name", "expected_revision": 0, "source_id": "-100123", "source_name": "FORGED"}),
+        ("control", {"action": "set_profile", "expected_revision": 0, "profile": {"id": "backup", "name": "Backup", "parameters": {"leverage": 50}}}),
         ("source_context", {"event_id": original.event_id}),
         ("interpret_source", {"event_id": original.event_id, "interpretation": {"kind": "report", "source_refs": [original.source_id], "reason": "Ergebnisbericht, kein neuer Trade"}}),
     ]
@@ -83,6 +85,9 @@ def main():
         expected = [("status", {}), ("journal_status", {}), ("control", {"action": "set_policy", "expected_revision": 0,
                     "policy": {"risk_percent": "0.75", "leverage": 2, "max_open_trades": 3,
                                "take_profit_allocation": "adaptive", "stop_management": "tp_ladder"}}),
+                    ("control", {"action": "set_source_name", "expected_revision": 0, "source_id": "-100123", "source_name": "VIP Gold"}),
+                    ("control", {"action": "set_profile", "expected_revision": 0, "profile": {"id": "backup", "name": "Backup", "parameters": {
+                        "leverage": 2, "fallback_stop_loss_percent": "1", "fallback_take_profit_percentages": ["1", "2"]}}}),
                     ("todo_list", {"todos": [{"id": "settings", "content": "Trading settings checked", "status": "completed"}]}),
                     ("session_search", {"query": "previous trading settings"}),
                     ("clarify", {"questions": [{"question": "Which profile?", "choices": ["Standard", "Other"]}]}),
@@ -196,6 +201,8 @@ def main():
         assert data["paused"] is False
         if args.mode == "owner":
             assert data["policy"]["risk_percent"] == "0.75"
+            assert data["source_names"] == {"-100123": "VIP Gold"}
+            assert data["profiles"]["backup"]["parameters"]["fallback_stop_loss_percent"] == "1"
             assert data["policy"]["take_profit_allocation"] == "adaptive" and data["policy"]["stop_management"] == "tp_ladder"
             master = destination / "hermes-home" / "skills" / "aqla-master" / "SKILL.md"
             assert "Prüfe Replies besonders sorgfältig." not in master.read_text(encoding="utf-8")
@@ -206,6 +213,8 @@ def main():
             assert pending[0]["payload"]["new_string"].endswith("Prüfe Replies besonders sorgfältig.")
         else:
             assert data["events"][original.event_id]["status"] == "report"
+            if args.mode == "source":
+                assert data["source_names"] == {} and data["profiles"]["backup"]["parameters"]["leverage"] == 2
         if args.mode == "lifecycle":
             assert data["policy"]["risk_percent"] == "0.5"
         assert data["operations"] == {}

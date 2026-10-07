@@ -122,7 +122,14 @@ class Hyperliquid:
         self.market_cache.update(result)
         return result
 
+    @staticmethod
+    def canonical_symbol(symbol: str, product="perp"):
+        if product == "perp" and symbol.upper().replace("/", "") in {"GOLD", "XAU", "XAUUSD", "XAUUSDT", "XAUUSDC"}:
+            return "xyz:GOLD"
+        return symbol
+
     async def market(self, symbol: str, product="perp"):
+        symbol = self.canonical_symbol(symbol, product)
         dex = symbol.split(":", 1)[0] if ":" in symbol else ""
         markets = await self.markets(product, dex)
         normalized = symbol.upper() if not dex else symbol
@@ -134,6 +141,8 @@ class Hyperliquid:
         candidates = [market for key, market in markets.items() if key == normalized or key == symbol]
         unique = {item.asset_id: item for item in candidates}
         if len(unique) != 1:
+            if symbol == "xyz:GOLD":
+                raise AqlaError(f"Configured Gold market xyz:GOLD is unavailable on {self.settings.network}; no substitute is used")
             raise AqlaError("Source market cannot be resolved uniquely; no substitute market is used")
         market = next(iter(unique.values()))
         if market.quote_token != "USDC" or market.product == "perp" and market.collateral_token != 0:

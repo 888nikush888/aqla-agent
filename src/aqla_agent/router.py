@@ -137,7 +137,9 @@ class Router:
                 row["status"] = "executed" if any(value.get("trade_id") for value in targets.values()) else "rejected"
                 errors = [value for value in targets.values() if value.get("error")]
                 if errors:
-                    data["notifications"].setdefault("targets:" + event_id, {"event_id": event_id, "targets": errors})
+                    chat = data["events"][event_id]["source"]["chat_id"]
+                    data["notifications"].setdefault("targets:" + event_id, {"event_id": event_id, "targets": errors,
+                        "source_id": chat, "source_name": data.get("source_names", {}).get(chat)})
         self.state.update(finish)
 
     async def execute(self, plan_id):

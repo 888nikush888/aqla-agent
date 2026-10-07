@@ -26,6 +26,9 @@ LEGACY_HEADERS = {table: list(headers) for table, headers in HEADERS.items()}
 TARGET_COLUMNS = ["Börse", "Netzwerk", "Konto", "Pipeline", "Profil", "Profilrevision", "Währung"]
 for _table in ("Trades", "Orders", "Fills", "Vorgänge"):
     HEADERS[_table] += TARGET_COLUMNS
+HEADERS["Signale"] += ["Quellenname"]
+TRADE_DETAILS = ["Quellenname", "Originalsymbol", "Signalhebel original", "Signalhebel abgerundet", "Hebel wirksam", "Backup-Felder", "Backup-Referenzentry", "Backup-SL (%)", "Backup-TPs (%)"]
+HEADERS["Trades"] += TRADE_DETAILS
 HEADERS["Handelsparameter"] += ["Profil", "Börse", "Währung", "Revision"]
 HEADERS["Pipelines"] = ["ID", "Name", "Quellen", "Börse", "Profil", "Aktiv", "Börse aktiv", "Revision"]
 TABLES = tuple(HEADERS)
@@ -93,7 +96,7 @@ def project(data):
     actions = {order.get("c"): order for operation in data["operations"].values() for order in operation["wire_action"].get("orders", []) if order.get("c")}
     for identity, event in data["events"].items():
         source, interpretation = event["source"], event.get("interpretation") or {}
-        add(record("Signale", identity, aliases.get(source["chat_id"], source["chat_id"]), source["message_id"], timestamp(source["sent_at"]), timestamp(source.get("edited_at")), source.get("reply_to_id"), source.get("historical", False), event["status"], interpretation.get("kind", ""), interpretation.get("symbol", ""), interpretation.get("side", ""), interpretation.get("update_action", ""), event.get("last_error") or interpretation.get("reason", ""), source["text"], event["source_id"]))
+        add(record("Signale", identity, aliases.get(source["chat_id"], source["chat_id"]), source["message_id"], timestamp(source["sent_at"]), timestamp(source.get("edited_at")), source.get("reply_to_id"), source.get("historical", False), event["status"], interpretation.get("kind", ""), interpretation.get("symbol", ""), interpretation.get("side", ""), interpretation.get("update_action", ""), event.get("last_error") or interpretation.get("reason", ""), source["text"], event["source_id"], data.get("source_names", {}).get(source["chat_id"], "")))
     for identity, trade in data["trades"].items():
         plan = trade["plan"]
         fills = trade.get("fill_events", {})
@@ -130,9 +133,16 @@ def project(data):
         operation = data["operations"].get(identity, {}) if table == "Vorgänge" else {}
         venue = plan.get("exchange", operation.get("exchange", "hyperliquid"))
         binding = data.get("venue_accounts", {}).get(venue, {})
-        row["values"][-7:] = [venue, plan.get("network", binding.get("network", data["network"])), plan.get("account", binding.get("account", data["account"])),
+        start = HEADERS[table].index("Börse")
+        row["values"][start:start + 7] = [venue, plan.get("network", binding.get("network", data["network"])), plan.get("account", binding.get("account", data["account"])),
                               plan.get("pipeline_id") or operation.get("pipeline_id") or "legacy", plan.get("profile_id") or operation.get("profile_id") or "standard",
                               plan.get("profile_revision") or operation.get("profile_revision") or "", plan.get("market", {}).get("quote_token", "USDT" if venue == "aster" else "USDC")]
+        if table == "Trades":
+            backup = plan.get("backup_values") or {}
+            final = trade.get("backup_finalization") or {}
+            row["values"][-len(TRADE_DETAILS):] = [data.get("source_names", {}).get(trade["chat_id"], ""), plan.get("source_symbol") or plan["market"]["symbol"],
+                number(plan.get("signal_leverage_original", plan.get("signal_leverage"))), number(plan.get("signal_leverage")), number(plan.get("effective_leverage")),
+                text(plan.get("backup_fields", [])), number(final.get("reference_entry")), number(backup.get("fallback_stop_loss_percent")), text(backup.get("fallback_take_profit_percentages", []))]
         row["fingerprint"] = fingerprint(row["values"])
     for row in data.get("journal_history", {}).values():
         add(row)

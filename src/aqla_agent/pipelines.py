@@ -27,6 +27,8 @@ class Parameters(Model):
     max_notional_quote: Positive = Decimal("500")
     leverage_mode: Literal["fixed", "signal"] = "fixed"
     leverage: int = Field(default=2, ge=1, le=100)
+    fallback_stop_loss_percent: Positive | None = Field(default=None, lt=100)
+    fallback_take_profit_percentages: list[Positive] = Field(default_factory=list, max_length=20)
     margin_mode: Literal["cross", "isolated"] = "isolated"
     entry_mode: Literal["source", "source_or_market"] = "source_or_market"
     entry_range_choice: Literal["near", "far", "midpoint"] = "midpoint"
@@ -93,7 +95,17 @@ class Pipeline(Model):
 def migrate(data):
     """Add routing without rehashing any existing trade, order or operation."""
     if "profiles" in data:
-        return False
+        changed = False
+        if "source_names" not in data:
+            data.update(source_names={}, source_names_revision=0)
+            changed = True
+        if "backup" not in data["profiles"]:
+            selected = data["profiles"].get("standard", {}).get("parameters") or Parameters().model_dump(mode="json")
+            values = {**selected, "leverage_mode": "fixed", "leverage": 2, "entry_mode": "source_or_market",
+                      "fallback_stop_loss_percent": None, "fallback_take_profit_percentages": []}
+            data["profiles"]["backup"] = {"id": "backup", "name": "Backup", "parameters": Parameters(**values).model_dump(mode="json"), "revision": 1}
+            changed = True
+        return changed
     selected = data.get("policy")
     parameters = Parameters.from_policy(selected).model_dump(mode="json") if selected and selected.get("product", "perp") == "perp" else None
     limits = {key: selected[key] for key in ("max_open_trades", "max_total_risk_percent")} if selected else None
@@ -104,6 +116,7 @@ def migrate(data):
                 venue_limits={"hyperliquid": limits, "aster": None, "lighter": None},
                 venue_enabled={"hyperliquid": True, "aster": False, "lighter": False},
                 venue_bindings={}, venue_events={}, venue_accounts={})
+    migrate(data)
     return True
 
 
@@ -120,6 +133,8 @@ def route_control(data, action, *, expected_revision, profile=None, pipeline=Non
     if action == "set_profile":
         if profile is None:
             raise AqlaError("A complete profile is required")
+        if profile.id == "backup" and profile.parameters.leverage_mode != "fixed":
+            raise AqlaError("The global Backup profile requires a fixed leverage")
         previous = data["profiles"].get(profile.id, {})
         data["profiles"][profile.id] = {**profile.model_dump(mode="json"), "revision": previous.get("revision", 0) + 1}
         if profile.id == "standard" and data["venue_limits"]["hyperliquid"]:
@@ -129,6 +144,10 @@ def route_control(data, action, *, expected_revision, profile=None, pipeline=Non
     elif action == "set_pipeline":
         if pipeline is None or any(target.profile_id not in data["profiles"] for target in pipeline.targets):
             raise AqlaError("A complete pipeline with existing profiles is required")
+        from .sources import resolve_source
+        pipeline = pipeline.model_copy(update={"sources": [resolve_source(data, source) for source in pipeline.sources]})
+        if len(set(pipeline.sources)) != len(pipeline.sources):
+            raise AqlaError("Pipeline sources resolve to duplicate Telegram IDs")
         if any(source not in ("*", "owner_forward") and source not in {*data["sources"], *data.get("source_aliases", {}).values()} for source in pipeline.sources):
             raise AqlaError("Subscribe the requested Telegram sources first")
         previous = data["pipelines"].get(pipeline.id, {})
@@ -147,7 +166,7 @@ def route_control(data, action, *, expected_revision, profile=None, pipeline=Non
             raise AqlaError("Set explicit account limits before activating the exchange")
         data["venue_enabled"][exchange] = enabled
     elif action in ("delete_pipeline", "delete_profile"):
-        if identity in ("legacy", "standard"):
+        if identity in ("legacy", "standard", "backup"):
             raise AqlaError("Keep the migration compatibility entries; disable the legacy pipeline instead")
         if action == "delete_profile" and any(target["profile_id"] == identity for row in data["pipelines"].values() for target in row["targets"]):
             raise AqlaError("Remove pipeline references before deleting a profile")
@@ -238,6 +257,8 @@ class VenueState:
 
     def validate_route(self, plan):
         data = self.root.snapshot()
+        if plan.backup_fields and data["profiles"]["backup"]["revision"] != plan.backup_profile_revision:
+            raise AqlaError("Backup profile changed; create a new unsent plan")
         if data["paused"] or not data["venue_enabled"].get(self.exchange):
             raise AqlaError("New entries are paused on this exchange")
         if self.exchange == "hyperliquid" and plan.pipeline_id in (None, "legacy"):

@@ -5,6 +5,8 @@ from aqla_hyperliquid_mcp.models import Policy
 
 # Field -> category, label, unit, allowed values, explanation.
 PARAMETERS = {
+    "fallback_stop_loss_percent": ("Backup", "SL bei fehlender Angabe", "% Kursbewegung", "> 0 bis < 100 oder nicht gesetzt", "Nur das globale Backup ergänzt fehlende SLs; Referenz ist der tatsächliche Entry-VWAP, unabhängig vom Hebel."),
+    "fallback_take_profit_percentages": ("Backup", "TPs bei fehlender Angabe", "% Kursbewegung", "1–20 eindeutige aufsteigende Werte zwischen 0 und 100", "Nur das globale Backup ergänzt eine vollständig fehlende TP-Liste. Vorhandene Signalziele bleiben erhalten."),
     "product": ("Markt", "Handelsprodukt", "", "USDC-Perpetuals", "Die automatische Signalstrecke handelt USDC-Perpetuals; Spot wird dort nicht ausgeführt."),
     "sizing_mode": ("Positionsgröße", "Größenberechnung", "", "Nach Risiko / Fester Positionswert", "Bestimmt die Positionsgröße. Risiko-, Margin- und Positionswertgrenzen gelten in beiden Modi."),
     "risk_percent": ("Risiko", "Risiko je Trade", "% Kontoequity", "> 0 bis 100", "Obergrenze für das berechnete SL-Risiko einschließlich Kostenreserve; auch bei festem Positionswert."),

@@ -96,6 +96,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         snapshot = state.snapshot()
         return {"network": settings.network, "account": exchange.account, "paused": snapshot["paused"],
                 "policy": snapshot["policy"], "policy_revision": snapshot["policy_revision"], "sources": snapshot["sources"],
+                "source_names": snapshot.get("source_names", {}), "source_names_revision": snapshot.get("source_names_revision", 0),
                 "pending": [row["event_id"] for row in snapshot["events"].values() if row["status"] in UNFINISHED],
                 "trades": [row for row in snapshot["trades"].values() if row["status"] in OPEN],
                 "unresolved_operations": [trading.public_operation(row) for row in snapshot["operations"].values() if row["phase"] in ("prepared", "sending", "unknown")],
@@ -174,13 +175,17 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.update(acknowledge)
 
     @server.tool(annotations=write)
-    async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "close_trade", "clear_notification", "set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled"],
+    async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "set_source_name", "close_trade", "clear_notification", "set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled"],
                       expected_revision: int | None = None, policy: Policy | None = None, sources: list[str] | None = None,
                       trade_id: str | None = None, notification_id: str | None = None, context_auth: str = "",
                       profile: TradingProfile | None = None, pipeline: Pipeline | None = None, exchange_id: Venue | None = None,
-                      limits: AccountLimits | None = None, enabled: bool | None = None, identity: str | None = None) -> dict:
+                      limits: AccountLimits | None = None, enabled: bool | None = None, identity: str | None = None,
+                      source_id: str | None = None, source_name: str | None = None) -> dict:
         """Apply an authenticated natural-language user request. Source turns cannot change rules."""
         claims = authorize(context_auth, operator=True)
+        if action == "set_source_name":
+            from aqla_agent.sources import set_source_name
+            return state.update(lambda data: set_source_name(data, source_id, source_name, expected_revision))
         if action == "close_trade":
             if trade_id is None:
                 raise AqlaError("trade_id is required")
@@ -205,7 +210,9 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             elif action == "set_sources":
                 if sources is None or any(not source for source in sources):
                     raise AqlaError("Supply the complete explicit source list")
-                data["sources"] = sorted(set(sources))
+                from aqla_agent.sources import resolve_source
+                resolved = [resolve_source(data, item) for item in sources]
+                data["sources"] = sorted(set(resolved))
                 data["source_aliases"] = {key: value for key, value in data.get("source_aliases", {}).items() if key in data["sources"]}
             elif action == "clear_notification":
                 data["notifications"].pop(notification_id, None)
