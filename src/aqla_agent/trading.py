@@ -415,6 +415,14 @@ class Trading:
             raise
 
     async def _entry_steps(self, plan, trade):
+        current_market = await self.exchange.market(plan.market.symbol, plan.market.product)
+        identity_fields = ("asset_id", "size_decimals", "quote_token", "price_tick", "quantity_step", "margin_leverage_scale")
+        if any(getattr(current_market, key) != getattr(plan.market, key) for key in identity_fields) or plan.effective_leverage > current_market.max_leverage:
+            raise AqlaError("Market identity, precision or leverage changed while entry was unsent")
+        if (plan.quantity < current_market.min_quantity or plan.quantity * plan.entry_limit < current_market.min_notional
+                or current_market.max_quantity is not None and plan.quantity > current_market.max_quantity
+                or any(size < current_market.min_quantity or size * price < current_market.min_notional for size, price in zip(plan.tp_quantities, plan.take_profits, strict=True))):
+            raise AqlaError("Exchange minimum/maximum order sizes changed while entry was unsent")
         latest_account, latest_quote = None, None
         async def live_guard():
             nonlocal latest_account, latest_quote
@@ -709,7 +717,9 @@ class Trading:
         limits = self.state.limits(plan) if hasattr(self.state, "limits") else plan.policy
         within_entry_band = (plan.entry_timing != "deferred" or
                              plan.entry_price * (1 - plan.policy.max_slippage_percent / 100) <= entry <= plan.entry_price * (1 + plan.policy.max_slippage_percent / 100))
-        permitted = (safe and within_entry_band and notional <= plan.policy.max_notional_usdc and risk <= plan.risk_usdc
+        target_sizes = split_targets(size, len(targets), plan.policy, plan.market)
+        targets_feasible = all(amount >= plan.market.min_quantity and amount * price >= plan.market.min_notional for amount, price in zip(target_sizes, targets, strict=True))
+        permitted = (safe and within_entry_band and targets_feasible and notional <= plan.policy.max_notional_usdc and risk <= plan.risk_usdc
                      and risk <= account.equity * plan.policy.risk_percent / 100
                      and risk + other_risk <= account.equity * limits.max_total_risk_percent / 100)
         check = {"phase": "after_fill", "snapshot": quote.model_dump(mode="json"), "entry_vwap": str(entry),
