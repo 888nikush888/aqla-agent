@@ -8,7 +8,7 @@ from collections import defaultdict
 
 from aqla_hyperliquid_mcp.models import AqlaError
 
-from .journal import HEADERS, LEGACY_HEADERS, JournalRecord, fingerprint, record_key
+from .journal import HEADERS, LEGACY_HEADERS, TARGET_COLUMNS, JournalRecord, fingerprint, record_key
 from .parameters import OPERATING_PARAMETERS, PARAMETERS
 
 BASE = "https://sheets.googleapis.com/v4/spreadsheets/"
@@ -76,10 +76,13 @@ class SheetsClient:
             if title in properties:
                 if create and table in LEGACY_HEADERS and len(headers) != len(LEGACY_HEADERS[table]):
                     cells = self.values([f"'{title}'!A1:{column(len(headers) + 2)}1"])
-                    old = [*LEGACY_HEADERS[table], *META_HEADERS]
-                    if cells and cells[0] and cells[0][0] == old:
+                    previous = [LEGACY_HEADERS[table]]
+                    if table in ("Trades", "Orders", "Fills", "Vorgänge"):
+                        previous.append([*LEGACY_HEADERS[table], *TARGET_COLUMNS])
+                    old = next((headers for headers in previous if cells and cells[0] and cells[0][0] == [*headers, *META_HEADERS]), None)
+                    if old is not None:
                         identity = properties[title]["sheetId"]
-                        start = len(LEGACY_HEADERS[table])
+                        start = len(old)
                         extra = len(headers) - start
                         requests.extend([
                             {"insertDimension": {"range": {"sheetId": identity, "dimension": "COLUMNS", "startIndex": start, "endIndex": start + extra}, "inheritFromBefore": True}},

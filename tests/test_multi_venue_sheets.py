@@ -42,6 +42,29 @@ def test_statistics_do_not_sum_usdc_usdt_or_testnet_mainnet():
     assert all(group["net_before_funding_usd"] == 1 for group in result["groups"].values())
 
 
+def test_trade_details_migrate_the_already_extended_multi_venue_schema():
+    from types import SimpleNamespace
+
+    from aqla_sheets_mcp.client import META_HEADERS
+    from aqla_sheets_mcp.journal import LEGACY_HEADERS, TARGET_COLUMNS
+
+    google = Google()
+    client = SheetsClient(SimpleNamespace(spreadsheet_id="unit-test-only"), session=google)
+    client.layout()
+    title = PREFIX + "Trades"
+    old = [*LEGACY_HEADERS["Trades"], *TARGET_COLUMNS]
+    # The actual previous release already had target columns and their values.
+    body = ["trade-existing", "channel", "BTC", "long", "closed", "now", 100, 100, 1, 1, 0, 90, "[]", 10, 0, 1, 0, 1, "[]",
+            "hyperliquid", "testnet", "account", "legacy", "standard", 3, "USDC"]
+    google.tables[title] = [[*old, *META_HEADERS], [*body, "old-digest", 77]]
+    google.properties[title]["gridProperties"]["columnCount"] = len(old) + 2
+    client.layout()
+    assert google.tables[title][0] == [*HEADERS["Trades"], *META_HEADERS]
+    assert google.tables[title][1][:len(body)] == body
+    assert google.tables[title][1][-2:] == ["old-digest", 77]
+    assert google.tables[title][1][len(body):-2] == [""] * (len(HEADERS["Trades"]) - len(old))
+
+
 def test_lighter_margin_fraction_rounding_reduces_size_and_aster_tiers_cap_signal():
     signal = Interpretation(kind="new_signal", source_refs=["unit-test-source"], symbol="BTC", side="long", leverage=20, entry="market", stop_loss="90", take_profits=["110"])
     market = Market(symbol="BTC", asset_id=1, product="perp", mid=100, size_decimals=5, quantity_step="0.00001", price_tick="0.1", max_leverage=50,

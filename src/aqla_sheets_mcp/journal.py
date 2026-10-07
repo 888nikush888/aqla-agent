@@ -78,7 +78,8 @@ def record(table, identity, *values):
     if table in LEGACY_HEADERS and len(cells) == len(LEGACY_HEADERS[table]):
         cells += [""] * (len(HEADERS[table]) - len(cells))
         if table in ("Trades", "Orders", "Fills", "Vorgänge"):
-            cells[-7:] = ["hyperliquid", "", "", "legacy", "standard", "", "USDC"]
+            start = HEADERS[table].index("Börse")
+            cells[start:start + 7] = ["hyperliquid", "", "", "legacy", "standard", "", "USDC"]
     if table not in HEADERS or len(cells) != len(HEADERS[table]):
         raise AqlaError("Journal row does not match its fixed table schema")
     return {"table": table, "record_id": identity, "values": cells, "fingerprint": fingerprint(cells)}
