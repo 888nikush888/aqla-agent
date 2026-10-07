@@ -178,7 +178,7 @@ class HermesExtension:
             await asyncio.sleep(3)
 
     async def sync_monthly(self):
-        if not self.settings.google_sheets.enabled or time.monotonic() - self.last_monthly_sync < 60:
+        if not self.settings.google_sheets.enabled or self.last_monthly_sync and time.monotonic() - self.last_monthly_sync < 60:
             return
         self.last_monthly_sync = time.monotonic()
         try:

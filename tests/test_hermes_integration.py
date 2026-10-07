@@ -60,8 +60,10 @@ def test_tool_claim_comes_from_native_metadata_not_text(extension):
 
 
 @pytest.mark.asyncio
-async def test_monthly_sheets_failure_never_acknowledges_publication(extension):
+async def test_monthly_sheets_failure_never_acknowledges_publication(extension, monkeypatch):
     ext, _ = extension
+    # CI workers can have a monotonic clock below the throttle interval after boot.
+    monkeypatch.setattr("aqla_agent.events.time.monotonic", lambda: 30.0)
     ext.settings.google_sheets.spreadsheet_id = "ci" + "0" * 25
     ext.settings.google_sheets.credentials_file = "ci-only.secret"
     ext.settings.google_sheets.enabled = True
