@@ -272,6 +272,23 @@ class VenueState:
     def snapshot(self):
         return copy.deepcopy(self.project(self.root.snapshot()))
 
+    def read(self, *roots, entries=None):
+        dependencies = {"network", "venue_accounts", "profiles", "venue_limits", "account_limits", "paused",
+                        "venue_enabled", "account_enabled", "pipelines"}
+        groups = {"nonces": {"nonces", "account_nonces", "venue_nonces"},
+                  "bindings": {"bindings", "account_bindings", "venue_bindings"},
+                  "events": {"events", "account_events", "venue_events"}}
+        needed = set(roots) | dependencies
+        for root, extra in groups.items():
+            if root in roots:
+                needed |= extra
+        data = self.root.read(*needed, entries=entries)
+        for root in ("trades", "plans", "operations", "events", "bindings", "nonces", "account_nonces",
+                     "venue_nonces", "account_bindings", "venue_bindings", "account_events", "venue_events"):
+            data.setdefault(root, {})
+        projected = self.project(data)
+        return copy.deepcopy({root: projected[root] for root in roots if root in projected})
+
     def preview_snapshot(self):
         basis = self.preview_basis.get()
         result = self.project(copy.deepcopy(basis) if basis is not None else self.root.snapshot())
@@ -302,19 +319,20 @@ class VenueState:
 
     def assert_binding(self, settings):
         binding = {"network": settings.network, "account": settings.account.lower()}
-        expected = self.root.snapshot()["execution_accounts"].get(self.account_key)
+        data = self.root.read("execution_accounts", "venue_accounts", "network")
+        expected = data["execution_accounts"].get(self.account_key)
         if expected:
             expected = {key: expected[key] for key in ("network", "account")}
         else:
-            expected = self.root.snapshot()["venue_accounts"].get(self.exchange) if self.legacy_context(self.root.snapshot()) else None
+            expected = data["venue_accounts"].get(self.exchange) if self.legacy_context(data) else None
         if expected and expected != binding:
             raise AqlaError("Exchange account/network changed; existing execution identities cannot be rebound")
-        if self.exchange == "hyperliquid" and self.legacy_context(self.root.snapshot()):
+        if self.exchange == "hyperliquid" and self.legacy_context(data):
             self.root.assert_binding(settings)
 
     def assert_operation_binding(self, settings, record):
         self.assert_binding(settings)
-        if self.exchange == "hyperliquid" and self.legacy_context(self.root.snapshot()):
+        if self.exchange == "hyperliquid" and self.legacy_context(self.root.read("network", "venue_accounts")):
             return self.root.assert_operation_binding(settings, record)
         target = getattr(settings, "vault_address", None) or settings.account
         if record["request"].get("network") != settings.network or record["request"].get("account", "").lower() != target.lower():

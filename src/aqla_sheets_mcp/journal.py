@@ -98,6 +98,26 @@ def record_key(row):
     return row["table"] + ":" + row["record_id"]
 
 
+def _signal_record(data, identity, event, aliases):
+    source, interpretation = event["source"], event.get("interpretation") or {}
+    return record("Signale", identity, aliases.get(source["chat_id"], source["chat_id"]), source["message_id"], timestamp(source["sent_at"]), timestamp(source.get("edited_at")), source.get("reply_to_id"), source.get("historical", False), event["status"], interpretation.get("kind", ""), interpretation.get("symbol", ""), interpretation.get("side", ""), interpretation.get("update_action", ""), event.get("last_error") or interpretation.get("reason", ""), source["text"], event["source_id"], data.get("source_names", {}).get(source["chat_id"], ""))
+
+
+def _selected_record(data, key, fallback, history):
+    table, separator, identity = key.partition(":")
+    if separator and table in ("Signale", "Ereignisse"):
+        row = history.get(key)
+        if row is not None:
+            return row
+        if table == "Signale" and identity in data["events"]:
+            aliases = {value: name for name, value in data.get("source_aliases", {}).items()}
+            return _signal_record(data, identity, data["events"][identity], aliases)
+        return None
+    if not fallback:
+        fallback.append(project(data))
+    return fallback[0].get(key)
+
+
 def project(data):
     rows = {}
     def add(row):
@@ -105,8 +125,7 @@ def project(data):
     aliases = {value: name for name, value in data.get("source_aliases", {}).items()}
     actions = {order.get("c"): order for operation in data["operations"].values() for order in operation["wire_action"].get("orders", []) if order.get("c")}
     for identity, event in data["events"].items():
-        source, interpretation = event["source"], event.get("interpretation") or {}
-        add(record("Signale", identity, aliases.get(source["chat_id"], source["chat_id"]), source["message_id"], timestamp(source["sent_at"]), timestamp(source.get("edited_at")), source.get("reply_to_id"), source.get("historical", False), event["status"], interpretation.get("kind", ""), interpretation.get("symbol", ""), interpretation.get("side", ""), interpretation.get("update_action", ""), event.get("last_error") or interpretation.get("reason", ""), source["text"], event["source_id"], data.get("source_names", {}).get(source["chat_id"], "")))
+        add(_signal_record(data, identity, event, aliases))
     for identity, trade in data["trades"].items():
         plan = trade["plan"]
         fills = trade.get("fill_events", {})
@@ -211,14 +230,15 @@ def seed(data):
 
 
 def batch(data, limit=100):
-    records = project(data)
     pending = data.get("journal_pending", {})
-    selected = []
+    history = {record_key(row): row for row in data.get("journal_history", {}).values() if record_key(row) in pending}
+    selected, fallback = [], []
     size = 0
     for key in pending:
-        if key not in records:
+        current = _selected_record(data, key, fallback, history)
+        if current is None:
             continue
-        row = {**records[key], "revision": data["sequence"]}
+        row = {**current, "revision": data["sequence"]}
         extra = len(text(row).encode("utf-8"))
         if len(selected) >= limit or size + extra > 600_000:
             break
@@ -228,11 +248,12 @@ def batch(data, limit=100):
 
 
 def acknowledge(data, accepted):
-    records = project(data)
+    fallback = []
+    history = {record_key(row): row for row in data.get("journal_history", {}).values() if record_key(row) in accepted} if accepted else {}
     pending = data.get("journal_pending", {})
     count = 0
     for key, version in accepted.items():
-        current = records.get(key)
+        current = _selected_record(data, key, fallback, history)
         if current and current["fingerprint"] == version and pending.get(key) == version:
             pending.pop(key)
             if current["table"] == "Ereignisse":

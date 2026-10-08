@@ -9,6 +9,10 @@ import portalocker
 from .models import AqlaError, Settings
 from .storage import SQLiteStore, database_path, read_snapshot
 
+METADATA_ROOTS = {"nonces": dict, "account_nonces": dict, "venue_nonces": dict, "cursors": dict,
+                  "notifications": dict, "monthly_jobs": dict, "monthly_requests": list,
+                  "monthly_request_generations": dict, "monthly_reports": dict}
+
 
 class State:
     """One writer and one transactional SQLite state, with legacy JSON import."""
@@ -116,14 +120,119 @@ class State:
     def _write(self, data):
         self._store.save(data)
 
+    def _initialize_journal_roots(self, proposed):
+        if self.journal_enabled:
+            proposed.setdefault("journal_pending", {})
+            proposed.setdefault("journal_history", {})
+
     def snapshot(self):
         with self._thread_lock:
             return copy.deepcopy(self.data)
 
+    def read(self, *roots, entries=None):
+        """Return detached selected roots/entries, never a callback over live state."""
+        entries = entries or {}
+        if any(not isinstance(root, str) for root in roots) or not set(entries) <= set(roots):
+            raise AqlaError("State read requires named roots and matching entry selectors")
+        with self._thread_lock:
+            result = {}
+            for root in roots:
+                if root not in self.data:
+                    continue
+                value = self.data[root]
+                if root in entries:
+                    if not isinstance(value, dict):
+                        raise AqlaError("Selected state entries require a dictionary root")
+                    value = {key: value[key] for key in entries[root] if key in value}
+                result[root] = value
+            return copy.deepcopy(result)
+
+    def has_entry(self, root, key):
+        with self._thread_lock:
+            value = self.data.get(root, {})
+            if not isinstance(value, dict):
+                raise AqlaError("State membership requires a dictionary root")
+            return key in value
+
+    def update_metadata(self, roots, callback):
+        """Persist detached allowlisted metadata, preserving the generic journal path."""
+        roots = tuple(roots)
+        if not roots or len(set(roots)) != len(roots) or any(root not in METADATA_ROOTS for root in roots):
+            raise AqlaError("Metadata transaction includes an unknown or financial state root")
+        with self._thread_lock:
+            part = {root: copy.deepcopy(self.data.get(root, METADATA_ROOTS[root]())) for root in roots}
+            result = callback(part)
+            if set(part) != set(roots) or any(not isinstance(part[root], METADATA_ROOTS[root]) for root in roots):
+                raise AqlaError("Metadata transaction changed undeclared roots or root types")
+            normalized = json.loads(json.dumps(part, allow_nan=False))
+            proposed = {**self.data, **normalized, "sequence": self.data["sequence"] + 1}
+            self._initialize_journal_roots(proposed)
+            self._write(proposed)
+            self.data = proposed
+            return copy.deepcopy(result)
+
+    def journal_batch(self, limit=100):
+        from aqla_sheets_mcp.journal import batch
+
+        with self._thread_lock:
+            return copy.deepcopy(batch(self.data, limit))
+
+    def acknowledge_journal(self, accepted):
+        """The only partial path allowed to release digest-confirmed history rows."""
+        from aqla_sheets_mcp.journal import acknowledge
+
+        if not isinstance(accepted, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in accepted.items()):
+            raise AqlaError("Journal acknowledgements require record keys and fingerprint strings")
+        with self._thread_lock:
+            proposed = dict(self.data)
+            for root in ("journal_pending", "journal_history"):
+                if root in self.data:
+                    proposed[root] = dict(self.data[root])
+            result = acknowledge(proposed, accepted)
+            proposed["sequence"] = self.data["sequence"] + 1
+            self._initialize_journal_roots(proposed)
+            self._write(proposed)
+            self.data = proposed
+            return copy.deepcopy(result)
+
+    def monthly_transaction(self, action, **arguments):
+        """Fixed job operations inspect current financial evidence under the lock."""
+        from aqla_agent.monthly import fail_publication, monthly_page, next_job, request_publication
+
+        functions = {"job": next_job, "page": monthly_page, "failure": fail_publication, "request": request_publication}
+        if action not in functions:
+            raise AqlaError("Unknown partial monthly job operation")
+        roots = ("monthly_jobs", "monthly_requests", "monthly_request_generations")
+        with self._thread_lock:
+            proposed = dict(self.data)
+            for root in roots:
+                if root in proposed:
+                    proposed[root] = copy.deepcopy(proposed[root])
+            # These reviewed builtins only read financial roots and mutate job roots.
+            # No arbitrary callback receives shared financial data through this API.
+            result = functions[action](proposed, **copy.deepcopy(arguments))
+            changed = {root: proposed[root] for root in roots if root in proposed}
+            normalized = json.loads(json.dumps(changed, allow_nan=False))
+            proposed.update(normalized)
+            proposed["sequence"] = self.data["sequence"] + 1
+            self._initialize_journal_roots(proposed)
+            self._write(proposed)
+            self.data = proposed
+            return copy.deepcopy(result)
+
     def update(self, callback):
+        return self._update(callback, conditional=False)
+
+    def update_if_changed(self, callback):
+        """Generic journal-safe update that preserves explicit revision/order changes."""
+        return self._update(callback, conditional=True)
+
+    def _update(self, callback, *, conditional):
         with self._thread_lock:
             proposed = copy.deepcopy(self.data)
             result = callback(proposed)
+            if conditional and json.dumps(proposed, allow_nan=False) == json.dumps(self.data, allow_nan=False):
+                return copy.deepcopy(result)
             proposed["sequence"] += 1
             if self.journal_enabled:
                 from aqla_sheets_mcp.journal import enqueue_changes

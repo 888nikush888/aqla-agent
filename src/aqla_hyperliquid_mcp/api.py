@@ -310,7 +310,34 @@ class Hyperliquid:
             state["nonces"][scope] = max(prior, value)
             return value
 
-        return self.state.update(advance)
+        root = getattr(self.state, "root", self.state)
+        if not hasattr(root, "update_metadata"):
+            return self.state.update(advance)
+
+        def scoped_advance(part):
+            self.state.assert_binding(self.settings)
+            if root is self.state:
+                return advance(part)
+            legacy = self.state.legacy_context(root.read("network", "venue_accounts"))
+            if self.state.exchange == "hyperliquid" and legacy:
+                nonces = part["nonces"]
+            else:
+                nonces = part["account_nonces"].setdefault(self.state.account_key,
+                    dict(root.read("venue_nonces").get("venue_nonces", {}).get(self.state.exchange, {})) if legacy else {})
+            return advance({"nonces": nonces})
+
+        roots = ("nonces",) if root is self.state else ("nonces", "account_nonces")
+        with root._thread_lock:
+            if root is not self.state:
+                self.state.assert_binding(self.settings)
+                legacy = self.state.legacy_context(root.read("network", "venue_accounts"))
+                if (not root.has_entry("account_events", self.state.account_key)
+                        or not (self.state.exchange == "hyperliquid" and legacy)
+                        and not root.has_entry("account_bindings", self.state.account_key)):
+                    # Preserve the view's first-use namespace initialization via
+                    # its existing complete, journal-validated transaction.
+                    return self.state.update(advance)
+            return root.update_metadata(roots, scoped_advance)
 
     async def mutate(self, operation_id: str, action: dict, *, deadline=None, sign_method="l1", signer=None, prepare_guard=None, async_prepare_guard=None):
         """Durable request binding, no automatic retries, per-leg result preservation."""
@@ -342,7 +369,7 @@ class Hyperliquid:
         self.state.assert_binding(self.settings)
         request_hash = digest(request)
         async with self.mutations:
-            previous = self.state.snapshot()["operations"].get(operation_id)
+            previous = self.state.read("operations", entries={"operations": [operation_id]})["operations"].get(operation_id)
             if previous:
                 self.state.assert_operation_binding(self.settings, previous)
                 matches = previous["request_hash"] == request_hash

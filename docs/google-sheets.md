@@ -96,6 +96,14 @@ Der schmale Index garantiert keinen global unveränderten historischen Bodybesta
 
 Gewinnwerte sind **realisierte Ergebnisse vor Funding**. USDC-Gebühren werden aus eigenen Fills berücksichtigt; bei fehlender Gebühreninformation oder fremder Gebührenwährung bleibt Netto unbestimmt. Trefferquoten nennen nur bekannte abgeschlossene Ergebnisse. Ungeschlossene Positionen erhalten keine erfundene Mark-to-Market-PnL. Funding und die volle Hermes-Gesprächshistorie werden nicht gespiegelt.
 
+Interne Journalbatches projizieren nur die tatsächlich angefragten Pendingrecords.
+Signale und Historie verwenden einen selektiven Pfad; andere Tabellen behalten
+zunächst den vollständigen Fallback. Ein ACK verlangt weiterhin den aktuellen und
+den Pendingfingerprint gleichzeitig. Nur dann werden Outboxeintrag und passende
+Historie atomar freigegeben. Leere und stale ACKs benötigen keine Vollprojektion;
+ihre bisherige Sequenz-/Initialisierungswirkung bleibt erhalten. Der Writer und
+das SQLiteformat ändern sich dadurch nicht.
+
 ## Prüfungen und API-Grenzen
 
 Tests prüfen tatsächliche Journalprojektion, Gebühren/PnL, Queue-Wiederanlauf, veraltete Bestätigungen, verlorene Antworten, sortierte Zeilen, Source-Text als Literal, Kopfzeilen-/ID-Manipulation und getrennte Autorität. Native Hermes-Smokes entdecken und verwenden den neuen stdio-MCP. Reale Google-API-Zugriffe brauchen die oben eingerichtete Tabelle und wurden ohne Zugangsdaten nicht behauptet.

@@ -382,26 +382,23 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             raise AqlaError("Integration key is not configured")
         authority.internal(token)
         if action == "monthly_job":
-            from aqla_agent.monthly import next_job
-            return state.update(next_job)
+            return state.monthly_transaction("job")
         if action == "monthly_failure":
-            from aqla_agent.monthly import fail_publication
             if failure is None:
                 raise AqlaError("A bound monthly publication failure is required")
-            return state.update(lambda data: fail_publication(data, failure))
+            return state.monthly_transaction("failure", failure=failure)
         if action == "monthly_page":
-            from aqla_agent.monthly import monthly_page
             if job is None or section is None:
                 raise AqlaError("Monthly internal page requires its selected job and section")
-            return state.update(lambda data: monthly_page(data, job, section, offset, limit))
+            return state.monthly_transaction("page", binding=job, section=section, offset=offset, limit=limit)
         if action == "monthly_request":
             from datetime import datetime
 
-            from aqla_agent.monthly import BERLIN, month_bounds, request_publication
+            from aqla_agent.monthly import BERLIN, month_bounds
             month_bounds(month)
             if month > datetime.now(BERLIN).strftime("%Y-%m"):
                 raise AqlaError("Zukünftige Monate haben noch keinen Monatsbericht")
-            return state.update(lambda data: request_publication(data, month))
+            return state.monthly_transaction("request", month=month)
         if action == "monthly_ack":
             from aqla_agent.monthly import acknowledge_publication
             if publication is None or job is None:
@@ -413,13 +410,11 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             return state.update(lambda data: acknowledge_publication(data, month, publication.fingerprint,
                                 publication.url, publication.revision, job=job))
         if action == "journal_snapshot":
-            from aqla_sheets_mcp.journal import batch
-            return batch(state.snapshot(), settings.google_sheets.batch_size)
+            return state.journal_batch(settings.google_sheets.batch_size)
         if action == "journal_ack":
-            from aqla_sheets_mcp.journal import acknowledge
             if accepted is None:
                 raise AqlaError("Missing journal acknowledgements")
-            return state.update(lambda data: acknowledge(data, accepted))
+            return state.acknowledge_journal(accepted)
         if action == "seed_context":
             snapshot = state.snapshot()
             allowed = {*snapshot["sources"], *snapshot.get("source_aliases", {}).values()}

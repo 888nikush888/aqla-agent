@@ -117,8 +117,10 @@ class Router:
         result = self.source.ingest(source, **kwargs)
         if result["status"] == "already_processed":
             return result
-        from .ranking import source_rank
-        self.state.update(lambda data: source_rank(data, source.chat_id))
+        from .ranking import source_key, source_rank
+        ranking = self.state.read("source_aliases", "source_ranks")
+        if source_key(ranking, source.chat_id) not in ranking.get("source_ranks", {}):
+            self.state.update(lambda data: source_rank(data, source.chat_id))
         return result
 
     def context(self, event_id):
@@ -390,7 +392,7 @@ class Router:
 
     async def recover(self):
         from .ranking import evaluate
-        self.state.update(evaluate)
+        self.state.update_if_changed(evaluate)
         reports = []
         for venue in self.errors:
             if any((row["plan"].get("account_key") == venue if ":" in venue else row["plan"].get("exchange", "hyperliquid") == venue)

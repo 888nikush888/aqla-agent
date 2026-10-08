@@ -33,6 +33,66 @@ def rank_data(tier="F"):
             "ranking_history": {}, "notifications": {}, "trades": {}, "source_aliases": {}}
 
 
+def test_router_hundred_identical_duplicates_have_no_state_or_journal_writes(setup, monkeypatch):
+    settings, state, _, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    state.journal_enabled = True
+    source = SourceEvent(chat_id="channel", message_id=101, sent_at=now_ms(), text="Same message", historical=True)
+    first = router.ingest(source)
+    before = state.snapshot()
+    writes, original = [], state._write
+    monkeypatch.setattr(state, "_write", lambda data: writes.append(data["sequence"]) or original(data))
+    for _ in range(100):
+        assert router.ingest(source) == first
+    assert writes == [] and state.snapshot() == before
+    edited = source.model_copy(update={"edited_at": source.sent_at + 1, "text": "New edit"})
+    assert router.ingest(edited)["event_id"] != first["event_id"]
+    assert len(writes) == 1
+
+
+def test_duplicate_router_ingest_rebinds_newly_resolved_source_rank_alias(setup):
+    settings, state, _, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    source = SourceEvent(chat_id="channel", message_id=101, sent_at=now_ms(), text="Alias context", historical=True)
+    router.ingest(source)
+    state.update(lambda data: data.update(source_aliases={"selector": "channel"}, source_ranks={"selector": {
+        "tier": "C", "bootstrap": True, "revision": 7, "evaluated": [], "up": None, "down": 0}}))
+    before = state.snapshot()
+    router.ingest(source)
+    after = state.snapshot()
+    assert after["sequence"] == before["sequence"] + 1
+    assert after["source_ranks"] == {"channel": before["source_ranks"]["selector"]}
+
+
+@pytest.mark.asyncio
+async def test_router_recover_rank_noop_has_no_write_but_preserves_new_metrics(setup, monkeypatch):
+    settings, state, _, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    writes, original = [], state._write
+    rank_deltas, rank_update = [], state.update_if_changed
+    def counted_rank(callback):
+        before = state.read("sequence")["sequence"]
+        result = rank_update(callback)
+        rank_deltas.append(state.read("sequence")["sequence"] - before)
+        return result
+    monkeypatch.setattr(state, "update_if_changed", counted_rank)
+    monkeypatch.setattr(state, "_write", lambda data: writes.append(data["sequence"]) or original(data))
+    await router.recover()
+    assert len(writes) == 1
+    assert router.engines["hyperliquid"].recovery_checked is True
+    writes.clear()
+    await router.recover()
+    assert rank_deltas == [0, 0]
+    state.update(lambda data: data["ranking_policy"].update(enabled=True))
+    writes.clear()
+    await router.recover()
+    assert rank_deltas[-1] == 1
+    before = state.snapshot()
+    await router.recover()
+    assert rank_deltas[-1] == 0
+    assert state.snapshot() == {**before, "sequence": before["sequence"] + 1}
+
+
 def change_ranking(state, enabled, tier=None):
     def change(data):
         data["ranking_policy"]["enabled"] = enabled
