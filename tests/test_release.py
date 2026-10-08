@@ -267,6 +267,16 @@ def test_synthetic_local_state_before_archive_open(release_project, tmp_path, mo
     assert not (tmp_path / "out.zip").exists()
 
 
+def test_synthetic_local_state_with_previous_pair_before_archive_open(release_project, tmp_path, monkeypatch):
+    output, sha, previous = _previous_pair(release_project, tmp_path)
+    (release_project / "tests/local.sqlite3").write_text("synthetic forbidden sentinel", encoding="utf-8")
+    monkeypatch.setattr(release.zipfile, "ZipFile", lambda *args, **kwargs: pytest.fail("Existing archive opened before source validation"))
+    monkeypatch.setattr(release, "_read_source", lambda *args: pytest.fail("Existing pair read before source validation"))
+    with pytest.raises(ValueError, match="Unsafe artifact member"):
+        build(release_project, output)
+    assert (output.read_bytes(), sha.read_bytes()) == previous
+
+
 def test_cli_returns_nonzero_without_success_json_for_forbidden_source(release_project, tmp_path):
     package = release_project / "src/aqla_agent"
     package.mkdir()

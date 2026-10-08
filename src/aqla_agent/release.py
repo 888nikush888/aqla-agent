@@ -179,8 +179,9 @@ def build(project: Path, output: Path):
     if any(previous):
         if not all(previous):
             raise ValueError(f"Incomplete existing ZIP/checksum pair: {output}")
-        _verify_pair(output, sha, output.name)
     files = _collect_sources(project)
+    if all(previous):
+        _verify_pair(output, sha, output.name)
     members = [item[2] for item in files]
     staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
     staged_zip, staged_sha = staging / "new.zip", staging / "new.sha256"
