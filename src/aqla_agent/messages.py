@@ -316,18 +316,38 @@ def monthly_message(report):
     return "\n\n".join(lines)
 
 
-def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
+def summary_block(notice):
+    title = {"entry_fill": "✅ **Einstieg ausgeführt**", "closed": "🏁 **Trade geschlossen**", "protection": "🚨 **Schutzvorfall**"}.get(notice["kind"], "ℹ️ **Systemmeldung**")
+    lines = [title]
+    labels = {"time": "Belegzeitpunkt (Millisekunden)", "trade_id": "Trade", "account_key": "Konto", "account": "Handelskonto",
+              "exchange": "Börse", "network": "Netzwerk", "market": "Markt", "direction": "Richtung", "status": "Status"}
+    for name, label in labels.items():
+        if name in notice:
+            value = str(notice[name])
+            lines.append(f"**{label}:** " + literal(value[:299] + "…" if len(value) > 300 else value))
+    if notice["kind"] == "protection":
+        lines.append("**Entries:** gesperrt")
+    if "reason" in notice:
+        lines.append(("**Grund (gekürzt):** " if notice.get("reason_shortened") else "**Grund:** ") + literal(notice["reason"]))
+    lines.append("**Details:** Umfangreiche gespeicherte Belege; vollständige Daten separat abrufbar.")
+    return "\n\n".join(lines)
+
+
+def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None, notification_versions=None, include_status=True):
+    from aqla_hyperliquid_mcp.models import digest
+
+    from .notifications import notification_sort_key
     notifications = data.get("notifications", {})
     # Urgent protection notices are independent of signal batching.
-    chosen = [identity for _, identity in sorted(enumerate(notifications), key=lambda item: (
-        not item[1].startswith("protection:"), notifications[item[1]].get("lifecycle", {}).get("time", notifications[item[1]].get("observed_at", 0)),
-        notifications[item[1]].get("lifecycle", {}).get("kind") == "closed", item[0]))][:MAX_NOTIFICATIONS]
+    chosen = sorted(notifications, key=lambda identity: notification_sort_key(identity, notifications[identity]))[:MAX_NOTIFICATIONS]
     groups = {}
     for identity in chosen:
         notice = notifications[identity]
         trade = data["trades"].get(notice.get("trade_id"))
         event = data["events"].get(notice.get("event_id") or (trade or {}).get("event_id"))
-        if notice.get("rank_change"):
+        if notice.get("detail_level") == "summary":
+            key = ("summary", identity)
+        elif notice.get("rank_change"):
             key = ("rank", identity)
         elif notice.get("monthly_report"):
             key = ("monthly", identity)
@@ -347,6 +367,10 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
     messages = []
     for key, items in groups.items():
         ids = [row[0] for row in items]
+        if key[0] == "summary":
+            messages.append({"notification_ids": ids, "severity": "urgent" if ids[0].startswith("protection:") else "normal",
+                             "texts": split_blocks(summary_block(items[0][1]))})
+            continue
         if key[0] == "rank":
             event = items[0][1]["rank_change"]
             score = event["metrics"].get("score")
@@ -393,5 +417,8 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
             notice = items[0][1]
             blocks.append("ℹ️ **Systemmeldung**\n" + literal(notice.get("error") or "Gespeichertes Ereignis ohne vollständige Trade-Zuordnung"))
         messages.append({"notification_ids": ids, "severity": "normal", "texts": split_blocks("\n\n".join(blocks))})
-    return {"status": split_blocks(status_text(data, exchanges, sheets_enabled, inventory or {})), "messages": messages,
+    for message in messages:
+        message["notification_versions"] = {identity: notification_versions[identity] if notification_versions is not None else digest(notifications[identity])
+                                            for identity in message["notification_ids"]}
+    return {"status": split_blocks(status_text(data, exchanges, sheets_enabled, inventory or {})) if include_status else [], "messages": messages,
             "remaining_notification_ids": [identity for identity in notifications if identity not in chosen]}

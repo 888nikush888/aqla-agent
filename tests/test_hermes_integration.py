@@ -420,7 +420,7 @@ async def test_slow_google_sync_does_not_stop_source_wakeups(extension, tmp_path
     blocked, woke_twice = asyncio.Event(), asyncio.Event()
     wakes = []
     async def source_call(*args, **kwargs):
-        return {"pending": ["new-source"], "notifications": []}
+        return {"pending": ["new-source"], "notification_pending": 0}
     async def slow_google():
         blocked.set()
         await asyncio.Event().wait()
@@ -492,7 +492,7 @@ def test_forwarded_slash_text_is_source_and_cannot_control_native_gateway(extens
 @pytest.mark.asyncio
 @pytest.mark.parametrize("blocked_start", [False, True])
 @pytest.mark.parametrize("notification_only", [False, True])
-async def test_reader_failure_or_blocked_start_does_not_stop_pending_wake(extension, tmp_path, monkeypatch, blocked_start, notification_only):
+async def test_reader_and_wake_continue_with_notification_backlog(extension, tmp_path, monkeypatch, blocked_start, notification_only):
     extension, ctx = extension
     extension.settings.telegram_session_file = tmp_path / "reader.secret"
     extension.settings.telegram_session_file.write_text("")
@@ -511,7 +511,7 @@ async def test_reader_failure_or_blocked_start_does_not_stop_pending_wake(extens
     monkeypatch.setattr("aqla_agent.events.TelegramReader", Reader)
     async def snapshot(*args, **kwargs):
         await started.wait()
-        return {"pending": [] if notification_only else ["persisted-forward"], "notifications": ["protection-result"] if notification_only else []}
+        return {"pending": [] if notification_only else ["persisted-forward"], "notification_pending": 400 if notification_only else 0}
     def inject(text, **kwargs):
         wakes.append(text)
         woke.set()
@@ -539,7 +539,7 @@ async def test_missing_reader_session_reports_status_and_preserves_pending_wake(
     woke = asyncio.Event()
     wakes = []
     async def snapshot(*args, **kwargs):
-        return {"pending": ["persisted-forward"], "notifications": []}
+        return {"pending": ["persisted-forward"], "notification_pending": 0}
     def inject(text, **kwargs):
         wakes.append(text)
         woke.set()

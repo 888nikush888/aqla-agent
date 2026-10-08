@@ -11,6 +11,14 @@ from pydantic import Field
 
 from aqla_agent.messages import telegram_view
 from aqla_agent.monthly import MonthlyFailure, MonthlyJobBinding, MonthlyPublication, MonthlySection
+from aqla_agent.notifications import (
+    NotificationAckResult,
+    NotificationDetailsResult,
+    NotificationReadResult,
+    acknowledge_notifications,
+    notification_details,
+    notification_page,
+)
 from aqla_agent.pipelines import (
     AccountLimits,
     Pipeline,
@@ -113,19 +121,22 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         snapshot = state.snapshot()
         ready = trading.ready()
         inventory = await trading.inventory_status()
+        page = notification_page(snapshot, authority.key if authority else None, ready, require_key=False)
         return {"network": settings.network, "account": exchange.account, "paused": snapshot["paused"],
                 "policy": snapshot["policy"], "policy_revision": snapshot["policy_revision"], "sources": snapshot["sources"],
                 "source_names": snapshot.get("source_names", {}), "source_names_revision": snapshot.get("source_names_revision", 0),
                 "pending": [row["event_id"] for row in snapshot["events"].values() if row["status"] in UNFINISHED],
                 "trades": [row for row in snapshot["trades"].values() if row["status"] in OPEN],
                 "unresolved_operations": [trading.public_operation(row) for row in snapshot["operations"].values() if row["phase"] in ("prepared", "sending", "unknown")],
-                "notifications": snapshot["notifications"],
+                "notifications": page["notifications"], "notification_versions": page["notification_versions"],
+                "notifications_page": {"pending": page["pending"], "next_cursor": page["next_cursor"], "pagination_available": authority is not None},
                 "configuration_revision": snapshot["configuration_revision"], "profiles": snapshot["profiles"],
                 "pipelines": snapshot["pipelines"], "exchanges": ready,
                 "account_inventory": inventory,
                 "execution_accounts": trading.accounts_ready(), "ranking_policy": snapshot["ranking_policy"],
                 "ranking_revision": snapshot["ranking_revision"], "source_ranks": status_view(snapshot),
-                "telegram_view": telegram_view(snapshot, trading.accounts_ready() if snapshot["ranking_policy"]["enabled"] else ready, sheets_enabled=settings.google_sheets.enabled, inventory=inventory),
+                "telegram_view": {**page["telegram_view"], "status": telegram_view({**snapshot, "notifications": {}}, trading.accounts_ready() if snapshot["ranking_policy"]["enabled"] else ready,
+                                                                                 sheets_enabled=settings.google_sheets.enabled, inventory=inventory)["status"]},
                 "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})), "last_synced_at": snapshot.get("journal_synced_at")}}
 
     @server.tool(annotations=read)
@@ -249,16 +260,24 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         authorize(context_auth)
         return await trading.reconcile(operation_id)
 
+    @server.tool(annotations=read)
+    async def notifications_read(cursor: str | None = None, limit: int = 100) -> NotificationReadResult:
+        """Read a bounded versioned page; after ACK/stale begin again with no cursor."""
+        # Notification messages use saved account/plan facts; no inventory/status
+        # overview is rendered here, so another complete readiness snapshot is unnecessary.
+        return notification_page(state.snapshot(), authority.key if authority else None, {}, cursor=cursor, limit=limit)
+
+    @server.tool(annotations=read)
+    async def notifications_details(notification_id: str, version: str, cursor: str | None = None, limit: int = 16384) -> NotificationDetailsResult:
+        """Read lossless canonical JSON fragments of the exact saved notification version."""
+        return notification_details(state.snapshot(), authority.key if authority else None, notification_id, version, cursor=cursor, limit=limit)
+
     @server.tool(annotations=write)
-    async def notifications_ack(notification_ids: list[str], context_auth: str = "") -> dict:
+    async def notifications_ack(notification_ids: list[str], context_auth: str = "", versions: dict[str, str] | None = None) -> NotificationAckResult:
         """Acknowledge status facts processed for the native Hermes response; not a Telegram delivery receipt."""
         authorize(context_auth)
         def acknowledge(data):
-            removed = []
-            for identity in notification_ids:
-                if data["notifications"].pop(identity, None) is not None:
-                    removed.append(identity)
-            return {"processed": removed, "delivery_owned_by": "Hermes"}
+            return acknowledge_notifications(data, notification_ids, versions)
         return state.update(acknowledge)
 
     @server.tool(annotations=write)
@@ -450,7 +469,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "context_ids": snapshot.get("context_ids", {}),
                 "source_aliases": snapshot.get("source_aliases", {}), "tracked_ids": tracked,
                 "pending": [row["event_id"] for row in snapshot["events"].values() if row["status"] in UNFINISHED][:50],
-                "notifications": snapshot["notifications"]}
+                "notification_pending": len(snapshot["notifications"])}
 
     if profile == "full":
         @server.tool(annotations=read)

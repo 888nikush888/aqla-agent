@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from decimal import Decimal
@@ -9,7 +10,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
 
-from aqla_hyperliquid_mcp.models import AqlaError, Model, Policy, Positive, digest
+from aqla_hyperliquid_mcp.models import AqlaError, Model, Policy, Positive, digest, now_ms
 
 Venue = Literal["hyperliquid", "aster", "lighter"]
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9_-]{1,64}$")]
@@ -379,5 +380,6 @@ class VenueState:
             if self.legacy_context(data):
                 data["venue_enabled"][self.exchange] = False
             data["account_enabled"][self.account_key] = False
-            data["notifications"]["protection:" + self.account_key] = {"exchange": self.exchange, "account_key": self.account_key, "network": self.settings.network, "error": reason}
+            data["notifications"]["protection:" + self.account_key] = {"exchange": self.exchange, "account_key": self.account_key, "network": self.settings.network, "error": reason,
+                                                                    "generation_id": uuid.uuid4().hex, "observed_at": now_ms()}
         self.root.update(pause)
