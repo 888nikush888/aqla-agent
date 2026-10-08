@@ -192,7 +192,11 @@ def evaluate(data):
         reason = None
         unseen = [row for row in results if row["setup_id"] not in rank["evaluated"]]
         for evidence in unseen:
-            prefix = results[:results.index(evidence) + 1]
+            # Late funding may complete an old setup after newer setups were
+            # already graded. Assess it with all previously evaluated valid
+            # evidence, not a historical prefix that omits today's performance.
+            considered = {*rank["evaluated"], evidence["setup_id"]}
+            prefix = [row for row in results if row["setup_id"] in considered]
             observation = metrics(prefix, policy)
             score, drawdown = Decimal(observation["score"]), Decimal(observation["drawdown_r"])
             index = TIERS.index(rank["tier"])

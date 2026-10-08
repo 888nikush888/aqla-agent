@@ -133,6 +133,24 @@ def test_demotion_two_completions_and_corrected_evidence_never_recounts(monkeypa
     assert snapshot["source_ranks"]["channel"]["evaluated"] == frozen
 
 
+def test_late_old_funding_uses_current_window_not_old_winning_prefix(monkeypatch):
+    snapshot = rank_data("F")
+    rows = [evidence("-.01", number) for number in range(101, 151)]
+    monkeypatch.setattr("aqla_agent.ranking.outcomes", lambda _: ({"channel": rows}, {}))
+    evaluate(snapshot)
+    assert snapshot["source_ranks"]["channel"]["tier"] == "F"
+    # Fifty much older winners gain their missing funding proof. The latest
+    # fifty setups still lose; they cannot earn a historical Mainnet promotion.
+    rows[:0] = [evidence(1, number) for number in range(1, 51)]
+    evaluate(snapshot)
+    assert snapshot["source_ranks"]["channel"]["tier"] == "F"
+    assert len(snapshot["source_ranks"]["channel"]["evaluated"]) == 100
+    assert Decimal(snapshot["source_ranks"]["channel"]["metrics"]["score"]) < 30
+    frozen = copy.deepcopy(snapshot)
+    evaluate(snapshot)
+    assert snapshot == frozen
+
+
 @pytest.mark.parametrize("unit,quote", [("course_percent", "ROI 20%"), ("course_percent", "TP1 20%"), ("roi_percent", "TP1 20%"), ("roi_percent", "net ROI 20%")])
 def test_ambiguous_or_incompatible_percent_proof_is_rejected(setup, unit, quote):
     from aqla_hyperliquid_mcp.rules import verify_evidence
