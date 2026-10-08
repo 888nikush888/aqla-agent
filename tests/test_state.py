@@ -214,6 +214,37 @@ def test_reader_projection_matches_full_snapshot_contract_and_detaches_returned_
     assert state.snapshot() == before
 
 
+def test_reader_projection_uses_linear_grouper_without_copying_unselected_roots(setup, monkeypatch):
+    from aqla_hyperliquid_mcp.server import reader_overview
+
+    _, state, *_ = setup
+    class CountedEvents(dict):
+        scans = 0
+        def values(self):
+            for row in super().values():
+                self.scans += 1
+                yield row
+    class UnselectedBody:
+        def __deepcopy__(self, _):
+            pytest.fail("The reader must not copy an unrelated full-state body")
+    events = {str(index): {"event_id": str(index), "source_id": "ref-" + str(index), "status": "pending" if index % 3 == 0 else "report",
+        "source": {"chat_id": str(index % 10), "message_id": index + 1}} for index in range(1000)}
+    state.data["events"] = events
+    expected = reader_overview(state.data, 5)
+    counted = CountedEvents(events)
+    state.data["events"] = counted
+    state.data["unselected_reader_test_body"] = UnselectedBody()
+    def reject_snapshot():
+        pytest.fail("The selective reader must not create a full state snapshot")
+    monkeypatch.setattr(state, "snapshot", reject_snapshot)
+    actual = state.reader_snapshot(5)
+    assert actual == expected and counted.scans == len(events)
+    actual["tracked_ids"]["0"].append(99999)
+    assert state.reader_snapshot(5) == expected
+    assert counted.scans == 2 * len(events)
+    del state.data["unselected_reader_test_body"]
+
+
 def test_metadata_commit_and_empty_journal_ack_do_not_project_full_history(setup, monkeypatch):
     from aqla_sheets_mcp import journal
 
