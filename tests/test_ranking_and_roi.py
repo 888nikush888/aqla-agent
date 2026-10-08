@@ -107,12 +107,14 @@ def test_family_waits_for_unfilled_leg_before_counting_proof():
     for row in (first, second):
         row["plan"]["source_refs"] = ["original"]
         row["initial_sl_risk"] = {"amount": "22"}
-    second.update(fill_events={}, status="waiting_entry")
+    second.update(fill_events={}, filled_quantity="0", status="waiting_entry")
     snapshot = monthly_data(first, second)
     assert not outcomes(snapshot)[0]
     second["status"] = "cancelled"
     valid, _ = outcomes(snapshot)
     assert len(valid["-1001"]) == 1 and valid["-1001"][0]["trade_ids"] == ["a"]
+    second.update(filled_quantity="2.2", status="closed")
+    assert not outcomes(snapshot)[0]  # A filled leg with missing fill evidence cannot be ignored.
 
 
 def test_demotion_two_completions_and_corrected_evidence_never_recounts(monkeypatch):

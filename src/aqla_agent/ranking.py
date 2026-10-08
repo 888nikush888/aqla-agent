@@ -113,7 +113,7 @@ def outcomes(data):
     from .monthly import report_row
     grouped, excluded = {}, {}
     for trade in data["trades"].values():
-        if not trade.get("fill_events"):
+        if not trade.get("fill_events") and Decimal(trade.get("filled_quantity", "0")) == 0:
             continue
         plan = trade["plan"]
         family = plan.get("setup_id") or digest([trade["chat_id"], sorted(plan["source_refs"])])[:32]
