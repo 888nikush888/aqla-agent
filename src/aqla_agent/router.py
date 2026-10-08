@@ -4,12 +4,12 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 
-from aqla_hyperliquid_mcp.models import AqlaError, Market, digest, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, Market, SymbolUnavailable, digest, now_ms
 
 from .accounting import inventory_view
 from .pipelines import VenueState
 from .trading import OPEN, Trading
-from .venues import VenueAdapter, adapter_settings
+from .venues import VenueAdapter, adapter_settings, execution_settings
 
 
 class Router:
@@ -42,20 +42,89 @@ class Router:
                 if venue not in state.snapshot()["venue_accounts"]:
                     state.update(lambda data, name=venue, account=binding: data["venue_accounts"].__setitem__(name, account))
                 self.engines[venue] = Trading(adapter, view)
+                self.register_account(view, selected)
             except Exception as error:
                 self.errors[venue] = str(error) if isinstance(error, AqlaError) else "Exchange initialization unavailable"
+        for key in settings.execution_accounts:
+            venue, network = key.split(":", 1) if ":" in key else ("", "")
+            if venue not in ("hyperliquid", "aster", "lighter") or network not in ("mainnet", "testnet"):
+                raise AqlaError("Execution account keys must be exchange:network")
+            selected = execution_settings(settings, key)
+            if selected is None:
+                self.errors[key] = "Dedicated execution account/API credentials are not configured"
+                continue
+            existing = self.engine_for(venue, network)
+            if existing:
+                if selected.account.lower() != existing.exchange.settings.account.lower():
+                    raise AqlaError("An existing exchange/network account cannot be rebound")
+                continue
+            try:
+                from aqla_hyperliquid_mcp.api import Hyperliquid
+
+                from .aster import Aster
+                from .lighter import Lighter
+                view = VenueState(state, venue, selected, legacy=False)
+                adapter = adapters.get(key) or {"hyperliquid": Hyperliquid, "aster": Aster, "lighter": Lighter}[venue](selected, view)
+                adapter.state = view
+                adapter.fail_closed_protection = True
+                view.assert_binding(selected)
+                self.register_account(view, selected)
+                self.engines[key] = Trading(adapter, view)
+            except Exception as error:
+                self.errors[key] = str(error) if isinstance(error, AqlaError) else "Execution account initialization unavailable"
+
+    def register_account(self, view, selected):
+        snapshot = self.state.snapshot()
+        expected = {"exchange": view.exchange, "network": selected.network, "account": selected.account.lower()}
+        if snapshot["execution_accounts"].get(view.account_key) == expected and view.account_key in snapshot["account_limits"] and view.account_key in snapshot["account_enabled"]:
+            return
+        def register(data):
+            binding = {"exchange": view.exchange, "network": selected.network, "account": selected.account.lower()}
+            existing = data["execution_accounts"].get(view.account_key)
+            if existing and existing != binding:
+                raise AqlaError("Execution account binding changed")
+            data["execution_accounts"][view.account_key] = binding
+            legacy = view.legacy_context(data)
+            data["account_limits"].setdefault(view.account_key, data["venue_limits"].get(view.exchange) if legacy else data["venue_limits"].get("hyperliquid"))
+            data["account_enabled"].setdefault(view.account_key, data["venue_enabled"].get(view.exchange, False) if legacy else False)
+        self.state.update(register)
+
+    def engine_for(self, venue, network):
+        return next((engine for engine in self.engines.values() if engine.state.exchange == venue and engine.exchange.settings.network == network), None)
+
+    def engine_for_plan(self, plan):
+        return self.engine_for(plan.get("exchange", "hyperliquid"), plan["network"])
+
+    def accounts_ready(self):
+        data = self.state.snapshot()
+        result = {}
+        for venue in ("hyperliquid", "aster", "lighter"):
+            for network in ("mainnet", "testnet"):
+                key = venue + ":" + network
+                engine = self.engine_for(venue, network)
+                legacy = engine and engine.state.legacy_context(data)
+                result[key] = {"exchange": venue, "network": network, "configured": bool(engine),
+                               "enabled": data["venue_enabled"].get(venue, False) if legacy else data["account_enabled"].get(key, False),
+                               "limits": data["venue_limits"].get(venue) if legacy else data["account_limits"].get(key),
+                               "reason": None if engine else self.errors.get(key, self.errors.get(venue, "Account is not configured"))}
+        return result
 
     def __getattr__(self, name):
         return getattr(self.engines["hyperliquid"], name)
 
     def ingest(self, source, **kwargs):
-        return self.source.ingest(source, **kwargs)
+        result = self.source.ingest(source, **kwargs)
+        from .ranking import source_rank
+        self.state.update(lambda data: source_rank(data, source.chat_id))
+        return result
 
     def context(self, event_id):
         result = self.source.context(event_id)
         data = self.state.snapshot()
         result.update(profiles=data["profiles"], pipelines=data["pipelines"], configuration_revision=data["configuration_revision"],
                       venue_limits=data["venue_limits"], execution_targets=data["events"][event_id].get("targets", {}))
+        from .ranking import snapshot_rank
+        result.update(source_rank=snapshot_rank(data, data["events"][event_id]["source"]["chat_id"]), execution_accounts=self.accounts_ready())
         return result
 
     def record_interpretation(self, event_id, interpretation):
@@ -112,23 +181,68 @@ class Router:
                 row["targets"]["legacy:hyperliquid"]["status"] = "pending"
             return row["targets"]
         targets = self.state.update(select)
+        ranked = self.state.snapshot()["ranking_policy"]["enabled"]
+        rank = None
+        if ranked:
+            from .ranking import snapshot_rank
+            rank = self.state.update(lambda data: snapshot_rank(data, data["events"][event_id]["source"]["chat_id"]))
         if not targets:
             self.state.update(lambda data: data["events"][event_id].update(status="unrouted", last_error="No enabled pipeline matches this source"))
             return {"event_id": event_id, "targets": [], "error": "No enabled pipeline matches this source"}
         outputs = []
-        for identity, target in targets.items():
+        order = sorted(targets, key=lambda identity: (targets[identity]["exchange"] == "hyperliquid", identity)) if ranked else list(targets)
+        reserved = set()
+        for identity in order:
+            target = targets[identity]
             if target["status"] != "pending":
                 outputs.append({**target, **({"plan": self.state.snapshot()["plans"][target["plan_id"]]["plan"]} if target.get("plan_id") else {})})
                 continue
-            engine = self.engines.get(target["exchange"])
+            network = rank["network"] if rank else self.engines[target["exchange"]].exchange.settings.network if target["exchange"] in self.engines else "mainnet"
+            requested = target["exchange"]
+            engine = self.engine_for(requested, network)
             try:
                 if engine is None:
-                    raise AqlaError(self.errors[target["exchange"]])
+                    raise AqlaError(self.errors.get(requested + ":" + network, self.errors.get(requested, "Required account/network is unavailable")))
+                if ranked:
+                    target = {**target, "requested_exchange": requested, "network": network, "rank_snapshot": rank,
+                              "setup_id": digest([rank["source_id"], sorted(interpretation.source_refs)])[:32], "leg_id": identity}
+                    try:
+                        await engine.exchange.market(interpretation.symbol)
+                    except SymbolUnavailable as missing:
+                        if requested != "hyperliquid":
+                            raise
+                        pipeline_target = next(row for row in self.state.snapshot()["pipelines"][target["pipeline_id"]]["targets"] if row["exchange"] == requested)
+                        replacements = pipeline_target.get("fallback_exchanges")
+                        replacements = ["aster", "lighter"] if replacements is None else replacements
+                        reasons = []
+                        replacement = None
+                        readiness = self.accounts_ready()
+                        for venue in replacements:
+                            candidate = self.engine_for(venue, network)
+                            key = venue + ":" + network
+                            if candidate is None or not readiness[key]["enabled"] or not readiness[key]["limits"]:
+                                reasons.append(venue + ": account/permissions/limits unavailable")
+                                continue
+                            if (key, interpretation.symbol.upper()) in reserved:
+                                reasons.append(venue + ": explicit pipeline target already reserves this market")
+                                continue
+                            try:
+                                await candidate.exchange.market(interpretation.symbol)
+                            except SymbolUnavailable:
+                                reasons.append(venue + ": market unavailable")
+                                continue
+                            replacement = candidate
+                            target.update(exchange=venue, fallback_reason=str(missing), skipped_replacements=reasons)
+                            break
+                        if replacement is None:
+                            raise AqlaError("No replacement market/account in " + network + ": " + "; ".join(reasons)) from missing
+                        engine = replacement
                 async with engine.lock:
                     with engine.state.scope(target):
                         plan = await engine.preview(event_id, interpretation)
                 row = {**target, "status": "planned", "plan_id": plan["plan_id"]}
                 outputs.append({**row, "plan": plan})
+                reserved.add((engine.state.account_key, interpretation.symbol.upper()))
             except Exception as error:
                 row = {**target, "status": "rejected", "error": str(error) if isinstance(error, AqlaError) else "Exchange preview unavailable"}
                 outputs.append(row)
@@ -139,6 +253,7 @@ class Router:
             return {**outputs[0]["plan"], "targets": outputs}
         if len(outputs) == 1 and outputs[0]["pipeline_id"] == "legacy" and outputs[0].get("error"):
             raise AqlaError(outputs[0]["error"])
+        outputs.sort(key=lambda row: list(targets).index(row.get("leg_id", row["pipeline_id"] + ":" + row.get("requested_exchange", row["exchange"]))))
         return {"event_id": event_id, "targets": outputs}
 
     def finish_event(self, event_id):
@@ -160,10 +275,11 @@ class Router:
             raise AqlaError("Unknown immutable plan")
         plan = saved["plan"]
         venue = plan.get("exchange", "hyperliquid")
-        engine = self.engines.get(venue)
+        engine = self.engine_for_plan(plan)
         if engine is None:
             raise AqlaError("The plan's exchange account is unavailable; no fallback exchange")
-        target = {"pipeline_id": plan.get("pipeline_id") or "legacy", "profile_id": plan.get("profile_id") or "standard"}
+        target = {"pipeline_id": plan.get("pipeline_id") or "legacy", "profile_id": plan.get("profile_id") or "standard",
+                  **({"rank_snapshot": plan["rank_snapshot"], "requested_exchange": plan.get("requested_exchange"), "setup_id": plan["setup_id"]} if plan.get("rank_snapshot") else {})}
         try:
             with engine.state.scope(target):
                 result = await engine.execute(plan_id)
@@ -225,15 +341,31 @@ class Router:
         return results[0]["result"] if len(results) == 1 and "result" in results[0] else {"targets": results}
 
     async def recover(self):
+        from .ranking import evaluate
+        self.state.update(evaluate)
         reports = []
         for venue in self.errors:
-            if any(row["plan"].get("exchange", "hyperliquid") == venue and row["status"] in OPEN for row in self.state.snapshot()["trades"].values()):
+            if any((row["plan"].get("account_key") == venue if ":" in venue else row["plan"].get("exchange", "hyperliquid") == venue)
+                   and row["status"] in OPEN for row in self.state.snapshot()["trades"].values()):
                 reports.append({"exchange": venue, "error": "The original account adapter is unavailable; existing exposure needs attention"})
         for venue, engine in self.engines.items():
             for row in engine.state.snapshot()["trades"].values():
                 market = Market.model_validate(row["plan"]["market"])
                 engine.exchange.market_cache[market.symbol] = market
             async with engine.lock:
+                for row in engine.state.snapshot()["trades"].values():
+                    saved_rank = row["plan"].get("rank_snapshot")
+                    if not saved_rank or row["status"] not in OPEN or Decimal(row["filled_quantity"]) > 0:
+                        continue
+                    from .ranking import snapshot_rank
+                    current_rank = snapshot_rank(self.state.snapshot(), saved_rank["source_id"])
+                    if current_rank["source_revision"] != saved_rank["source_revision"] or current_rank["policy_revision"] != saved_rank["policy_revision"]:
+                        try:
+                            await engine.cancel_entry(row["trade_id"])
+                            if engine.state.snapshot()["trades"][row["trade_id"]]["status"] in OPEN:
+                                await engine.refresh_trade(row["trade_id"])
+                        except Exception:
+                            reports.append({"trade_id": row["trade_id"], "error": "Rank-changed entry cancellation/fill reconciliation is unconfirmed"})
                 rows = await engine.recover()
             reports.extend({"exchange": venue, **row} for row in rows)
         def expire(data):
@@ -261,7 +393,7 @@ class Router:
         row = self.state.snapshot()["trades"].get(trade_id)
         if row is None:
             raise AqlaError("Specify one exact trade ID; do not guess between exchanges")
-        engine = self.engines.get(row["plan"].get("exchange", "hyperliquid"))
+        engine = self.engine_for_plan(row["plan"])
         if engine is None:
             raise AqlaError("This trade's original exchange account is unavailable")
         async with engine.lock:
@@ -271,7 +403,10 @@ class Router:
         row = self.state.snapshot()["operations"].get(operation_id)
         if row is None:
             raise AqlaError("Unknown operation")
-        return await self.engines[row.get("exchange", "hyperliquid")].exchange.reconcile(operation_id)
+        engine = self.engine_for(row.get("exchange", "hyperliquid"), row["request"]["network"])
+        if engine is None:
+            raise AqlaError("Original operation account is unavailable")
+        return await engine.exchange.reconcile(operation_id)
 
     async def close(self):
         for engine in self.engines.values():

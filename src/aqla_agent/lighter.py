@@ -124,6 +124,9 @@ class Lighter(VenueAdapter):
         raw = await self.read("orderBookDetails", {"filter": "perp"})
         rows = [row for row in raw.get("order_book_details", []) if row["symbol"] == name and row.get("status") == "active"]
         if len(rows) != 1:
+            if not rows:
+                from aqla_hyperliquid_mcp.models import SymbolUnavailable
+                raise SymbolUnavailable("Lighter symbol is unavailable or delisted in this network")
             raise AqlaError("Lighter symbol is unavailable or ambiguous")
         row = rows[0]
         if Decimal(str(row.get("multiplier", "1"))) != 1:

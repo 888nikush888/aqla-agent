@@ -17,6 +17,7 @@ from aqla_agent.pipelines import (
     route_control,
     sync_legacy_policy,
 )
+from aqla_agent.ranking import RankingPolicy, status_view
 from aqla_agent.reporting import Reporting
 from aqla_agent.router import Router
 
@@ -95,7 +96,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         """Report actual endpoint coverage, configured account/network and signing scope."""
         return {"name": "aqla Agent", "version": __version__, "profile": profile, "network": settings.network,
                 "account": exchange.account, "writes_configured": exchange.wallet is not None,
-                "state": "atomic_json_single_writer", "source_images": False,
+                "state": "transactional_sqlite_single_writer", "source_images": False,
                 "automatic_source_products": ["perp"],
                 "automatic_source_exchanges": trading.ready(), "pipeline_execution": "independent_targets",
                 "info_types": sorted(INFO_MODELS), "sdk_exchange_operations": sorted(SDK_MODELS),
@@ -120,8 +121,25 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "configuration_revision": snapshot["configuration_revision"], "profiles": snapshot["profiles"],
                 "pipelines": snapshot["pipelines"], "exchanges": ready,
                 "account_inventory": inventory,
-                "telegram_view": telegram_view(snapshot, ready, sheets_enabled=settings.google_sheets.enabled, inventory=inventory),
+                "execution_accounts": trading.accounts_ready(), "ranking_policy": snapshot["ranking_policy"],
+                "ranking_revision": snapshot["ranking_revision"], "source_ranks": status_view(snapshot),
+                "telegram_view": telegram_view(snapshot, trading.accounts_ready() if snapshot["ranking_policy"]["enabled"] else ready, sheets_enabled=settings.google_sheets.enabled, inventory=inventory),
                 "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})), "last_synced_at": snapshot.get("journal_synced_at")}}
+
+    @server.tool(annotations=read)
+    async def ranking_status(source: str | None = None, history_limit: int = 30) -> dict:
+        """Read source tiers, net-R performance, proof/exclusions, policy and rank history. Never consumes new proof or changes ranks."""
+        from aqla_agent.ranking import source_key
+        from aqla_agent.sources import resolve_source
+        data = state.snapshot()
+        if not 1 <= history_limit <= 100:
+            raise AqlaError("Ranking history limit must be 1–100")
+        selected = source_key(data, resolve_source(data, source)) if source else None
+        return {"policy": data["ranking_policy"], "revision": data["ranking_revision"],
+                "sources": {identity: {**row, "source_id": identity, "name": data.get("source_names", {}).get(identity, identity)}
+                            for identity, row in status_view(data).items() if selected is None or identity == selected},
+                "history": sorted([row for row in data["ranking_history"].values() if selected is None or row["source_id"] == selected], key=lambda row: row["time"], reverse=True)[:history_limit],
+                "execution_accounts": trading.accounts_ready(), "basis": "net_R_per_original_signal_setup"}
 
     @server.tool(annotations=read)
     async def monthly_report(month: str, offset: int = 0, limit: int = 100) -> dict:
@@ -158,6 +176,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "source_names": snapshot.get("source_names", {}), "orders": trade["orders"], "exit_orders": trade.get("exit_orders", []),
                 "order_observations": trade.get("order_observations", {}), "fill_events": trade.get("fill_events", {}),
                 "entry_vwap": trade.get("entry_vwap"), "entry_accounting": trade.get("entry_accounting"),
+                "initial_sl_risk": trade.get("initial_sl_risk"), "source_tp_finalization": trade.get("percent_finalization"),
+                "source_tp_updates": trade.get("percent_updates", {}), "execution_incident": trade.get("execution_incident"),
                 "price_checks": trade.get("price_checks", []), "waiting_snapshot": trade.get("waiting_snapshot"),
                 "waiting_error": trade.get("waiting_error"), "unsent_reason": trade.get("unsent_reason"),
                 "close_reason": trade.get("close_reason", close_reason(trade)), "lifecycle_events": trade.get("lifecycle_events", {}),
@@ -233,14 +253,53 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.update(acknowledge)
 
     @server.tool(annotations=write)
-    async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "set_source_name", "close_trade", "clear_notification", "set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled"],
+    async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "set_source_name", "close_trade", "clear_notification", "set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled", "set_ranking_policy", "set_account_limits", "set_account_enabled"],
                       expected_revision: int | None = None, policy: Policy | None = None, sources: list[str] | None = None,
                       trade_id: str | None = None, notification_id: str | None = None, context_auth: str = "",
                       profile: TradingProfile | None = None, pipeline: Pipeline | None = None, exchange_id: Venue | None = None,
                       limits: AccountLimits | None = None, enabled: bool | None = None, identity: str | None = None,
-                      source_id: str | None = None, source_name: str | None = None) -> dict:
+                      source_id: str | None = None, source_name: str | None = None,
+                      ranking_policy: RankingPolicy | None = None, account_key: str | None = None) -> dict:
         """Apply an authenticated natural-language user request. Source turns cannot change rules."""
         claims = authorize(context_auth, operator=True)
+        if action == "set_ranking_policy":
+            if ranking_policy is None or expected_revision != state.snapshot()["ranking_revision"]:
+                raise AqlaError("Supply the complete ranking policy and its current revision")
+            def set_ranking(data):
+                data["ranking_policy"] = ranking_policy.model_dump(mode="json")
+                data["ranking_revision"] += 1
+                for row in data["source_ranks"].values():
+                    row.update(up=None, down=0)
+                return {"policy": data["ranking_policy"], "revision": data["ranking_revision"]}
+            return state.update(set_ranking)
+        if action in ("set_account_limits", "set_account_enabled"):
+            data = state.snapshot()
+            if account_key not in data["execution_accounts"] or expected_revision != data["configuration_revision"]:
+                raise AqlaError("Select a configured execution account and current configuration revision")
+            if action == "set_account_enabled" and enabled:
+                engine = trading.engine_for(*account_key.split(":"))
+                if engine is None or not data["account_limits"].get(account_key):
+                    raise AqlaError("Account credentials and explicit limits must be ready before activation")
+                await engine.exchange.verify_signer()
+                engine.state.assert_binding(engine.exchange.settings)
+            def set_account(values):
+                if action == "set_account_limits":
+                    if limits is None:
+                        raise AqlaError("Complete account limits are required")
+                    values["account_limits"][account_key] = limits.model_dump(mode="json")
+                else:
+                    if enabled is None:
+                        raise AqlaError("Specify the account activation value")
+                    values["account_enabled"][account_key] = enabled
+                engine = trading.engine_for(*account_key.split(":"))
+                if engine and engine.state.legacy_context(values):
+                    venue = account_key.split(":")[0]
+                    values["venue_limits"][venue] = values["account_limits"][account_key]
+                    values["venue_enabled"][venue] = values["account_enabled"][account_key]
+                values["configuration_revision"] += 1
+                return {"configuration_revision": values["configuration_revision"], "account": account_key,
+                        "limits": values["account_limits"][account_key], "enabled": values["account_enabled"][account_key]}
+            return state.update(set_account)
         if action == "set_source_name":
             from aqla_agent.sources import set_source_name
             return state.update(lambda data: set_source_name(data, source_id, source_name, expected_revision))
@@ -271,6 +330,9 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 from aqla_agent.sources import resolve_source
                 resolved = [resolve_source(data, item) for item in sources]
                 data["sources"] = sorted(set(resolved))
+                from aqla_agent.ranking import source_rank
+                for source in data["sources"]:
+                    source_rank(data, source)
                 data["source_aliases"] = {key: value for key, value in data.get("source_aliases", {}).items() if key in data["sources"]}
             elif action == "clear_notification":
                 data["notifications"].pop(notification_id, None)
@@ -348,7 +410,12 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             selected = state.snapshot()["sources"]
             if aliases is None or any(key not in selected or not value.lstrip("-").isdigit() for key, value in aliases.items()):
                 raise AqlaError("Reader source resolution must bind only configured sources to actual Telegram IDs")
-            state.update(lambda data: data.update(source_aliases=aliases))
+            def resolve(data):
+                data["source_aliases"] = aliases
+                from aqla_agent.ranking import source_rank
+                for source in aliases.values():
+                    source_rank(data, source)
+            state.update(resolve)
             return {"source_aliases": aliases}
         if action in ("ingest", "native_forward"):
             if source is None:

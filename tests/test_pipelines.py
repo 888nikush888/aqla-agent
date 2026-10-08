@@ -36,6 +36,66 @@ def routed(setup):
 
 
 @pytest.mark.asyncio
+async def test_ranked_fallback_preserves_leg_profile_network_and_explicit_priority(routed, setup, signal, monkeypatch):
+    from aqla_hyperliquid_mcp.models import SymbolUnavailable
+    router, boundaries = routed
+    state = setup[1]
+    state.update(lambda data: data["ranking_policy"].update(enabled=True))
+    state.update(lambda data: data["source_ranks"]["channel"].update(tier="D"))
+    # Explicit Aster wins its slot; only the Hyperliquid leg moves to Lighter.
+    state.update(lambda data: data["pipelines"]["source-one"].update(targets=data["pipelines"]["source-one"]["targets"][:2]))
+    async def missing(*_):
+        raise SymbolUnavailable("Fresh metadata confirms missing BTC market")
+    monkeypatch.setattr(router.engines["hyperliquid"].exchange, "market", missing)
+    source, interpretation = signal
+    result = await router.preview(source.event_id, interpretation)
+    assert [row["exchange"] for row in result["targets"]] == ["lighter", "aster"]
+    replacement = result["targets"][0]["plan"]
+    assert replacement["requested_exchange"] == "hyperliquid"
+    assert replacement["profile_id"] == "a" and replacement["network"] == "testnet"
+    assert replacement["routing_leg_id"] == "source-one:hyperliquid" and replacement["fallback_reason"]
+    assert replacement["setup_id"] == result["targets"][1]["plan"]["setup_id"]
+    executed = await router.execute_many([row["plan_id"] for row in result["targets"]])
+    assert all(row["status"] == "open" for row in executed["targets"])
+    assert not boundaries["hyperliquid"].actions and boundaries["aster"].actions and boundaries["lighter"].actions
+    await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["Fresh price data unavailable", "Insufficient margin", "Timeout: result unknown"])
+async def test_ranked_non_listing_errors_never_fallback(routed, setup, signal, monkeypatch, reason):
+    router, boundaries = routed
+    setup[1].update(lambda data: data["ranking_policy"].update(enabled=True))
+    setup[1].update(lambda data: data["source_ranks"]["channel"].update(tier="D"))
+    async def unavailable(*_):
+        raise AqlaError(reason)
+    monkeypatch.setattr(router.engines["hyperliquid"].exchange, "market", unavailable)
+    source, interpretation = signal
+    result = await router.preview(source.event_id, interpretation)
+    assert result["targets"][0]["status"] == "rejected" and result["targets"][0]["error"] == reason
+    assert all(row["requested_exchange"] == row["exchange"] for row in result["targets"])
+    assert all(not boundary.actions for boundary in boundaries.values())
+    await router.close()
+
+
+@pytest.mark.asyncio
+async def test_ranked_fallback_no_mainnet_escape_when_testnet_unavailable(routed, setup, signal, monkeypatch):
+    from aqla_hyperliquid_mcp.models import SymbolUnavailable
+    router, _ = routed
+    setup[1].update(lambda data: data["ranking_policy"].update(enabled=True))
+    setup[1].update(lambda data: data["venue_enabled"].update(aster=False, lighter=False))
+    async def missing(*_):
+        raise SymbolUnavailable("Confirmed absent")
+    monkeypatch.setattr(router.engines["hyperliquid"].exchange, "market", missing)
+    source, interpretation = signal
+    result = await router.preview(source.event_id, interpretation)
+    assert result["targets"][0]["status"] == "rejected"
+    assert "testnet" in result["targets"][0]["error"] and "account/permissions/limits" in result["targets"][0]["error"]
+    assert not setup[1].snapshot()["operations"]
+    await router.close()
+
+
+@pytest.mark.asyncio
 async def test_same_signal_routes_independently_with_shared_profiles(routed, setup, signal):
     router, boundaries = routed
     source, interpretation = signal

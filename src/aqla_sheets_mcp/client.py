@@ -8,7 +8,15 @@ from collections import defaultdict
 
 from aqla_hyperliquid_mcp.models import AqlaError
 
-from .journal import HEADERS, LEGACY_HEADERS, TARGET_COLUMNS, JournalRecord, fingerprint, record_key
+from .journal import (
+    HEADERS,
+    LEGACY_HEADERS,
+    PRE_RANK_HEADERS,
+    TARGET_COLUMNS,
+    JournalRecord,
+    fingerprint,
+    record_key,
+)
 from .parameters import OPERATING_PARAMETERS, PARAMETERS
 
 BASE = "https://sheets.googleapis.com/v4/spreadsheets/"
@@ -43,6 +51,7 @@ class SheetsClient:
         self.scope = scope
         self.session = session
         self.lock = threading.RLock()
+        self.allowed_tables = set(HEADERS)
 
     def _session(self):
         if self.session is None:
@@ -79,11 +88,15 @@ class SheetsClient:
                     raise AqlaError("Google Sheets journal has not been initialized by the synchronizer yet")
                 requests.append({"createDeveloperMetadata": {"developerMetadata": {"metadataKey": self.scope_key, "metadataValue": self.scope, "visibility": "DOCUMENT", "location": {"spreadsheet": True}}}})
         for table, headers in HEADERS.items():
+            if table not in self.allowed_tables:
+                continue
             title = self.prefix + table
             if title in properties:
-                if create and table in LEGACY_HEADERS and len(headers) != len(LEGACY_HEADERS[table]):
+                if create and table in PRE_RANK_HEADERS:
                     cells = self.values([f"'{title}'!A1:{column(len(headers) + 2)}1"])
-                    previous = [LEGACY_HEADERS[table]]
+                    previous = [PRE_RANK_HEADERS[table]]
+                    if table in LEGACY_HEADERS:
+                        previous.append(LEGACY_HEADERS[table])
                     if table in ("Trades", "Orders", "Fills", "Vorgänge"):
                         previous.append([*LEGACY_HEADERS[table], *TARGET_COLUMNS])
                     old = next((headers for headers in previous if cells and cells[0] and cells[0][0] == [*headers, *META_HEADERS]), None)

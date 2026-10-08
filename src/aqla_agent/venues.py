@@ -20,6 +20,22 @@ def adapter_settings(root, venue):
                               "telegram_owner_id": root.telegram_owner_id, "vault_address": None, "venue": venue})
 
 
+def execution_settings(root, key):
+    configured = root.execution_accounts.get(key)
+    if configured is None or not configured.private_key_file or not configured.private_key_file.is_file():
+        return None
+    if key != configured.exchange + ":" + configured.network:
+        raise AqlaError("Execution account key differs from its exchange/network")
+    if configured.exchange == "hyperliquid":
+        if not configured.account:
+            return None
+        return root.model_copy(update={"network": configured.network, "account": configured.account, "vault_address": configured.vault_address,
+                         "signer_role": configured.signer_role, "private_key_file": configured.private_key_file, "shared_account": configured.shared_account})
+    account = configured.account if configured.exchange == "aster" else str(configured.account_index) if configured.account_index is not None else None
+    return SimpleNamespace(**{**root.model_dump(), **configured.model_dump(), "account": account, "venue": configured.exchange,
+                              "vault_address": None}) if account else None
+
+
 class VenueAdapter:
     """Canonical order intents; each signed leg is checkpointed before its only send."""
     fail_closed_protection = True

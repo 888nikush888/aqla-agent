@@ -74,6 +74,13 @@ class TradingProfile(Model):
 class PipelineTarget(Model):
     exchange: Venue
     profile_id: Identifier
+    fallback_exchanges: list[Venue] | None = Field(default=None, max_length=2)
+
+    @model_validator(mode="after")
+    def fallback_valid(self):
+        if self.fallback_exchanges is not None and (self.exchange != "hyperliquid" or len(set(self.fallback_exchanges)) != len(self.fallback_exchanges) or "hyperliquid" in self.fallback_exchanges):
+            raise ValueError("Only Hyperliquid targets support unique Aster/Lighter replacements")
+        return self
 
 
 class Pipeline(Model):
@@ -96,6 +103,14 @@ def migrate(data):
     """Add routing without rehashing any existing trade, order or operation."""
     if "profiles" in data:
         changed = False
+        if "execution_accounts" not in data:
+            from .ranking import RankingPolicy
+            data.update(execution_accounts={}, account_limits={}, account_enabled={}, account_bindings={}, account_nonces={}, account_events={},
+                        ranking_policy=RankingPolicy().model_dump(mode="json"), ranking_revision=1,
+                        source_ranks={source: {"tier": "C", "bootstrap": True, "revision": 1, "evaluated": [], "up": None, "down": 0} for source in data["sources"]},
+                        ranking_history={})
+            data["schema"] = 3
+            changed = True
         if "source_names" not in data:
             data.update(source_names={}, source_names_revision=0)
             changed = True
@@ -179,8 +194,10 @@ def route_control(data, action, *, expected_revision, profile=None, pipeline=Non
 
 class VenueState:
     """A filtered view, never a second writer or state file."""
-    def __init__(self, root, exchange, settings):
+    def __init__(self, root, exchange, settings, *, legacy=True):
         self.root, self.exchange, self.settings = root, exchange, settings
+        self.account_key = exchange + ":" + settings.network
+        self.legacy = legacy
         self.route = ContextVar("aqla_route_" + exchange, default=None)
 
     @contextmanager
@@ -194,21 +211,39 @@ class VenueState:
     def project(self, data):
         result = dict(data)
         for key in ("trades", "plans", "operations"):
-            result[key] = {identity: row for identity, row in data[key].items() if (row.get("plan", {}).get("exchange", "hyperliquid") if key != "operations" else row.get("exchange", "hyperliquid")) == self.exchange}
-        result["bindings"] = data["bindings"] if self.exchange == "hyperliquid" else data["venue_bindings"].setdefault(self.exchange, {})
-        result["nonces"] = data["nonces"] if self.exchange == "hyperliquid" else data.setdefault("venue_nonces", {}).setdefault(self.exchange, {})
-        event_states = data["venue_events"].get(self.exchange, {})
+            result[key] = {identity: row for identity, row in data[key].items() if self.record_key(row, operation=key == "operations", default_network=self.settings.network) == self.account_key}
+        legacy = self.legacy_context(data)
+        result["bindings"] = data["bindings"] if self.exchange == "hyperliquid" and legacy else data["account_bindings"].setdefault(self.account_key, copy.deepcopy(data["venue_bindings"].get(self.exchange, {})) if legacy else {})
+        result["nonces"] = data["nonces"] if self.exchange == "hyperliquid" and legacy else data["account_nonces"].setdefault(self.account_key, copy.deepcopy(data.get("venue_nonces", {}).get(self.exchange, {})) if legacy else {})
+        event_states = data["account_events"].get(self.account_key, data["venue_events"].get(self.exchange, {}) if legacy else {})
         result["events"] = {key: {**value, **event_states.get(key, {})} for key, value in data["events"].items()}
         route = self.route.get()
         profile = data["profiles"].get(route["profile_id"] if route else "standard", {})
-        limits = data["venue_limits"].get(self.exchange)
-        result["policy"] = Parameters(**profile["parameters"]).policy(AccountLimits(**limits)).model_dump(mode="json") if profile.get("parameters") and limits else None
+        limits = data["venue_limits"].get(self.exchange) if legacy else data["account_limits"].get(self.account_key)
+        parameters = profile.get("parameters")
+        if route and route.get("rank_snapshot") and parameters:
+            from .ranking import weighted_parameters
+            parameters = weighted_parameters(parameters, route["rank_snapshot"])
+        result["policy"] = Parameters(**parameters).policy(AccountLimits(**limits)).model_dump(mode="json") if parameters and limits else None
         result["policy_revision"] = profile.get("revision", 0)
-        result["network"], result["account"], result["trading_account"] = self.settings.network, self.settings.account.lower(), self.settings.account.lower()
-        result["paused"] = data["paused"] or not data["venue_enabled"].get(self.exchange, False)
+        target = getattr(self.settings, "vault_address", None) or self.settings.account
+        result["network"], result["account"], result["trading_account"] = self.settings.network, self.settings.account.lower(), target.lower()
+        result["paused"] = data["paused"] or not (data["venue_enabled"].get(self.exchange, False) if legacy else data["account_enabled"].get(self.account_key, False))
         if route:
             result["paused"] |= not data["pipelines"].get(route["pipeline_id"], {}).get("enabled", False)
         return result
+
+    @staticmethod
+    def record_key(row, operation=False, default_network=""):
+        plan = row.get("plan", {})
+        return row.get("account_key") if operation and row.get("account_key") else plan.get("account_key") or (
+            row.get("exchange", "hyperliquid") + ":" + row.get("request", {}).get("network", default_network) if operation else plan.get("exchange", "hyperliquid") + ":" + plan.get("network", default_network))
+
+    def legacy_context(self, data):
+        if not self.legacy:
+            return False
+        binding = data["venue_accounts"].get(self.exchange)
+        return bool(binding and binding["network"] == self.settings.network) or not binding and (self.exchange != "hyperliquid" or data["network"] == self.settings.network)
 
     def snapshot(self):
         return copy.deepcopy(self.project(self.root.snapshot()))
@@ -222,27 +257,37 @@ class VenueState:
                 for identity, row in local[key].items():
                     if key == "operations":
                         row["exchange"] = self.exchange
+                        row["account_key"] = self.account_key
                     data[key][identity] = row
-            states = data["venue_events"].setdefault(self.exchange, {})
+            states = data["account_events"].setdefault(self.account_key, {})
             for identity, row in local["events"].items():
                 if row != original_events[identity]:
                     states[identity] = {key: value for key, value in row.items() if key not in ("source", "source_id", "event_id")}
+            if self.legacy_context(data) and self.exchange != "hyperliquid":
+                data["venue_bindings"][self.exchange] = copy.deepcopy(local["bindings"])
+                data.setdefault("venue_nonces", {})[self.exchange] = copy.deepcopy(local["nonces"])
+                data["venue_events"][self.exchange] = copy.deepcopy(states)
             return result
         return self.root.update(change)
 
     def assert_binding(self, settings):
         binding = {"network": settings.network, "account": settings.account.lower()}
-        expected = self.root.snapshot()["venue_accounts"].get(self.exchange)
+        expected = self.root.snapshot()["execution_accounts"].get(self.account_key)
+        if expected:
+            expected = {key: expected[key] for key in ("network", "account")}
+        else:
+            expected = self.root.snapshot()["venue_accounts"].get(self.exchange) if self.legacy_context(self.root.snapshot()) else None
         if expected and expected != binding:
             raise AqlaError("Exchange account/network changed; existing execution identities cannot be rebound")
-        if self.exchange == "hyperliquid":
+        if self.exchange == "hyperliquid" and self.legacy_context(self.root.snapshot()):
             self.root.assert_binding(settings)
 
     def assert_operation_binding(self, settings, record):
         self.assert_binding(settings)
-        if self.exchange == "hyperliquid":
+        if self.exchange == "hyperliquid" and self.legacy_context(self.root.snapshot()):
             return self.root.assert_operation_binding(settings, record)
-        if record["request"].get("network") != settings.network or record["request"].get("account", "").lower() != settings.account.lower():
+        target = getattr(settings, "vault_address", None) or settings.account
+        if record["request"].get("network") != settings.network or record["request"].get("account", "").lower() != target.lower():
             raise AqlaError("Operation belongs to another venue account/network")
 
     def stamp_plan(self, plan):
@@ -254,12 +299,22 @@ class VenueState:
             plan.pipeline_revision = self.root.snapshot()["pipelines"][plan.pipeline_id]["revision"]
             if self.exchange != "hyperliquid" or plan.pipeline_id != "legacy":
                 plan.trade_id = digest([self.exchange, plan.network, plan.account, plan.pipeline_id, sorted(plan.source_refs)])[:32]
+            if route.get("rank_snapshot"):
+                plan.account_key = self.account_key
+                plan.rank_snapshot = copy.deepcopy(route["rank_snapshot"])
+                plan.base_parameters = copy.deepcopy(self.root.snapshot()["profiles"][plan.profile_id]["parameters"])
+                plan.requested_exchange = route.get("requested_exchange", self.exchange)
+                plan.routing_leg_id = route.get("leg_id", plan.pipeline_id + ":" + plan.requested_exchange)
+                plan.fallback_reason = route.get("fallback_reason")
+                plan.setup_id = route["setup_id"]
+                plan.rank_revision = route["rank_snapshot"]["source_revision"]
 
     def validate_route(self, plan):
         data = self.root.snapshot()
         if plan.backup_fields and data["profiles"]["backup"]["revision"] != plan.backup_profile_revision:
             raise AqlaError("Backup profile changed; create a new unsent plan")
-        if data["paused"] or not data["venue_enabled"].get(self.exchange):
+        enabled = data["venue_enabled"].get(self.exchange) if self.legacy_context(data) else data["account_enabled"].get(self.account_key)
+        if data["paused"] or not enabled:
             raise AqlaError("New entries are paused on this exchange")
         if self.exchange == "hyperliquid" and plan.pipeline_id in (None, "legacy"):
             if not data["pipelines"]["legacy"]["enabled"]:
@@ -276,19 +331,28 @@ class VenueState:
             pipeline = data["pipelines"].get(plan.pipeline_id, {})
             if not pipeline.get("enabled") or profile.get("revision") != plan.profile_revision or pipeline.get("revision") != plan.pipeline_revision:
                 raise AqlaError("Relevant pipeline/profile changed; create a new unsent plan")
-            if {"exchange": self.exchange, "profile_id": plan.profile_id} not in pipeline.get("targets", []):
+            requested = plan.requested_exchange or self.exchange
+            if not any(target["exchange"] == requested and target["profile_id"] == plan.profile_id for target in pipeline.get("targets", [])):
                 raise AqlaError("The plan no longer belongs to the configured pipeline target")
         elif data["policy_revision"] != plan.policy_revision:
             raise AqlaError("Policy changed; legacy unsent plan cannot execute")
+        if plan.rank_snapshot and data["ranking_policy"]["enabled"]:
+            from .ranking import snapshot_rank
+            current = snapshot_rank(data, plan.rank_snapshot["source_id"])
+            if current["source_revision"] != plan.rank_revision or current["policy_revision"] != plan.rank_snapshot["policy_revision"] or current["network"] != plan.network:
+                raise AqlaError("Source rank/risk/network changed; old unsent entry is no longer eligible")
 
     def limits(self, plan=None):
-        selected = self.root.snapshot()["venue_limits"].get(self.exchange)
+        data = self.root.snapshot()
+        selected = data["venue_limits"].get(self.exchange) if self.legacy_context(data) else data["account_limits"].get(self.account_key)
         if selected is None:
             raise AqlaError("Explicit exchange account limits are required")
         return AccountLimits(**selected)
 
     def pause_entries(self, reason):
         def pause(data):
-            data["venue_enabled"][self.exchange] = False
-            data["notifications"]["protection:" + self.exchange] = {"exchange": self.exchange, "error": reason}
+            if self.legacy_context(data):
+                data["venue_enabled"][self.exchange] = False
+            data["account_enabled"][self.account_key] = False
+            data["notifications"]["protection:" + self.account_key] = {"exchange": self.exchange, "account_key": self.account_key, "network": self.settings.network, "error": reason}
         self.root.update(pause)

@@ -8,6 +8,27 @@ integration_key_file: secrets/integration.secret
 sources: []
 # Rules are set by you through Hermes; none are silently selected for you.
 policy: null
+ranking_enabled: true
+# Each additional exchange/network has its own protected credentials and approval.
+# Account limits and activation are set explicitly through authenticated control.
+execution_accounts:
+  hyperliquid:mainnet:
+    exchange: hyperliquid
+    network: mainnet
+    account: null
+    private_key_file: secrets/hyperliquid-mainnet.secret
+  aster:testnet:
+    exchange: aster
+    network: testnet
+    account: null
+    signer: null
+    private_key_file: secrets/aster-testnet.secret
+  lighter:testnet:
+    exchange: lighter
+    network: testnet
+    account_index: null
+    api_key_index: null
+    private_key_file: secrets/lighter-testnet.secret
 venues:
   aster:
     network: mainnet

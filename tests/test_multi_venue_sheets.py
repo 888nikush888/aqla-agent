@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+import pytest
 from test_sheets import Google
 
 from aqla_hyperliquid_mcp.models import AccountSnapshot, Interpretation, Market, Policy, now_ms
@@ -22,6 +23,39 @@ def test_header_extension_preserves_existing_rows_ids_and_metadata(setup):
     assert google.tables[PREFIX + "Trades"][1][-2:] == [fingerprint(previous), 7]
     assert len(google.tables[PREFIX + "Trades"]) == 2
     assert PREFIX + "Pipelines" in google.tables
+
+
+@pytest.mark.asyncio
+async def test_rank_journal_scopes_account_network_and_preserves_historical_id(setup):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from aqla_hyperliquid_mcp.models import ExecutionSettings, GoogleSheetsSettings
+    from aqla_sheets_mcp.server import create_server
+
+    settings = setup[0]
+    settings.ranking_enabled = True
+    settings.google_sheets = GoogleSheetsSettings(enabled=True, spreadsheet_id="ci-spreadsheet-" + "0" * 25,
+                                                credentials_file=settings.state_path.parent / "google.secret")
+    settings.execution_accounts["aster:mainnet"] = ExecutionSettings(exchange="aster", network="mainnet", account="0x" + "1" * 40)
+    google = Google()
+    client = SheetsClient(settings.google_sheets, session=google, scope=settings.network + ":" + settings.account.lower())
+    server = create_server(settings, client=client)
+    row = record("Trades", "unchanged-id", "channel", "BTC", "long", "closed", "now", 100, 100, 1, 1, 0, 90, "[]", 10, 0, 1, 0, 1, "[]")
+    start = HEADERS["Trades"].index("Börse")
+    row["values"][start:start + 7] = ["aster", "mainnet", "0x" + "1" * 40, "pipeline", "profile", 1, "USDT"]
+    row["fingerprint"] = fingerprint(row["values"])
+    token = settings.integration_key_file.read_text()
+    result = await server.call_tool("sync_internal", {"token": token, "records": [row]})
+    assert not result.is_error
+    title = "aqla Aster Mainnet Trades"
+    assert google.tables[title][1][0] == "unchanged-id" and len(google.tables[title]) == 2
+    await server.call_tool("sync_internal", {"token": token, "records": [row]})
+    assert len(google.tables[title]) == 2
+    assert "aqla Aster Mainnet Ränge" not in google.tables
+    row["values"][HEADERS["Trades"].index("Konto")] = "0x" + "2" * 40
+    row["fingerprint"] = fingerprint(row["values"])
+    with pytest.raises(ToolError, match="different configured"):
+        await server.call_tool("sync_internal", {"token": token, "records": [row]})
 
 
 def test_statistics_do_not_sum_usdc_usdt_or_testnet_mainnet():

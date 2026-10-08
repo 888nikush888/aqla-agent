@@ -31,13 +31,17 @@ def main():
              'targets': ['101', '102'], 'target_budgets': ['1', '1'],
              'plan': {'market': {'symbol': 'BTC', 'quote_token': 'USDC'}, 'side': 'long', 'source_refs': ['setup'],
                       'quantity': '2', 'effective_leverage': 12, 'signal_leverage': 12, 'signal_leverage_original': '12.78',
-                      'network': 'testnet', 'exchange': 'hyperliquid', 'profile_id': 'standard', 'backup_fields': []}}
+                      'network': 'testnet', 'exchange': 'aster', 'requested_exchange': 'hyperliquid', 'fallback_reason': 'Confirmed absent',
+                      'rank_snapshot': {'tier': 'D', 'factor': '.75'}, 'policy': {'risk_percent': '3.75'},
+                      'source_tp': {'unit': 'roi_percent', 'values': ['20', '40']}, 'profile_id': 'standard', 'backup_fields': []},
+             'initial_sl_risk': {'amount': '2'}}
     data = {'trades': {'trade': trade}, 'events': {}, 'operations': {}, 'paused': False,
             'source_names': {'-100123': '[VIP]* Gold_`'}, 'profiles': {'standard': {'name': 'Standard'}},
             'notifications': {'notice': {'trade_id': 'trade', 'change': {'status': 'open', 'filled_quantity': '2'},
                                          'previous': {'status': 'opening', 'filled_quantity': '0'}}}}
     view = telegram_view(data, {'hyperliquid': {'network': 'testnet', 'configured': True, 'enabled': True}})
     card = '\n\n'.join(view['messages'][0]['texts'])
+    assert 'ROI vor Kosten' in card and 'Kanalrang' in card and 'Börsenersatz' in card and 'RPR-Budget' in card
     monthly = monthly_message({'month': '2026-10', 'summary': {'trades': 2, 'complete': 1, 'excluded': 1,
         'wins': 1, 'losses': 0, 'win_rate_percent': '100', 'roe_sum_percent': '12.5', 'net_by_currency': {'USDC': '3.75'}},
         'open_trades': [], 'undated_closed_trades': [], 'url': 'https://docs.google.com/spreadsheets/d/ci/edit#gid=1'})

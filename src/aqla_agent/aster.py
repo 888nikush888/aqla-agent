@@ -17,11 +17,12 @@ DOMAIN = {"name": "AsterSignTransaction", "version": "1", "chainId": 1666, "veri
 BASE_URLS = {"mainnet": "https://fapi.asterdex.com", "testnet": "https://fapi.asterdex-testnet.com"}
 
 
-def sign_parameters(wallet, parameters):
+def sign_parameters(wallet, parameters, *, network="mainnet"):
     message = "&".join(f"{key}={value}" for key, value in sorted(parameters.items()))
+    domain = {**DOMAIN, "chainId": 714 if network == "testnet" else 1666}
     typed = {"types": {"EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"},
                {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}],
-               "Message": [{"name": "msg", "type": "string"}]}, "primaryType": "Message", "domain": DOMAIN, "message": {"msg": message}}
+               "Message": [{"name": "msg", "type": "string"}]}, "primaryType": "Message", "domain": domain, "message": {"msg": message}}
     return "0x" + wallet.sign_message(encode_typed_data(full_message=typed)).signature.hex().removeprefix("0x")
 
 
@@ -61,7 +62,7 @@ class Aster(VenueAdapter):
             return nonce
         nonce = self.state.update(reserve)
         payload = {**params, "nonce": str(nonce), "user": self.account, "signer": self.wallet.address.lower()}
-        payload["signature"] = sign_parameters(self.wallet, payload)
+        payload["signature"] = sign_parameters(self.wallet, payload, network=self.settings.network)
         return {"method": method, "path": path, "params": payload, "nonce": nonce}
 
     async def send(self, request):
@@ -99,6 +100,9 @@ class Aster(VenueAdapter):
         candidates = [row for row in meta["symbols"] if row.get("status") == "TRADING" and row.get("contractType") == "PERPETUAL"
                       and name in (row["symbol"], row["baseAsset"])]
         if len(candidates) != 1:
+            if not candidates:
+                from aqla_hyperliquid_mcp.models import SymbolUnavailable
+                raise SymbolUnavailable("Aster symbol is unavailable or delisted in this network")
             raise AqlaError("Aster symbol is unavailable or ambiguous")
         row = candidates[0]
         filters = {item["filterType"]: item for item in row["filters"]}

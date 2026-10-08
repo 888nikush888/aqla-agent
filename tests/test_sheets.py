@@ -330,7 +330,7 @@ def test_parameter_page_covers_every_rule_without_activating_defaults(setup):
     original = copy.deepcopy(data)
     rows = {row["record_id"]: row for row in project(data).values() if row["table"] == "Handelsparameter"}
     assert set(PARAMETERS) == set(Policy.model_fields)
-    assert len(rows) == len(Policy.model_fields) + 6 + 2 * len(data["venue_limits"]) + len(data["profiles"]["backup"]["parameters"])
+    assert len(rows) == len(Policy.model_fields) + 6 + 2 * len(data["venue_limits"]) + len(data["profiles"]["backup"]["parameters"]) + 11 + 2 * len(data["account_limits"])
     assert all(rows[name]["values"][3] == "Nicht festgelegt" for name in Policy.model_fields)
     assert rows["risk_percent"]["values"][6] == 0.5
     assert rows["policy_selected"]["values"][3] == "Nein"

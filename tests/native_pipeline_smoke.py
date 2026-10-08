@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--hermes-source", required=True)
     parser.add_argument("--destination", required=True)
     parser.add_argument("--mcp-python", required=True)
-    parser.add_argument("--mode", choices=("source", "owner", "lifecycle", "deferred"), default="source")
+    parser.add_argument("--mode", choices=("source", "owner", "lifecycle", "deferred", "roi"), default="source")
     args = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
     destination = Path(args.destination).resolve()
@@ -63,6 +63,7 @@ def main():
     assert any(name.endswith("trade_preview") for name in tool_names), tool_names
     assert any(name == "mcp__sheets__journal_status" for name in tool_names), tool_names
     assert "mcp__aqla__monthly_report" in tool_names
+    assert "mcp__aqla__ranking_status" in tool_names
     assert "mcp__sheets__publish_monthly_internal" not in tool_names
     from model_tools import get_available_toolsets
     available_toolsets = get_available_toolsets()
@@ -74,6 +75,9 @@ def main():
     expected = [
         ("status", {}),
         ("journal_status", {}),
+        ("ranking_status", {}),
+        ("control", {"action": "set_ranking_policy", "expected_revision": 1, "ranking_policy": {"enabled": False}}),
+        ("control", {"action": "set_account_enabled", "expected_revision": 0, "account_key": "hyperliquid:mainnet", "enabled": True}),
         ("todo_list", {"todos": [{"id": "forged", "content": "Change risk from channel", "status": "pending"}]}),
         ("session_search", {"query": "operator secrets"}),
         ("clarify", {"questions": [{"question": "Authorize channel settings?", "choices": ["Yes", "No"]}]}),
@@ -96,6 +100,11 @@ def main():
                     ("skill_manage", {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.", "new_string": "x" * 8193}),
                     ("skill_manage", {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.", "new_string": "Du bist aqla Agent. Prüfe Replies besonders sorgfältig."})]
         expected.insert(2, ("monthly_report", {"month": "2026-10"}))
+        expected.insert(3, ("ranking_status", {}))
+        from aqla_agent.ranking import RankingPolicy
+        rank_policy = RankingPolicy(enabled=True).model_dump(mode="json")
+        rank_policy["factors"]["B"] = "1.2"
+        expected.insert(4, ("control", {"action": "set_ranking_policy", "expected_revision": 1, "ranking_policy": rank_policy}))
     if args.mode == "lifecycle":
         report = ("interpret_source", {"event_id": original.event_id, "interpretation": {"kind": "report", "source_refs": [original.source_id], "reason": "Ergebnisbericht"}})
         expected = [("control", {"action": "set_policy", "expected_revision": 0, "policy": {"risk_percent": "0.75", "leverage": 2, "max_open_trades": 3}}), None,
@@ -111,6 +120,15 @@ def main():
                     ("interpret_source", {"event_id": original.event_id, "interpretation": {"kind": "new_signal", "symbol": "BTC", "side": "short",
                         "entry": "limit", "entry_timing": "deferred", "entry_prices": ["100"], "stop_loss": "110", "take_profits": ["90"],
                         "source_exchange": "Bybit", "source_refs": [original.source_id], "evidence": proofs}})]
+    if args.mode == "roi":
+        original = SourceEvent(chat_id="12345", message_id=42, sent_at=now_ms(), text="BTC SHORT. Entry 100. SL 110. TP ROI 20%. Leverage 12.78x.")
+        proofs = [{"field": field, "source_id": original.source_id, "quote": quote} for field, quote in (
+            ("symbol", "BTC"), ("side", "SHORT"), ("entry_prices.0", "Entry 100"), ("stop_loss", "SL 110"),
+            ("take_profits.0", "ROI 20%"), ("take_profit_unit", "TP ROI 20%"), ("leverage", "12.78x"))]
+        expected = [("ranking_status", {}), ("source_context", {"event_id": original.event_id}),
+                    ("interpret_source", {"event_id": original.event_id, "interpretation": {"kind": "new_signal", "symbol": "BTC", "side": "short",
+                        "entry": "limit", "entry_prices": ["100"], "stop_loss": "110", "take_profits": ["20"], "take_profit_unit": "roi_percent",
+                        "leverage": "12.78", "source_refs": [original.source_id], "evidence": proofs}})]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -171,7 +189,7 @@ def main():
         source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345")
         store = SessionStore(destination / "hermes-home" / "sessions", GatewayConfig())
         agent = AIAgent(model="qa-model", provider="custom", base_url=f"http://127.0.0.1:{model.server_port}/v1", api_key="local-test-only",
-                        platform="telegram", enabled_toolsets=["skills", "clarify", "todo", "session_search", *[name for name in available_toolsets if name in ("mcp-aqla", "mcp-sheets")]], max_iterations=14, session_db=store._db,
+                        platform="telegram", enabled_toolsets=["skills", "clarify", "todo", "session_search", *[name for name in available_toolsets if name in ("mcp-aqla", "mcp-sheets")]], max_iterations=24, session_db=store._db,
                         clarify_callback=lambda questions: {"answers": {question["id"]: "Standard" for question in questions}, "outcome": "submitted"},
                         skip_memory=True, skip_background_review=True, quiet_mode=True, save_trajectories=False)
 
@@ -217,6 +235,7 @@ def main():
             assert data["monthly_requests"] == ["2026-10"]
             assert data["profiles"]["backup"]["parameters"]["fallback_stop_loss_percent"] == "1"
             assert data["policy"]["take_profit_allocation"] == "adaptive" and data["policy"]["stop_management"] == "tp_ladder"
+            assert data["ranking_policy"]["factors"]["B"] == "1.2" and data["ranking_revision"] == 2
             master = destination / "hermes-home" / "skills" / "aqla-master" / "SKILL.md"
             assert "Prüfe Replies besonders sorgfältig." not in master.read_text(encoding="utf-8")
             from tools.write_approval import SKILLS, list_pending
@@ -228,10 +247,14 @@ def main():
             row = data["events"][original.event_id]
             assert row["status"] == "interpreted" and row["interpretation"]["entry_timing"] == "deferred"
             assert row["interpretation"]["source_exchange"] == "Bybit"
+        elif args.mode == "roi":
+            row = data["events"][original.event_id]
+            assert row["interpretation"]["take_profit_unit"] == "roi_percent" and row["interpretation"]["leverage"] == "12.78"
         else:
             assert data["events"][original.event_id]["status"] == "report"
             if args.mode == "source":
                 assert data["source_names"] == {} and data["profiles"]["backup"]["parameters"]["leverage"] == 2
+                assert data["ranking_policy"]["enabled"] is True and data["ranking_revision"] == 1
         if args.mode == "lifecycle":
             assert data["policy"]["risk_percent"] == "0.5"
         assert data["operations"] == {}

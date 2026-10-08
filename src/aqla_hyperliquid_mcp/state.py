@@ -31,7 +31,7 @@ class State:
                 raise AqlaError("Previously initialized SQLite state is missing; explicit recovery is required")
             if existing or legacy_path.exists():
                 self.data = read_snapshot(self.path) if existing else json.loads(legacy_path.read_text(encoding="utf-8"))
-                if not isinstance(self.data, dict) or self.data.get("schema") not in (1, 2) or self.data.get("network") != settings.network or self.data.get("account", "").lower() != settings.account.lower():
+                if not isinstance(self.data, dict) or self.data.get("schema") not in (1, 2, 3) or self.data.get("network") != settings.network or self.data.get("account", "").lower() != settings.account.lower():
                     raise AqlaError("State version, account or network differs; use a separate state")
                 for key in ("events", "trades", "operations", "nonces", "plans", "bindings", "sources"):
                     if key not in self.data:
@@ -57,16 +57,23 @@ class State:
             self.assert_binding(settings)
             for row in [*self.data["plans"].values(), *self.data["trades"].values()]:
                 plan = row["plan"]
-                if plan.get("exchange", "hyperliquid") != "hyperliquid":
+                if plan.get("exchange", "hyperliquid") != "hyperliquid" or plan.get("account_key") not in (None, "hyperliquid:" + settings.network):
                     continue
                 if plan["account"].lower() != target or plan["network"] != settings.network or plan.get("principal") not in (None, settings.account.lower()):
                     raise AqlaError("Saved plan belongs to another trading target or network")
             for row in self.data["operations"].values():
-                if row.get("exchange", "hyperliquid") == "hyperliquid":
+                if row.get("exchange", "hyperliquid") == "hyperliquid" and row.get("account_key") in (None, "hyperliquid:" + settings.network):
                     self.assert_operation_binding(settings, row)
             from aqla_agent.pipelines import migrate
 
+            had_ranking = "ranking_policy" in self.data
             migrated = migrate(self.data)
+            if settings.ranking_enabled and not had_ranking:
+                self.data["ranking_policy"]["enabled"] = True
+                migrated = True
+            if not existing and not legacy_path.exists():
+                for row in self.data["source_ranks"].values():
+                    row.update(tier="F", bootstrap=False)
             if self.journal_enabled:
                 from aqla_sheets_mcp.journal import seed
                 seed(self.data)

@@ -170,6 +170,22 @@ def verify_evidence(signal: Interpretation, events: dict):
         raise AqlaError("Deferred entry timing needs contextual source evidence")
     if signal.source_exchange is not None and not any(signal.source_exchange.casefold() in value.casefold() for value in fields.get("source_exchange", [])):
         raise AqlaError("Source exchange needs contextual source evidence")
+    if signal.take_profit_unit != "price" and signal.take_profits and not fields.get("take_profit_unit"):
+        raise AqlaError("Percentage TP unit needs contextual source evidence")
+    if signal.take_profit_unit != "price" and signal.take_profits:
+        unit_proof = " ".join(fields["take_profit_unit"])
+        roi = re.search(r"\b(?:ROI|ROE)\b|return on (?:equity|investment)|рентабельност", unit_proof, re.I)
+        movement = re.search(r"price|kurs|course|цены|движени|unleveraged|без плеч|hebelunabhängig", unit_proof, re.I)
+        if "%" not in unit_proof or (not roi if signal.take_profit_unit == "roi_percent" else not movement or roi):
+            raise AqlaError("Ambiguous percentage TP definition; evidence must distinguish price movement from nominal ROI/ROE")
+        if signal.take_profit_unit == "roi_percent" and re.search(r"annuali[sz]ed|net ROI|net ROE|netto|годов|после (?:комисс|издерж)", unit_proof, re.I):
+            raise AqlaError("This ROI definition cannot be converted as nominal linear ROI before costs")
+    if signal.take_profit_unit == "price":
+        for index, _value in enumerate(signal.take_profits):
+            # A quoted percent is not an absolute price. Precise price-only excerpts
+            # remain possible when a channel supplies price and ROI together.
+            if fields.get(f"take_profits.{index}") and all("%" in quote for quote in fields[f"take_profits.{index}"]):
+                raise AqlaError("A TP percentage cannot be interpreted as an absolute price")
 
 
 def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, policy: Policy,
@@ -226,7 +242,21 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
             backup.fallback_stop_loss_percent if "stop_loss" in fields else None,
             selected_targets(backup.fallback_take_profit_percentages, policy) if "take_profits" in fields else ())
         stop = derived_stop if "stop_loss" in fields else price_grid(signal.stop_loss, market, up=not long)
-        targets = derived_targets if "take_profits" in fields else [price_grid(value, market, up=not long) for value in selected_targets(signal.take_profits, policy)]
+        source_tp = None
+        from aqla_agent.percent_targets import reference_entry
+        source_reference = reference_entry(signal, policy)
+        if signal.take_profit_unit != "price" and signal.take_profits:
+            from aqla_agent.percent_targets import prices
+            reference = source_reference
+            selected = selected_targets(signal.take_profits, policy)
+            targets = prices(reference or entry, signal.side, market, signal.take_profit_unit, selected, signal.leverage)
+            source_tp = {"unit": signal.take_profit_unit, "values": [str(value) for value in selected],
+                         "reference_kind": "signal_entry" if reference is not None else "fill_vwap",
+                         "reference_entry": str(reference) if reference is not None else None,
+                         "signal_leverage": str(signal.leverage) if signal.leverage is not None else None,
+                         "preview_reference": str(reference or entry), "preview_prices": [str(value) for value in targets], "nominal_before_costs": True}
+        else:
+            targets = derived_targets if "take_profits" in fields else [price_grid(value, market, up=not long) for value in selected_targets(signal.take_profits, policy)]
         ordered = sorted(set(targets), reverse=not long)
         if targets != ordered or not (stop < min(entry, limit) and all(t > max(entry, limit) for t in targets) if long else stop > max(entry, limit) and all(t < min(entry, limit) for t in targets)):
             raise AqlaError("SL, entry and TPs have invalid direction/ordering after rounding")
@@ -269,4 +299,8 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
                           "direction": "down" if market.mid > entry else "up" if market.mid < entry else "at_entry"})
         if signal.source_exchange is not None:
             values["source_exchange"] = signal.source_exchange
+        if source_tp is not None:
+            values["source_tp"] = source_tp
+        if source_reference is not None:
+            values["source_entry_reference"] = source_reference
         return TradePlan(plan_id=digest(values), **values)

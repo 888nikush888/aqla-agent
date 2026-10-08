@@ -63,7 +63,7 @@ class Reporting:
 
     async def refresh(self, trade_id):
         trade = self.state.snapshot()["trades"][trade_id]
-        engine = self.router.engines.get(trade["plan"].get("exchange", "hyperliquid"))
+        engine = self.router.engine_for_plan(trade["plan"]) if hasattr(self.router, "engine_for_plan") else self.router.engines.get(trade["plan"].get("exchange", "hyperliquid"))
         if engine and (not trade.get("entry_accounting") or not trade.get("closed_at") or trade.get("entry_fill_quantity_confirmed") is None):
             try:
                 await self.hydrate(trade_id, engine)
@@ -161,7 +161,7 @@ class Reporting:
         # Keep slow reporting reads outside the protection/admission lock. One bounded
         # reconciliation per pass, persistent fairness even after gateway restarts.
         candidates = [trade for trade in self.state.snapshot()["trades"].values()
-                      if trade["status"] in CLOSED and trade["plan"]["network"] == "mainnet" and (trade.get("fill_events") or Decimal(trade.get("filled_quantity", "0")) > 0)]
+                      if trade["status"] in CLOSED and (trade.get("fill_events") or Decimal(trade.get("filled_quantity", "0")) > 0)]
         candidates.sort(key=lambda trade: (trade.get("reporting_checked_at", 0), trade["trade_id"]))
         if candidates and now_ms() - candidates[0].get("reporting_checked_at", 0) >= 3_600_000:
             trade_id = candidates[0]["trade_id"]

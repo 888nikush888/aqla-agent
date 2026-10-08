@@ -5,7 +5,7 @@ import re
 from decimal import Decimal, InvalidOperation
 
 VENUES = {"hyperliquid": "Hyperliquid", "aster": "Aster", "lighter": "Lighter"}
-OPEN = {"preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
+OPEN = {"waiting_entry", "entry_pending", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
 ERRORS = {
     "SL, entry and TPs have invalid direction/ordering after rounding": "Preisordnung nach Rundung unzulässig; auch die Slippage-Ordergrenze wird geprüft.",
     "Existing exchange exposure has no free logical owner; no additional entry": "Bereits vorhandene Börsenposition; Aqla eröffnet keinen zusätzlichen Trade.",
@@ -78,7 +78,37 @@ def profile_name(data, identity):
 def context(data, plan):
     venue = plan.get("exchange", "hyperliquid")
     network = plan.get("network") or data.get("venue_accounts", {}).get(venue, {}).get("network") or (data.get("network") if venue == "hyperliquid" else "mainnet")
-    return f"**Börse:** {VENUES.get(venue, literal(venue))} · {literal(network).capitalize()}\n**Profil:** {profile_name(data, plan.get('profile_id', 'standard'))}"
+    text = f"**Börse:** {VENUES.get(venue, literal(venue))} · {literal(network).capitalize()}\n**Profil:** {profile_name(data, plan.get('profile_id', 'standard'))}"
+    rank = plan.get("rank_snapshot")
+    if rank:
+        text += f"\n**Kanalrang:** {literal(rank['tier'])} · **Risikofaktor:** {number(rank['factor'])}×"
+        if rank.get("bootstrap") and rank.get("provisional"):
+            text += " · Startfreigabe"
+    if plan.get("fallback_reason"):
+        text += "\n**Börsenersatz:** " + VENUES.get(plan.get("requested_exchange"), literal(plan.get("requested_exchange"))) + " → " + VENUES[venue]
+        text += " · ursprünglicher Markt dort nicht gelistet"
+    return text
+
+
+def risk_block(trade):
+    plan = trade["plan"]
+    if not plan.get("rank_snapshot"):
+        return None
+    quote = literal(plan["market"].get("quote_token", "USDC"))
+    text = "**RPR-Budget:** " + number(plan["policy"]["risk_percent"]) + " %"
+    equity = trade.get("entry_equity_snapshot", {}).get("equity")
+    if equity is not None:
+        text += " · " + number(decimal(equity) * decimal(plan["policy"]["risk_percent"]) / 100) + " " + quote
+    risk = trade.get("initial_sl_risk", {}).get("amount")
+    text += "\n**Anfängliches SL-Risiko:** " + (number(risk) + " " + quote if risk is not None else "noch nicht finalisiert")
+    return text
+
+
+def target_label(plan, index):
+    spec = plan.get("source_tp")
+    if spec and index < len(spec["values"]):
+        return " · " + number(spec["values"][index]) + (" % ROI vor Kosten" if spec["unit"] == "roi_percent" else " % Kursbewegung")
+    return ""
 
 
 def pnl(trade):
@@ -127,6 +157,8 @@ def trade_block(data, trade, notices):
     else:
         title = "✅ **Trade eröffnet**" if opening else "🔄 **Trade aktualisiert**"
     lines = [f"{title} · {market} {direction}", context(data, plan)]
+    if risk_block(trade):
+        lines.append(risk_block(trade))
     if stage == "waiting_entry":
         lines.append("**Status:** lokaler Wartezustand · noch keine Börsenorder")
     quote = literal(plan["market"].get("quote_token", "USDC"))
@@ -141,7 +173,7 @@ def trade_block(data, trade, notices):
         targets = trade.get("targets", plan.get("take_profits", []))
         budgets = trade.get("target_budgets") or plan.get("tp_quantities", [])
         total = sum((decimal(value) or Decimal(0) for value in budgets), Decimal(0))
-        legs = [f"TP{index + 1}: {number(price)} {quote}" + (f" · {number((decimal(budgets[index]) or Decimal(0)) / total * 100)} %" if total and index < len(budgets) else " · Anteil nicht bestätigt") for index, price in enumerate(targets)]
+        legs = [f"TP{index + 1}: {number(price)} {quote}" + target_label(plan, index) + (f" · {number((decimal(budgets[index]) or Decimal(0)) / total * 100)} % Position" if total and index < len(budgets) else " · Anteil nicht bestätigt") for index, price in enumerate(targets)]
         if legs:
             lines.append("**Ziele · Positionsanteil**\n" + "\n".join(legs))
         raw, rounded, effective = plan.get("signal_leverage_original", plan.get("signal_leverage")), plan.get("signal_leverage"), plan.get("effective_leverage")
@@ -207,6 +239,8 @@ def lifecycle_block(data, event):
              "**Menge:** " + number(trade["filled_quantity"]) + (" · Teilfill" if partial else ""),
              "**SL vorgesehen:** " + number(trade["stop_price"]) + " " + quote,
              "**Schutz:** " + ("bestätigt" if protected else "zum Belegzeitpunkt nicht bestätigt")]
+    if risk_block(trade):
+        lines.append(risk_block(trade))
     if plan.get("source_exchange"):
         lines.append("**Signalbörse:** " + literal(plan["source_exchange"]))
     targets = trade.get("targets", plan.get("take_profits", []))
@@ -214,7 +248,7 @@ def lifecycle_block(data, event):
     total = sum((decimal(value) or Decimal(0) for value in budgets), Decimal(0))
     if targets:
         lines.append("**Ziele vorgesehen · Positionsanteil**\n" + "\n".join(
-            f"TP{index + 1}: {number(price)} {quote}" + (" · " + number((decimal(budgets[index]) or 0) / total * 100) + " %" if total and index < len(budgets) else "")
+            f"TP{index + 1}: {number(price)} {quote}" + target_label(plan, index) + (" · " + number((decimal(budgets[index]) or 0) / total * 100) + " % Position" if total and index < len(budgets) else "")
             for index, price in enumerate(targets)))
     return "\n\n".join(lines)
 
@@ -225,7 +259,10 @@ def status_text(data, exchanges, sheets_enabled, inventory):
     unknown = sum(row["phase"] in ("prepared", "sending", "unknown") for row in data["operations"].values())
     enabled = any(row.get("enabled") and row.get("configured") for row in exchanges.values())
     lines = ["📊 **Aqla · Systemstatus**", "**Entries:** " + ("pausiert" if data["paused"] else "nach Profilregeln freigegeben" if enabled else "keine Börse freigegeben")]
-    lines += [f"**{VENUES.get(venue, literal(venue))}:** {literal(row.get('network', ''))} · " + ("aktiv" if row.get("enabled") and row.get("configured") else "deaktiviert" if not row.get("enabled") else "nicht bereit") for venue, row in exchanges.items()]
+    lines += [f"**{VENUES.get(row.get('exchange', venue), literal(venue))}:** {literal(row.get('network', ''))} · " + ("aktiv" if row.get("enabled") and row.get("configured") else "Einrichtung fehlt" if not row.get("configured") else "deaktiviert") for venue, row in exchanges.items()]
+    if data.get("ranking_policy", {}).get("enabled"):
+        ranks = data.get("source_ranks", {})
+        lines.append("**Kanalränge:** " + " · ".join(f"{source_name(data, source)}: {literal(row['tier'])}" + (" (Startfreigabe)" if row.get("bootstrap") and row.get("metrics", {}).get("score") is None else "") for source, row in ranks.items()))
     lines.append(f"**Offene Trades:** {len(active)} · **Ausstehende Quellen:** {pending}\n**Ungeklärte Vorgänge:** {unknown}")
     queue = len(data.get("journal_pending", {}))
     lines.append("**Sheets:** " + ("deaktiviert" if not sheets_enabled else f"{queue} Übertragungen ausstehend" if queue else "Journal synchronisiert"))
@@ -273,7 +310,9 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
         notice = notifications[identity]
         trade = data["trades"].get(notice.get("trade_id"))
         event = data["events"].get(notice.get("event_id") or (trade or {}).get("event_id"))
-        if notice.get("monthly_report"):
+        if notice.get("rank_change"):
+            key = ("rank", identity)
+        elif notice.get("monthly_report"):
             key = ("monthly", identity)
         elif identity.startswith("protection:"):
             key = ("urgent", identity)
@@ -291,6 +330,18 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
     messages = []
     for key, items in groups.items():
         ids = [row[0] for row in items]
+        if key[0] == "rank":
+            event = items[0][1]["rank_change"]
+            score = event["metrics"].get("score")
+            text = "🏅 **Kanalrang geändert** · " + source_name(data, event["source_id"])
+            text += "\n\n**Rang:** " + event["old"] + " → " + event["new"]
+            text += "\n**Score:** " + number(score) + " · **Drawdown:** " + number(event["metrics"]["drawdown_r"]) + " R"
+            if event.get("reason"):
+                text += "\n**Grund:** " + literal(event["reason"])
+            text += "\n**Neue Entries:** " + event["network"].capitalize() + " · **Risikofaktor:** " + number(event.get("factor", data["ranking_policy"]["factors"][event["new"]])) + "×"
+            text += "\nBestehende Positionen behalten ihre Ausführung und Parameter."
+            messages.append({"notification_ids": ids, "severity": "normal", "texts": split_blocks(text)})
+            continue
         if key[0] == "lifecycle":
             blocks = ["**Quelle:** " + source_name(data, items[0][2]["chat_id"])]
             blocks += [lifecycle_block(data, row[1]["lifecycle"]) for row in items]
@@ -315,7 +366,7 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None):
             for target in notice.get("targets", []):
                 if target.get("trade_id") in by_trade:
                     continue
-                plan = {"exchange": target["exchange"], "profile_id": target.get("profile_id")}
+                plan = {name: target.get(name) for name in ("exchange", "network", "profile_id", "rank_snapshot", "requested_exchange", "fallback_reason")}
                 signal = (event or {}).get("interpretation") or {}
                 title = literal(signal.get("symbol") or "Markt nicht zugeordnet")
                 reason = target.get("error", "Ergebnis nicht bestätigt")

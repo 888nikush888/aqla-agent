@@ -90,3 +90,13 @@ def parameter_values(data):
         for field in ("max_open_trades", "max_total_risk_percent"):
             category, label, unit, allowed, description = PARAMETERS[field]
             yield "limits:" + venue + ":" + field, "Börsenlimits", label, display(limits[field]) if limits else "Nicht festgelegt", unit, allowed, "", "Gemeinsam für alle Pipelines auf diesem Börsenkonto.", "", venue, "", data.get("configuration_revision", 0)
+    for key, limits in data.get("account_limits", {}).items():
+        for field in ("max_open_trades", "max_total_risk_percent"):
+            category, label, unit, allowed, description = PARAMETERS[field]
+            yield "account:" + key + ":" + field, "Kontolimits", label, display(limits[field]) if limits else "Nicht festgelegt", unit, allowed, "", "Gemeinsam je Börse/Netzwerk/Konto, einschließlich Reservierungen.", "", key, "", data.get("configuration_revision", 0)
+    ranking = data.get("ranking_policy")
+    if ranking:
+        for tier, factor in ranking["factors"].items():
+            yield "rank:" + tier, "Ranking", "RPR-Faktor " + tier, display(factor), "× Profil-RPR", "> 0", "", "B/A/S erhöhen im Mainnet zusätzlich den Positionsdeckel; Kontolimits bleiben verbindlich.", "", "", "Je Konto", data["ranking_revision"]
+        for field in ("window", "promotion_confirmations", "demotion_confirmations", "hard_drawdown_r"):
+            yield "ranking:" + field, "Ranking", field, display(ranking[field]), "R" if field == "hard_drawdown_r" else "Setups", "Authentifizierte Betreiberkonfiguration", "", "Nur belegte Netto-R-Ergebnisse; ein ursprüngliches Setup zählt einmal.", "", "", "", data["ranking_revision"]

@@ -1,5 +1,13 @@
 # aqla Agent — Auslieferungsstand
 
+## Kanalranking, getrennte Konten und ROI-Ziele (08.10.2026)
+
+- Schema 3 bewahrt historische Ausführungsidentitäten und gibt vorhandenen Quellen eine C-Startfreigabe; neue Quellen beginnen F. Netto-R je vollständigem Signalsetup, konservative Belegprüfung, langsamere Aufstiege, schnellere Abstiege und 5R-Mainnet-Sperre. Risikogewichtung betrifft neue Trades; Kontolimits bleiben separat.
+- Sechs getrennte Börsen-/Netzwerkkontexte über einen SQLite-Schreibprozess. Börsenersatz ausschließlich bei frischer bestätigter Markt-Abwesenheit; explizite Ziele zuerst, keine Profilzusammenlegung oder Netzwerk-Ausweichroute. Aster V3 signiert netzwerkspezifisch.
+- Belegte Kurs-/ROI-Prozente verwenden den ursprünglichen Bezug und Dezimal-Signalhebel. VWAP-Finalisierung, Tick-/Mindestgrößenprüfung und unveränderliche Operationsidentitäten gelten weiterhin. Prozentupdates ändern den Quellenbeleg nicht.
+- Telegram, Diagnose und Sheets zeigen Rang, Risiko, Herkunft und Börsenersatz. Ränge/Ranghistorie und getrennte Kontotabs erweitern die Analyse; Mainnet-Monatsberichte behalten tatsächliche Geldverluste unabhängig von Ranking-Ausschlüssen.
+- Adapter-, Ranking-/Routing-, Migrations-, Quellenautoritäts- und native Hermes/Telegram-Tests ergänzen die bestehende Qualitätspipeline. Einrichtung und Abnahme ohne synthetische Mainnet-Orders. Siehe `docs/ranking-routing-roi.md`.
+
 ## Verzögerte Einstiege und getrennte Ereignisse (07.10.2026)
 
 - Belegpflichtiges `entry_timing=deferred` und `source_exchange`; lokale, dauerhaft gespeicherte Entry-Reservierungen mit Annäherungsrichtung, Ablauf, Pause und Wiederanlauf. Ein zukünftiger SL wird erst beim tatsächlichen Einstieg gegen die Zielbörse geprüft.

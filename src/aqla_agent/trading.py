@@ -352,7 +352,7 @@ class Trading:
         if changed:
             self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Waiting entry configuration changed")
             return self.state.snapshot()["trades"][trade_id]
-        if snapshot["paused"] or hasattr(self.state, "root") and not self.state.root.snapshot()["venue_enabled"].get(self.state.exchange):
+        if snapshot["paused"]:
             return trade
         try:
             self.validate_admission(snapshot, plan, owned=True)
@@ -399,6 +399,7 @@ class Trading:
             self.state.update(lambda data: data["trades"][plan.trade_id].setdefault("price_checks", []).append({"phase": "before_send", "snapshot": quote.model_dump(mode="json"), "error": message}))
             raise
         self.state.update(lambda data: data["trades"][plan.trade_id].setdefault("price_checks", []).append({"phase": "before_send", "snapshot": quote.model_dump(mode="json"), "result": result}))
+        self._patch(plan.trade_id, entry_equity_snapshot={"equity": str(account.equity), "currency": plan.market.quote_token, "observed_at": account.observed_at})
         quote.fresh()
         return account, quote
 
@@ -658,6 +659,8 @@ class Trading:
             try:
                 if not await self.finalize_backup(trade_id):
                     return self.state.snapshot()["trades"][trade_id]
+                if not await self.finalize_source_targets(trade_id):
+                    return self.state.snapshot()["trades"][trade_id]
                 await self.validate_actual_entry(trade_id)
                 await self.ensure_protection(trade_id)
                 current = self.state.snapshot()["trades"][trade_id]
@@ -675,6 +678,7 @@ class Trading:
                 if not getattr(self.exchange, "fail_closed_protection", False) and not set(plan.backup_fields) & {"stop_loss", "take_profits"}:
                     raise
                 reason = "Protection could not be confirmed; closing own exposure: " + (str(error) if isinstance(error, AqlaError) else type(error).__name__)
+                self._patch(trade_id, execution_incident=reason)
                 if hasattr(self.state, "pause_entries"):
                     self.state.pause_entries(reason)
                 else:
@@ -728,6 +732,10 @@ class Trading:
         if not permitted:
             raise AqlaError("Confirmed entry violates price structure, position value or SL risk limits")
         self._patch(trade_id, entry_validated_fingerprint=fingerprint)
+        current = self.state.snapshot()["trades"][trade_id]
+        if current.get("entry_accounting") and not current.get("initial_sl_risk"):
+            self._patch(trade_id, initial_sl_risk={"amount": str(size * abs(entry - stop)), "entry": str(entry), "stop": str(stop),
+                         "quantity": str(size), "currency": plan.market.quote_token, "entry_fingerprint": current["entry_accounting"]["entry_fingerprint"]})
 
     async def ensure_protection(self, trade_id):
         trade = self.state.snapshot()["trades"][trade_id]
@@ -791,6 +799,36 @@ class Trading:
                 tighter = entry > Decimal(trade["stop_price"]) if plan.side == "long" else entry < Decimal(trade["stop_price"])
                 if tighter:
                     await self.replace_stop(trade_id, entry, "break-even:" + trade_id + ":" + str(stage))
+
+    async def finalize_source_targets(self, trade_id):
+        trade = self.state.snapshot()["trades"][trade_id]
+        plan = TradePlan.model_validate(trade["plan"])
+        specification = plan.source_tp
+        if not specification:
+            return True
+        final = trade.get("percent_finalization")
+        if final:
+            if final["filled_quantity"] != trade["filled_quantity"] or final["entry_vwap"] != trade["entry_vwap"]:
+                raise AqlaError("Final source percentage entry fills changed; do not recalculate frozen prices")
+            return True
+        await self.cancel_entry(trade_id)
+        await self.capture_fills(trade_id)
+        trade = self.state.snapshot()["trades"][trade_id]
+        if not trade.get("entry_accounting"):
+            raise AqlaError("Source percentage targets require confirmed final entry fills")
+        from .percent_targets import prices
+        reference = specification["reference_entry"] or trade["entry_vwap"]
+        targets = prices(reference, plan.side, plan.market, specification["unit"], specification["values"], specification["signal_leverage"])
+        entry = Decimal(trade["entry_vwap"])
+        if any(value <= entry if plan.side == "long" else value >= entry for value in targets):
+            raise AqlaError("Source percentage targets are no longer profitable relative to the executed entry")
+        sizes = split_targets(Decimal(trade["filled_quantity"]), len(targets), plan.policy, plan.market)
+        if any(size < plan.market.min_quantity or size * price < plan.market.min_notional for size, price in zip(sizes, targets, strict=True)):
+            raise AqlaError("Final source percentage TP is below exchange minimum size/notional")
+        final = {**specification, "reference_entry": str(reference), "entry_vwap": trade["entry_vwap"],
+                 "filled_quantity": trade["filled_quantity"], "prices": [str(value) for value in targets], "phase": "applied"}
+        self._patch(trade_id, percent_finalization=final, targets=final["prices"])
+        return True
 
     async def finalize_backup(self, trade_id):
         """One durable fill reference, before TP intent construction or SL replacement."""
@@ -1142,8 +1180,25 @@ class Trading:
                 old = Decimal(trade["stop_price"])
                 if not plan.policy.allow_stop_widening and (signal.stop_loss < old if plan.side == "long" else signal.stop_loss > old):
                     raise AqlaError("Stop widening is not permitted")
+            update_targets = signal.take_profits
             if signal.update_action == "replace_targets":
-                self.validate_targets(trade, plan, signal.take_profits)
+                if signal.take_profit_unit != "price":
+                    from .percent_targets import prices
+                    specification = trade.get("percent_finalization") or plan.source_tp
+                    if not specification:
+                        specification = {"reference_entry": str(plan.source_entry_reference) if plan.source_entry_reference is not None else trade.get("entry_vwap"),
+                                         "signal_leverage": plan.signal_leverage_original or plan.signal_leverage}
+                    reference = specification.get("reference_entry") or trade["entry_vwap"]
+                    if reference is None:
+                        raise AqlaError("Percentage TP update requires this trade's stored source reference")
+                    converted = prices(reference, plan.side, plan.market, signal.take_profit_unit, selected_targets(signal.take_profits, plan.policy), specification.get("signal_leverage"))
+                    original = signal.model_dump(mode="json")
+                    update_targets = converted
+                    # Validate the quoted update before converting; computed prices
+                    # have no invented price quotations.
+                    self.state.update(lambda data: data["trades"][trade["trade_id"]].setdefault("percent_updates", {}).__setitem__(event_id,
+                                      {"source": original, "reference": reference, "prices": [str(value) for value in converted]}))
+                self.validate_targets(trade, plan, update_targets)
             if trade["status"] == "waiting_entry" and signal.update_action in ("break_even", "reduce"):
                 raise AqlaError("Waiting entry has no filled position for this update")
             if not previous:
@@ -1157,7 +1212,7 @@ class Trading:
                     self._patch(trade["trade_id"], stop_price=str(stop), management_revision=trade["management_revision"] + 1)
                     result = {"waiting_stop_updated": True}
                 else:
-                    targets = self.validate_targets(trade, plan, signal.take_profits)
+                    targets = self.validate_targets(trade, plan, update_targets)
                     self._patch(trade["trade_id"], targets=[str(price) for price in targets], management_revision=trade["management_revision"] + 1)
                     result = {"waiting_targets_updated": True}
                 self.state.update(lambda data: data["events"][event_id].update(status="updated"))
@@ -1172,7 +1227,7 @@ class Trading:
                     raise AqlaError("Stop update needs a price or proved entry VWAP")
                 result = await self.replace_stop(trade["trade_id"], price, operation)
             else:
-                result = await self.replace_targets(trade["trade_id"], signal.take_profits, operation)
+                result = await self.replace_targets(trade["trade_id"], update_targets, operation)
             uncertain = result.get("phase") in ("prepared", "sending", "unknown") or result.get("replacement_unconfirmed")
             self.state.update(lambda state: state["events"][event_id].update(status="needs_reconciliation" if uncertain else "updated"))
             return {"trade_id": trade["trade_id"], "result": result}

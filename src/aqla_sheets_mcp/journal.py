@@ -31,8 +31,15 @@ TRADE_DETAILS = ["Quellenname", "Originalsymbol", "Signalhebel original", "Signa
 HEADERS["Trades"] += TRADE_DETAILS
 HEADERS["Handelsparameter"] += ["Profil", "Börse", "Währung", "Revision"]
 HEADERS["Pipelines"] = ["ID", "Name", "Quellen", "Börse", "Profil", "Aktiv", "Börse aktiv", "Revision"]
+PRE_RANK_HEADERS = {table: list(headers) for table, headers in HEADERS.items()}
+RANK_DETAILS = ["Konto-Kontext", "Setup-ID", "Angeforderte Börse", "Routing-Ziel", "Ersatzgrund", "Rang beim Entry", "Score beim Entry", "Risikofaktor",
+                "Profil-RPR (%)", "RPR-Budget (%)", "Anfängliches SL-Risiko", "TP-Quelle", "TP-Prozentbelege"]
+HEADERS["Trades"] += RANK_DETAILS
+HEADERS["Pipelines"] += ["Ersatzbörsen", "Netzwerkregel"]
+HEADERS["Ränge"] = ["ID", "Quellenname", "Rang", "Startfreigabe", "Score", "Nachweise gesamt", "Setups im Fenster", "Durchschnitt Netto-R", "Profit-Faktor", "Drawdown R", "Gewinnquote (%)", "Risikofaktor", "Netzwerk", "Rangrevision", "Regelrevision", "Ausgeschlossene Setups"]
+HEADERS["Ranghistorie"] = ["ID", "Quelle", "Quellenname", "Zeit (UTC)", "Von", "Nach", "Score", "Drawdown R", "Netzwerk", "Revision", "Grund", "Nachweise", "Risikofaktor"]
 TABLES = tuple(HEADERS)
-Table = Literal["Trades", "Signale", "Orders", "Fills", "Vorgänge", "Regeln", "Handelsparameter", "Ereignisse", "Pipelines"]
+Table = Literal["Trades", "Signale", "Orders", "Fills", "Vorgänge", "Regeln", "Handelsparameter", "Ereignisse", "Pipelines", "Ränge", "Ranghistorie"]
 
 
 class JournalRecord(Model):
@@ -75,6 +82,8 @@ def fingerprint(values):
 
 def record(table, identity, *values):
     cells = [fit_cell(value if value is not None else "") for value in [identity, *values]]
+    if table in PRE_RANK_HEADERS and len(cells) == len(PRE_RANK_HEADERS[table]):
+        cells += [""] * (len(HEADERS[table]) - len(cells))
     if table in LEGACY_HEADERS and len(cells) == len(LEGACY_HEADERS[table]):
         cells += [""] * (len(HEADERS[table]) - len(cells))
         if table in ("Trades", "Orders", "Fills", "Vorgänge"):
@@ -124,7 +133,23 @@ def project(data):
     for identity, pipeline in data.get("pipelines", {}).items():
         for target in pipeline["targets"]:
             add(record("Pipelines", identity + ":" + target["exchange"], pipeline["name"], text(pipeline["sources"]), target["exchange"],
-                       target["profile_id"], pipeline["enabled"], data["venue_enabled"].get(target["exchange"], False), pipeline["revision"]))
+                       target["profile_id"], pipeline["enabled"], data["venue_enabled"].get(target["exchange"], False), pipeline["revision"],
+                       text(target.get("fallback_exchanges") if target.get("fallback_exchanges") is not None else ["aster", "lighter"] if target["exchange"] == "hyperliquid" else []), "Rang: C+ Mainnet, D/E/F Testnet"))
+    if data.get("ranking_policy"):
+        from aqla_agent.ranking import FACTORS, source_key
+        for source, rank in data.get("source_ranks", {}).items():
+            metrics = rank.get("metrics", {})
+            resolved = source_key(data, source)
+            tier = rank["tier"]
+            add(record("Ränge", source, data.get("source_names", {}).get(resolved, resolved), tier, rank.get("bootstrap", False),
+                       number(metrics.get("score")), len(rank.get("evidence", [])), metrics.get("count", 0), number(metrics.get("mean_r")),
+                       metrics.get("profit_factor", ""), number(metrics.get("drawdown_r")), number(metrics.get("win_rate")),
+                       data["ranking_policy"]["factors"].get(tier, FACTORS[tier]), "mainnet" if tier in ("C", "B", "A", "S") else "testnet",
+                       rank["revision"], data["ranking_revision"], len(rank.get("exclusions", []))))
+        for identity, event in data.get("ranking_history", {}).items():
+            add(record("Ranghistorie", identity, event["source_id"], data.get("source_names", {}).get(event["source_id"], event["source_id"]), timestamp(event["time"]),
+                       event["old"], event["new"], number(event["metrics"].get("score")), number(event["metrics"].get("drawdown_r")), event["network"], event["revision"],
+                       event.get("reason"), event.get("proof_total"), event.get("factor")))
     for row in rows.values():
         table, identity = row["table"], row["record_id"]
         if table not in ("Trades", "Orders", "Fills", "Vorgänge"):
@@ -141,9 +166,16 @@ def project(data):
         if table == "Trades":
             backup = plan.get("backup_values") or {}
             final = trade.get("backup_finalization") or {}
-            row["values"][-len(TRADE_DETAILS):] = [data.get("source_names", {}).get(trade["chat_id"], ""), plan.get("source_symbol") or plan["market"]["symbol"],
+            details_start = HEADERS[table].index("Quellenname")
+            row["values"][details_start:details_start + len(TRADE_DETAILS)] = [data.get("source_names", {}).get(trade["chat_id"], ""), plan.get("source_symbol") or plan["market"]["symbol"],
                 number(plan.get("signal_leverage_original", plan.get("signal_leverage"))), number(plan.get("signal_leverage")), number(plan.get("effective_leverage")),
                 text(plan.get("backup_fields", [])), number(final.get("reference_entry")), number(backup.get("fallback_stop_loss_percent")), text(backup.get("fallback_take_profit_percentages", []))]
+            rank = plan.get("rank_snapshot") or {}
+            base = plan.get("base_parameters") or {}
+            row["values"][-len(RANK_DETAILS):] = [plan.get("account_key", venue + ":" + plan["network"]), plan.get("setup_id", ""), plan.get("requested_exchange", venue), plan.get("routing_leg_id", ""),
+                       plan.get("fallback_reason", ""), rank.get("tier", ""), number(rank.get("score")), rank.get("factor", ""),
+                       number(base.get("risk_percent")), number(plan["policy"]["risk_percent"]), number(trade.get("initial_sl_risk", {}).get("amount")),
+                       plan.get("source_tp", {}).get("unit", "price"), text(trade.get("percent_finalization") or plan.get("source_tp") or {})]
         row["fingerprint"] = fingerprint(row["values"])
     for row in data.get("journal_history", {}).values():
         add(row)

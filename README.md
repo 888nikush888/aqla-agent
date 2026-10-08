@@ -8,7 +8,9 @@ Hyperliquid-Mainnet unterstützt manuelle Positionen neben Aqla auf freien Märk
 
 Gold/XAU wird auf Hyperliquid als `xyz:GOLD` erkannt; Dezimalhebel werden abgerundet und gedeckelt. Eigene Kanalnamen vereinfachen die Bedienung. Ein globales Profil „Backup“ ergänzt fehlende Signalangaben: anfangs Hebel 2 und Markt-Entry; SL-/TP-Prozentfelder bleiben bis zu deiner Konfiguration leer. [Bedienung und Ausführungsregeln](docs/gold-backup-and-names.md).
 
-Eigenständiges Python-Projekt. Ein eigener Hyperliquid-MCP, ein kurzer bearbeitbarer Master-Skill und ein read-only Telegram-Quellenleser für abonnierte Kanäle. SQLite speichert Handelszustand und Hermes-Gespräche. Keine eigene Bot-Anbindung, MiniApp, Kanalbewertungen oder autonome Strategieoptimierung. Manuell an den Hermes-Bot weitergeleitete Signale werden ebenfalls als Quellen erfasst.
+Eigenständiges Python-Projekt. Ein kontrollierter Handels-MCP, ein kurzer bearbeitbarer Master-Skill und ein read-only Telegram-Quellenleser für abonnierte Kanäle. SQLite speichert Handelszustand und Hermes-Gespräche. Keine eigene Bot-Anbindung, MiniApp oder autonome Strategieoptimierung. Manuell an den Hermes-Bot weitergeleitete Signale werden ebenfalls als Quellen erfasst.
+
+Kanalränge F–S gewichten das Profilrisiko und wählen Testnet oder Mainnet für neue Entries. Bei einem bestätigten fehlenden Hyperliquid-Markt können Pipelines auf Aster oder Lighter im selben Netzwerk ausweichen. Belegte ROI-/ROE-TPs werden mit dem ursprünglichen Signalhebel in Kursziele übersetzt. [Ranking, Konten, Börsenersatz und Prozentziele](docs/ranking-routing-roi.md).
 
 Telegram-Handelsmeldungen verwenden kompakte, aus gespeicherten Fakten erzeugte Vorlagen mit getrennten Börsenergebnissen, bestätigten Preisen und klaren Statusüberschriften. [Nachrichtenansichten](docs/telegram-messages.md).
 

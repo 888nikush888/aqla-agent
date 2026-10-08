@@ -113,6 +113,8 @@ class Settings(Model):
     telegram_owner_id: str | None = None
     google_sheets: GoogleSheetsSettings = Field(default_factory=GoogleSheetsSettings)
     venues: dict[Literal["aster", "lighter"], VenueSettings] = Field(default_factory=dict)
+    execution_accounts: dict[str, ExecutionSettings] = Field(default_factory=dict)
+    ranking_enabled: bool = False
 
     @model_validator(mode="after")
     def journal_network(self):
@@ -145,6 +147,9 @@ class Settings(Model):
             for key in ("private_key_file",):
                 if venue.get(key):
                     venue[key] = str((path.parent / venue[key]).resolve())
+        for execution in raw.get("execution_accounts", {}).values():
+            if execution.get("private_key_file"):
+                execution["private_key_file"] = str((path.parent / execution["private_key_file"]).resolve())
         return cls.model_validate(raw)
 
 
@@ -155,6 +160,13 @@ class VenueSettings(Model):
     account_index: int | None = Field(default=None, ge=0)
     api_key_index: int | None = Field(default=None, ge=4, le=254)
     private_key_file: Path | None = None
+
+
+class ExecutionSettings(VenueSettings):
+    exchange: Literal["hyperliquid", "aster", "lighter"]
+    signer_role: Literal["api_wallet", "master"] = "api_wallet"
+    vault_address: Address | None = None
+    shared_account: bool = False
 
 
 Settings.model_rebuild()
@@ -202,6 +214,7 @@ class Interpretation(Model):
     entry_prices: list[Positive] = Field(default_factory=list, max_length=2)
     stop_loss: Positive | None = None
     take_profits: list[Positive] = Field(default_factory=list, max_length=20)
+    take_profit_unit: Literal["price", "course_percent", "roi_percent"] = Field(default="price", description="Source TP values: absolute prices, unleveraged course percentages, or evidenced nominal gross ROI/ROE percentages for linear perps. Unlabelled/ambiguous percentages cannot be guessed.")
     update_action: Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"] | None = None
     reduce_percent: Positive | None = Field(default=None, le=100)
     bound_trade_id: str | None = None
@@ -215,6 +228,8 @@ class Interpretation(Model):
             result.pop("entry_timing", None)
         if self.source_exchange is None:
             result.pop("source_exchange", None)
+        if self.take_profit_unit == "price":
+            result.pop("take_profit_unit", None)
         return result
 
     @model_validator(mode="after")
@@ -334,6 +349,16 @@ class TradePlan(Model):
     entry_timing: Literal["standard", "deferred"] = "standard"
     source_exchange: str | None = None
     entry_gate: dict | None = None
+    account_key: str | None = None
+    rank_snapshot: dict | None = None
+    rank_revision: int | None = None
+    base_parameters: dict | None = None
+    requested_exchange: Literal["hyperliquid", "aster", "lighter"] | None = None
+    routing_leg_id: str | None = None
+    setup_id: str | None = None
+    fallback_reason: str | None = None
+    source_tp: dict | None = None
+    source_entry_reference: Positive | None = None
     entry_price: Positive
     entry_limit: Positive
     stop_loss: Positive
@@ -359,6 +384,9 @@ class TradePlan(Model):
             result.pop("source_exchange", None)
         if self.entry_gate is None:
             result.pop("entry_gate", None)
+        for key in ("account_key", "rank_snapshot", "rank_revision", "base_parameters", "requested_exchange", "routing_leg_id", "setup_id", "fallback_reason", "source_tp", "source_entry_reference"):
+            if getattr(self, key) is None:
+                result.pop(key, None)
         return result
 
     @model_validator(mode="after")
@@ -389,3 +417,7 @@ class AqlaError(ToolError, ValueError):
 
 class ExternalInterference(AqlaError):
     """The observed position no longer matches proved own fills."""
+
+
+class SymbolUnavailable(AqlaError):
+    """Confirmed absence/delisting, never a transport, collateral or ambiguity error."""
