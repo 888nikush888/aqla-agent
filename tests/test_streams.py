@@ -6,9 +6,9 @@ import zlib
 
 import pytest
 
+from aqla_agent.notifications import native_response_bytes
 from aqla_hyperliquid_mcp.models import AqlaError
 from aqla_hyperliquid_mcp.streams import SUBSCRIPTION_ADAPTER, SUBSCRIPTION_MODELS, Streams
-from aqla_agent.notifications import native_response_bytes
 
 
 @pytest.mark.asyncio
@@ -26,7 +26,7 @@ async def test_subscription_cap_is_checked_before_desired_mutation_and_duplicate
 
 def test_event_byte_overflow_has_gap_and_exact_utf8_accounting():
     stream = Streams("https://example.invalid", max_events=100, max_event_bytes=1500)
-    for index in range(10):
+    for _ in range(10):
         stream.receive({"channel": "trades", "data": "🚀" * 80, "sequence": -10})
     assert stream.sequence == 10 and stream.events[-1]["sequence"] == 10
     actual = sum(len(json.dumps(row, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")) for row in stream.events)
@@ -47,7 +47,7 @@ def test_oversize_single_event_is_visible_gap_with_bounded_forward_progress():
 
 def test_complete_stream_read_byte_limit_pages_every_emitted_event():
     stream = Streams("https://example.invalid", max_read_bytes=4000)
-    for index in range(40):
+    for _ in range(40):
         stream.receive({"channel": "trades", "data": {"proof": "\\\"🚀" * 80}})
     cursor, found = 0, []
     while cursor < stream.sequence:
@@ -145,6 +145,47 @@ class PausedConnection:
 
     async def __aexit__(self, *_):
         return None
+
+
+@pytest.mark.asyncio
+async def test_actual_stream_loop_decodes_failures_continues_and_cancels_without_payload_leak():
+    class Socket(PausedSocket):
+        def __init__(self):
+            super().__init__()
+            self.rows = iter(['{"private-payload"', json.dumps({"channel": "fastAssetCtxs", "data": "bad-sensitive-base64"}),
+                              json.dumps({"channel": "trades", "data": {"valid": True}})])
+            self.consumed = asyncio.Event()
+        async def __anext__(self):
+            try:
+                return next(self.rows)
+            except StopIteration:
+                self.consumed.set()
+                await self.done.wait()
+                raise StopAsyncIteration from None
+    socket = Socket()
+    stream = Streams("https://unused.invalid", connector=lambda *_args, **_kwargs: PausedConnection(socket))
+    stream.start()
+    await asyncio.wait_for(socket.consumed.wait(), 1)
+    assert stream.read()["diagnostics"]["error_counts"] == {"decode": 2, "transport": 0, "timeout": 0}
+    assert stream.read()["events"][-1]["data"] == {"valid": True}
+    assert stream.read()["rest_reconciliation_required"]
+    assert "sensitive" not in json.dumps(stream.read()) and "private-payload" not in json.dumps(stream.read())
+    await stream.close()
+    assert not stream.ready.is_set() and stream.task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_actual_stream_timeout_is_categorized_without_exception_text_or_retry_action():
+    class Connection:
+        async def __aenter__(self):
+            stream.closed = True
+            raise TimeoutError("sensitive-credentials")
+        async def __aexit__(self, *_):
+            return None
+    stream = Streams("https://unused.invalid", connector=lambda *_args, **_kwargs: Connection())
+    await stream._run()
+    assert stream.read()["diagnostics"]["last_error"]["category"] == "timeout"
+    assert "sensitive" not in json.dumps(stream.read()) and stream.posts == 0
 
 
 @pytest.mark.asyncio

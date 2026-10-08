@@ -533,6 +533,9 @@ async def test_channel_rpc_error_isolates_source_and_recovers_without_skipping(p
     assert not any(chat == "-1001" for chat, _ in deliveries)
     assert reader.status_error() == {"code": "sources_unavailable", "sources": ["@gone"]}
     assert configuration["cursors"].get("-1001", 0) <= 1
+    before_queries = list(queries)
+    await reader.sync_sources()
+    assert queries == before_queries
     # A high live ID cannot bypass an unsuccessful lower-ID backfill.
     item = reader.client.item(SimpleNamespace(identity=-1001), 99)
     await reader.received(SimpleNamespace(message=item))

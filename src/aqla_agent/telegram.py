@@ -177,6 +177,8 @@ class TelegramReader:
                 continue
             try:
                 reread = force or chat not in self.history_reads or now - self.history_reads[chat] >= self.history_interval
+                if chat in self.failed_sources and not reread:
+                    continue
                 if chat_id is None and not reread:
                     continue
                 delivered.update(await self.sync_source(chat, entity, configuration, reread=reread, through=through))
@@ -185,6 +187,7 @@ class TelegramReader:
             except Exception as error:
                 if SourceAccessError.from_error(error).code != "sources_access_denied":
                     raise
+                self.history_reads[chat] = now
                 self.failed_sources[chat] = [name for name, resolved_chat in self.aliases.items() if resolved_chat == chat]
             else:
                 self.failed_sources.pop(chat, None)

@@ -136,6 +136,43 @@ async def test_reader_worker_auth_backoff_avoids_three_second_reconnect_loop(ext
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repair", ["secret_metadata", "selection"])
+async def test_reader_retry_repair_resets_deadline_without_credential_output(extension, tmp_path, monkeypatch, repair):
+    ext, _ = extension
+    clock, starts = [0.0], []
+    ext.settings.telegram_session_file = tmp_path / "session.secret"
+    ext.reader_retry = ReaderRetry(clock=lambda: clock[0], wall_clock=lambda: 1000, jitter=lambda: 0.5)
+    class Reader:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def start(self):
+            starts.append(clock[0])
+            if len(starts) == 1:
+                raise SourceAccessError("reader_session_unauthorized")
+        async def sync_sources(self):
+            pass
+        def status_error(self):
+            return None
+        async def close(self):
+            pass
+    async def snapshot(*args, **kwargs):
+        return {"sources": ["a" if clock[0] < 6 else "b"]}
+    async def sleep(seconds):
+        clock[0] += seconds
+        if repair == "secret_metadata" and clock[0] == 3:
+            ext.settings.telegram_session_file.write_text("synthetic repaired session", encoding="utf-8")
+        if clock[0] >= 9:
+            raise asyncio.CancelledError
+    monkeypatch.setattr("aqla_agent.events.TelegramReader", Reader)
+    monkeypatch.setattr("aqla_agent.events.asyncio", SimpleNamespace(sleep=sleep, CancelledError=asyncio.CancelledError))
+    ext.call = snapshot
+    with pytest.raises(asyncio.CancelledError):
+        await ext.reader_worker()
+    assert starts == [0.0, 3.0 if repair == "secret_metadata" else 6.0]
+    assert ext.reader_error is None and ext.reader_retry.status is None and ext.reader_retry.attempts == 0
+
+
+@pytest.mark.asyncio
 async def test_monthly_sheets_failure_never_acknowledges_publication(extension, monkeypatch):
     from aqla_agent.monthly import next_job
 
