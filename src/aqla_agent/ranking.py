@@ -79,7 +79,7 @@ def weighted_parameters(parameters, rank):
         raise AqlaError("Rank-weighted RPR exceeds 100%; adjust the profile or ranking factors")
     if parameters.get("fixed_notional_quote") is not None:
         result["fixed_notional_quote"] = str(Decimal(str(parameters["fixed_notional_quote"])) * factor)
-    if rank["network"] == "mainnet" and factor > 1:
+    if rank["network"] == "mainnet" and rank.get("tier") in ("B", "A", "S") and factor > 1:
         result["max_notional_quote"] = str(Decimal(str(parameters["max_notional_quote"])) * factor)
     return result
 

@@ -83,9 +83,10 @@ def test_rank_weighting_keeps_testnet_cap_and_scales_fixed_notional():
     base = {"risk_percent": "5", "max_notional_quote": "500", "fixed_notional_quote": "100"}
     assert weighted_parameters(base, {"factor": ".25", "network": "testnet"}) == {
         "risk_percent": "1.25", "max_notional_quote": "500", "fixed_notional_quote": "25.00"}
-    weighted = weighted_parameters(base, {"factor": "2", "network": "mainnet"})
+    weighted = weighted_parameters(base, {"factor": "2", "network": "mainnet", "tier": "S"})
     assert Decimal(weighted["risk_percent"]) == 10 and Decimal(weighted["max_notional_quote"]) == 1000
     assert base["risk_percent"] == "5"
+    assert weighted_parameters(base, {"factor": "2", "network": "mainnet", "tier": "C"})["max_notional_quote"] == "500"
 
 
 def test_signal_family_counts_once_and_system_link_fault_remains_in_cash_journal():
