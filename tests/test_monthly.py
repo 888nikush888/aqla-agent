@@ -1,4 +1,5 @@
 import copy
+import json
 from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from test_sheets import Google
 
+from aqla_agent import monthly as jobs
 from aqla_agent.funding import aster_funding, bounded_history, hyperliquid_funding, lighter_funding, payment
 from aqla_agent.messages import monthly_message, telegram_view
 from aqla_agent.monthly import (
@@ -194,6 +196,85 @@ def test_request_publication_and_catchup():
     assert list(snapshot["notifications"])[0].startswith("monthly-request:2026-09:")
     assert not snapshot["monthly_requests"]
     assert next_job(snapshot, due_at("2026-12"))["report"]["month"] == "2026-10"
+
+
+def fail_selected_month(snapshot, clock, code):
+    selected = next_job(snapshot, clock)
+    jobs.fail_publication(snapshot, {"job": selected["job"], "error_code": code}, clock)
+    return selected
+
+
+def test_failed_old_month_does_not_starve_later_month():
+    snapshot = data()
+    clock = due_at("2026-11")
+    failed = fail_selected_month(snapshot, clock, "budget")
+    assert failed["report"]["month"] == "2026-10"
+    selected = next_job(snapshot, clock)
+    assert selected["report"]["month"] == "2026-11"
+    blocked = snapshot["monthly_jobs"]["2026-10"]
+    assert blocked["status"] == "blocked" and blocked["last_error"] == "budget"
+    assert blocked["attempt_count"] == 1 and blocked["last_attempt"] == clock
+    assert blocked["next_retry_at"] is None
+
+
+def test_monthly_retry_state_survives_restart(setup, monkeypatch):
+    from aqla_hyperliquid_mcp.state import State
+
+    settings, state, *_ = setup
+    clock = due_at("2026-10")
+    state.update(lambda snapshot: fail_selected_month(snapshot, clock, "temporary"))
+    expected = state.snapshot()["monthly_jobs"]
+    state.close()
+    restarted = State(settings)
+    try:
+        assert restarted.snapshot()["monthly_jobs"] == expected
+        assert next_job(restarted.snapshot(), clock + 59_999)["report"] is None
+        assert restarted.update(lambda snapshot: next_job(snapshot, clock + 60_000))["job"]["attempt_count"] == 2
+    finally:
+        restarted.close()
+
+
+def test_monthly_fingerprint_change_releases_block():
+    snapshot = data(trade())
+    clock = due_at("2026-10")
+    blocked = fail_selected_month(snapshot, clock, "schema")
+    assert next_job(snapshot, clock)["report"] is None
+    snapshot["source_names"]["-1001"] = "Changed source evidence label"
+    current = next_job(snapshot, clock)
+    assert current["report"]["fingerprint"] != blocked["report"]["fingerprint"]
+    assert current["job"]["attempt_count"] == 1
+    with pytest.raises(AqlaError, match="stale monthly job"):
+        jobs.fail_publication(snapshot, {"job": blocked["job"], "error_code": "budget"}, clock)
+    assert snapshot["monthly_jobs"]["2026-10"]["status"] == "publishing"
+
+
+def test_monthly_temporary_failure_uses_bounded_retry():
+    snapshot, clock = data(), due_at("2026-10")
+    for attempt, seconds in enumerate([60, 120, 240, 480, 960, 1920, 3600, 3600], start=1):
+        selected = fail_selected_month(snapshot, clock, "temporary")
+        job = snapshot["monthly_jobs"]["2026-10"]
+        assert job["attempt_count"] == attempt and job["status"] == "retry"
+        assert job["next_retry_at"] == clock + seconds * 1000
+        assert next_job(snapshot, clock + seconds * 1000 - 1)["report"] is None
+        assert selected["job"]["attempt_count"] == attempt
+        clock += seconds * 1000
+
+
+def test_monthly_retry_keeps_scheduled_notice_unique():
+    snapshot, clock = data(), due_at("2026-10")
+    fail_selected_month(snapshot, clock, "temporary")
+    selected = next_job(snapshot, clock + 60_000)
+    report = selected["report"]
+    acknowledge_publication(snapshot, report["month"], report["fingerprint"], "url", report["revision"], clock + 60_000,
+                            job=selected["job"])
+    assert list(snapshot["notifications"]) == ["monthly:2026-10"]
+    assert snapshot["monthly_jobs"]["2026-10"]["status"] == "published"
+    assert snapshot["monthly_jobs"]["2026-10"]["last_error"] is None
+    snapshot["notifications"].clear()
+    assert next_job(snapshot, clock + 60_001)["report"] is None
+    acknowledge_publication(snapshot, report["month"], report["fingerprint"], "url", report["revision"], clock + 60_001,
+                            job=selected["job"])
+    assert not snapshot["notifications"]
 
 
 def sheet_client():
@@ -416,15 +497,63 @@ async def test_actual_monthly_mcp_read_internal_authority_and_publication_ack(se
     await server.call_tool("integration", {"action": "monthly_request", "token": token, "month": "2026-09"})
     assert state.snapshot()["monthly_requests"] == ["2026-09"]
     assert not state.snapshot()["notifications"]
-    report = next_job(state.snapshot())["report"]
+    selected = state.update(next_job)
+    report = selected["report"]
     settings.google_sheets.spreadsheet_id = "ci" + "0" * 25
-    publication = {"fingerprint": report["fingerprint"], "revision": report["revision"],
+    publication = {"month": "2026-09", "fingerprint": report["fingerprint"], "revision": report["revision"],
                    "url": "https://docs.google.com/spreadsheets/d/" + settings.google_sheets.spreadsheet_id + "/edit#gid=7"}
     with pytest.raises(ToolError, match="URL"):
         await server.call_tool("integration", {"action": "monthly_ack", "token": token, "month": "2026-09",
-                               "publication": {**publication, "url": "https://forged.invalid"}})
-    await server.call_tool("integration", {"action": "monthly_ack", "token": token, "month": "2026-09", "publication": publication})
+                               "publication": {**publication, "url": "https://forged.invalid"}, "job": selected["job"]})
+    await server.call_tool("integration", {"action": "monthly_ack", "token": token, "month": "2026-09", "publication": publication, "job": selected["job"]})
     assert state.snapshot()["notifications"] and not fake.actions
     assert state.snapshot()["profiles"] == baseline["profiles"]
     assert (await server.call_tool("status", {})).is_error is not True
     await close_server(server)
+
+
+@pytest.mark.asyncio
+async def test_actual_monthly_failure_and_ack_reject_stale_generations(setup, monkeypatch):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from aqla_hyperliquid_mcp.server import close_server, create_server
+
+    settings, state, fake, exchange, _ = setup
+    clock = due_at("2026-11")
+    monkeypatch.setattr(jobs, "now_ms", lambda: clock)
+    settings.google_sheets.spreadsheet_id = "ci" + "0" * 25
+    server = create_server(settings, state=state, exchange=exchange)
+    token = settings.integration_key_file.read_text()
+
+    async def call(action, **args):
+        response = await server.call_tool("integration", {"action": action, "token": token, **args})
+        return json.loads(response.content[0].text)
+
+    try:
+        first = await call("monthly_job")
+        assert first["report"]["month"] == "2026-10"
+        await call("monthly_failure", failure={"job": first["job"], "error_code": "budget"})
+        assert state.snapshot()["monthly_jobs"]["2026-10"]["status"] == "blocked"
+        later = await call("monthly_job")
+        assert later["report"]["month"] == "2026-11"
+        await call("monthly_request", month="2026-10")
+        fresh = await call("monthly_job")
+        assert fresh["job"]["request_generation"] == first["job"]["request_generation"] + 1
+        publication = {"month": "2026-10", "fingerprint": first["report"]["fingerprint"], "revision": first["report"]["revision"],
+                       "url": "https://docs.google.com/spreadsheets/d/" + settings.google_sheets.spreadsheet_id + "/edit#gid=7"}
+        before = state.snapshot()
+        with pytest.raises(ToolError, match="stale monthly job"):
+            await call("monthly_failure", failure={"job": first["job"], "error_code": "schema"})
+        with pytest.raises(ToolError, match="stale monthly job"):
+            await call("monthly_ack", month="2026-10", job=first["job"], publication=publication)
+        with pytest.raises(ToolError):
+            await call("monthly_failure", failure={"job": fresh["job"], "error_code": "payload-or-secret", "detail": "not-persisted"})
+        assert state.snapshot() == before
+        await call("monthly_ack", month="2026-10", job=fresh["job"], publication=publication)
+        assert state.snapshot()["monthly_jobs"]["2026-10"]["status"] == "published"
+        with pytest.raises(ToolError, match="stale monthly job"):
+            await call("monthly_failure", failure={"job": fresh["job"], "error_code": "temporary"})
+        assert list(state.snapshot()["notifications"]) == ["monthly:2026-10"]
+        assert fake.actions == []
+    finally:
+        await close_server(server)

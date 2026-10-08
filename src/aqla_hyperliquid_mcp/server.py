@@ -9,6 +9,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
 from aqla_agent.messages import telegram_view
+from aqla_agent.monthly import MonthlyFailure, MonthlyJobBinding, MonthlyPublication
 from aqla_agent.pipelines import (
     AccountLimits,
     Pipeline,
@@ -341,44 +342,42 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.update(apply)
 
     @server.tool(annotations=write)
-    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack", "monthly_job", "monthly_ack", "monthly_request"], token: str, source: SourceEvent | None = None,
+    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack", "monthly_job", "monthly_ack", "monthly_request", "monthly_failure"], token: str, source: SourceEvent | None = None,
                           aliases: dict[str, str] | None = None, cutoffs: dict[str, int] | None = None,
                           context_ids: dict[str, list[int]] | None = None,
                           accepted: dict[str, str] | None = None, month: str | None = None,
-                          publication: dict | None = None) -> dict:
+                          publication: MonthlyPublication | None = None, job: MonthlyJobBinding | None = None,
+                          failure: MonthlyFailure | None = None) -> dict:
         """Internal native-plugin access, filtered out of agent tools; token never enters model context."""
         if authority is None:
             raise AqlaError("Integration key is not configured")
         authority.internal(token)
         if action == "monthly_job":
             from aqla_agent.monthly import next_job
-            return next_job(state.snapshot())
+            return state.update(next_job)
+        if action == "monthly_failure":
+            from aqla_agent.monthly import fail_publication
+            if failure is None:
+                raise AqlaError("A bound monthly publication failure is required")
+            return state.update(lambda data: fail_publication(data, failure))
         if action == "monthly_request":
             from datetime import datetime
 
-            from aqla_agent.monthly import BERLIN, month_bounds
+            from aqla_agent.monthly import BERLIN, month_bounds, request_publication
             month_bounds(month)
             if month > datetime.now(BERLIN).strftime("%Y-%m"):
                 raise AqlaError("Zukünftige Monate haben noch keinen Monatsbericht")
-            def request_month(data):
-                from aqla_agent.monthly import monthly_report as calculate
-                if calculate(data, month)["published_current_revision"]:
-                    return {"requested_month": month, "already_published": True}
-                wanted = data.setdefault("monthly_requests", [])
-                if month not in wanted:
-                    wanted.append(month)
-                return {"requested_month": month}
-            return state.update(request_month)
+            return state.update(lambda data: request_publication(data, month))
         if action == "monthly_ack":
             from aqla_agent.monthly import acknowledge_publication
-            if not publication:
-                raise AqlaError("Confirmed Sheets publication is required")
+            if publication is None or job is None:
+                raise AqlaError("Confirmed Sheets publication and selected monthly job are required")
             import re
             expected = settings.google_sheets.spreadsheet_id
-            if not re.fullmatch(r"https://docs\.google\.com/spreadsheets/d/" + re.escape(expected or "") + r"/edit#gid=\d+", publication.get("url", "")):
+            if not re.fullmatch(r"https://docs\.google\.com/spreadsheets/d/" + re.escape(expected or "") + r"/edit#gid=\d+", publication.url):
                 raise AqlaError("Monthly publication URL does not match the configured spreadsheet")
-            return state.update(lambda data: acknowledge_publication(data, month, publication["fingerprint"],
-                                publication["url"], publication["revision"]))
+            return state.update(lambda data: acknowledge_publication(data, month, publication.fingerprint,
+                                publication.url, publication.revision, job=job))
         if action == "journal_snapshot":
             from aqla_sheets_mcp.journal import batch
             return batch(state.snapshot(), settings.google_sheets.batch_size)

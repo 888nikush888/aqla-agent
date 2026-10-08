@@ -4,14 +4,79 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from decimal import Decimal
+from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
-from aqla_hyperliquid_mcp.models import TERMINAL_ORDER, AqlaError, Market, digest, margin_leverage, now_ms
+from pydantic import Field, model_validator
+
+from aqla_hyperliquid_mcp.models import (
+    TERMINAL_ORDER,
+    AqlaError,
+    Market,
+    Model,
+    digest,
+    margin_leverage,
+    now_ms,
+)
 
 BERLIN = ZoneInfo("Europe/Berlin")
 FIRST_MONTH = "2026-10"
 SUM_LABEL = "Summe der Trade-Renditen — keine Kontorendite"
 CLOSED = {"closed", "cancelled", "rejected"}
+MonthlyErrorCode = Literal["temporary", "schema", "budget", "conflict", "integrity"]
+Counter = Annotated[int, Field(strict=True, ge=0)]
+Revision = Annotated[int, Field(strict=True, ge=1)]
+Fingerprint = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class MonthlyJobBinding(Model):
+    month: Annotated[str, Field(pattern=r"^20\d{2}-(0[1-9]|1[0-2])$")]
+    fingerprint: Fingerprint
+    revision: Revision
+    request_generation: Counter = 0
+    attempt_count: Counter = 0
+
+
+class MonthlyJob(MonthlyJobBinding):
+    status: Literal["pending", "publishing", "retry", "blocked", "published"] = "pending"
+    last_error: MonthlyErrorCode | None = None
+    last_attempt: Counter | None = None
+    next_retry_at: Counter | None = None
+
+
+class MonthlyFailure(Model):
+    job: MonthlyJobBinding
+    error_code: MonthlyErrorCode
+
+
+class MonthlySelection(Model):
+    status: Literal["ready", "idle"]
+    report: dict | None = None
+    job: MonthlyJobBinding | None = None
+    scheduled: bool = False
+    blocked: list[MonthlyJob] = Field(default_factory=list)
+
+
+class MonthlyPublication(Model):
+    month: Annotated[str, Field(pattern=r"^20\d{2}-(0[1-9]|1[0-2])$")]
+    fingerprint: Fingerprint
+    revision: Revision
+    url: str
+
+
+class MonthlyPublishOutcome(Model):
+    status: Literal["published", "blocked", "retry"]
+    publication: MonthlyPublication | None = None
+    error_code: MonthlyErrorCode | None = None
+
+    @model_validator(mode="after")
+    def consistent(self):
+        if self.status == "published":
+            if self.publication is None or self.error_code is not None:
+                raise ValueError("Published outcome requires a confirmed publication")
+        elif self.publication is not None or self.error_code is None or (self.status == "retry") != (self.error_code == "temporary"):
+            raise ValueError("Failure outcome requires a safe error category")
+        return self
 
 
 def month_bounds(month):
@@ -173,33 +238,97 @@ def monthly_report(data, month):
     result["fingerprint"] = digest(result)
     publication = data.get("monthly_reports", {}).get(month, {})
     result["revision"] = publication.get("revision", 0) + (publication.get("fingerprint") != result["fingerprint"])
+    job = data.get("monthly_jobs", {}).get(month, {})
+    if job:
+        result["revision"] = max(result["revision"], job["revision"] + (job["fingerprint"] != result["fingerprint"]))
     result["url"] = publication.get("url")
-    result["published_current_revision"] = publication.get("fingerprint") == result["fingerprint"]
+    result["published_current_revision"] = publication.get("fingerprint") == result["fingerprint"] and publication.get("revision") == result["revision"]
     return result
 
 
 def next_job(data, clock=None):
     clock = now_ms() if clock is None else clock
     current = datetime.fromtimestamp(clock / 1000, BERLIN).strftime("%Y-%m")
-    wanted = set(data.get("monthly_requests", [])) | set(data.get("monthly_reports", {}))
+    wanted = set(data.get("monthly_requests", [])) | set(data.get("monthly_reports", {})) | set(data.get("monthly_jobs", {}))
     year, month = map(int, FIRST_MONTH.split("-"))
     while (candidate := f"{year:04d}-{month:02d}") < current:
         if due_at(candidate) <= clock:
             wanted.add(candidate)
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    blocked = []
     for candidate in sorted(wanted):
         report = monthly_report(data, candidate)
         scheduled = candidate >= FIRST_MONTH and due_at(candidate) <= clock
         published = data.get("monthly_reports", {}).get(candidate, {})
         if not report["published_current_revision"] or scheduled and not published.get("scheduled_notified") or candidate in data.get("monthly_requests", []):
-            return {"report": report, "scheduled": scheduled}
-    return {"report": None}
+            generation = data.get("monthly_request_generations", {}).get(candidate, 0)
+            stored = data.setdefault("monthly_jobs", {}).get(candidate)
+            job = MonthlyJob.model_validate(stored) if stored else MonthlyJob(month=candidate, fingerprint=report["fingerprint"], revision=report["revision"])
+            if (job.fingerprint, job.revision, job.request_generation) != (report["fingerprint"], report["revision"], generation):
+                job = MonthlyJob(month=candidate, fingerprint=report["fingerprint"], revision=report["revision"], request_generation=generation)
+            if job.status == "blocked":
+                blocked.append(job)
+                continue
+            if job.next_retry_at is not None and clock < job.next_retry_at:
+                continue
+            job.status = "publishing"
+            job.attempt_count += 1
+            job.last_attempt, job.next_retry_at = clock, clock + 60_000
+            data["monthly_jobs"][candidate] = job.model_dump(mode="json")
+            binding = MonthlyJobBinding.model_validate({key: getattr(job, key) for key in MonthlyJobBinding.model_fields})
+            return MonthlySelection(status="ready", report=report, scheduled=scheduled, job=binding, blocked=blocked).model_dump(mode="json")
+    return MonthlySelection(status="idle", blocked=blocked).model_dump(mode="json")
 
 
-def acknowledge_publication(data, month, fingerprint, url, revision, clock=None):
+def request_publication(data, month):
+    month_bounds(month)
+    report = monthly_report(data, month)
+    if report["published_current_revision"]:
+        return {"requested_month": month, "already_published": True}
+    wanted = data.setdefault("monthly_requests", [])
+    if month not in wanted:
+        wanted.append(month)
+    generations = data.setdefault("monthly_request_generations", {})
+    generations[month] = generations.get(month, 0) + 1
+    return {"requested_month": month}
+
+
+def _bound_job(data, binding, *, allow_published=False):
+    binding = MonthlyJobBinding.model_validate(binding)
+    stored = data.get("monthly_jobs", {}).get(binding.month)
+    report = monthly_report(data, binding.month)
+    if not stored:
+        raise AqlaError("stale monthly job: request a current publication job")
+    job = MonthlyJob.model_validate(stored)
+    current = {key: getattr(job, key) for key in MonthlyJobBinding.model_fields}
+    if (current != binding.model_dump() or binding.request_generation != data.get("monthly_request_generations", {}).get(binding.month, 0)
+            or (report["fingerprint"], report["revision"]) != (binding.fingerprint, binding.revision)
+            or job.status not in ({"publishing", "published"} if allow_published else {"publishing"})):
+        raise AqlaError("stale monthly job: financial evidence or publication attempt changed")
+    return job
+
+
+def fail_publication(data, failure, clock=None):
+    failure = MonthlyFailure.model_validate(failure)
+    job = _bound_job(data, failure.job)
+    clock = now_ms() if clock is None else clock
+    job.last_error = failure.error_code
+    if failure.error_code == "temporary":
+        job.status = "retry"
+        job.next_retry_at = clock + min(60 * 2 ** min(job.attempt_count - 1, 6), 3600) * 1000
+    else:
+        job.status, job.next_retry_at = "blocked", None
+    data["monthly_jobs"][job.month] = job.model_dump(mode="json")
+    return data["monthly_jobs"][job.month]
+
+
+def acknowledge_publication(data, month, fingerprint, url, revision, clock=None, *, job=None):
     report = monthly_report(data, month)
     if report["fingerprint"] != fingerprint or report["revision"] != revision:
         raise AqlaError("Monatsbelege wurden während der Veröffentlichung geändert; erneut abgleichen")
+    bound = _bound_job(data, job, allow_published=True) if job is not None else None
+    if bound is not None and (bound.month, bound.fingerprint, bound.revision) != (month, fingerprint, revision):
+        raise AqlaError("stale monthly job: publication does not match the selected job")
     clock = now_ms() if clock is None else clock
     previous = data.setdefault("monthly_reports", {}).get(month, {})
     scheduled = month >= FIRST_MONTH and due_at(month) <= clock
@@ -214,5 +343,8 @@ def acknowledge_publication(data, month, fingerprint, url, revision, clock=None)
         data["notifications"].setdefault("monthly-request:" + month + ":" + fingerprint,
                                         {"monthly_report": notice, "observed_at": clock})
     data["monthly_reports"][month] = publication
+    if bound is not None:
+        bound.status, bound.last_error, bound.next_retry_at = "published", None, None
+        data["monthly_jobs"][month] = bound.model_dump(mode="json")
     data["monthly_requests"] = [item for item in data.get("monthly_requests", []) if item != month]
     return publication

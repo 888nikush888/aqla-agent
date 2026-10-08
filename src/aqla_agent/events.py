@@ -178,18 +178,36 @@ class HermesExtension:
             await asyncio.sleep(3)
 
     async def sync_monthly(self):
+        from .monthly import MonthlyPublishOutcome, MonthlySelection
+
         if not self.settings.google_sheets.enabled or self.last_monthly_sync and time.monotonic() - self.last_monthly_sync < 60:
             return
         self.last_monthly_sync = time.monotonic()
+        pending = None
         try:
-            pending = await self.mcp_call(self.server, "integration", {"action": "monthly_job", "token": self.authority.key.decode()})
-            if not pending.get("report"):
+            pending = MonthlySelection.model_validate(await self.mcp_call(self.server, "integration", {"action": "monthly_job", "token": self.authority.key.decode()}))
+            for blocked in pending.blocked:
+                LOG.warning("aqla monthly publication blocked (month=%s, code=%s)", blocked.month, blocked.last_error)
+            if pending.status == "idle":
                 return
-            published = await self.mcp_call("sheets", "publish_monthly_internal", {"token": self.authority.key.decode(), "report": pending["report"]})
+            if pending.job is None or pending.report is None:
+                raise AqlaError("Monthly publication selection is incomplete")
+            published = MonthlyPublishOutcome.model_validate(await self.mcp_call("sheets", "publish_monthly_internal", {"token": self.authority.key.decode(), "report": pending.report}))
+            if published.status != "published":
+                await self.mcp_call(self.server, "integration", {"action": "monthly_failure", "token": self.authority.key.decode(),
+                                    "failure": {"job": pending.job.model_dump(mode="json"), "error_code": published.error_code}})
+                return
             await self.mcp_call(self.server, "integration", {"action": "monthly_ack", "token": self.authority.key.decode(),
-                                "month": pending["report"]["month"], "publication": published})
+                                "month": pending.report["month"], "publication": published.publication.model_dump(mode="json"),
+                                "job": pending.job.model_dump(mode="json")})
         except Exception as error:
             LOG.warning("aqla monthly publication unavailable (%s); report remains pending", type(error).__name__)
+            if pending is not None and pending.job is not None:
+                try:
+                    await self.mcp_call(self.server, "integration", {"action": "monthly_failure", "token": self.authority.key.decode(),
+                                        "failure": {"job": pending.job.model_dump(mode="json"), "error_code": "temporary"}})
+                except Exception as failure_error:
+                    LOG.warning("aqla monthly failure persistence unavailable (%s)", type(failure_error).__name__)
 
     async def reader_worker(self):
         try:

@@ -61,28 +61,81 @@ def test_tool_claim_comes_from_native_metadata_not_text(extension):
 
 @pytest.mark.asyncio
 async def test_monthly_sheets_failure_never_acknowledges_publication(extension, monkeypatch):
+    from aqla_agent.monthly import next_job
+
     ext, _ = extension
     # CI workers can have a monotonic clock below the throttle interval after boot.
     monkeypatch.setattr("aqla_agent.events.time.monotonic", lambda: 30.0)
     ext.settings.google_sheets.spreadsheet_id = "ci" + "0" * 25
     ext.settings.google_sheets.credentials_file = "ci-only.secret"
     ext.settings.google_sheets.enabled = True
+    pending = next_job({"monthly_requests": ["2026-09"]})
     calls = []
     async def failed(server, tool, args):
         calls.append((server, tool, args))
         if args.get("action") == "monthly_job":
-            return {"report": {"month": "2026-09"}}
+            return pending
         raise OSError("lost Sheets result")
     ext.mcp_call = failed
     await ext.sync_monthly()
     assert not any(row[2].get("action") == "monthly_ack" for row in calls)
+    assert calls[-1][2]["action"] == "monthly_failure"
+    assert calls[-1][2]["failure"] == {"job": pending["job"], "error_code": "temporary"}
     ext.last_monthly_sync = 0
     async def accepted(server, tool, args):
         calls.append((server, tool, args))
-        return {"report": {"month": "2026-09"}} if args.get("action") == "monthly_job" else {"url": "confirmed"}
+        return pending if args.get("action") == "monthly_job" else {
+            "status": "published", "publication": {"month": "2026-09", "fingerprint": pending["report"]["fingerprint"],
+                                                   "revision": 1, "url": "confirmed"}}
     ext.mcp_call = accepted
     await ext.sync_monthly()
     assert calls[-1][2]["action"] == "monthly_ack"
+    assert calls[-1][2]["job"] == pending["job"]
+
+
+@pytest.mark.asyncio
+async def test_monthly_worker_persists_safe_failure_and_continues_later_month(extension, setup, monkeypatch):
+    import json
+
+    from aqla_agent import monthly
+    from aqla_hyperliquid_mcp.server import close_server, create_server
+
+    ext, _ = extension
+    settings, state, fake, exchange, _ = setup
+    clock = monthly.due_at("2026-11")
+    monkeypatch.setattr(monthly, "now_ms", lambda: clock)
+    monkeypatch.setattr("aqla_agent.events.time.monotonic", lambda: 30.0)
+    settings.google_sheets.spreadsheet_id = ext.settings.google_sheets.spreadsheet_id = "ci" + "0" * 25
+    ext.settings.google_sheets.credentials_file = "ci-only.secret"
+    ext.settings.google_sheets.enabled = True
+    server = create_server(settings, state=state, exchange=exchange)
+    seen = []
+
+    async def actual_call(selected, tool, args):
+        seen.append((selected, tool, args))
+        if selected == "sheets":
+            report = args["report"]
+            if report["month"] == "2026-10":
+                return {"status": "blocked", "error_code": "budget"}
+            return {"status": "published", "publication": {
+                "month": report["month"], "fingerprint": report["fingerprint"], "revision": report["revision"],
+                "url": "https://docs.google.com/spreadsheets/d/" + settings.google_sheets.spreadsheet_id + "/edit#gid=7"}}
+        result = await server.call_tool(tool, args)
+        return json.loads(result.content[0].text)
+
+    ext.mcp_call = actual_call
+    try:
+        await ext.sync_monthly()
+        assert state.snapshot()["monthly_jobs"]["2026-10"]["status"] == "blocked"
+        assert state.snapshot()["monthly_jobs"]["2026-10"]["last_error"] == "budget"
+        assert not any(args.get("action") == "monthly_ack" for _, _, args in seen)
+        ext.last_monthly_sync = 0
+        await ext.sync_monthly()
+        assert state.snapshot()["monthly_jobs"]["2026-11"]["status"] == "published"
+        assert list(state.snapshot()["notifications"]) == ["monthly:2026-11"]
+        assert fake.actions == []
+    finally:
+        await close_server(server)
 
 
 def test_only_actual_owner_monthly_requests_trigger_internal_publication(extension):
