@@ -26,13 +26,13 @@ def main():
     from aqla_agent.install import prepare
 
     prepare(project, destination, "12345", "qa-model", "https://example.invalid/v1")
-    from aqla_agent.events import EXTENSIONS, HermesExtension
-    from aqla_agent.hermes_runtime import install_strict_profile
-    from aqla_agent.skill_review import REVIEW_FOCUS
-
     import gateway.run as native_gateway
     from gateway.run_turn import GatewayTurnMixin
     from tools import write_approval as approval_before
+
+    from aqla_agent.events import EXTENSIONS, HermesExtension
+    from aqla_agent.hermes_runtime import install_strict_profile
+    from aqla_agent.skill_review import REVIEW_FOCUS
     before_factory = native_gateway._start_gateway_start_cron_and_housekeeping
     before_stage = approval_before.stage_write
     before_turn = GatewayTurnMixin._run_agent
@@ -49,6 +49,19 @@ def main():
         assert native_gateway._start_gateway_start_cron_and_housekeeping is before_factory
         assert approval_before.stage_write is before_stage
         assert GatewayTurnMixin._run_agent is incompatible_turn
+    finally:
+        GatewayTurnMixin._run_agent = before_turn
+    del GatewayTurnMixin._run_agent
+    try:
+        try:
+            install_strict_profile()
+        except RuntimeError as error:
+            assert "compatibility contract" in str(error)
+        else:
+            raise AssertionError("Missing native method was accepted")
+        assert native_gateway._start_gateway_start_cron_and_housekeeping is before_factory
+        assert approval_before.stage_write is before_stage
+        assert "_run_agent" not in GatewayTurnMixin.__dict__
     finally:
         GatewayTurnMixin._run_agent = before_turn
     undo = install_strict_profile()

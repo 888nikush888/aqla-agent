@@ -33,7 +33,11 @@ def validate_hooks(contracts: list[HookContract]) -> None:
         original = function
         while hasattr(original, "__aqla_contract_original__"):
             original = original.__aqla_contract_original__
-        if not callable(function) or parameter_contract(function) != contract.parameters or inspect.iscoroutinefunction(original) != contract.asynchronous:
+        try:
+            valid = callable(function) and parameter_contract(function) == contract.parameters and inspect.iscoroutinefunction(original) == contract.asynchronous
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
             failures.append(contract.name)
     if failures:
         raise RuntimeError("Pinned Hermes compatibility contract changed; no Aqla patches installed: " + ", ".join(failures))
@@ -61,14 +65,19 @@ def check_native_contract() -> None:
         ("tools.write_approval", "", "get_pending", "subsystem,pending_id", False),
         ("tools.skill_manager_tool", "", "apply_skill_pending", "payload", False),
         ("tools.skill_manager_tool", "", "_skill_mutation_lock", "name", False),
+        ("tools.skill_usage", "", "adopt_skill", "skill_name", False),
+        ("tools.fuzzy_match", "", "fuzzy_find_and_replace", "content,old_string,new_string,replace_all=", False),
         ("agent.background_review", "", "spawn_background_review_thread", "agent,messages_snapshot,review_memory=,review_skills=,focus=,task_cfg=,review_run=,explicit=", False),
         ("agent.background_review", "", "_action_lines", "data,detail,verbose", False),
         ("agent.background_review", "", "_publish_review_summary", "agent,actions", False),
     ]
     contracts = []
     for module_name, class_name, name, parameters, asynchronous in specifications:
-        module = importlib.import_module(module_name)
-        target = getattr(module, class_name) if class_name else module
+        try:
+            module = importlib.import_module(module_name)
+            target = getattr(module, class_name) if class_name else module
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(f"Pinned Hermes compatibility target missing: {module_name}.{class_name or name}; no Aqla patches installed") from error
         contracts.append(HookContract(target, name, parameters, asynchronous))
     gateway = importlib.import_module("gateway.run")
     root = Path(gateway.__file__).resolve().parents[1]
