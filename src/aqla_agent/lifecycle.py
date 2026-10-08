@@ -7,6 +7,19 @@ from decimal import Decimal
 from aqla_hyperliquid_mcp.models import now_ms
 
 
+def exit_reason(trade, fill) -> tuple[str, str]:
+    if fill["kind"] == "sl":
+        return "stop_loss", "Stop-Loss"
+    if fill["kind"] == "tp":
+        return "take_profit", "Take-Profit"
+    if fill["kind"] == "close":
+        match = next((order for order in trade.get("exit_orders", []) if order.get("oid") == fill["oid"] or trade.get("order_observations", {}).get(order["cloid"], {}).get("oid") == fill["oid"]), {})
+        reason = match.get("reason", "unconfirmed")
+        label = {"operator_close": "Nutzerauftrag", "source_close": "Quellenauftrag", "protection_failure": "Schutzmaßnahme"}.get(reason, "Grund nicht vollständig belegt")
+        return reason, label
+    return "unconfirmed", "Grund nicht vollständig belegt"
+
+
 def close_reason(trade):
     fills = list(trade.get("fill_events", {}).values())
     exits = [row for row in fills if row["kind"] != "entry"]
@@ -16,19 +29,14 @@ def close_reason(trade):
         return {"kind": "unconfirmed", "label": "Grund nicht vollständig belegt"}
     if any(not isinstance(row.get("time"), int) or row.get("oid") is None for row in exits):
         return {"kind": "unconfirmed", "label": "Grund nicht vollständig belegt"}
-    last = max(exits, key=lambda row: row["time"])
-    kind = last["kind"]
-    if kind == "sl":
-        label, reason = "Stop-Loss", "stop_loss"
-    elif kind == "tp":
-        label, reason = "Take-Profit", "take_profit"
-    elif kind == "close":
-        match = next((order for order in trade.get("exit_orders", []) if order.get("oid") == last["oid"] or trade.get("order_observations", {}).get(order["cloid"], {}).get("oid") == last["oid"]), {})
-        reason = match.get("reason", "unconfirmed")
-        label = {"operator_close": "Nutzerauftrag", "source_close": "Quellenauftrag", "protection_failure": "Schutzmaßnahme"}.get(reason, "Grund nicht vollständig belegt")
-    else:
-        label, reason = "Grund nicht vollständig belegt", "unconfirmed"
-    return {"kind": reason, "label": label, "last_exit_time": last["time"], "last_exit_price": last["px"], "last_exit_oid": last["oid"]}
+    last_time = max(row["time"] for row in exits)
+    latest = [row for row in exits if row["time"] == last_time]
+    reasons = {exit_reason(trade, row) for row in latest}
+    reason, label = reasons.pop() if len(reasons) == 1 else ("unconfirmed", "Grund nicht vollständig belegt")
+    result = {"kind": reason, "label": label, "last_exit_time": last_time}
+    if len(latest) == 1:
+        result.update(last_exit_price=latest[0]["px"], last_exit_oid=latest[0]["oid"])
+    return result
 
 
 def record_lifecycle(data, trade_id, kind):

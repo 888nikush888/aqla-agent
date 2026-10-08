@@ -18,6 +18,10 @@ Unzulässige Stopausweitungen werden vor Annahme geprüft: ohne Fill anhand der 
 
 PnL wird nur mit vollständigen eigenen Entry-/Exit-Fills und bekannten Gebühren angezeigt, getrennt nach Abrechnungswährung und ausdrücklich vor Funding. Unbekannte Ausgänge bleiben ungeklärt. Eine generische Preisordnungs-Ablehnung wird nicht als Beweis einer bestimmten aktuellen Kurslage ausgegeben.
 
+Alle Exitbelege mit dem letzten gemeinsamen Zeitstempel tragen zum Schließgrund bei. Stimmen ihre Gründe überein, bleibt dieser bestätigt; unterschiedliche Gründe werden als „Grund nicht vollständig belegt“ dargestellt. Bei mehreren letzten Fills werden kein einzelner Exitpreis und keine einzelne Order-ID als letzter Beleg ausgewählt. Bereits gespeicherte Lifecyclefakten bleiben unverändert.
+
+Terminale Quellenereignisse einschließlich `rejected` und `superseded` unterliegen derselben Body-Retention wie andere abgeschlossene Ereignisse. Tombstones bewahren ihre Identität gegen Wiederverarbeitung. Aktive Plan-/Tradebezüge, wartende SL-Aufträge samt gebundenen Quellenrevisionen, benötigter Kontext und noch ausstehende Journalexports schützen die betreffenden Bodies weiter, auch wenn dadurch die Mengenobergrenze überschritten wird. Eine neue Nachrichtenrevision besitzt ihre eigene Ereignisidentität.
+
 Dynamische Labels werden als Daten behandelt, nicht als Markdown-Anweisungen oder Links. Lange Inhalte werden an vollständigen Blöcken beziehungsweise Zeilen aufgeteilt. Native Hermes übernimmt MarkdownV2-Konvertierung, Zustellung, Wiederholungen und die endgültige Telegram-Aufteilung. Kein zusätzlicher Bottransport wird eingeführt.
 
 Der Master verwendet dieselben Gestaltungsregeln für kurze Rückfragen und Konfigurationsbestätigungen. Ein leerer automatischer Durchlauf ohne Statusänderung verwendet Hermes' nativen `NO_REPLY`-Marker. Direkte Betreiberfragen erhalten weiterhin Antworten. Native Tests simulieren Telegram-Versand und prüfen Formatierung, Aufteilung und unveränderte Speicherung in der Hermes-Sitzungsdatenbank ohne reale Nachrichten.

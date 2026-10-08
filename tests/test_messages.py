@@ -1,11 +1,77 @@
 import copy
 from decimal import Decimal
+from itertools import permutations
 
 import pytest
 
+from aqla_agent.lifecycle import close_reason, record_lifecycle
 from aqla_agent.messages import MAX_NOTIFICATIONS, literal, number, split_blocks, telegram_view
 
 READY = {'hyperliquid': {'configured': True, 'enabled': True, 'network': 'testnet'}}
+
+
+def exit_trade(reasons, times=None):
+    mapping = {"stop_loss": "sl", "take_profit": "tp", "source_close": "close", "operator_close": "close"}
+    fills = [{"kind": mapping[reason], "sz": "1", "px": str(90 + index * 10), "oid": index + 2,
+              "time": times[index] if times else 2000} for index, reason in enumerate(reasons)]
+    orders = [{"cloid": "exit" + str(index), "oid": index + 2, "reason": reason} for index, reason in enumerate(reasons) if mapping[reason] == "close"]
+    return fills, {"fill_events": {"entry": {"kind": "entry", "sz": str(len(reasons)), "px": "100", "oid": 1, "time": 1000}}, "exit_orders": orders}
+
+
+def test_tied_exit_reasons_are_permutation_invariant():
+    exits, base = exit_trade(["stop_loss", "take_profit", "source_close", "operator_close"])
+    expected = {"kind": "unconfirmed", "label": "Grund nicht vollständig belegt", "last_exit_time": 2000}
+    for ordered in permutations(exits):
+        trade = {**base, "fill_events": {**base["fill_events"], **{str(row["oid"]): row for row in ordered}}}
+        assert close_reason(trade) == expected
+
+
+@pytest.mark.parametrize("reason", ["stop_loss", "take_profit", "source_close", "operator_close"])
+def test_tied_exits_with_same_reason_remain_confirmed(reason):
+    exits, base = exit_trade([reason, reason])
+    results = []
+    for ordered in permutations(exits):
+        trade = {**base, "fill_events": {**base["fill_events"], **{str(row["oid"]): row for row in ordered}}}
+        result = close_reason(trade)
+        assert result["kind"] == reason and result["last_exit_time"] == 2000
+        assert "last_exit_price" not in result and "last_exit_oid" not in result
+        results.append(result)
+    assert results[0] == results[1]
+
+
+def test_unique_last_exit_retains_chronological_evidence():
+    exits, base = exit_trade(["stop_loss", "take_profit", "source_close"], [1500, 2000, 2500])
+    for ordered in permutations(exits):
+        trade = {**base, "fill_events": {**base["fill_events"], **{str(row["oid"]): row for row in ordered}}}
+        assert close_reason(trade) == {"kind": "source_close", "label": "Quellenauftrag", "last_exit_time": 2500,
+                                       "last_exit_price": "110", "last_exit_oid": 4}
+
+
+def test_existing_immutable_closed_lifecycle_is_not_rewritten(opened):
+    identity, trade = next(iter(opened["trades"].items()))
+    trade["status"] = "closed"
+    record_lifecycle(opened, identity, "closed")
+    frozen = copy.deepcopy(trade["lifecycle_events"]["closed"])
+    original_reason = copy.deepcopy(trade["close_reason"])
+    exits, base = exit_trade(["stop_loss", "take_profit"])
+    trade.update(base, fill_events={**base["fill_events"], **{str(row["oid"]): row for row in exits}})
+    record_lifecycle(opened, identity, "closed")
+    assert trade["lifecycle_events"]["closed"] == frozen
+    assert trade["close_reason"] == original_reason
+
+
+def test_tied_exit_reason_is_honest_in_formatter_and_lifecycle(opened):
+    identity, trade = next(iter(opened["trades"].items()))
+    exits, base = exit_trade(["stop_loss", "take_profit"])
+    trade.update(base, fill_events={**base["fill_events"], **{str(row["oid"]): row for row in exits}},
+                 status="closed", remaining_quantity="0")
+    opened["notifications"].clear()
+    record_lifecycle(opened, identity, "closed")
+    event = trade["lifecycle_events"]["closed"]
+    assert event["time"] == 2000
+    assert event["facts"]["close_reason"] == {"kind": "unconfirmed", "label": "Grund nicht vollständig belegt", "last_exit_time": 2000}
+    rendered = text(telegram_view(opened, READY))
+    assert "Trade geschlossen" in rendered and "Grund nicht vollständig belegt" in rendered
 
 
 def text(view):
