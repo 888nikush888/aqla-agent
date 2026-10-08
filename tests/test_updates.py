@@ -22,6 +22,49 @@ def update(trading, message_id, action, text, **fields):
     return source, interpretation
 
 
+async def waiting_gtc(setup, signal):
+    _, _, fake, _, trading = setup
+    source, interpretation = signal
+    fake.mid = "101"
+    interpretation = interpretation.model_copy(update={"entry": "limit", "entry_prices": [Decimal("100")]})
+    plan = await trading.preview(source.event_id, interpretation)
+    trade = await trading.execute(plan["plan_id"])
+    assert trade["status"] == "opening" and Decimal(trade["filled_quantity"]) == 0
+    return trade
+
+
+def stop_update(trading, message_id=2, stop="95"):
+    source, interpretation = update(trading, message_id, "move_stop", "SL auf " + stop, stop_loss=stop)
+    interpretation.evidence = [Evidence(field="stop_loss", source_id=source.source_id, quote=stop)]
+    return source, interpretation
+
+
+@pytest.mark.asyncio
+async def test_unfilled_gtc_stop_update_remains_pending_until_confirmed(setup, signal):
+    _, state, fake, _, trading = setup
+    trade = await waiting_gtc(setup, signal)
+    source, interpretation = stop_update(trading)
+    before = len(fake.actions)
+    result = await trading.update_trade(source.event_id, interpretation)
+    assert result["result"]["pending_stop_update"] is True
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert current["pending_stop_update"]["phase"] == "waiting_fill"
+    assert state.snapshot()["events"][source.event_id]["status"] == "needs_reconciliation"
+    assert current["plan"] == trade["plan"] and Decimal(current["stop_price"]) == 90
+    await trading.update_trade(source.event_id, interpretation)
+    assert len(fake.actions) == before
+    fake.mid = "100"
+    fake.fill(trade["entry_cloid"], trade["plan"]["quantity"], "100")
+    await trading.refresh_trade(trade["trade_id"])
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert current["pending_stop_update"]["phase"] == "confirmed"
+    assert state.snapshot()["events"][source.event_id]["status"] == "updated"
+    assert Decimal(current["stop_price"]) == 95
+    assert any(fake.orders[order["cloid"]]["status"] == "open" and fake.orders[order["cloid"]]["order"]["triggerPx"] == "95"
+               for order in current["orders"] if order["kind"] == "sl")
+    assert current["plan"] == trade["plan"]
+
+
 @pytest.mark.asyncio
 async def test_partial_entry_is_frozen_before_targets_are_sized(setup, signal):
     _, _, fake, _, trading = setup

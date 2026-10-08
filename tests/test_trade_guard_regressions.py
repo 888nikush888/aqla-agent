@@ -1,5 +1,8 @@
+import copy
+import json
 from decimal import Decimal
 
+import httpx
 import pytest
 
 from aqla_agent.router import Router
@@ -22,6 +25,58 @@ async def admitted_without_entry(trading, source, interpretation, monkeypatch):
 
 def entry_actions(fake):
     return [action for action in fake.actions if action["type"] == "order" and any(not order["r"] for order in action["orders"])]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_evidence", [False, True], ids=["coherent", "late"])
+async def test_cancel_fill_race_rechecks_stop_widening_budget(setup, signal, late_evidence):
+    _, state, fake, exchange, trading = setup
+    exchange.fail_closed_protection = True
+    state.update(lambda data: data["policy"].update(allow_stop_widening=True, sizing_mode="fixed_notional", fixed_notional_usdc="480"))
+    source, interpretation = signal
+    interpretation = interpretation.model_copy(update={"entry": "limit", "entry_prices": [Decimal("100")]})
+    plan = await trading.preview(source.event_id, interpretation)
+    fake.partial_limit_fraction = .5
+    original = fake.handle
+    delayed = injected = update_started = False
+    partial_fills = []
+
+    def delayed_exchange(request):
+        nonlocal delayed, injected, partial_fills
+        payload = json.loads(request.content)
+        if request.url.path == "/exchange" and payload["action"]["type"] == "cancelByCloid" and not injected:
+            cloid = payload["action"]["cancels"][0]["cloid"]
+            order = fake.orders.get(cloid)
+            if order and not order["order"]["reduceOnly"] and order["status"] == "open":
+                partial_fills = copy.deepcopy(fake.fills)
+                fake.fill(cloid, order["order"]["sz"], "100")
+                injected = True
+                delayed = late_evidence
+        if request.url.path == "/info" and payload.get("type") == "orderStatus" and update_started and delayed:
+            delayed = False
+        response = original(request)
+        if request.url.path == "/info" and delayed:
+            if payload.get("type") == "userFillsByTime":
+                return httpx.Response(200, json=partial_fills)
+            if payload.get("type") == "clearinghouseState":
+                data = response.json()
+                for row in data["assetPositions"]:
+                    row["position"]["szi"] = "2.40"
+                return httpx.Response(200, json=data)
+        return response
+
+    exchange.client._transport = httpx.MockTransport(delayed_exchange)
+    trade = await trading.execute(plan["plan_id"])
+    assert injected and trade["status"] == "open"
+    assert Decimal(trade["remaining_quantity"]) == Decimal("2.40" if late_evidence else "4.80")
+    initial_stop = next(row for row in trade["orders"] if row["kind"] == "sl")
+    before = len(fake.actions)
+    update_started = True
+    with pytest.raises(AqlaError, match="original loss budget"):
+        await trading.replace_stop(trade["trade_id"], Decimal("80"), "widen-late-evidence")
+    assert fake.orders[initial_stop["cloid"]]["status"] == "open"
+    assert Decimal(state.snapshot()["trades"][trade["trade_id"]]["stop_price"]) == 90
+    assert len(fake.actions) == before
 
 
 @pytest.mark.asyncio
