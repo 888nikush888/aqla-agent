@@ -275,6 +275,8 @@ class Trading:
         if owned and snapshot["trades"][plan.trade_id]["status"] not in OPEN:
             raise AqlaError("Entry was terminated; no unsent exposure may execute")
         self.validate_configuration(snapshot, plan)
+        if any(row.get("quantity_evidence_pending") and row["status"] in OPEN for row in snapshot["trades"].values()):
+            raise AqlaError("Own entry quantity evidence requires reconciliation before new exposure")
         if now_ms() >= plan.deadline_at:
             raise AqlaError("Entry plan deadline expired")
         if self.source_revisions(snapshot, plan.source_refs) != plan.source_revisions:
@@ -713,6 +715,10 @@ class Trading:
             total, cost = await self.capture_fills(trade_id, entry_status)
         signed = self.position_size(await self.positions(plan.market), plan.market)
         remaining = self.owned_remaining(trade_id, signed) if total else abs(signed)
+        current = self.state.snapshot()["trades"][trade_id]
+        if (current.get("quantity_evidence_pending") and current.get("entry_fill_quantity_confirmed") is not None
+                and Decimal(current["entry_fill_quantity_confirmed"]) == total):
+            self._patch(trade_id, quantity_evidence_pending=False, waiting_error=None)
         if total and remaining:
             pending = trade.get("pending_stop_update")
             closing_pending = trade["status"] == "closing" and pending and pending["phase"] in STOP_UPDATE_ACTIVE
@@ -1210,6 +1216,7 @@ class Trading:
         except ExternalInterference:
             raise
         except StopEvidencePending as error:
+            self._patch(trade_id, status="unknown", quantity_evidence_pending=True, waiting_error=str(error))
             self.stop_phase(trade_id, "waiting_fill", str(error))
             return
         except AqlaError as error:
@@ -1262,7 +1269,8 @@ class Trading:
         signed = self.position_size(await self.positions(plan.market), plan.market)
         remaining = self.owned_remaining(trade_id, signed)
         trade = self.state.snapshot()["trades"][trade_id]
-        self.validate_final_stop_quantity(trade)
+        if not initial_protection:
+            self.validate_final_stop_quantity(trade)
         self.validate_stop_budget(trade, plan, stop, remaining, initialize_backup=initialize_backup)
         if not remaining:
             return {"already_closed": True}
@@ -1284,7 +1292,8 @@ class Trading:
             if digest(facts) != entry_fingerprint:
                 raise AqlaError("Own entry facts changed before stop replacement")
             self.validate_stop_budget(row, plan, stop, remaining, initialize_backup=initialize_backup)
-            self.validate_final_stop_quantity(row)
+            if not initial_protection:
+                self.validate_final_stop_quantity(row)
             pending = row.get("pending_stop_update")
             if pending and pending["operation_id"] == operation_id:
                 if pending["phase"] not in STOP_UPDATE_ACTIVE or pending["management_revision"] != row["management_revision"]:
@@ -1298,7 +1307,8 @@ class Trading:
             await self.capture_fills(trade_id)
             current_size = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
             row = self.state.snapshot()["trades"][trade_id]
-            self.validate_final_stop_quantity(row)
+            if not initial_protection:
+                self.validate_final_stop_quantity(row)
             self.validate_stop_budget(row, plan, stop, current_size, initialize_backup=initialize_backup)
             if current_size != remaining:
                 raise AqlaError("Final own position changed; reconcile before stop replacement")

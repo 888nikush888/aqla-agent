@@ -7,7 +7,7 @@ import pytest
 
 from aqla_agent.messages import trade_block
 from aqla_agent.router import Router
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, TradePlan, now_ms
 
 
 async def opened(setup, signal):
@@ -139,6 +139,51 @@ async def test_pending_stop_waits_for_terminal_quantity_and_complete_own_fills(s
     assert Decimal(current["remaining_quantity"]) == Decimal("4.80")
     assert Decimal(current["stop_price"]) == 95
     assert current["plan"] == trade["plan"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_stop", ["canceled", "malformed"])
+async def test_terminal_quantity_lag_does_not_silence_missing_initial_protection(setup, signal, old_stop):
+    _, state, fake, exchange, trading = setup
+    exchange.fail_closed_protection = True
+    trade, visibility = await lagged_final_entry(setup, signal)
+    initial = next(order for order in trade["orders"] if order["kind"] == "sl")
+    if old_stop == "canceled":
+        fake.orders[initial["cloid"]]["status"] = "canceled"
+    else:
+        fake.orders[initial["cloid"]]["order"]["reduceOnly"] = False
+    source, instruction = stop_update(trading)
+    original_entry = copy.deepcopy(state.snapshot()["operations"][trade["entry_operation_id"]])
+    await trading.update_trade(source.event_id, instruction)
+    await trading.recover()
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    effective = [order for order in fake.orders.values() if order["status"] == "open"
+                 and order["order"].get("reduceOnly") is True and order["order"].get("isTrigger") is True
+                 and order["order"].get("side") == "A" and Decimal(order["order"].get("sz", "0"))
+                 >= Decimal(current["remaining_quantity"])]
+    assert effective or Decimal(str(fake.position)) == 0
+    assert Decimal(current["filled_quantity"]) == Decimal(current["remaining_quantity"]) == Decimal("2.40")
+    assert Decimal(current["entry_vwap"]) == 100 and Decimal(current["reserved_risk"]) == Decimal(trade["reserved_risk"])
+    assert current["status"] == "unknown" and current["quantity_evidence_pending"] is True
+    with pytest.raises(AqlaError, match="quantity evidence.*reconciliation"):
+        trading.validate_admission(state.snapshot(), TradePlan.model_validate(current["plan"]), owned=True)
+    assert current["pending_stop_update"]["phase"] == "waiting_fill"
+    assert state.snapshot()["events"][source.event_id]["status"] == "needs_reconciliation"
+    assert "update:" + source.event_id not in state.snapshot()["operations"]
+    assert any(Decimal(order["order"]["sz"]) == Decimal("2.40") for order in effective)
+    before = len(fake.actions)
+    await trading.recover()
+    assert len(fake.actions) == before
+    visibility["hidden"] = False
+    await trading.recover()
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert current["pending_stop_update"]["phase"] == "confirmed"
+    assert current["quantity_evidence_pending"] is False
+    assert trading.validate_admission(state.snapshot(), TradePlan.model_validate(current["plan"]), owned=True) is None
+    assert Decimal(current["remaining_quantity"]) == Decimal("4.80") and Decimal(current["stop_price"]) == 95
+    assert current["plan"] == trade["plan"]
+    assert state.snapshot()["operations"][trade["entry_operation_id"]] == original_entry
+    assert len([action for action in fake.actions if action["type"] == "order" and any(order.get("c") == exchange.cloid("update:" + source.event_id) for order in action["orders"])]) == 1
 
 
 @pytest.mark.asyncio
