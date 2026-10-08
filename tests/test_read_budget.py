@@ -8,7 +8,13 @@ import pytest
 from aqla_agent.aster import Aster
 from aqla_agent.funding import aster_funding, hyperliquid_funding, lighter_funding
 from aqla_agent.lighter import Lighter
-from aqla_agent.read_budget import ReadBudget, ReadBudgetExceeded, observed_request, read_limits
+from aqla_agent.read_budget import (
+    ReadBudget,
+    ReadBudgetExceeded,
+    observation_auth,
+    observed_request,
+    read_limits,
+)
 from aqla_hyperliquid_mcp.api import Hyperliquid
 from aqla_hyperliquid_mcp.models import Market
 
@@ -83,6 +89,34 @@ async def test_private_auth_retries_and_transport_failures_consume_actual_reques
             with pytest.raises(httpx.ConnectError), observed_request(client, "GET", "/read"):
                 await client.get("/read")
         assert len(calls) == limit.requests == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_fresh_auth_followup_without_extensions_and_new_url_cannot_escape_budget(method):
+    class Auth(httpx.Auth):
+        def auth_flow(self, request):
+            response = yield request
+            if response.status_code == 401:
+                yield httpx.Request(method, "https://synthetic.invalid/auth-read")
+    calls = []
+    async with httpx.AsyncClient(base_url="https://synthetic.invalid", auth=Auth(), transport=httpx.MockTransport(lambda request: calls.append(request) or httpx.Response(401))) as client:
+        limit = ReadBudget("tick", 1, 100, clock=lambda: 0)
+        with read_limits(limit), pytest.raises(ReadBudgetExceeded, match="tick_request_limit"), observed_request(client, "GET", "/read"):
+            await client.get("/read", auth=observation_auth(client))
+        assert limit.requests == len(calls) == 1 and calls[0].url.path == "/read"
+
+
+@pytest.mark.asyncio
+async def test_reused_request_marker_after_read_scope_does_not_count_an_unrelated_send():
+    calls = []
+    async with httpx.AsyncClient(base_url="https://synthetic.invalid", transport=httpx.MockTransport(lambda request: calls.append(request) or httpx.Response(200))) as client:
+        request = client.build_request("GET", "/read")
+        limit = ReadBudget("tick", 1, 100, clock=lambda: 0)
+        with read_limits(limit), observed_request(client, "GET", "/read"):
+            await client.send(request)
+        await client.send(request)
+        assert limit.requests == 1 and len(calls) == 2
 
 
 @pytest.mark.asyncio

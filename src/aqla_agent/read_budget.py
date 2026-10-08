@@ -79,17 +79,47 @@ def _install_hook(client: httpx.AsyncClient) -> None:
         return
     reference = weakref.ref(client)
     async def count(request: httpx.Request) -> None:
-        budgets = request.extensions.get(_EXTENSION)
         boundary = _boundary.get()
-        if budgets is None and boundary is not None and reference() is boundary.client and request.method == boundary.method and request.url.path == boundary.path:
-            budgets = boundary.budgets
-            request.extensions[_EXTENSION] = budgets
-        # HTTPX carries request extensions into redirect requests; auth retries
-        # matching the original read also pass this hook. Writes are never tagged.
-        if isinstance(budgets, RequestBudgets):
-            budgets.spend()
+        if boundary is None or reference() is not boundary.client:
+            return
+        if request.method == "GET" or request.method == boundary.method and request.url.path == boundary.path:
+            request.extensions[_EXTENSION] = boundary.budgets
+        # Only the currently executing read chain owns this marker. An old
+        # request reused after the read scope cannot consume another budget.
+        if request.extensions.get(_EXTENSION) is boundary.budgets:
+            boundary.budgets.spend()
     client.event_hooks["request"].append(count)
     _hooks[client] = count
+
+
+class ObservationAuth(httpx.Auth):
+    """Forward native per-request authentication and mark its actual followups."""
+    def __init__(self, original: httpx.Auth, budgets: RequestBudgets):
+        self.original, self.budgets = original, budgets
+
+    async def async_auth_flow(self, request: httpx.Request):
+        flow = self.original.async_auth_flow(request)
+        try:
+            try:
+                following = await anext(flow)
+            except StopAsyncIteration:
+                return
+            while True:
+                following.extensions[_EXTENSION] = self.budgets
+                response = yield following
+                try:
+                    following = await flow.asend(response)
+                except StopAsyncIteration:
+                    return
+        finally:
+            await flow.aclose()
+
+
+def observation_auth(client: httpx.AsyncClient):
+    boundary = _boundary.get()
+    if boundary is None or boundary.client is not client:
+        return httpx.USE_CLIENT_DEFAULT
+    return ObservationAuth(client.auth or httpx.Auth(), boundary.budgets)
 
 
 @contextmanager

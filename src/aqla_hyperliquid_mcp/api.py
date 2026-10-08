@@ -89,9 +89,9 @@ class Hyperliquid:
 
     async def info(self, kind: str, **params):
         # Callers use catalog-validated public inputs or fixed internal requests.
-        from aqla_agent.read_budget import observed_request
+        from aqla_agent.read_budget import observation_auth, observed_request
         with observed_request(self.client, "POST", "/info"):
-            response = await self.client.post("/info", json={"type": kind, **params})
+            response = await self.client.post("/info", json={"type": kind, **params}, auth=observation_auth(self.client))
             response.raise_for_status()
             return response.json()
 

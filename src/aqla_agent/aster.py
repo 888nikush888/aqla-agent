@@ -11,7 +11,7 @@ from eth_account.messages import encode_typed_data
 
 from aqla_hyperliquid_mcp.models import AqlaError, Market, digest, now_ms
 
-from .read_budget import observed_request
+from .read_budget import observation_auth, observed_request
 from .venues import VenueAdapter
 
 DOMAIN = {"name": "AsterSignTransaction", "version": "1", "chainId": 1666, "verifyingContract": "0x" + "0" * 40}
@@ -68,6 +68,8 @@ class Aster(VenueAdapter):
 
     async def send(self, request):
         kwargs = {"params": request["params"]} if request["method"] == "GET" else {"content": urlencode(request["params"]), "headers": {"Content-Type": "application/x-www-form-urlencoded"}}
+        if request["method"] == "GET":
+            kwargs["auth"] = observation_auth(self.client)
         response = await self.client.request(request["method"], request["path"], **kwargs)
         if response.status_code >= 500 or response.status_code in (408, 429):
             raise AqlaError("Aster response is uncertain; reconcile before any further send")
@@ -81,7 +83,7 @@ class Aster(VenueAdapter):
             if private:
                 result = await self.send(self.signed("GET", "/fapi/v3/" + path, params or {}))
             else:
-                response = await self.client.get("/fapi/v3/" + path, params=params)
+                response = await self.client.get("/fapi/v3/" + path, params=params, auth=observation_auth(self.client))
                 response.raise_for_status()
                 result = response.json()
         if self.rejected(result):

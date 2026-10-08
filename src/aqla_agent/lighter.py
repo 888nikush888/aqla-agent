@@ -160,10 +160,10 @@ class Lighter(VenueAdapter):
         return token
 
     async def read(self, path, params=None, *, private=False):
-        from .read_budget import observed_request
+        from .read_budget import observation_auth, observed_request
         with observed_request(self.client, "GET", "/api/v1/" + path):
             headers = {"Authorization": self.auth()} if private else {}
-            response = await self.client.get("/api/v1/" + path, params=params, headers=headers)
+            response = await self.client.get("/api/v1/" + path, params=params, headers=headers, auth=observation_auth(self.client))
             response.raise_for_status()
             result = response.json()
         if result.get("code", 200) != 200:
