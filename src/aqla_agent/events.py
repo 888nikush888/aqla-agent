@@ -423,7 +423,8 @@ class HermesExtension:
             return {"action": "block", "message": "Journal delivery is reserved for the native synchronizer"}
         short = tool_name.removeprefix("mcp__aqla__").removeprefix("mcp_aqla_")
         origin = self.active_context
-        if short == "monthly_report" and origin and origin[0] == "operator":
+        claim = self.turn_claim.get()
+        if short == "monthly_report" and origin and origin[0] == "operator" and claim.can_change() and not args.get("diagnostics_only", False):
             # The read tool stays read-only. The native owner-request hook asks the
             # internal publisher for an analysis tab, separately from model tools.
             from .monthly import month_bounds

@@ -59,6 +59,53 @@ def test_tool_claim_comes_from_native_metadata_not_text(extension):
     assert extension.before_tool("mcp__aqla__monthly_report", {"month": "2026-09"}) is None
 
 
+@pytest.mark.parametrize("outcome", ["timeout", "skipped", "cancelled", "undelivered", "delivery_failed"])
+def test_monthly_request_after_unanswered_question_has_no_side_effect(extension, outcome):
+    from aqla_agent.events import EXTENSIONS, record_clarify_outcome
+
+    ext, ctx = extension
+    requests = []
+    ctx.call_mcp = lambda *args: requests.append(args) or {"ok": True, "result": {}}
+    EXTENSIONS.add(ext)
+    try:
+        with ext.claim_scope(("operator", "unanswered-question")):
+            record_clarify_outcome({"outcome": outcome, "answers": {}})
+            assert not ext.turn_claim.get().can_change()
+            assert ext.before_tool("mcp__aqla__monthly_report", {"month": "2026-10"}) is None
+            assert requests == []
+            assert ext.before_tool("mcp__aqla__control", {"action": "pause"})["action"] == "block"
+        with ext.claim_scope(("operator", "fresh-request")):
+            assert ext.before_tool("mcp__aqla__monthly_report", {"month": "2026-10"}) is None
+            assert len(requests) == 1
+            assert requests[0][2]["action"] == "monthly_request"
+    finally:
+        EXTENSIONS.discard(ext)
+
+
+def test_monthly_request_answered_owner_source_and_diagnostics_contract(extension):
+    from aqla_agent.events import EXTENSIONS, record_clarify_outcome
+
+    ext, ctx = extension
+    requests = []
+    ctx.call_mcp = lambda *args: requests.append(args) or {"ok": True, "result": {}}
+    EXTENSIONS.add(ext)
+    try:
+        with ext.claim_scope(("source", "source-only")):
+            assert ext.before_tool("mcp__aqla__monthly_report", {"month": "2026-10"}) is None
+        with ext.claim_scope(("operator", "diagnostic-only")):
+            assert ext.before_tool("mcp__aqla__monthly_report", {"month": "2026-10", "diagnostics_only": True}) is None
+        assert requests == []
+        with ext.claim_scope(("operator", "answered-owner")):
+            record_clarify_outcome({"outcome": "submitted", "answers": {"question": "confirmed"}})
+            assert ext.turn_claim.get().can_change()
+            assert ext.before_tool("mcp__aqla__monthly_report", {"month": "2026-10"}) is None
+        assert len(requests) == 1
+        assert ext.before_tool("mcp__aqla__monthly_report", {"month": "2026-10"}) is None
+        assert len(requests) == 1  # Finalized claim cannot create another request.
+    finally:
+        EXTENSIONS.discard(ext)
+
+
 @pytest.mark.asyncio
 async def test_monthly_sheets_failure_never_acknowledges_publication(extension, monkeypatch):
     from aqla_agent.monthly import next_job
