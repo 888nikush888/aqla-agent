@@ -114,10 +114,10 @@ async def test_unknown_stop_result_retains_old_stop_and_reuses_intent(setup, mon
         if identity==op:
             fake.lost_response=True
         return await original_mutate(identity,action,**kwargs)
-    async def invisible(identity):
+    async def invisible(identity, user=None):
         if identity==exchange.cloid(op) and blocked['value']:
             return {'status':'unknownOid'}
-        return await original_status(identity)
+        return await original_status(identity, user)
     monkeypatch.setattr(exchange,'mutate',lost)
     monkeypatch.setattr(exchange,'order_status',invisible)
     await trading.refresh_trade(trade['trade_id'])
