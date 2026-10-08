@@ -191,24 +191,10 @@ class State:
 
     def reader_snapshot(self, max_context_messages):
         """Fixed read-only projection; no full state/body snapshot leaves the lock."""
-        from aqla_agent.trading import OPEN, UNFINISHED
+        from .projections import reader_overview
 
         with self._thread_lock:
-            data, tracked = self.data, {}
-            active_refs = {ref for trade in data["trades"].values() if trade["status"] in OPEN for ref in trade["plan"]["source_refs"]}
-            for row in data["events"].values():
-                chat = row["source"]["chat_id"]
-                tracked.setdefault(chat, []).append(row["source"]["message_id"])
-            for chat, values in tracked.items():
-                recent = sorted(set(values))[-max_context_messages:]
-                active = [row["source"]["message_id"] for row in data["events"].values()
-                          if row["source"]["chat_id"] == chat and row["source_id"] in active_refs]
-                tracked[chat] = sorted(set([*recent, *active]))
-            return copy.deepcopy({"sources": data["sources"], "cursors": data["cursors"],
-                "context_cutoffs": data.get("context_cutoffs", {}), "context_ids": data.get("context_ids", {}),
-                "source_aliases": data.get("source_aliases", {}), "tracked_ids": tracked,
-                "pending": [row["event_id"] for row in data["events"].values() if row["status"] in UNFINISHED][:50],
-                "notification_pending": len(data["notifications"])})
+            return copy.deepcopy(reader_overview(self.data, max_context_messages))
 
     def acknowledge_journal(self, accepted):
         """The only partial path allowed to release digest-confirmed history rows."""
