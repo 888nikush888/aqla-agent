@@ -1,6 +1,7 @@
 """Evidence-based monthly ROE. Reporting never changes exchange orders or rules."""
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from decimal import Decimal
@@ -23,6 +24,9 @@ BERLIN = ZoneInfo("Europe/Berlin")
 FIRST_MONTH = "2026-10"
 SUM_LABEL = "Summe der Trade-Renditen — keine Kontorendite"
 CLOSED = {"closed", "cancelled", "rejected"}
+MAX_PUBLICATION_ROWS = 10_000
+MAX_NATIVE_MONTHLY_BYTES = 600_000
+MonthlySection = Literal["rows", "open_trades", "undated_closed_trades"]
 MonthlyErrorCode = Literal["temporary", "schema", "budget", "conflict", "integrity"]
 Counter = Annotated[int, Field(strict=True, ge=0)]
 Revision = Annotated[int, Field(strict=True, ge=1)]
@@ -54,7 +58,33 @@ class MonthlySelection(Model):
     report: dict | None = None
     job: MonthlyJobBinding | None = None
     scheduled: bool = False
-    blocked: list[MonthlyJob] = Field(default_factory=list)
+    blocked: list[MonthlyJob] = Field(default_factory=list, max_length=10)
+    paged: bool = False
+    totals: dict[MonthlySection, Counter] = Field(default_factory=dict)
+
+
+class MonthlyPage(Model):
+    status: Literal["page", "blocked"]
+    job: MonthlyJobBinding
+    section: MonthlySection
+    offset: Counter
+    rows: list[dict] = Field(default_factory=list, max_length=100)
+    total: Counter
+    next_offset: Counter | None = None
+    complete: bool = False
+    error_code: MonthlyErrorCode | None = None
+
+
+class MonthlyPayloadError(AqlaError):
+    def __init__(self, code: MonthlyErrorCode):
+        self.code = code
+        super().__init__("Monthly internal payload rejected: " + code)
+
+
+def native_monthly_bytes(payload):
+    """Bound the complete native JSON/text envelope, including escaping and UTF-8."""
+    return max(len(json.dumps({"result": json.dumps(payload, ensure_ascii=ascii_only, indent=2)},
+                             ensure_ascii=False).encode("utf-8")) for ascii_only in (False, True))
 
 
 class MonthlyPublication(Model):
@@ -255,7 +285,7 @@ def next_job(data, clock=None):
         if due_at(candidate) <= clock:
             wanted.add(candidate)
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
-    blocked = []
+    blocked, eligible = [], []
     for candidate in sorted(wanted):
         report = monthly_report(data, candidate)
         scheduled = candidate >= FIRST_MONTH and due_at(candidate) <= clock
@@ -271,13 +301,38 @@ def next_job(data, clock=None):
                 continue
             if job.next_retry_at is not None and clock < job.next_retry_at:
                 continue
-            job.status = "publishing"
-            job.attempt_count += 1
-            job.last_attempt, job.next_retry_at = clock, clock + 60_000
-            data["monthly_jobs"][candidate] = job.model_dump(mode="json")
-            binding = MonthlyJobBinding.model_validate({key: getattr(job, key) for key in MonthlyJobBinding.model_fields})
-            return MonthlySelection(status="ready", report=report, scheduled=scheduled, job=binding, blocked=blocked).model_dump(mode="json")
-    return MonthlySelection(status="idle", blocked=blocked).model_dump(mode="json")
+            # Reject the same bounded publication size before a large native handoff.
+            publication_rows = 19 + len(report["summary"]["net_by_currency"]) + sum(
+                len(report[key]) for key in ("rows", "open_trades", "undated_closed_trades"))
+            if publication_rows > MAX_PUBLICATION_ROWS:
+                job.status, job.last_error, job.next_retry_at = "blocked", "budget", None
+                job.attempt_count += 1
+                job.last_attempt = clock
+                data["monthly_jobs"][candidate] = job.model_dump(mode="json")
+                blocked.append(job)
+                continue
+            eligible.append((job, report, scheduled))
+    for job, report, scheduled in sorted(eligible, key=lambda item: (item[0].last_attempt if item[0].last_attempt is not None else -1, item[0].month)):
+        job.status = "publishing"
+        job.attempt_count += 1
+        job.last_attempt, job.next_retry_at = clock, clock + 60_000
+        data["monthly_jobs"][job.month] = job.model_dump(mode="json")
+        binding = MonthlyJobBinding.model_validate({key: getattr(job, key) for key in MonthlyJobBinding.model_fields})
+        selection = MonthlySelection(status="ready", report=report, scheduled=scheduled, job=binding, blocked=blocked[:10])
+        result = selection.model_dump(mode="json")
+        if native_monthly_bytes(result) > MAX_NATIVE_MONTHLY_BYTES:
+            sections = ("rows", "open_trades", "undated_closed_trades")
+            selection.paged = True
+            selection.totals = {key: len(report[key]) for key in sections}
+            selection.report = {key: value for key, value in report.items() if key not in sections}
+            result = selection.model_dump(mode="json")
+            if native_monthly_bytes(result) > MAX_NATIVE_MONTHLY_BYTES:
+                job.status, job.last_error, job.next_retry_at = "blocked", "budget", None
+                data["monthly_jobs"][job.month] = job.model_dump(mode="json")
+                blocked.append(job)
+                continue
+        return result
+    return MonthlySelection(status="idle", blocked=blocked[:10]).model_dump(mode="json")
 
 
 def request_publication(data, month):
@@ -320,6 +375,34 @@ def fail_publication(data, failure, clock=None):
         job.status, job.next_retry_at = "blocked", None
     data["monthly_jobs"][job.month] = job.model_dump(mode="json")
     return data["monthly_jobs"][job.month]
+
+
+def monthly_page(data, binding, section: MonthlySection, offset=0, limit=100):
+    binding = MonthlyJobBinding.model_validate(binding)
+    _bound_job(data, binding)
+    report = monthly_report(data, binding.month)
+    if section not in ("rows", "open_trades", "undated_closed_trades") or type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+        raise AqlaError("Monthly internal page requires a known section, offset >= 0 and limit between 1 and 100")
+    total = len(report[section])
+    if offset > total:
+        raise AqlaError("Monthly internal page offset exceeds its bound section")
+    rows = []
+    result = MonthlyPage(status="page", job=binding, section=section, offset=offset, total=total)
+    for row in report[section][offset:offset + limit]:
+        result.rows = [*rows, row]
+        consumed = offset + len(result.rows)
+        result.next_offset, result.complete = (consumed if consumed < total else None), consumed == total
+        if native_monthly_bytes(result.model_dump(mode="json")) > MAX_NATIVE_MONTHLY_BYTES:
+            result.rows = rows
+            break
+        rows = result.rows
+    if not rows and offset < total:
+        fail_publication(data, MonthlyFailure(job=binding, error_code="budget"))
+        return MonthlyPage(status="blocked", job=binding, section=section, offset=offset, total=total,
+                           error_code="budget").model_dump(mode="json")
+    consumed = offset + len(rows)
+    result.rows, result.next_offset, result.complete = rows, consumed if consumed < total else None, consumed == total
+    return result.model_dump(mode="json")
 
 
 def acknowledge_publication(data, month, fingerprint, url, revision, clock=None, *, job=None):

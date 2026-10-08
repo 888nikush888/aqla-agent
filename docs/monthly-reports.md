@@ -14,6 +14,55 @@ und Testnet-Journale bleiben erhalten. Nach verifiziertem Schreiben aller Tabell
 entsteht eine dauerhafte Meldung für den nativen Hermes-Telegram-Versand.
 Eine quittierte geplante Meldung wird bei Neustart nicht erneut erzeugt.
 
+Jeder Monatsauftrag speichert seinen Status (`pending`, `publishing`, `retry`,
+`blocked` oder `published`), Versuchszahl, letzten Versuch, nächste Retryzeit und
+ausschließlich eine sichere Fehlerkategorie. Temporäre Ausfälle werden nach
+60, 120, 240 Sekunden bis höchstens einer Stunde erneut versucht. Schema-,
+Budget-, Inhalts- oder Revisionskonflikte bleiben sichtbar blockiert. Der lesende
+Monatsabruf zeigt diese Diagnose in `publication_job`; Fehlerpayloads und Tokens
+werden dafür nicht gespeichert. Andere fällige Monate werden nach dem letzten
+Versuch fair ausgewählt, auch wenn eine Jobantwort verloren ging und ihre
+60-Sekunden-Lease abläuft. Neue Belege oder eine frische authentifizierte
+Betreiberanfrage erlauben eine neue Prüfung. Failure und ACK müssen zu
+Fingerprint, Revision, Requestgeneration und konkretem Versuch passen; verspätete
+Antworten dürfen keinen neueren Auftrag blockieren oder quittieren.
+
+Ein Bericht bleibt auf 10.000 tatsächliche Tabellenzeilen einschließlich Kopf-
+und Abschnittszeilen begrenzt. Schon 10.000 Tradezeilen überschreiten dieses
+Budget; sie erzeugen einen blockierten Auftrag mit Diagnose `budget` und keine
+vollständig veröffentlichte Teilmenge. Die normale Journalübertragung und andere
+Monate laufen weiter.
+
+Große zulässige Berichte werden intern als jobgebundener Kopf mit exakten Counts
+und Seiten der drei Abschnitte übertragen. Jede vollständige native Antwort bleibt
+einschließlich JSON-/Textwrapper und UTF-8-Escaping unter 600.000 Bytes; eine Seite
+enthält höchstens 100 Zeilen. Jede Folge prüft die aktuelle Fingerprint-, Revisions-,
+Request- und Versuchbindung erneut. Die native Erweiterung setzt alle Abschnitte
+mit lückenlosen Offsets zusammen und prüft den vollständigen unveränderten
+Berichtsfingerprint, bevor sie den einen vollständigen Bericht an Sheets gibt.
+Eine einzelne Zeile, die nicht in dieses Antwortbudget passt, blockiert den Job
+sichtbar mit `budget`; es gibt keine leere Fortschrittsschleife oder still
+veröffentlichte Teilberichte.
+
+Das Sheets-Monatsmanifest bindet Revision, Beleg-Fingerprint, tatsächliche
+Inhaltslänge und bestätigten Tabelleninhalt. Ältere Revisionen sowie andere
+Fingerprints bei gleicher Revision werden vor dem Schreiben abgewiesen. Eine
+identische bestätigte Generation wird erst nach Prüfung aller Inhaltszellen
+quittiert und benötigt keine Valueswrites. Unbestätigte gleiche Generationen
+können nach einer verlorenen Antwort repariert werden. Neue und schrumpfende
+Berichte schreiben und prüfen nur die größere alte beziehungsweise neue
+Inhaltslänge; der alte Tail wird gelöscht. Große Rasterkapazität wird nicht als
+Inhaltslänge behandelt. Legacytabs ohne Manifest werden konservativ im gesamten
+vorhandenen Raster bis zum bisherigen Verifikationsbudget geprüft beziehungsweise
+überführt.
+
+Sichtbare Änderungen bestätigter Inhaltszellen oder eine konkurrierende neue
+Generation vor Commit beziehungsweise Readback verhindern eine Erfolgsquittierung.
+Die Veröffentlichung verwendet weiterhin RAW, den Clientlock und die vorhandene
+native Writerstrecke. Sie behauptet keine atomare CAS-Garantie zwischen mehreren
+unabhängigen Googleprozessen. Ein erfolgreicher erster Write oder allein der
+gespeicherte Fingerprint beweist keinen vollständig bestätigten Bericht.
+
 Nur Aqla-Mainnet-Trades mit belegtem vollständigem Abschluss zählen zum Schließmonat.
 Der Bericht enthält das gesamte Ergebnis einschließlich früherer Teil-Exits. Am
 Monatsende offene Trades und Abschlüsse ohne belegbares Schließdatum stehen separat.

@@ -1,8 +1,23 @@
 """Idempotent monthly analysis tabs. RAW data cannot become spreadsheet formulas."""
 from __future__ import annotations
 
-from aqla_agent.monthly import SUM_LABEL, month_bounds, stamp
-from aqla_hyperliquid_mcp.models import AqlaError, digest
+import json
+import re
+from typing import Annotated
+
+from pydantic import Field, model_validator
+
+from aqla_agent.monthly import (
+    MAX_PUBLICATION_ROWS,
+    SUM_LABEL,
+    Fingerprint,
+    MonthlyPublication,
+    MonthlyPublishOutcome,
+    Revision,
+    month_bounds,
+    stamp,
+)
+from aqla_hyperliquid_mcp.models import AqlaError, Model, digest
 
 HEADERS = ["Trade-ID", "Entry (Berlin)", "Schließung (Berlin)", "Quelle", "Quellen-ID", "Markt", "Richtung",
            "Börse", "Netzwerk", "Profil", "Positionswert", "Margin-Hebel", "Anfangsmargin", "Brutto-PnL",
@@ -10,6 +25,96 @@ HEADERS = ["Trade-ID", "Entry (Berlin)", "Schließung (Berlin)", "Quelle", "Quel
 KEYS = ["trade_id", "entry_at", "closed_at", "source_name", "source_id", "symbol", "side", "exchange", "network",
         "profile", "entry_notional", "margin_leverage", "initial_margin", "gross_pnl", "fees", "funding", "net_pnl",
         "currency", "roe_percent", "complete", "issues"]
+MANIFEST_PREFIX = "aqla.monthly."
+
+
+class MonthlyManifest(Model):
+    version: Annotated[int, Field(strict=True, ge=1, le=1)] = 1
+    revision: Revision
+    fingerprint: Fingerprint
+    length: Annotated[int, Field(strict=True, ge=1, le=10_000)]
+    extent: Annotated[int, Field(strict=True, ge=1, le=20_000)]
+    content_digest: Fingerprint
+    confirmed: Annotated[bool, Field(strict=True)]
+
+    @model_validator(mode="after")
+    def valid_extent(self):
+        if self.extent < self.length or self.confirmed and self.extent != self.length:
+            raise ValueError("Invalid monthly content extent")
+        return self
+
+
+class PublicationRejected(AqlaError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__("Monthly publication rejected: " + code)
+
+
+def _manifest(raw, sheet_id):
+    entries = [item for item in raw.get("developerMetadata", []) if item.get("metadataKey") == MANIFEST_PREFIX + str(sheet_id)]
+    if len(entries) > 1:
+        raise PublicationRejected("schema")
+    if not entries:
+        return None, None
+    entry = entries[0]
+    if type(entry.get("metadataId")) is not int or entry.get("location") != {"sheetId": sheet_id}:
+        raise PublicationRejected("schema")
+    try:
+        return MonthlyManifest.model_validate_json(entry["metadataValue"]), entry["metadataId"]
+    except (ValueError, KeyError):
+        raise PublicationRejected("schema") from None
+
+
+def _check_scope(client, raw):
+    scopes = [item["metadataValue"] for item in raw.get("developerMetadata", []) if item.get("metadataKey") == client.scope_key]
+    if client.scope and scopes != [client.scope]:
+        raise PublicationRejected("schema")
+
+
+def _store_manifest(client, sheet_id, manifest, metadata_id):
+    value = json.dumps(manifest.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    if metadata_id is None:
+        operation = {"createDeveloperMetadata": {"developerMetadata": {
+            "metadataKey": MANIFEST_PREFIX + str(sheet_id), "metadataValue": value,
+            "visibility": "DOCUMENT", "location": {"sheetId": sheet_id}}}}
+    else:
+        operation = {"updateDeveloperMetadata": {"dataFilters": [{"developerMetadataLookup": {"metadataId": metadata_id}}],
+                     "developerMetadata": {"metadataValue": value}, "fields": "metadataValue"}}
+    client.request("POST", ":batchUpdate", json={"requests": [operation]})
+
+
+def _read_values(client, title, length):
+    from .client import column
+
+    returned = client.values([f"'{title}'!A1:{column(len(HEADERS))}{length}"])[0]
+    if len(returned) > length or any(len(row) > len(HEADERS) for row in returned):
+        raise PublicationRejected("integrity")
+    return [row + [""] * (len(HEADERS) - len(row)) for row in returned] + [[""] * len(HEADERS) for _ in range(length - len(returned))]
+
+
+def _check_generation(manifest, cells, report):
+    generations = [(manifest.revision, manifest.fingerprint)] if manifest else []
+    revision, fingerprint = cells[2][1], cells[3][1]
+    if revision != "" or fingerprint != "":
+        if isinstance(revision, bool) or not re.fullmatch(r"[1-9]\d*", str(revision)) or not re.fullmatch(r"[0-9a-f]{64}", str(fingerprint)):
+            raise PublicationRejected("schema")
+        generations.append((int(revision), fingerprint))
+    for previous_revision, previous_fingerprint in generations:
+        if previous_revision > report["revision"] or previous_revision == report["revision"] and previous_fingerprint != report["fingerprint"]:
+            raise PublicationRejected("conflict")
+
+
+def _guard(client, title, sheet_id, report, expected_manifest=None):
+    raw = client.request("GET", params={"fields": "sheets.properties,developerMetadata"})
+    _check_scope(client, raw)
+    properties = [item["properties"] for item in raw.get("sheets", []) if item["properties"]["title"] == title]
+    if len(properties) != 1 or properties[0]["sheetId"] != sheet_id:
+        raise PublicationRejected("conflict")
+    manifest, metadata_id = _manifest(raw, sheet_id)
+    _check_generation(manifest, _read_values(client, title, 4), report)
+    if expected_manifest is not None and manifest != expected_manifest:
+        raise PublicationRejected("conflict")
+    return manifest, metadata_id
 
 
 def table_values(report):
@@ -44,23 +149,25 @@ def table_values(report):
     return [row + [""] * (len(HEADERS) - len(row)) for row in rows], header_index
 
 
-def publish(client, report):
+def _publish(client, report):
     month_bounds(report["month"])
     content = {key: value for key, value in report.items() if key not in ("fingerprint", "revision", "url", "published_current_revision")}
-    if digest(content) != report["fingerprint"] or not isinstance(report["revision"], int) or report["revision"] < 1:
-        raise AqlaError("Monthly report content/revision does not match its immutable fingerprint")
+    if digest(content) != report["fingerprint"] or type(report["revision"]) is not int or report["revision"] < 1:
+        raise PublicationRejected("schema")
     if client.prefix != "aqla Mainnet ":
-        raise AqlaError("Mainnet monthly reports require the separate Mainnet Sheets namespace")
+        raise PublicationRejected("schema")
     values, header = table_values(report)
-    if len(values) > 10_000:
-        raise AqlaError("Monthly report exceeds the bounded sheet publication budget")
+    if len(values) > MAX_PUBLICATION_ROWS:
+        raise PublicationRejected("budget")
     title = client.prefix + "Monatsbericht " + report["month"]
     with client.lock:
         client.layout(create=True)  # Enforces the existing account/network scope.
-        raw = client.request("GET", params={"fields": "sheets.properties"})
+        raw = client.request("GET", params={"fields": "sheets.properties,developerMetadata"})
+        _check_scope(client, raw)
         props = [row["properties"] for row in raw["sheets"] if row["properties"]["title"] == title]
         if len(props) > 1:
-            raise AqlaError("Duplicate monthly worksheet title")
+            raise PublicationRejected("schema")
+        created = not props
         if not props:
             used = {row["properties"]["sheetId"] for row in raw["sheets"]}
             sheet_id = int(digest([client.scope, title])[:7], 16)
@@ -72,27 +179,47 @@ def publish(client, report):
         else:
             prop = props[0]
             sheet_id = prop["sheetId"]
-        total_rows = max(prop["gridProperties"]["rowCount"], len(values))
-        if total_rows > 20_000:
-            raise AqlaError("Monthly sheet grid exceeds the bounded verification budget")
-        if total_rows > prop["gridProperties"]["rowCount"]:
+        manifest, metadata_id = _manifest(raw, sheet_id)
+        _check_generation(manifest, _read_values(client, title, 4), report)
+        if manifest and manifest.confirmed:
+            previous = _read_values(client, title, manifest.length)
+            if digest(previous) != manifest.content_digest:
+                raise PublicationRejected("integrity")
+            if manifest.revision == report["revision"]:
+                if manifest.length != len(values) or previous != values:
+                    raise PublicationRejected("integrity")
+                _guard(client, title, sheet_id, report, manifest)
+                if _read_values(client, title, manifest.length) != values:
+                    raise PublicationRejected("integrity")
+                return MonthlyPublication(month=report["month"], fingerprint=report["fingerprint"], revision=report["revision"],
+                    url=f"https://docs.google.com/spreadsheets/d/{client.settings.spreadsheet_id}/edit#gid={sheet_id}")
+        # Without a manifest, the old writer could have used every grid row.
+        extent = max(len(values), manifest.extent if manifest else 0 if created else prop["gridProperties"]["rowCount"])
+        if extent > 20_000:
+            raise PublicationRejected("budget")
+        if extent > prop["gridProperties"]["rowCount"]:
             client.request("POST", ":batchUpdate", json={"requests": [{"updateSheetProperties": {
-                "properties": {"sheetId": sheet_id, "gridProperties": {"rowCount": total_rows}}, "fields": "gridProperties.rowCount"}}]})
+                "properties": {"sheetId": sheet_id, "gridProperties": {"rowCount": extent}}, "fields": "gridProperties.rowCount"}}]})
         # Blank the old tail in the same bounded writes; a shrinking revision leaves no stale rows.
-        padded = values + [[""] * len(HEADERS) for _ in range(total_rows - len(values))]
+        padded = values + [[""] * len(HEADERS) for _ in range(extent - len(values))]
+        legacy_confirmed = manifest is None and not created and _read_values(client, title, extent) == padded
+        if manifest is not None:
+            _guard(client, title, sheet_id, report, manifest)
+        pending = MonthlyManifest(revision=report["revision"], fingerprint=report["fingerprint"], length=len(values),
+                                  extent=extent, content_digest=digest(values), confirmed=False)
+        _store_manifest(client, sheet_id, pending, metadata_id)
+        _, metadata_id = _guard(client, title, sheet_id, report, pending)
         from .client import column
         last = column(len(HEADERS))
-        for offset in range(0, total_rows, 100):
-            chunk = padded[offset:offset + 100]
-            client.request("POST", "/values:batchUpdate", json={"valueInputOption": "RAW", "data": [{
-                "range": f"'{title}'!A{offset + 1}:{last}{offset + len(chunk)}", "values": chunk}]})
+        if not legacy_confirmed:
+            for offset in range(0, extent, 100):
+                chunk = padded[offset:offset + 100]
+                client.request("POST", "/values:batchUpdate", json={"valueInputOption": "RAW", "data": [{
+                    "range": f"'{title}'!A{offset + 1}:{last}{offset + len(chunk)}", "values": chunk}]})
         # Verify every written cell, not merely a returned digest or a successful first chunk.
-        checked = client.request("GET", "/values:batchGet", params={"ranges": [f"'{title}'!A1:{last}{total_rows}"]})
-        returned = checked["valueRanges"][0].get("values", [])
-        normalized = [(row + [""] * len(HEADERS))[:len(HEADERS)] for row in returned]
-        normalized += [[""] * len(HEADERS) for _ in range(total_rows - len(normalized))]
-        if normalized != padded:
-            raise AqlaError("Monthly Sheets publication is not completely confirmed; no notification yet")
+        _guard(client, title, sheet_id, report, pending)
+        if _read_values(client, title, extent) != padded:
+            raise PublicationRejected("integrity")
         client.request("POST", ":batchUpdate", json={"requests": [
             {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": header, "endRowIndex": header + 1},
                             "cell": {"userEnteredFormat": {"textFormat": {"bold": True}, "backgroundColor": {"red": .85, "green": .93, "blue": .98}}}, "fields": "userEnteredFormat"}},
@@ -102,5 +229,25 @@ def publish(client, report):
                                            "properties": {"pixelSize": 440}, "fields": "pixelSize"}},
             {"repeatCell": {"range": {"sheetId": sheet_id}, "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP"}}, "fields": "userEnteredFormat.wrapStrategy"}}
         ]})
-        return {"month": report["month"], "fingerprint": report["fingerprint"], "revision": report["revision"],
-                "url": f"https://docs.google.com/spreadsheets/d/{client.settings.spreadsheet_id}/edit#gid={sheet_id}"}
+        _guard(client, title, sheet_id, report, pending)
+        confirmed = pending.model_copy(update={"confirmed": True, "extent": len(values)})
+        _store_manifest(client, sheet_id, confirmed, metadata_id)
+        _guard(client, title, sheet_id, report, confirmed)
+        if _read_values(client, title, extent) != padded:
+            raise PublicationRejected("integrity")
+        return MonthlyPublication(month=report["month"], fingerprint=report["fingerprint"], revision=report["revision"],
+            url=f"https://docs.google.com/spreadsheets/d/{client.settings.spreadsheet_id}/edit#gid={sheet_id}")
+
+
+def publish(client, report):
+    """Return only typed outcomes and safe error codes to the native worker."""
+    try:
+        return MonthlyPublishOutcome(status="published", publication=_publish(client, report)).model_dump(mode="json")
+    except PublicationRejected as error:
+        return MonthlyPublishOutcome(status="blocked", error_code=error.code).model_dump(mode="json")
+    except AqlaError as error:
+        if str(error).startswith(("This Google spreadsheet", "Google Sheets journal", "Monat als")):
+            return MonthlyPublishOutcome(status="blocked", error_code="schema").model_dump(mode="json")
+        return MonthlyPublishOutcome(status="retry", error_code="temporary").model_dump(mode="json")
+    except (ValueError, TypeError, KeyError, IndexError):
+        return MonthlyPublishOutcome(status="blocked", error_code="schema").model_dump(mode="json")

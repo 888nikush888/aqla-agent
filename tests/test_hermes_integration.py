@@ -138,6 +138,70 @@ async def test_monthly_worker_persists_safe_failure_and_continues_later_month(ex
         await close_server(server)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corrupt", [None, "offset", "duplicate", "skip"])
+async def test_monthly_worker_requires_complete_bound_pages_before_publish(extension, monkeypatch, corrupt):
+    from test_monthly import data, trade
+
+    from aqla_agent import monthly
+
+    ext, _ = extension
+    ext.settings.google_sheets.spreadsheet_id = "ci" + "0" * 25
+    ext.settings.google_sheets.credentials_file = "ci-only.secret"
+    ext.settings.google_sheets.enabled = True
+    clock = monthly.due_at("2026-10")
+    monkeypatch.setattr(monthly, "now_ms", lambda: clock)
+    monkeypatch.setattr("aqla_agent.events.time.monotonic", lambda: 30.0)
+    opened = trade("open-at-month-end", close="2026-11-02T12:00:00+01:00")
+    undated = trade("undated-close")
+    undated.pop("closed_at")
+    undated["fill_events"].pop(list(undated["fill_events"])[-1])
+    snapshot = data(*(trade(f"worker-{index:04d}") for index in range(1100)), opened, undated)
+    published, page_calls = [], []
+
+    async def call(selected, tool, args):
+        if selected == "sheets":
+            report = args["report"]
+            published.append(report)
+            assert report == monthly.monthly_report(snapshot, "2026-10")
+            return {"status": "published", "publication": {"month": report["month"], "fingerprint": report["fingerprint"],
+                "revision": report["revision"], "url": "confirmed"}}
+        action = args["action"]
+        if action == "monthly_job":
+            pending = monthly.next_job(snapshot, clock)
+            assert pending["paged"] is True
+            return pending
+        if action == "monthly_page":
+            page_calls.append((args["section"], args["offset"]))
+            page = monthly.monthly_page(snapshot, args["job"], args["section"], args["offset"], args["limit"])
+            if corrupt == "offset":
+                page["offset"] += 1
+            elif corrupt == "duplicate":
+                page["rows"][1] = page["rows"][0]
+            elif corrupt == "skip":
+                page["rows"] = page["rows"][1:]
+            return page
+        if action == "monthly_failure":
+            return monthly.fail_publication(snapshot, args["failure"], clock)
+        assert action == "monthly_ack"
+        publication = args["publication"]
+        return monthly.acknowledge_publication(snapshot, args["month"], publication["fingerprint"], publication["url"],
+                                             publication["revision"], clock, job=args["job"])
+
+    ext.mcp_call = call
+    await ext.sync_monthly()
+    if corrupt:
+        assert published == [] and snapshot["monthly_jobs"]["2026-10"]["status"] == "blocked"
+        assert snapshot["monthly_jobs"]["2026-10"]["last_error"] == "integrity"
+        assert not snapshot["notifications"]
+    else:
+        assert len(published) == 1
+        assert page_calls == [("rows", offset) for offset in range(0, 1100, 100)] + [("open_trades", 0), ("undated_closed_trades", 0)]
+        assert len(published[0]["rows"]) == 1100 and len(published[0]["open_trades"]) == len(published[0]["undated_closed_trades"]) == 1
+        assert snapshot["monthly_jobs"]["2026-10"]["status"] == "published"
+        assert list(snapshot["notifications"]) == ["monthly:2026-10"]
+
+
 def test_only_actual_owner_monthly_requests_trigger_internal_publication(extension):
     ext, ctx = extension
     calls = []

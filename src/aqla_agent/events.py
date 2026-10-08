@@ -178,7 +178,9 @@ class HermesExtension:
             await asyncio.sleep(3)
 
     async def sync_monthly(self):
-        from .monthly import MonthlyPublishOutcome, MonthlySelection
+        from aqla_hyperliquid_mcp.models import digest
+
+        from .monthly import MonthlyPage, MonthlyPayloadError, MonthlyPublishOutcome, MonthlySelection
 
         if not self.settings.google_sheets.enabled or self.last_monthly_sync and time.monotonic() - self.last_monthly_sync < 60:
             return
@@ -192,7 +194,37 @@ class HermesExtension:
                 return
             if pending.job is None or pending.report is None:
                 raise AqlaError("Monthly publication selection is incomplete")
-            published = MonthlyPublishOutcome.model_validate(await self.mcp_call("sheets", "publish_monthly_internal", {"token": self.authority.key.decode(), "report": pending.report}))
+            report = dict(pending.report)
+            if pending.paged:
+                sections = {"rows", "open_trades", "undated_closed_trades"}
+                if set(pending.totals) != sections or sections.intersection(report):
+                    raise MonthlyPayloadError("schema")
+                for section in ("rows", "open_trades", "undated_closed_trades"):
+                    total, offset, collected = pending.totals[section], 0, []
+                    while offset < total:
+                        page = MonthlyPage.model_validate(await self.mcp_call(self.server, "integration", {
+                            "action": "monthly_page", "token": self.authority.key.decode(), "job": pending.job.model_dump(mode="json"),
+                            "section": section, "offset": offset, "limit": 100}))
+                        if page.job != pending.job or page.section != section or page.offset != offset or page.total != total:
+                            raise MonthlyPayloadError("integrity")
+                        if page.status == "blocked":
+                            if page.error_code != "budget" or page.rows or page.next_offset is not None or page.complete:
+                                raise MonthlyPayloadError("schema")
+                            return
+                        consumed = offset + len(page.rows)
+                        if (not page.rows or consumed > total or page.next_offset != (consumed if consumed < total else None)
+                                or page.complete != (consumed == total) or page.error_code is not None):
+                            raise MonthlyPayloadError("integrity")
+                        collected.extend(page.rows)
+                        offset = consumed
+                    if len({row.get("trade_id") for row in collected}) != total:
+                        raise MonthlyPayloadError("integrity")
+                    report[section] = collected
+            content = {key: value for key, value in report.items() if key not in ("fingerprint", "revision", "url", "published_current_revision")}
+            if (digest(content) != pending.job.fingerprint or report.get("fingerprint") != pending.job.fingerprint
+                    or report.get("revision") != pending.job.revision or report.get("month") != pending.job.month):
+                raise MonthlyPayloadError("integrity")
+            published = MonthlyPublishOutcome.model_validate(await self.mcp_call("sheets", "publish_monthly_internal", {"token": self.authority.key.decode(), "report": report}))
             if published.status != "published":
                 await self.mcp_call(self.server, "integration", {"action": "monthly_failure", "token": self.authority.key.decode(),
                                     "failure": {"job": pending.job.model_dump(mode="json"), "error_code": published.error_code}})
@@ -205,7 +237,7 @@ class HermesExtension:
             if pending is not None and pending.job is not None:
                 try:
                     await self.mcp_call(self.server, "integration", {"action": "monthly_failure", "token": self.authority.key.decode(),
-                                        "failure": {"job": pending.job.model_dump(mode="json"), "error_code": "temporary"}})
+                                        "failure": {"job": pending.job.model_dump(mode="json"), "error_code": error.code if isinstance(error, MonthlyPayloadError) else "temporary"}})
                 except Exception as failure_error:
                     LOG.warning("aqla monthly failure persistence unavailable (%s)", type(failure_error).__name__)
 

@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Annotated, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from aqla_agent.messages import telegram_view
-from aqla_agent.monthly import MonthlyFailure, MonthlyJobBinding, MonthlyPublication
+from aqla_agent.monthly import MonthlyFailure, MonthlyJobBinding, MonthlyPublication, MonthlySection
 from aqla_agent.pipelines import (
     AccountLimits,
     Pipeline,
@@ -145,13 +146,17 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     @server.tool(annotations=read)
     async def monthly_report(month: str, offset: int = 0, limit: int = 100) -> dict:
         """Read Aqla Mainnet trades closed in YYYY-MM, fees/funding, initial-margin ROE and completeness. No exchange writes."""
+        from aqla_agent.monthly import MonthlyJob
         from aqla_agent.monthly import monthly_report as calculate
         if isinstance(offset, bool) or isinstance(limit, bool) or offset < 0 or not 1 <= limit <= 500:
             raise AqlaError("Monthly page requires offset >= 0 and limit between 1 and 500")
-        report = calculate(state.snapshot(), month)
+        snapshot = state.snapshot()
+        report = calculate(snapshot, month)
+        stored_job = snapshot.get("monthly_jobs", {}).get(month)
+        diagnostic = MonthlyJob.model_validate(stored_job).model_dump(mode="json") if stored_job else None
         totals = {key: len(report[key]) for key in ("rows", "open_trades", "undated_closed_trades")}
         return {**report, **{key: report[key][offset:offset + limit] for key in totals},
-                "page": {"offset": offset, "limit": limit, "totals": totals}}
+                "page": {"offset": offset, "limit": limit, "totals": totals}, "publication_job": diagnostic}
 
     @server.tool(annotations=read)
     async def trade_diagnostics(trade_id: str | None = None, symbol: str | None = None) -> dict:
@@ -342,12 +347,14 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.update(apply)
 
     @server.tool(annotations=write)
-    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack", "monthly_job", "monthly_ack", "monthly_request", "monthly_failure"], token: str, source: SourceEvent | None = None,
+    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack", "monthly_job", "monthly_ack", "monthly_request", "monthly_failure", "monthly_page"], token: str, source: SourceEvent | None = None,
                           aliases: dict[str, str] | None = None, cutoffs: dict[str, int] | None = None,
                           context_ids: dict[str, list[int]] | None = None,
                           accepted: dict[str, str] | None = None, month: str | None = None,
                           publication: MonthlyPublication | None = None, job: MonthlyJobBinding | None = None,
-                          failure: MonthlyFailure | None = None) -> dict:
+                          failure: MonthlyFailure | None = None, section: MonthlySection | None = None,
+                          offset: Annotated[int, Field(strict=True, ge=0)] = 0,
+                          limit: Annotated[int, Field(strict=True, ge=1, le=100)] = 100) -> dict:
         """Internal native-plugin access, filtered out of agent tools; token never enters model context."""
         if authority is None:
             raise AqlaError("Integration key is not configured")
@@ -360,6 +367,11 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             if failure is None:
                 raise AqlaError("A bound monthly publication failure is required")
             return state.update(lambda data: fail_publication(data, failure))
+        if action == "monthly_page":
+            from aqla_agent.monthly import monthly_page
+            if job is None or section is None:
+                raise AqlaError("Monthly internal page requires its selected job and section")
+            return state.update(lambda data: monthly_page(data, job, section, offset, limit))
         if action == "monthly_request":
             from datetime import datetime
 

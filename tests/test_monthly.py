@@ -25,6 +25,7 @@ from aqla_agent.monthly import (
 from aqla_agent.reporting import Reporting
 from aqla_hyperliquid_mcp.models import AqlaError, GoogleSheetsSettings, Market, digest
 from aqla_sheets_mcp.client import SheetsClient
+from aqla_sheets_mcp.monthly import table_values
 
 
 def millis(text):
@@ -217,6 +218,35 @@ def test_failed_old_month_does_not_starve_later_month():
     assert blocked["next_retry_at"] is None
 
 
+def test_lost_monthly_selection_reply_expired_lease_is_fair_to_later_month():
+    snapshot, clock = data(), due_at("2026-11")
+    lost = next_job(snapshot, clock)
+    assert lost["report"]["month"] == "2026-10"
+    later = next_job(snapshot, clock + 60_000)
+    assert later["report"]["month"] == "2026-11"
+    assert next_job(snapshot, clock + 120_000)["report"]["month"] == "2026-10"
+
+
+@pytest.mark.asyncio
+async def test_monthly_public_read_exposes_safe_blocked_job_diagnosis(setup, monkeypatch):
+    from aqla_hyperliquid_mcp.server import close_server, create_server
+
+    settings, state, fake, exchange, _ = setup
+    monkeypatch.setattr(jobs, "now_ms", lambda: due_at("2026-10"))
+    state.update(lambda snapshot: fail_selected_month(snapshot, due_at("2026-10"), "budget"))
+    server = create_server(settings, state=state, exchange=exchange)
+    try:
+        before = state.snapshot()
+        result = json.loads((await server.call_tool("monthly_report", {"month": "2026-10"})).content[0].text)
+        diagnostic = result["publication_job"]
+        assert diagnostic["status"] == "blocked" and diagnostic["last_error"] == "budget"
+        assert diagnostic["attempt_count"] == 1 and diagnostic["next_retry_at"] is None
+        assert set(diagnostic) == set(jobs.MonthlyJob.model_fields)
+        assert state.snapshot() == before and not fake.actions
+    finally:
+        await close_server(server)
+
+
 def test_monthly_retry_state_survives_restart(setup, monkeypatch):
     from aqla_hyperliquid_mcp.state import State
 
@@ -277,10 +307,316 @@ def test_monthly_retry_keeps_scheduled_notice_unique():
     assert not snapshot["notifications"]
 
 
+def test_oversized_month_is_blocked_before_native_handoff_and_later_month_runs():
+    snapshot = data(*(trade(f"bounded-{index:05d}") for index in range(10_000)))
+    expected_trades = copy.deepcopy(snapshot["trades"])
+    selected = next_job(snapshot, due_at("2026-11"))
+    assert selected["report"]["month"] == "2026-11"
+    blocked = snapshot["monthly_jobs"]["2026-10"]
+    assert blocked["status"] == "blocked" and blocked["last_error"] == "budget"
+    assert selected["blocked"][0]["month"] == "2026-10"
+    assert "report" not in blocked
+    assert snapshot["trades"] == expected_trades
+
+
+def test_large_monthly_selection_and_pages_reconstruct_complete_fingerprint():
+    snapshot = data(*(trade(f"paged-{index:05d}") for index in range(1100)))
+    clock = due_at("2026-10")
+    expected = monthly_report(snapshot, "2026-10")
+    selected = next_job(snapshot, clock)
+    assert selected["paged"] is True
+    assert jobs.native_monthly_bytes(selected) <= 600_000
+    reconstructed = dict(selected["report"])
+    for section, total in selected["totals"].items():
+        offset, rows = 0, []
+        while offset < total:
+            page = jobs.monthly_page(snapshot, selected["job"], section, offset, 100)
+            assert page["status"] == "page" and page["job"] == selected["job"]
+            assert page["offset"] == offset and page["total"] == total
+            assert jobs.native_monthly_bytes(page) <= 600_000
+            rows.extend(page["rows"])
+            offset += len(page["rows"])
+            assert page["next_offset"] == (offset if offset < total else None)
+        reconstructed[section] = rows
+    assert reconstructed == expected
+    assert [row["trade_id"] for row in reconstructed["rows"]] == [f"paged-{index:05d}" for index in range(1100)]
+
+
+@pytest.mark.parametrize("change", ["fingerprint", "request", "attempt"])
+def test_monthly_pages_reject_stale_financial_request_and_attempt_bindings(change):
+    snapshot, clock = data(trade()), due_at("2026-10")
+    selected = next_job(snapshot, clock)
+    if change == "fingerprint":
+        snapshot["source_names"]["-1001"] = "Changed after selection"
+    elif change == "request":
+        jobs.request_publication(snapshot, "2026-10")
+    else:
+        next_job(snapshot, clock + 60_000)
+    with pytest.raises(AqlaError, match="stale monthly job"):
+        jobs.monthly_page(snapshot, selected["job"], "rows")
+
+
+def test_monthly_single_row_above_native_page_budget_blocks_without_progress_loop():
+    snapshot, clock = data(trade()), due_at("2026-10")
+    snapshot["source_names"]["-1001"] = "😀" * 100_000
+    selected = next_job(snapshot, clock)
+    assert selected["paged"] is True
+    page = jobs.monthly_page(snapshot, selected["job"], "rows")
+    assert page["status"] == "blocked" and page["error_code"] == "budget"
+    assert page["rows"] == [] and page["next_offset"] is None and not page["complete"]
+    assert snapshot["monthly_jobs"]["2026-10"]["status"] == "blocked"
+    assert snapshot["monthly_jobs"]["2026-10"]["last_error"] == "budget"
+
+
+class MonthlyGoogle(Google):
+    """Extend the real range fake with native developer-metadata updates."""
+    def request(self, method, url, **kwargs):
+        response = super().request(method, url, **kwargs)
+        if method == "POST" and url.endswith(":batchUpdate") and not url.endswith("/values:batchUpdate"):
+            for item in self.metadata:
+                if "metadataId" not in item:
+                    item["metadataId"] = max((entry.get("metadataId", 0) for entry in self.metadata), default=0) + 1
+            for operation in kwargs["json"]["requests"]:
+                if "updateDeveloperMetadata" in operation:
+                    update = operation["updateDeveloperMetadata"]
+                    identity = update["dataFilters"][0]["developerMetadataLookup"]["metadataId"]
+                    item = next(item for item in self.metadata if item["metadataId"] == identity)
+                    item.update(update["developerMetadata"])
+        return response
+
+
 def sheet_client():
     settings = GoogleSheetsSettings(enabled=True, spreadsheet_id="ci-monthly-" + "0" * 25, tab_namespace="mainnet", credentials_file="ci-only.secret")
-    google = Google()
+    google = MonthlyGoogle()
     return google, SheetsClient(settings, session=google, scope="mainnet:ci-account")
+
+
+def report_at(snapshot, revision):
+    return {**monthly_report(snapshot, "2026-10"), "revision": revision}
+
+
+def values_writes(google):
+    return [kwargs["json"] for method, url, kwargs in google.calls if method == "POST" and url.endswith("/values:batchUpdate")]
+
+
+def written_rows(google):
+    return sum(len(update["values"]) for call in values_writes(google) for update in call["data"])
+
+
+def test_monthly_older_revision_cannot_overwrite_newer():
+    google, client = sheet_client()
+    snapshot = data(trade())
+    first = report_at(snapshot, 1)
+    assert client.publish_monthly(first)["status"] == "published"
+    snapshot["source_names"]["-1001"] = "Newer source label"
+    newer = report_at(snapshot, 2)
+    assert client.publish_monthly(newer)["status"] == "published"
+    expected = copy.deepcopy(google.tables["aqla Mainnet Monatsbericht 2026-10"])
+    google.calls.clear()
+    rejected = client.publish_monthly(first)
+    assert rejected.get("status") == "blocked" and rejected["error_code"] == "conflict"
+    assert google.tables["aqla Mainnet Monatsbericht 2026-10"] == expected
+    assert values_writes(google) == []
+
+
+def test_monthly_same_revision_conflict_is_rejected():
+    google, client = sheet_client()
+    snapshot = data(trade())
+    assert client.publish_monthly(report_at(snapshot, 1))["status"] == "published"
+    snapshot["source_names"]["-1001"] = "Conflicting source label"
+    google.calls.clear()
+    rejected = client.publish_monthly(report_at(snapshot, 1))
+    assert rejected.get("status") == "blocked" and rejected["error_code"] == "conflict"
+    assert values_writes(google) == []
+
+
+def test_identical_monthly_revision_has_no_values_writes():
+    google, client = sheet_client()
+    report = report_at(data(trade()), 1)
+    assert client.publish_monthly(report)["status"] == "published"
+    google.calls.clear()
+    assert client.publish_monthly(report)["status"] == "published"
+    assert values_writes(google) == [] and written_rows(google) == 0
+    expected, _ = table_values(report)
+    readback = [query for method, url, kwargs in google.calls if method == "GET" and url.endswith("/values:batchGet")
+                for query in kwargs["params"]["ranges"] if "Monatsbericht" in query]
+    assert any(Google.coordinates(query)[2:] == (1, 21, len(expected)) for query in readback)
+
+
+def test_partial_monthly_write_retries_same_generation():
+    google, client = sheet_client()
+    report = report_at(data(*(trade(f"trade-{index:03d}") for index in range(150))), 1)
+    google.lose_reply = True
+    try:
+        first = client.publish_monthly(report)
+    except AqlaError:
+        first = {"status": "retry"}
+    assert first["status"] == "retry"
+    google.calls.clear()
+    outcome = client.publish_monthly(report)
+    assert outcome.get("status") == "published"
+    expected, _ = table_values(report)
+    assert google.tables["aqla Mainnet Monatsbericht 2026-10"][:len(expected)] == expected
+    assert written_rows(google) <= len(expected)
+
+
+def test_monthly_shrink_clears_old_content_tail():
+    google, client = sheet_client()
+    old = report_at(data(*(trade(f"old-{index}") for index in range(15))), 1)
+    assert client.publish_monthly(old)["status"] == "published"
+    old_values, _ = table_values(old)
+    shrunk = report_at(data(), 2)
+    new_values, _ = table_values(shrunk)
+    google.calls.clear()
+    assert client.publish_monthly(shrunk)["status"] == "published"
+    actual = google.tables["aqla Mainnet Monatsbericht 2026-10"]
+    assert actual[:len(new_values)] == new_values
+    assert all(not any(row) for row in actual[len(new_values):len(old_values)])
+    assert written_rows(google) == len(old_values)
+    assert len(values_writes(google)) == 1
+
+
+def test_monthly_external_cell_edit_is_not_acknowledged():
+    google, client = sheet_client()
+    report = report_at(data(trade()), 1)
+    assert client.publish_monthly(report)["status"] == "published"
+    _, header = table_values(report)
+    google.tables["aqla Mainnet Monatsbericht 2026-10"][header + 1][0] = "external-cell-edit"
+    google.calls.clear()
+    outcome = client.publish_monthly(report)
+    assert outcome.get("status") == "blocked" and outcome["error_code"] == "integrity"
+    assert values_writes(google) == []
+
+
+@pytest.mark.parametrize("fault", ["pending_reply", "commit_reply", "commit_read"])
+def test_monthly_manifest_fault_retry_confirms_only_complete_generation(monkeypatch, fault):
+    google, client = sheet_client()
+    report = report_at(data(trade()), 1)
+    original, failed, committed = google.request, False, False
+
+    def faulty_request(method, url, **kwargs):
+        nonlocal failed, committed
+        result = original(method, url, **kwargs)
+        operations = kwargs.get("json", {}).get("requests", [])
+        for operation in operations:
+            metadata = operation.get("createDeveloperMetadata", operation.get("updateDeveloperMetadata", {})).get("developerMetadata", {})
+            value = metadata.get("metadataValue", "")
+            if '"confirmed":' not in value:
+                continue
+            confirmed = json.loads(value)["confirmed"]
+            committed |= confirmed
+            if not failed and (fault == "pending_reply" and not confirmed or fault == "commit_reply" and confirmed):
+                failed = True
+                raise OSError("Monthly metadata reply lost")
+        if not failed and fault == "commit_read" and committed and method == "GET" and "developerMetadata" in kwargs.get("params", {}).get("fields", ""):
+            failed = True
+            raise OSError("Monthly confirmation read failed")
+        return result
+
+    monkeypatch.setattr(google, "request", faulty_request)
+    first = client.publish_monthly(report)
+    assert failed and first == {"status": "retry", "publication": None, "error_code": "temporary"}
+    google.calls.clear()
+    second = client.publish_monthly(report)
+    assert second["status"] == "published"
+    if fault.startswith("commit"):
+        assert values_writes(google) == []
+    assert google.tables["aqla Mainnet Monatsbericht 2026-10"] == table_values(report)[0]
+
+
+@pytest.mark.parametrize("when", ["before_write", "readback", "commit", "after_commit"])
+def test_monthly_visible_competing_generation_prevents_success(monkeypatch, when):
+    google, client = sheet_client()
+    snapshot = data(trade())
+    assert client.publish_monthly(report_at(snapshot, 1))["status"] == "published"
+    snapshot["source_names"]["-1001"] = "Second generation"
+    second = report_at(snapshot, 2)
+    snapshot["source_names"]["-1001"] = "Competing third generation"
+    third = report_at(snapshot, 3)
+    competing_values, _ = table_values(third)
+    title = "aqla Mainnet Monatsbericht 2026-10"
+    original, changed, metadata_reads, wrote = google.request, False, 0, False
+
+    def advance():
+        nonlocal changed
+        changed = True
+        google.tables[title] = copy.deepcopy(competing_values)
+        entry = next(item for item in google.metadata if item["metadataKey"].startswith("aqla.monthly."))
+        entry["metadataValue"] = json.dumps({"version": 1, "revision": 3, "fingerprint": third["fingerprint"],
+            "length": len(competing_values), "extent": len(competing_values), "content_digest": digest(competing_values), "confirmed": True})
+
+    def competing_request(method, url, **kwargs):
+        nonlocal metadata_reads, wrote
+        metadata_read = method == "GET" and "developerMetadata" in kwargs.get("params", {}).get("fields", "")
+        if metadata_read:
+            metadata_reads += 1
+        committing = any('"confirmed":true' in operation.get("updateDeveloperMetadata", {}).get("developerMetadata", {}).get("metadataValue", "")
+                         for operation in kwargs.get("json", {}).get("requests", []))
+        if not changed and (when == "before_write" and metadata_reads == 3 and metadata_read
+                            or when == "readback" and wrote and metadata_read or when == "commit" and committing):
+            advance()
+        result = original(method, url, **kwargs)
+        wrote |= method == "POST" and url.endswith("/values:batchUpdate")
+        if not changed and when == "after_commit" and committing:
+            advance()
+        return result
+
+    monkeypatch.setattr(google, "request", competing_request)
+    google.calls.clear()
+    outcome = client.publish_monthly(second)
+    assert changed and outcome == {"status": "blocked", "publication": None, "error_code": "conflict"}
+    assert google.tables[title] == competing_values
+    if when == "before_write":
+        assert values_writes(google) == []
+
+
+def test_monthly_readback_fault_does_not_confirm_partial_values(monkeypatch):
+    google, client = sheet_client()
+    report = report_at(data(trade()), 1)
+    original, corrupted, wrote = google.request, False, False
+
+    def bad_readback(method, url, **kwargs):
+        nonlocal corrupted, wrote
+        result = original(method, url, **kwargs)
+        wrote |= method == "POST" and url.endswith("/values:batchUpdate")
+        if wrote and not corrupted and method == "GET" and url.endswith("/values:batchGet"):
+            query = kwargs["params"]["ranges"][0]
+            if "Monatsbericht" in query and Google.coordinates(query)[4] > 4:
+                corrupted = True
+                result.json()["valueRanges"][0]["values"][4][1] = "faulty-readback"
+        return result
+
+    monkeypatch.setattr(google, "request", bad_readback)
+    assert client.publish_monthly(report) == {"status": "blocked", "publication": None, "error_code": "integrity"}
+    entry = next(item for item in google.metadata if item["metadataKey"].startswith("aqla.monthly."))
+    assert json.loads(entry["metadataValue"])["confirmed"] is False
+    assert client.publish_monthly(report)["status"] == "published"
+
+
+def test_monthly_legacy_without_manifest_verifies_entire_grid_before_adoption():
+    google, client = sheet_client()
+    report = report_at(data(trade()), 1)
+    assert client.publish_monthly(report)["status"] == "published"
+    google.metadata[:] = [item for item in google.metadata if not item["metadataKey"].startswith("aqla.monthly.")]
+    google.calls.clear()
+    assert client.publish_monthly(report)["status"] == "published"
+    assert values_writes(google) == []
+    queries = [query for method, url, kwargs in google.calls if method == "GET" and url.endswith("/values:batchGet")
+               for query in kwargs["params"]["ranges"] if "Monatsbericht" in query]
+    assert any(Google.coordinates(query)[4] == 1000 for query in queries)
+    entry = next(item for item in google.metadata if item["metadataKey"].startswith("aqla.monthly."))
+    manifest = json.loads(entry["metadataValue"])
+    assert manifest["confirmed"] is True and manifest["length"] == len(table_values(report)[0])
+
+
+def test_monthly_publication_budget_is_permanent_and_creates_no_partial_sheet():
+    google, client = sheet_client()
+    report = report_at(data(trade()), 1)
+    report["rows"] *= 10_000
+    content = {key: value for key, value in report.items() if key not in ("fingerprint", "revision", "url", "published_current_revision")}
+    report["fingerprint"] = digest(content)
+    assert client.publish_monthly(report) == {"status": "blocked", "publication": None, "error_code": "budget"}
+    assert google.calls == [] and google.tables == {}
 
 
 def test_sheet_publication_lose_reply_restart_shrink_and_raw_names():
@@ -289,17 +625,19 @@ def test_sheet_publication_lose_reply_restart_shrink_and_raw_names():
     snapshot["source_names"]["-1001"] = '=IMPORTXML("untrusted")'
     report = monthly_report(snapshot, "2026-10")
     google.lose_reply = True
-    with pytest.raises(AqlaError):
-        client.publish_monthly(report)
-    published = client.publish_monthly(report)
+    assert client.publish_monthly(report)["status"] == "retry"
+    outcome = client.publish_monthly(report)
+    assert outcome["status"] == "published"
+    published = outcome["publication"]
     title = "aqla Mainnet Monatsbericht 2026-10"
     assert sum(name == title for name in google.tables) == 1
     assert published["url"].endswith("#gid=" + str(google.properties[title]["sheetId"]))
     assert any('=IMPORTXML("untrusted")' in row for row in google.tables[title])
     assert all(call[2]["json"]["valueInputOption"] == "RAW" for call in google.calls if call[1].endswith("/values:batchUpdate"))
+    acknowledge_publication(snapshot, "2026-10", report["fingerprint"], published["url"], report["revision"])
     snapshot["trades"] = {}
     report = monthly_report(snapshot, "2026-10")
-    client.publish_monthly(report)
+    assert client.publish_monthly(report)["status"] == "published"
     assert not any("trade" in row for row in google.tables[title])
 
 
@@ -308,12 +646,10 @@ def test_sheet_confirm_all_values_scope_and_fingerprint():
     report = monthly_report(data(), "2026-10")
     altered = copy.deepcopy(report)
     altered["summary"]["trades"] = 99
-    with pytest.raises(AqlaError, match="fingerprint"):
-        client.publish_monthly(altered)
-    client.publish_monthly(report)
+    assert client.publish_monthly(altered) == {"status": "blocked", "publication": None, "error_code": "schema"}
+    assert client.publish_monthly(report)["status"] == "published"
     google.metadata = [{"metadataKey": "aqla.scope.mainnet", "metadataValue": "mainnet:another-account"}]
-    with pytest.raises(AqlaError, match="different"):
-        client.publish_monthly(report)
+    assert client.publish_monthly(report) == {"status": "blocked", "publication": None, "error_code": "schema"}
 
 
 @pytest.mark.asyncio

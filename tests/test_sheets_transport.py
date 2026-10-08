@@ -323,6 +323,40 @@ def test_cursor_lost_read_does_not_advance_client_position(transport, monkeypatc
     assert google.writes == 0
 
 
+def test_monthly_publisher_transport_tracks_content_extent_not_grid_capacity():
+    from test_monthly import data, report_at, sheet_client, values_writes, written_rows
+
+    from aqla_sheets_mcp.monthly import table_values
+
+    google, client = sheet_client()
+    report = report_at(data(), 1)
+    expected, _ = table_values(report)
+    assert client.publish_monthly(report)["status"] == "published"
+    assert len(values_writes(google)) == 1 and written_rows(google) == len(expected)
+    assert all(call["valueInputOption"] == "RAW" for call in values_writes(google))
+    google.properties["aqla Mainnet Monatsbericht 2026-10"]["gridProperties"]["rowCount"] = 1_000_000
+    google.calls.clear()
+    assert client.publish_monthly(report)["status"] == "published"
+    assert values_writes(google) == []
+    queried = [Google.coordinates(query) for method, url, kwargs in google.calls
+               if method == "GET" and url.endswith("/values:batchGet")
+               for query in kwargs["params"]["ranges"] if "Monatsbericht" in query]
+    assert max(item[4] for item in queried) == len(expected)
+
+
+def test_monthly_legacy_grid_beyond_verification_budget_has_no_values_writes():
+    from test_monthly import data, report_at, sheet_client, values_writes
+
+    google, client = sheet_client()
+    report = report_at(data(), 1)
+    assert client.publish_monthly(report)["status"] == "published"
+    google.metadata[:] = [item for item in google.metadata if not item["metadataKey"].startswith("aqla.monthly.")]
+    google.properties["aqla Mainnet Monatsbericht 2026-10"]["gridProperties"]["rowCount"] = 20_001
+    google.calls.clear()
+    assert client.publish_monthly(report) == {"status": "blocked", "publication": None, "error_code": "budget"}
+    assert values_writes(google) == []
+
+
 def test_equal_content_advances_revision_and_rejects_intermediate_state(transport):
     google, client = transport
     client.sync([rules(1)])
