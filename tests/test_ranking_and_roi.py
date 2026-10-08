@@ -90,7 +90,11 @@ async def test_router_recover_rank_noop_has_no_write_but_preserves_new_metrics(s
     before = state.snapshot()
     await router.recover()
     assert rank_deltas[-1] == 0
-    assert state.snapshot() == {**before, "sequence": before["sequence"] + 1}
+    after = state.snapshot()
+    assert after == {**before, "sequence": before["sequence"] + 1, "account_recovery": after["account_recovery"]}
+    diagnostic = after["account_recovery"]["hyperliquid:testnet"]
+    assert diagnostic["category"] == "complete" and diagnostic["error_count"] == 0
+    assert diagnostic["last_success_at"] >= before["account_recovery"]["hyperliquid:testnet"]["last_success_at"]
 
 
 def change_ranking(state, enabled, tier=None):

@@ -28,7 +28,7 @@ from aqla_agent.pipelines import (
 )
 from aqla_agent.ranking import RankingPolicy, status_view
 from aqla_agent.reporting import Reporting
-from aqla_agent.router import Router
+from aqla_agent.router import Router, recovery_diagnostics
 
 from . import __version__
 from .actions import NATIVE_MODELS, NativeRequest
@@ -132,6 +132,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "configuration_revision": snapshot["configuration_revision"], "profiles": snapshot["profiles"],
                 "pipelines": snapshot["pipelines"], "exchanges": ready,
                 "account_inventory": inventory,
+                "account_recovery": recovery_diagnostics(snapshot),
                 "execution_accounts": trading.accounts_ready(), "ranking_policy": snapshot["ranking_policy"],
                 "ranking_revision": snapshot["ranking_revision"], "source_ranks": status_view(snapshot),
                 "telegram_view": {**page["telegram_view"], "status": telegram_view({**snapshot, "notifications": {}}, trading.accounts_ready() if snapshot["ranking_policy"]["enabled"] else ready,

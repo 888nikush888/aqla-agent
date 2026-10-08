@@ -10,6 +10,10 @@ Ziele mit C0-/DEL-Kontrollzeichen oder einfachen/doppelten Anführungszeichen we
 
 Die lokale Linuxprüfung verwendet vorhandene WSL-/systemd-Werkzeuge in einem isolierten Netzwerknamespace und frische synthetische Ziele. `systemd-analyze verify --generators=no --man=no` prüft einen tatsächlich vorhandenen ausführbaren Interpreterpfad; ohne genau diese Datei muss die Gegenprobe den vollständigen Pfad als nicht ausführbar melden. Secret-/Homeverzeichnisse bleiben 0700, Integrationsdatei und `vps.env` 0600. Diese statische Abnahme startet keinen Dienst und ist keine neue Liveabnahme des VPS.
 
+## Recoverydiagnose — Offlineprüfung 09.10.2026
+
+`status.account_recovery` zeigt höchstens die sechs Börsen-/Netzwerkpaare mit letztem Versuch, letztem erfolgreich abgeschlossenen Schutzdurchlauf, Dauer und sicherer Kategorie (`complete`, `incomplete`, `unavailable`, `timeout`, `cancelled`). Exceptiontext und Providerpayload werden nicht gespeichert oder ausgegeben. Ein Timeout oder ungeklärte Operationen/Mengen aktualisieren keinen Erfolgsbeleg; der frühere Erfolgszeitpunkt bleibt als Historie erhalten. Der Konstruktor begrenzt standardmäßig zwei parallele Konten und 40 Sekunden je Abgleich, ohne Signer-/Nonce-/Orderidentitäten oder die bestehenden Preisfreshnessguards zu ändern. Diese Grenzen und Ereignisfixtures sind lokale Funktionsprüfungen, keine neue VPS-/Live-Latenzabnahme.
+
 ## Nachgewiesen
 
 - Release-ZIP per verschlüsseltem SFTP übertragen, SHA-256 vor Extraktion verglichen.

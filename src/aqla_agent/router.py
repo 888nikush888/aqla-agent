@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import time
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, NotRequired, TypedDict
 
 from aqla_hyperliquid_mcp.models import AqlaError, Market, SymbolUnavailable, TradePlan, digest, now_ms
 
@@ -12,11 +14,50 @@ from .pipelines import ConfigurationChanged, VenueState, validate_ranking_bindin
 from .trading import OPEN, PendingStopUpdate, StopUpdatePhase, Trading
 from .venues import VenueAdapter, adapter_settings, execution_settings
 
+RecoveryCategory = Literal["complete", "incomplete", "unavailable", "timeout", "cancelled"]
+
+
+class RecoveryDiagnostic(TypedDict):
+    last_attempt_at: int
+    last_success_at: NotRequired[int]
+    duration_ms: int
+    category: RecoveryCategory
+    error_count: int
+
+
+def recovery_diagnostics(data) -> dict[str, RecoveryDiagnostic]:
+    """Bounded safe metadata; no source text, exception or provider payload."""
+    result = {}
+    for venue in ("hyperliquid", "aster", "lighter"):
+        for network in ("mainnet", "testnet"):
+            key = venue + ":" + network
+            row = data.get("account_recovery", {}).get(key, {})
+            if row.get("category") not in ("complete", "incomplete", "unavailable", "timeout", "cancelled"):
+                continue
+            numbers = ("last_attempt_at", "duration_ms", "error_count")
+            if any(type(row.get(name)) is not int or row[name] < 0 for name in numbers):
+                continue
+            fact = {name: row[name] for name in numbers}
+            fact["category"] = row["category"]
+            if type(row.get("last_success_at")) is int and row["last_success_at"] >= 0:
+                fact["last_success_at"] = row["last_success_at"]
+            result[key] = fact
+    return result
+
 
 class Router:
-    def __init__(self, settings, state, hyperliquid, *, adapters=None):
+    def __init__(self, settings, state, hyperliquid, *, adapters=None, recovery_concurrency: int = 2, recovery_timeout_seconds: float = 40):
+        if type(recovery_concurrency) is not int or not 1 <= recovery_concurrency <= 6:
+            raise AqlaError("Recovery concurrency must be 1–6 independent accounts")
+        if type(recovery_timeout_seconds) not in (int, float) or not math.isfinite(recovery_timeout_seconds) or not 0 < recovery_timeout_seconds <= 120:
+            raise AqlaError("Account recovery timeout must be positive and at most 120 seconds")
         self.settings, self.state, self.exchange = settings, state, hyperliquid
         self.lock = asyncio.Lock()
+        self._recovery_semaphore = asyncio.Semaphore(recovery_concurrency)
+        self._recovery_timeout = recovery_timeout_seconds
+        self._recovery_tasks: set[asyncio.Task] = set()
+        self._recovery_owners: set[asyncio.Task] = set()
+        self._closing = False
         self.source = Trading(hyperliquid, state)
         self.engines = {}
         self.errors = {}
@@ -391,33 +432,73 @@ class Router:
         return result
 
     async def recover(self):
+        if self._closing:
+            raise AqlaError("Account recovery is closed")
+        owner = asyncio.current_task()
+        self._recovery_owners.add(owner)
+        try:
+            return await self._recover()
+        finally:
+            self._recovery_owners.discard(owner)
+
+    async def _recover(self):
         from .ranking import evaluate
         self.state.update_if_changed(evaluate)
         reports = []
+        diagnostics: dict[str, RecoveryDiagnostic] = {}
         for venue in self.errors:
             if any((row["plan"].get("account_key") == venue if ":" in venue else row["plan"].get("exchange", "hyperliquid") == venue)
                    and row["status"] in OPEN for row in self.state.snapshot()["trades"].values()):
                 reports.append({"exchange": venue, "error": "The original account adapter is unavailable; existing exposure needs attention"})
-        for venue, engine in self.engines.items():
-            for row in engine.state.snapshot()["trades"].values():
-                market = Market.model_validate(row["plan"]["market"])
-                engine.exchange.market_cache[market.symbol] = market
-            async with engine.lock:
-                for row in engine.state.snapshot()["trades"].values():
-                    if row["status"] not in OPEN or Decimal(row["filled_quantity"]) > 0:
-                        continue
-                    try:
-                        validate_ranking_binding(self.state.snapshot(), TradePlan.model_validate(row["plan"]))
-                    except AqlaError:
-                        try:
-                            await engine.cancel_entry(row["trade_id"])
-                            if engine.state.snapshot()["trades"][row["trade_id"]]["status"] in OPEN:
-                                await engine.refresh_trade(row["trade_id"])
-                        except Exception:
-                            reports.append({"trade_id": row["trade_id"], "error": "Rank-changed entry cancellation/fill reconciliation is unconfirmed"})
-                rows = await engine.recover()
-            reports.extend({"exchange": venue, **row} for row in rows)
+        async def account(venue, engine):
+            async with self._recovery_semaphore:
+                started, attempted = time.monotonic(), now_ms()
+                category: RecoveryCategory = "unavailable"
+                rows = []
+                try:
+                    rows = await asyncio.wait_for(self._recover_account(engine), timeout=self._recovery_timeout)
+                    view = engine.state.snapshot()
+                    unresolved = any(row["phase"] in ("prepared", "sending", "unknown") for row in view["operations"].values())
+                    unsettled = any(row["status"] in OPEN and (row["status"] not in ("open", "opening", "waiting_entry")
+                        or row.get("quantity_evidence_pending")) for row in view["trades"].values())
+                    category = "incomplete" if not engine.recovery_checked or unresolved or unsettled or any(row.get("error") or row.get("market_conflict") for row in rows) else "complete"
+                except TimeoutError:
+                    engine.recovery_checked = False
+                    category = "timeout"
+                    rows = [{"error": "Account recovery timed out; protection reconciliation is unconfirmed"}]
+                except asyncio.CancelledError:
+                    engine.recovery_checked = False
+                    category = "cancelled"
+                    raise
+                except Exception:
+                    engine.recovery_checked = False
+                    rows = [{"error": "Account recovery is unavailable; protection reconciliation is unconfirmed"}]
+                finally:
+                    old = self.state.read("account_recovery").get("account_recovery", {}).get(engine.state.account_key, {})
+                    fact: RecoveryDiagnostic = {"last_attempt_at": attempted, "duration_ms": max(0, int((time.monotonic() - started) * 1000)),
+                        "category": category, "error_count": sum(bool(row.get("error") or row.get("market_conflict")) for row in rows)}
+                    if "last_success_at" in old:
+                        fact["last_success_at"] = old["last_success_at"]
+                    if category == "complete":
+                        fact["last_success_at"] = now_ms()
+                    diagnostics[engine.state.account_key] = fact
+                return [{"exchange": venue, **row} for row in rows]
+        tasks = [asyncio.create_task(account(venue, engine)) for venue, engine in self.engines.items()]
+        self._recovery_tasks.update(tasks)
+        try:
+            results = await asyncio.gather(*tasks)
+            reports.extend(row for rows in results for row in rows)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if diagnostics:
+                self.state.update(lambda data: data.setdefault("account_recovery", {}).update(diagnostics))
+            raise
+        finally:
+            self._recovery_tasks.difference_update(tasks)
         def expire(data):
+            data.setdefault("account_recovery", {}).update(diagnostics)
             stop_statuses = self.stop_event_statuses(data)
             for event_id, event in data["events"].items():
                 if event.get("update_targets") and (status := stop_statuses.get(event_id)):
@@ -431,6 +512,27 @@ class Router:
                 if event.get("targets") and all(target["status"] not in ("planned", "pending") for target in event["targets"].values()):
                     event["status"] = "executed" if any(target.get("trade_id") for target in event["targets"].values()) else "rejected"
         self.state.update(expire)
+        return reports
+
+    async def _recover_account(self, engine):
+        reports = []
+        async with engine.lock:
+            for row in engine.state.snapshot()["trades"].values():
+                market = Market.model_validate(row["plan"]["market"])
+                engine.exchange.market_cache[market.symbol] = market
+            for row in engine.state.snapshot()["trades"].values():
+                if row["status"] not in OPEN or Decimal(row["filled_quantity"]) > 0:
+                    continue
+                try:
+                    validate_ranking_binding(self.state.snapshot(), TradePlan.model_validate(row["plan"]))
+                except AqlaError:
+                    try:
+                        await engine.cancel_entry(row["trade_id"])
+                        if engine.state.snapshot()["trades"][row["trade_id"]]["status"] in OPEN:
+                            await engine.refresh_trade(row["trade_id"])
+                    except Exception:
+                        reports.append({"trade_id": row["trade_id"], "error": "Rank-changed entry cancellation/fill reconciliation is unconfirmed"})
+            reports.extend(await engine.recover())
         return reports
 
     async def activate(self, venue):
@@ -462,6 +564,12 @@ class Router:
         return await engine.exchange.reconcile(operation_id)
 
     async def close(self):
+        self._closing = True
+        tasks = [task for task in self._recovery_tasks | self._recovery_owners if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for engine in self.engines.values():
             await engine.exchange.close()
 
