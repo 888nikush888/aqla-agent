@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_FLOOR, ROUND_UP, Decimal, localcontext
+from typing import Literal
 
 from .models import (
     AccountSnapshot,
@@ -188,9 +190,38 @@ def verify_evidence(signal: Interpretation, events: dict):
                 raise AqlaError("A TP percentage cannot be interpreted as an absolute price")
 
 
+@dataclass(frozen=True)
+class EntryPrices:
+    kind: Literal["limit", "market"]
+    price: Decimal
+    limit: Decimal
+
+
+def entry_prices(signal: Interpretation, market: Market, policy: Policy) -> EntryPrices:
+    """Pure price selection after the source, product and account guards."""
+    long = signal.side == "long"
+    kind: Literal["limit", "market"] = "limit" if signal.entry in ("limit", "range") else "market"
+    if kind == "limit":
+        if len(signal.entry_prices) != (2 if signal.entry == "range" else 1):
+            raise AqlaError("Entry prices do not match entry type")
+        low, high = signal.entry_prices[0], signal.entry_prices[-1]
+        if policy.entry_range_choice == "midpoint":
+            price = (low + high) / 2
+        else:
+            price = (high if long else low) if policy.entry_range_choice == "near" else (low if long else high)
+        price = price_grid(price, market, up=not long)
+        limit = price
+    else:
+        price = market.mid
+        limit = slippage_price(price, policy.max_slippage_percent, market, buy=long)
+    if signal.entry_timing == "deferred":
+        limit = slippage_price(price, policy.max_slippage_percent, market, buy=long)
+    return EntryPrices(kind=kind, price=price, limit=limit)
+
+
 def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, policy: Policy,
               revision: int, source_time: int, binding: tuple[str, str], reserved_risk=Decimal(0), stamp=None, principal=None,
-              backup: BackupValues | None = None, backup_revision=None):
+              backup: BackupValues | None = None, backup_revision=None) -> TradePlan:
     stamp = now_ms() if stamp is None else stamp
     with localcontext() as context:
         context.prec = 50
@@ -217,27 +248,13 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         if market.product == "spot" and signal.side == "short":
             raise AqlaError("Spot short signals are unsupported")
         long = signal.side == "long"
-        kind = "limit" if signal.entry in ("limit", "range") else "market"
         if signal.entry == "unspecified":
             if backup is not None and backup.entry_mode == "source_or_market":
                 fields.append("entry")
             elif policy.entry_mode != "source_or_market":
                 raise AqlaError("Entry missing and Backup market entry is not configured")
-        if kind == "limit":
-            if len(signal.entry_prices) != (2 if signal.entry == "range" else 1):
-                raise AqlaError("Entry prices do not match entry type")
-            low, high = signal.entry_prices[0], signal.entry_prices[-1]
-            if policy.entry_range_choice == "midpoint":
-                entry = (low + high) / 2
-            else:
-                entry = (high if long else low) if policy.entry_range_choice == "near" else (low if long else high)
-            entry = price_grid(entry, market, up=not long)
-            limit = entry
-        else:
-            entry = market.mid
-            limit = slippage_price(entry, policy.max_slippage_percent, market, buy=long)
-        if signal.entry_timing == "deferred":
-            limit = slippage_price(entry, policy.max_slippage_percent, market, buy=long)
+        selected_entry = entry_prices(signal, market, policy)
+        kind, entry, limit = selected_entry.kind, selected_entry.price, selected_entry.limit
         derived_stop, derived_targets = backup_prices(entry, signal.side, market,
             backup.fallback_stop_loss_percent if "stop_loss" in fields else None,
             selected_targets(backup.fallback_take_profit_percentages, policy) if "take_profits" in fields else ())
