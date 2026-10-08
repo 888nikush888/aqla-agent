@@ -48,6 +48,44 @@ def body_ranges(google):
     return ranges
 
 
+def filtered_ids(google, client, table, filters, *, limit=100):
+    """Follow legacy offsets before continuing the remaining physical index."""
+    identities, offset, cursor = [], 0, None
+    for _ in range(100):
+        google.calls.clear()
+        kwargs = {"scan_cursor": cursor} if cursor is not None else {}
+        page = client.read(table, offset=offset, limit=limit, filters=filters, **kwargs)
+        identities.extend(row["ID"] for row in page["rows"])
+        assert len(body_ranges(google)) <= adapter.MAX_BODY_REQUESTS
+        body_calls = [kwargs for method, url, kwargs in google.calls
+                      if method == "GET" and url.endswith("/values:batchGet")
+                      and any(Google.coordinates(query)[1] == 1 and Google.coordinates(query)[2] > 1
+                              and Google.coordinates(query)[3] > 1 for query in kwargs["params"]["ranges"])]
+        assert len(body_calls) <= adapter.MAX_BODY_REQUESTS
+        if page["next_offset"] is not None:
+            assert page.get("next_scan_cursor") is None
+            offset = page["next_offset"]
+        elif page.get("next_scan_cursor") is not None:
+            offset, cursor = 0, page["next_scan_cursor"]
+        else:
+            return identities
+    pytest.fail("Filtered pagination did not terminate")
+
+
+def test_filtered_125_signal_ids_are_reachable_without_duplicates(transport):
+    google, client = transport
+    expected = [f"signal-{index:04d}" for index in range(125)]
+    preload(google, "Signale", [signal(identity) for identity in expected])
+    assert filtered_ids(google, client, "Signale", {"Quelle": "channel"}) == expected
+
+
+def test_filtered_1255_trade_ids_match_complete_oracle(transport):
+    google, client = transport
+    expected = [f"trade-{index:04d}" for index in range(1255)]
+    preload(google, "Trades", [trade(identity) for identity in expected])
+    assert filtered_ids(google, client, "Trades", {"Quelle": "channel"}) == expected
+
+
 def test_equal_content_advances_revision_and_rejects_intermediate_state(transport):
     google, client = transport
     client.sync([rules(1)])
