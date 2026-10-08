@@ -113,6 +113,12 @@ class Trading:
             return
         protected_refs = {ref for trade in state["trades"].values() if trade["status"] in OPEN for ref in trade["plan"]["source_refs"]}
         protected_events = {event for plan in state["plans"].values() if plan["plan"]["deadline_at"] > now_ms() for event in plan["plan"].get("source_revisions", {}).values()}
+        for trade in state["trades"].values():
+            pending = trade.get("pending_stop_update")
+            if pending and pending["phase"] in STOP_UPDATE_ACTIVE:
+                protected_events.add(pending["event_id"])
+                protected_events.update(pending["source_revisions"].values())
+                protected_refs.update(pending["source_revisions"])
         protected_events.update(key.removeprefix("Signale:") for key in state.get("journal_pending", {}) if key.startswith("Signale:"))
         # State.update enqueues journal changes after this callback, in the same write.
         if self.state.journal_enabled and inserted_event:
@@ -124,7 +130,7 @@ class Trading:
             rows.sort(key=lambda row: (row["source"]["sent_at"], row["source"].get("edited_at") or 0))
             protected_events.update(row["event_id"] for row in rows[-self.exchange.settings.max_context_messages:])
         candidates = [row for row in state["events"].values() if row["source_id"] not in protected_refs and row["event_id"] not in protected_events
-                      and row["status"] in ("report", "unrelated", "ambiguous", "incomplete", "context", "executed", "updated")]
+                      and row["status"] in ("report", "unrelated", "ambiguous", "incomplete", "context", "executed", "updated", "rejected", "superseded")]
         candidates.sort(key=lambda row: row["source"]["received_at"])
         for row in candidates[:max(0, len(state["events"]) - maximum)]:
             state.setdefault("event_tombstones", {})[row["event_id"]] = row["source_id"]

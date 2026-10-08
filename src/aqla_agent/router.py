@@ -115,6 +115,8 @@ class Router:
 
     def ingest(self, source, **kwargs):
         result = self.source.ingest(source, **kwargs)
+        if result["status"] == "already_processed":
+            return result
         from .ranking import source_rank
         self.state.update(lambda data: source_rank(data, source.chat_id))
         return result
