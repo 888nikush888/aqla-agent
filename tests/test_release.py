@@ -277,13 +277,20 @@ def test_synthetic_local_state_with_previous_pair_before_archive_open(release_pr
     assert (output.read_bytes(), sha.read_bytes()) == previous
 
 
-def test_cli_returns_nonzero_without_success_json_for_forbidden_source(release_project, tmp_path):
+@pytest.mark.parametrize("pythonpath", ["existing", "unset", "reversed"])
+def test_cli_returns_nonzero_without_success_json_for_forbidden_source(release_project, tmp_path, monkeypatch, pythonpath):
     package = release_project / "src/aqla_agent"
     package.mkdir()
     for name in ("__init__.py", "release.py", "artifact_rules.py"):
         (package / name).write_bytes((ROOT / "src/aqla_agent" / name).read_bytes())
     (release_project / "tests/local.sqlite3").write_text("synthetic forbidden sentinel", encoding="utf-8")
-    environment = dict(os.environ, PYTHONPATH=os.pathsep.join([str(Path(os.environ["PYTHONPATH"].split(os.pathsep)[0])), str(release_project / "src")]))
+    if pythonpath == "unset":
+        monkeypatch.delenv("PYTHONPATH", raising=False)
+    elif pythonpath == "reversed":
+        entries = [entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep) if entry]
+        monkeypatch.setenv("PYTHONPATH", os.pathsep.join(reversed(entries)))
+    inherited = [entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep) if entry]
+    environment = dict(os.environ, PYTHONPATH=os.pathsep.join([str(release_project / "src"), *inherited]))
     result = subprocess.run([sys.executable, "-m", "aqla_agent.release", "--output", str(tmp_path / "out.zip")], cwd=release_project, env=environment, capture_output=True, text=True)
     assert result.returncode != 0
     assert result.stdout == ""
