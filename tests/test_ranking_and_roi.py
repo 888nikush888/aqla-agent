@@ -8,6 +8,7 @@ from test_monthly import data as monthly_data
 from test_monthly import trade as monthly_trade
 
 from aqla_agent.percent_targets import prices
+from aqla_agent.pipelines import Pipeline, TradingProfile, route_control
 from aqla_agent.ranking import RankingPolicy, evaluate, metrics, outcomes, snapshot_rank, weighted_parameters
 from aqla_agent.router import Router
 from aqla_hyperliquid_mcp.api import Hyperliquid
@@ -28,6 +29,110 @@ def rank_data(tier="F"):
     return {"ranking_policy": RankingPolicy(enabled=True).model_dump(mode="json"), "ranking_revision": 1,
             "source_ranks": {"channel": {"tier": tier, "bootstrap": tier == "C", "revision": 1, "evaluated": [], "up": None, "down": 0}},
             "ranking_history": {}, "notifications": {}, "trades": {}, "source_aliases": {}}
+
+
+def change_ranking(state, enabled, tier=None):
+    def change(data):
+        data["ranking_policy"]["enabled"] = enabled
+        data["ranking_revision"] += 1
+        if tier is not None:
+            data["source_ranks"]["channel"]["tier"] = tier
+    state.update(change)
+
+
+@pytest.mark.asyncio
+async def test_old_plan_rejected_after_ranking_enable(setup, signal):
+    settings, state, fake, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    await router.recover()
+    source, interpretation = signal
+    plan = await router.preview(source.event_id, interpretation)
+    assert plan.get("rank_snapshot") is None
+    change_ranking(state, True, "F")
+    with pytest.raises(AqlaError, match="[Rr]anking.*changed"):
+        await router.execute(plan["plan_id"])
+    assert fake.actions == []
+    assert not state.snapshot()["trades"]
+    await router.close()
+
+
+@pytest.mark.asyncio
+async def test_old_ranked_plan_rejected_after_ranking_disable(setup, signal):
+    settings, state, fake, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    change_ranking(state, True, "D")
+    await router.recover()
+    source, interpretation = signal
+    plan = await router.preview(source.event_id, interpretation)
+    assert plan["rank_snapshot"]["policy_revision"] == state.snapshot()["ranking_revision"]
+    change_ranking(state, False)
+    with pytest.raises(AqlaError, match="[Rr]anking.*changed"):
+        await router.execute(plan["plan_id"])
+    assert fake.actions == []
+    assert not state.snapshot()["trades"]
+    await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_ranking_toggle_during_preview_invalidates_weighted_context(setup, signal, monkeypatch, enabled):
+    settings, state, fake, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    if enabled:
+        change_ranking(state, True, "D")
+    original = exchange.market
+    changed = False
+
+    async def toggle(*args, **kwargs):
+        nonlocal changed
+        market = await original(*args, **kwargs)
+        if not changed:
+            changed = True
+            change_ranking(state, not enabled, "F")
+        return market
+
+    monkeypatch.setattr(exchange, "market", toggle)
+    source, interpretation = signal
+    with pytest.raises(AqlaError, match="changed.*preview|preview.*changed"):
+        await router.preview(source.event_id, interpretation)
+    assert not state.snapshot()["plans"]
+    assert fake.actions == []
+    await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_component", ["profile", "pipeline"])
+async def test_route_changed_during_preview_cannot_stamp_old_risk_as_current(setup, signal, monkeypatch, changed_component):
+    settings, state, fake, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    profile = state.snapshot()["profiles"]["standard"]
+    selected = TradingProfile(id="standard", name=profile["name"], parameters={**profile["parameters"], "risk_percent": "2"})
+    state.update(lambda data: route_control(data, "set_profile", expected_revision=data["configuration_revision"], profile=selected))
+    before = state.snapshot()["profiles"]["standard"]["revision"]
+    original = exchange.market
+    changed = False
+
+    async def revise(*args, **kwargs):
+        nonlocal changed
+        market = await original(*args, **kwargs)
+        if not changed:
+            changed = True
+            if changed_component == "profile":
+                revised = selected.model_copy(update={"parameters": selected.parameters.model_copy(update={"risk_percent": Decimal("0.1")})})
+                state.update(lambda data: route_control(data, "set_profile", expected_revision=data["configuration_revision"], profile=revised))
+            else:
+                pipeline = Pipeline.model_validate({key: value for key, value in state.snapshot()["pipelines"]["legacy"].items() if key != "revision"})
+                state.update(lambda data: route_control(data, "set_pipeline", expected_revision=data["configuration_revision"], pipeline=pipeline))
+        return market
+
+    monkeypatch.setattr(exchange, "market", revise)
+    source, interpretation = signal
+    with pytest.raises(AqlaError, match="changed.*preview|preview.*changed"):
+        await router.preview(source.event_id, interpretation)
+    assert state.snapshot()["profiles"]["standard"]["revision"] == before + (changed_component == "profile")
+    assert not state.snapshot()["plans"]
+    assert fake.actions == []
+    await router.close()
 
 
 def evidence(value, index):
