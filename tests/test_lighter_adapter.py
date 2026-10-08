@@ -249,6 +249,28 @@ async def test_positive_terminal_order_does_not_require_unrelated_later_history_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [{"status": "filled"}, {"status": "filled", "order_index": 999},
+    {"status": "filled", "order_index": 999, "client_order_index": []}, "unrelated malformed native row"])
+async def test_positive_order_survives_unrelated_nonindexable_rows_but_missing_order_is_not_proved(lighter, monkeypatch, malformed):
+    adapter, _, _, _ = lighter
+    await adapter.market("BTC")
+    calls = []
+    async def read(path, params=None, **kwargs):
+        calls.append(path)
+        return {"orders": [] if path == "accountActiveOrders" else [terminal_order(0), malformed]}
+    monkeypatch.setattr(adapter, "read", read)
+    assert (await adapter.order_status(100))["order"]["status"] == "filled"
+    with adapter.order_observations():
+        result = await adapter.order_status(100)
+        assert result["order"]["status"] == "filled" and result["order"]["order"]["oid"] == 100
+        count = len(calls)
+        with pytest.raises((AqlaError, KeyError, TypeError)):
+            await adapter.order_status(999)
+        assert len(calls) > count
+    await adapter.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("damage", [None, "parent", "market", "owner", "missing_parent"])
 async def test_scoped_nil_client_stop_requires_its_parent_market_and_original_owner(lighter, signal, monkeypatch, damage):
     adapter, boundary, _, engine = lighter

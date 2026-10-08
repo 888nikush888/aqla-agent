@@ -7,7 +7,7 @@ import json
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 
 import httpx
 
@@ -34,6 +34,25 @@ def integer_price(value, step):
     return result
 
 
+def cacheable_terminal_order(row) -> bool:
+    if not isinstance(row, dict) or row.get("status") not in ("filled", "canceled", "cancelled", "expired", "rejected"):
+        return False
+    required = {"order_index", "client_order_index", "market_index", "owner_account_index", "is_ask",
+                "reduce_only", "initial_base_amount", "remaining_base_amount"}
+    if not required <= row.keys():
+        return False
+    if any(type(row[key]) is not int for key in ("order_index", "client_order_index", "market_index")):
+        return False
+    if type(row["is_ask"]) is not bool or type(row["reduce_only"]) is not bool or type(row["owner_account_index"]) not in (int, str):
+        return False
+    try:
+        numbers = [Decimal(str(row[key])) for key in ("initial_base_amount", "remaining_base_amount")]
+        numbers.append(Decimal(str(row.get("trigger_price", "0"))))
+        return all(value.is_finite() and value >= 0 for value in numbers)
+    except (InvalidOperation, ValueError):
+        return False
+
+
 @dataclass
 class TerminalOrderIndex:
     generation: int
@@ -43,7 +62,7 @@ class TerminalOrderIndex:
 
     def add(self, rows: list[dict]) -> None:
         for row in rows:
-            if row.get("status") not in ("filled", "canceled", "cancelled", "expired", "rejected"):
+            if not cacheable_terminal_order(row):
                 continue
             if row["order_index"] in self.by_oid:
                 continue
