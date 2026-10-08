@@ -844,7 +844,7 @@ async def test_reporting_timeout_and_fairness_do_not_starve_other_closed_trades(
     first["funding_coverage"] = second["funding_coverage"] = {}
     snapshot = data(first, second)
     fake_state = SimpleNamespace(snapshot=lambda: copy.deepcopy(snapshot), update=lambda fn: fn(snapshot))
-    reporter = Reporting(fake_state, SimpleNamespace(engines={}))
+    reporter = Reporting(fake_state, SimpleNamespace(engines={}), max_jobs=1)
     async def timeout(coroutine, **_):
         coroutine.close()
         raise TimeoutError

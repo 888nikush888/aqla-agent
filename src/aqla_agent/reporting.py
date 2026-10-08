@@ -2,13 +2,41 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import time
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
+from typing import Literal, TypedDict
 
 from aqla_hyperliquid_mcp.models import AqlaError, Market, TradePlan, digest, now_ms
 
-from .evidence import market_fills, order_observations
+from .evidence import FundingCoverage, market_fills, order_observations, verified_coverage_matches
 from .funding import bounded_history
 from .monthly import CLOSED, accounting_facts, entry_quantity_evidence, fill_identity
+from .read_budget import BudgetCode, ReadBudget, ReadBudgetExceeded, read_limits
+
+RefreshReason = Literal["complete", "missing_lifecycle", "history_unavailable", "evidence_conflict", "unavailable"]
+AttemptReason = RefreshReason | BudgetCode | Literal["timeout"]
+
+
+class RefreshResult(TypedDict):
+    complete: bool
+    reason: RefreshReason
+
+
+class ReportingAttempt(TypedDict):
+    trade_id: str
+    complete: bool
+    reason: AttemptReason
+    requests: int
+    elapsed_seconds: float
+
+
+class ReportingTick(TypedDict):
+    attempts: list[ReportingAttempt]
+    requests: int
+    elapsed_seconds: float
+    stop_reason: Literal["idle", "complete", "max_jobs", "tick_request_limit", "tick_time_limit"]
 
 
 class EvidenceConflict(AqlaError):
@@ -16,8 +44,22 @@ class EvidenceConflict(AqlaError):
 
 
 class Reporting:
-    def __init__(self, state, router):
+    def __init__(self, state, router, *, max_jobs=8, max_requests=32, time_budget_seconds=10.0,
+                 job_requests=None, job_time_seconds=None, clock: Callable[[], float] = time.monotonic,
+                 wall_clock: Callable[[], int] | None = None, wait_for: Callable[..., Awaitable[RefreshResult]] | None = None):
+        job_requests = min(8, max_requests) if job_requests is None and type(max_requests) is int else job_requests
+        job_time_seconds = min(2.0, time_budget_seconds) if job_time_seconds is None and type(time_budget_seconds) in (int, float) else job_time_seconds
+        if any(type(value) is not int or not 1 <= value <= 4096 for value in (max_jobs, max_requests, job_requests)):
+            raise ValueError("Reporting job/request budgets must be integers in 1..4096")
+        if any(type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 40 for value in (time_budget_seconds, job_time_seconds)):
+            raise ValueError("Reporting time budgets must be finite seconds in (0,40]")
+        if job_requests > max_requests or job_time_seconds > time_budget_seconds:
+            raise ValueError("A reporting job budget cannot exceed its tick budget")
         self.state, self.router = state, router
+        self.max_jobs, self.max_requests, self.job_requests = max_jobs, max_requests, job_requests
+        self.time_budget_seconds, self.job_time_seconds = time_budget_seconds, job_time_seconds
+        self.clock, self.wall_clock, self.wait_for = clock, wall_clock or now_ms, wait_for
+        self._tick_lock = asyncio.Lock()
 
     async def hydrate(self, trade_id, engine):
         with order_observations(engine.exchange):
@@ -66,17 +108,19 @@ class Reporting:
             current.update(accounting_facts(current))
         self.state.update(save)
 
-    async def refresh(self, trade_id):
+    async def refresh(self, trade_id) -> RefreshResult:
         trade = self.state.snapshot()["trades"][trade_id]
         engine = self.router.engine_for_plan(trade["plan"]) if hasattr(self.router, "engine_for_plan") else self.router.engines.get(trade["plan"].get("exchange", "hyperliquid"))
         if engine and (not trade.get("entry_accounting") or not trade.get("closed_at") or trade.get("entry_fill_quantity_confirmed") is None):
             try:
                 await self.hydrate(trade_id, engine)
                 trade = self.state.snapshot()["trades"][trade_id]
+            except ReadBudgetExceeded:
+                raise
             except Exception:
                 self.state.update(lambda data: data["trades"][trade_id].update(reporting_checked_at=now_ms(),
                     funding_coverage={"complete": False, "reason": "Historische Entry-/Exit-Belege nicht vollständig verfügbar"}))
-                return
+                return {"complete": False, "reason": "history_unavailable"}
         metrics = accounting_facts(trade)
         if metrics:
             self.state.update(lambda data: data["trades"][trade_id].update(metrics))
@@ -85,8 +129,8 @@ class Reporting:
         start, end = entry.get("entry_at"), trade.get("closed_at")
         if not start or not end:
             self.state.update(lambda data: data["trades"][trade_id].update(reporting_checked_at=now_ms()))
-            return
-        coverage = {"start": start, "end": end, "complete": False}
+            return {"complete": False, "reason": "missing_lifecycle"}
+        coverage: FundingCoverage = {"start": start, "end": end, "complete": False}
         try:
             if engine is None:
                 raise AqlaError("Börsenkonto für Funding-Abgleich nicht verfügbar")
@@ -150,36 +194,71 @@ class Reporting:
                 current.update(funding_events=assigned, funding_coverage=coverage, report_fee_evidence=fee_evidence,
                                reporting_checked_at=now_ms())
             self.state.update(save)
-            return
+            return {"complete": True, "reason": "complete"}
+        except ReadBudgetExceeded:
+            raise
         except Exception as error:
+            failure_reason: RefreshReason = "evidence_conflict" if isinstance(error, EvidenceConflict) else "unavailable"
             coverage["reason"] = str(error) if isinstance(error, AqlaError) else "Börsenbelege für Funding/Gebühren vorübergehend nicht vollständig verfügbar"
-            old = trade.get("funding_coverage", {})
-            if (not isinstance(error, EvidenceConflict) and old.get("complete")
-                    and old.get("start") == start and old.get("end") == end
-                    and old.get("fill_fingerprint") == digest(trade.get("fill_events", {}))
-                    and old.get("payments_fingerprint") == digest(trade.get("funding_events", {}))):
+            if not isinstance(error, EvidenceConflict) and verified_coverage_matches(trade, start=start, end=end):
                 self.state.update(lambda data: data["trades"][trade_id].update(reporting_checked_at=now_ms(), reporting_last_error=coverage["reason"]))
-                return
+                return {"complete": False, "reason": "unavailable"}
         self.state.update(lambda data: data["trades"][trade_id].update(funding_coverage=coverage, reporting_checked_at=now_ms()))
+        return {"complete": False, "reason": failure_reason}
 
-    async def tick(self):
-        # Keep slow reporting reads outside the protection/admission lock. One bounded
-        # reconciliation per pass, persistent fairness even after gateway restarts.
-        candidates = [trade for trade in self.state.snapshot()["trades"].values()
-                      if trade["status"] in CLOSED and (trade.get("fill_events") or Decimal(trade.get("filled_quantity", "0")) > 0)]
-        candidates.sort(key=lambda trade: (trade.get("reporting_checked_at", 0), trade["trade_id"]))
-        if candidates and now_ms() - candidates[0].get("reporting_checked_at", 0) >= 3_600_000:
-            trade_id = candidates[0]["trade_id"]
-            try:
-                await asyncio.wait_for(self.refresh(trade_id), timeout=40)
-            except TimeoutError:
-                def timeout(data):
-                    row = data["trades"][trade_id]
-                    old = row.get("funding_coverage", {})
-                    if (old.get("complete") and old.get("fill_fingerprint") == digest(row.get("fill_events", {}))
-                            and old.get("payments_fingerprint") == digest(row.get("funding_events", {}))):
-                        row["reporting_last_error"] = "Zeitlimit beim erneuten Funding-Abgleich; gespeicherte Belege erhalten"
-                    else:
-                        row["funding_coverage"] = {"complete": False, "reason": "Zeitlimit beim vollständigen Funding-Abgleich"}
-                    row["reporting_checked_at"] = now_ms()
-                self.state.update(timeout)
+    def _incomplete(self, trade_id: str, reason: str) -> None:
+        def save(data):
+            row = data["trades"][trade_id]
+            if verified_coverage_matches(row):
+                row["reporting_last_error"] = reason
+            else:
+                row["funding_coverage"] = {**row.get("funding_coverage", {}), "complete": False, "reason": reason}
+            row["reporting_checked_at"] = self.wall_clock()
+        self.state.update(save)
+
+    async def tick(self) -> ReportingTick:
+        # Jobs remain serial and independent of the execution lock. Durable
+        # attempt ordering survives cancellation/restarts at the same millisecond.
+        async with self._tick_lock:
+            started = self.clock()
+            tick = ReadBudget("tick", self.max_requests, started + self.time_budget_seconds, self.clock)
+            snapshot = self.state.snapshot()
+            candidates = [trade for trade in snapshot["trades"].values()
+                          if trade["status"] in CLOSED and (trade.get("fill_events") or Decimal(trade.get("filled_quantity", "0")) > 0)
+                          and self.wall_clock() - trade.get("reporting_checked_at", 0) >= 3_600_000]
+            candidates.sort(key=lambda trade: (trade.get("reporting_attempt_sequence", 0), trade.get("reporting_checked_at", 0), trade["trade_id"]))
+            result: ReportingTick = {"attempts": [], "requests": 0, "elapsed_seconds": 0.0, "stop_reason": "idle" if not candidates else "complete"}
+            for trade in candidates:
+                if len(result["attempts"]) == self.max_jobs:
+                    result["stop_reason"] = "max_jobs"
+                    break
+                try:
+                    tick.check()
+                except ReadBudgetExceeded as exhausted:
+                    result["stop_reason"] = "tick_request_limit" if exhausted.code == "tick_request_limit" else "tick_time_limit"
+                    break
+                trade_id = trade["trade_id"]
+                def reserve(data, trade_id=trade_id):
+                    sequence = max((row.get("reporting_attempt_sequence", 0) for row in data["trades"].values()), default=0) + 1
+                    data["trades"][trade_id].update(reporting_attempt_sequence=sequence, reporting_attempted_at=self.wall_clock())
+                self.state.update(reserve)
+                job_started = self.clock()
+                duration = min(self.job_time_seconds, max(0.0, tick.deadline - job_started))
+                job = ReadBudget("job", min(self.job_requests, self.max_requests - tick.requests), job_started + duration, self.clock)
+                with read_limits(tick, job):
+                    try:
+                        refreshed = await (self.wait_for or asyncio.wait_for)(self.refresh(trade_id), timeout=duration)
+                        complete, reason = refreshed["complete"], refreshed["reason"]
+                    except (ReadBudgetExceeded, TimeoutError) as exhausted:
+                        reason = exhausted.code if isinstance(exhausted, ReadBudgetExceeded) else "timeout"
+                        message = ("Lesebudget beim Funding-Abgleich erreicht; gespeicherte Belege erhalten" if "request" in reason
+                                   else "Zeitlimit beim erneuten Funding-Abgleich; gespeicherte Belege erhalten")
+                        self._incomplete(trade_id, message)
+                        complete = False
+                    except Exception:
+                        self._incomplete(trade_id, "Börsenbelege für Funding/Gebühren vorübergehend nicht vollständig verfügbar")
+                        complete, reason = False, "unavailable"
+                result["attempts"].append({"trade_id": trade_id, "complete": complete, "reason": reason,
+                                           "requests": job.requests, "elapsed_seconds": max(0.0, self.clock() - job_started)})
+            result.update(requests=tick.requests, elapsed_seconds=max(0.0, self.clock() - started))
+            return result

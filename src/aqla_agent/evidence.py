@@ -4,7 +4,7 @@ from __future__ import annotations
 from contextlib import AbstractContextManager, nullcontext
 from typing import NotRequired, TypedDict
 
-from aqla_hyperliquid_mcp.models import Market
+from aqla_hyperliquid_mcp.models import Market, digest
 
 
 class FillObservation(TypedDict):
@@ -16,6 +16,24 @@ class FillObservation(TypedDict):
     tid: NotRequired[int | str]
     fee: NotRequired[str | None]
     feeToken: NotRequired[str | None]
+
+
+class FundingCoverage(TypedDict):
+    complete: bool
+    start: NotRequired[int]
+    end: NotRequired[int]
+    fill_fingerprint: NotRequired[str]
+    payments_fingerprint: NotRequired[str]
+    reason: NotRequired[str]
+
+
+def verified_coverage_matches(trade, *, start: int | None = None, end: int | None = None) -> bool:
+    """Pure positive-proof check shared by refresh and interrupted job handling."""
+    old = trade.get("funding_coverage", {})
+    return bool(old.get("complete") and (start is None or old.get("start") == start)
+                and (end is None or old.get("end") == end)
+                and old.get("fill_fingerprint") == digest(trade.get("fill_events", {}))
+                and old.get("payments_fingerprint") == digest(trade.get("funding_events", {})))
 
 
 def order_observations(adapter) -> AbstractContextManager[None]:

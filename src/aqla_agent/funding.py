@@ -2,8 +2,19 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import TypedDict
 
 from aqla_hyperliquid_mcp.models import AqlaError, digest
+
+
+class FundingPayment(TypedDict):
+    identity: str
+    time: int
+    amount: str
+    currency: str
+    market: str
+    signed_size: str | None
+    raw: dict[str, object] | None
 
 
 async def bounded_history(fetch, start, end, *, limit, window_ms=7 * 86_400_000, budget=64):
@@ -33,7 +44,7 @@ async def bounded_history(fetch, start, end, *, limit, window_ms=7 * 86_400_000,
     return list(result.values())
 
 
-def payment(identity, timestamp, amount, currency, market, *, size=None, raw=None):
+def payment(identity, timestamp, amount, currency, market, *, size=None, raw=None) -> FundingPayment:
     if not identity or isinstance(timestamp, bool) or not isinstance(timestamp, int):
         raise AqlaError("Funding payment lacks a stable identity or timestamp")
     amount = Decimal(str(amount))
@@ -44,7 +55,7 @@ def payment(identity, timestamp, amount, currency, market, *, size=None, raw=Non
             "market": market, "signed_size": str(quantity) if quantity is not None else None, "raw": raw}
 
 
-async def hyperliquid_funding(exchange, market, start, end):
+async def hyperliquid_funding(exchange, market, start, end) -> list[FundingPayment]:
     async def fetch(low, high):
         return await exchange.info("userFunding", user=exchange.account, startTime=low, endTime=high)
     rows = await bounded_history(fetch, start, end, limit=500)
@@ -60,7 +71,7 @@ async def hyperliquid_funding(exchange, market, start, end):
     return result
 
 
-async def aster_funding(exchange, market, start, end):
+async def aster_funding(exchange, market, start, end) -> list[FundingPayment]:
     async def fetch(low, high):
         return await exchange.read("income", {"symbol": market.native_symbol, "incomeType": "FUNDING_FEE",
                                               "startTime": str(low), "endTime": str(high), "limit": "1000"}, private=True)
@@ -74,7 +85,7 @@ async def aster_funding(exchange, market, start, end):
     return result
 
 
-async def lighter_funding(exchange, market, start, end):
+async def lighter_funding(exchange, market, start, end) -> list[FundingPayment]:
     result, cursor, seen = {}, None, set()
     for _ in range(64):
         raw = await exchange.read("positionFunding", {"account_index": exchange.account, "limit": 100,
