@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from typing import Literal, TypedDict
+
+from pydantic import Field
 
 from aqla_hyperliquid_mcp.api import Hyperliquid, wire_number
 from aqla_hyperliquid_mcp.models import (
@@ -10,6 +13,7 @@ from aqla_hyperliquid_mcp.models import (
     BackupValues,
     ExternalInterference,
     Interpretation,
+    Model,
     Policy,
     SourceEvent,
     TradePlan,
@@ -36,6 +40,39 @@ from .pipelines import ConfigurationChanged, validate_ranking_binding
 
 OPEN = {"waiting_entry", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
 UNFINISHED = {"pending", "interpreted", "needs_reconciliation"}
+StopUpdatePhase = Literal["waiting_fill", "replacing", "unknown", "confirmed", "rejected", "superseded", "closed_without_application"]
+STOP_UPDATE_ACTIVE = {"waiting_fill", "replacing", "unknown"}
+
+
+class StopSourceBinding(Model):
+    trade_id: str
+    kind: Literal["move_stop", "break_even"]
+    payload_hash: str
+
+
+class PendingStopUpdate(Model):
+    event_id: str
+    operation_id: str
+    stop: Decimal = Field(gt=0)
+    reference_stop: Decimal = Field(gt=0)
+    original_budget: Decimal = Field(gt=0)
+    source_binding: StopSourceBinding
+    source_revisions: dict[str, str]
+    management_revision: int = Field(ge=0)
+    phase: StopUpdatePhase
+    accepted_at: int
+    reason: str | None = None
+
+
+class StopUpdateResult(TypedDict):
+    pending_stop_update: bool
+    phase: StopUpdatePhase
+    stop: str
+    reason: str | None
+
+
+class StopEvidencePending(AqlaError):
+    """Terminal entry quantity and immutable own fill facts are still inconsistent."""
 
 
 class Trading:
@@ -515,7 +552,7 @@ class Trading:
             return self.state.snapshot()["trades"][trade_id]
         return await self.guarded_entry_steps(plan, trade)
 
-    def _patch(self, trade_id, **values):
+    def _patch(self, trade_id, *, preserve_pending_stop=False, **values):
         old = self.state.snapshot()["trades"][trade_id]
         changed = {key: value for key, value in values.items() if old.get(key) != value}
         if not changed:
@@ -523,6 +560,13 @@ class Trading:
 
         def patch(state):
             row = state["trades"][trade_id]
+            pending = row.get("pending_stop_update")
+            original_pending = old.get("pending_stop_update")
+            if (preserve_pending_stop and "management_revision" in changed and pending and original_pending
+                    and pending["phase"] in STOP_UPDATE_ACTIVE and pending["management_revision"] == row["management_revision"]
+                    and all(pending[key] == original_pending[key] for key in ("stop", "source_binding", "operation_id"))
+                    and state["bindings"].get(pending["operation_id"]) == pending["source_binding"]):
+                pending["management_revision"] = changed["management_revision"]
             row.update(changed)
             important = {key: value for key, value in changed.items() if key in ("status", "filled_quantity", "remaining_quantity", "stop_price", "tp_filled")}
             if row.get("lifecycle_version") and row["status"] == "closed":
@@ -670,8 +714,13 @@ class Trading:
         signed = self.position_size(await self.positions(plan.market), plan.market)
         remaining = self.owned_remaining(trade_id, signed) if total else abs(signed)
         if total and remaining:
+            pending = trade.get("pending_stop_update")
+            closing_pending = trade["status"] == "closing" and pending and pending["phase"] in STOP_UPDATE_ACTIVE
             self._patch(trade_id, filled_quantity=str(total), remaining_quantity=str(remaining), entry_vwap=str(cost / total),
-                        status="open" if trade["status"] == "open" else "protecting")
+                        status="closing" if closing_pending else "open" if trade["status"] == "open" else "protecting")
+            if closing_pending:
+                await self.resume_pending_stop(trade_id)
+                return self.state.snapshot()["trades"][trade_id]
             try:
                 if not await self.finalize_backup(trade_id):
                     return self.state.snapshot()["trades"][trade_id]
@@ -690,6 +739,11 @@ class Trading:
                     raise AqlaError("No confirmed effective stop loss")
             except ExternalInterference:
                 raise
+            except StopEvidencePending as error:
+                self._patch(trade_id, status="unknown", waiting_error=str(error))
+                if pending and pending["phase"] in STOP_UPDATE_ACTIVE:
+                    self.stop_phase(trade_id, "waiting_fill", str(error))
+                return self.state.snapshot()["trades"][trade_id]
             except Exception as error:
                 if not getattr(self.exchange, "fail_closed_protection", False) and not set(plan.backup_fields) & {"stop_loss", "take_profits"}:
                     raise
@@ -713,6 +767,7 @@ class Trading:
         elif now_ms() >= plan.deadline_at and stage == "open":
             await self.cancel_entry(trade_id)
             return await self.refresh_trade(trade_id)
+        await self.resume_pending_stop(trade_id)
         return self.state.snapshot()["trades"][trade_id]
 
     async def validate_actual_entry(self, trade_id):
@@ -767,7 +822,7 @@ class Trading:
         covered = any(row.get("order", {}).get("status") == "open" and self._stop_matches(row, plan, remaining, Decimal(trade["stop_price"])) for _, row in status_rows)
         if not covered:
             await self.cancel_entry(trade_id)
-            await self.replace_stop(trade_id, Decimal(trade["stop_price"]))
+            await self.replace_stop(trade_id, Decimal(trade["stop_price"]), initial_protection=True)
             refreshed = self.state.snapshot()["trades"][trade_id]
             if refreshed["status"] in ("protecting", "closing"):
                 return
@@ -802,6 +857,9 @@ class Trading:
                 self._patch(trade_id, status="protecting")
                 return
         self._patch(trade_id, status="open")
+        pending = self.state.snapshot()["trades"][trade_id].get("pending_stop_update")
+        if pending and pending["phase"] in STOP_UPDATE_ACTIVE:
+            return
         if plan.policy.stop_management == "tp_ladder":
             await self.advance_stop_ladder(trade_id)
             return
@@ -970,7 +1028,212 @@ class Trading:
             raise AqlaError("Entry remainder termination is not proved; preserve existing protection")
         return result
 
-    async def replace_stop(self, trade_id, proposed: Decimal, operation_id=None, *, initialize_backup=False):
+    @staticmethod
+    def stop_update_result(pending) -> StopUpdateResult:
+        request = PendingStopUpdate.model_validate(pending)
+        return {"pending_stop_update": request.phase in STOP_UPDATE_ACTIVE, "phase": request.phase,
+                "stop": str(request.stop), "reason": request.reason}
+
+    @staticmethod
+    def write_stop_phase(data, trade_id, pending, phase: StopUpdatePhase, reason=None):
+        request = PendingStopUpdate.model_validate(pending)
+        request.phase, request.reason = phase, reason
+        saved = request.model_dump(mode="json", exclude_none=True)
+        trade = data["trades"][trade_id]
+        current = trade.get("pending_stop_update")
+        if current is None or current["operation_id"] == request.operation_id:
+            trade["pending_stop_update"] = saved
+        if phase not in STOP_UPDATE_ACTIVE:
+            trade.setdefault("stop_update_history", {})[request.operation_id] = saved
+        status = "needs_reconciliation" if phase in STOP_UPDATE_ACTIVE else "updated" if phase == "confirmed" else "superseded" if phase == "superseded" else "rejected"
+        data["events"][request.event_id].update(status=status, stop_update_reason=reason)
+        identity = "stop-update:" + digest([request.operation_id, phase, reason])[:32]
+        data["notifications"].setdefault(identity, {"trade_id": trade_id, "event_id": request.event_id,
+            "stop_update": saved, "observed_at": now_ms()})
+        return saved
+
+    def stop_phase(self, trade_id, phase: StopUpdatePhase, reason=None):
+        pending = self.state.snapshot()["trades"][trade_id]["pending_stop_update"]
+        if pending["phase"] == phase and pending.get("reason") == reason:
+            return pending
+        return self.state.update(lambda data: self.write_stop_phase(data, trade_id,
+            data["trades"][trade_id]["pending_stop_update"], phase, reason))
+
+    @staticmethod
+    def validate_stop_budget(trade, plan, stop, size=None, *, initialize_backup=False):
+        old_stop = Decimal(trade["stop_price"])
+        widening = stop < old_stop if plan.side == "long" else stop > old_stop
+        if widening and not plan.policy.allow_stop_widening and not initialize_backup:
+            raise AqlaError("Stop widening is not permitted")
+        size = Decimal(trade["remaining_quantity"]) if size is None else size
+        reference = Decimal(trade["entry_vwap"]) if trade["entry_vwap"] is not None else plan.entry_price
+        if not Decimal(trade["filled_quantity"]):
+            size = plan.quantity
+        budget = min(plan.risk_usdc, Decimal(trade["reserved_risk"]))
+        pending = trade.get("pending_stop_update")
+        if pending and pending["phase"] in STOP_UPDATE_ACTIVE:
+            budget = min(budget, Decimal(pending["original_budget"]))
+        if widening and size * abs(reference - stop) > budget:
+            raise AqlaError("Stop widening exceeds the original loss budget")
+
+    @staticmethod
+    def validate_final_stop_quantity(trade):
+        confirmed = trade.get("entry_fill_quantity_confirmed")
+        if confirmed is not None and Decimal(confirmed) != Decimal(trade["filled_quantity"]):
+            raise StopEvidencePending("Terminal entry quantity and own fills are not yet reconciled; preserve original protection")
+
+    async def queue_stop_update(self, trade_id, event_id, signal, proposed):
+        origin = self.state.snapshot()
+        source_revisions = self.source_revisions(origin, signal.source_refs)
+        trade = origin["trades"][trade_id]
+        old = trade.get("pending_stop_update")
+        if old and old["phase"] in STOP_UPDATE_ACTIVE:
+            operation = self.state.snapshot()["operations"].get(old["operation_id"])
+            if old["phase"] == "unknown" or operation and operation.get("outcome") != "not_sent":
+                await self.resume_pending_stop(trade_id)
+                old = self.state.snapshot()["trades"][trade_id]["pending_stop_update"]
+                if old["phase"] in STOP_UPDATE_ACTIVE:
+                    raise AqlaError("Reconcile the original pending stop operation before another stop instruction")
+        trade = self.state.snapshot()["trades"][trade_id]
+        management_revision = trade["management_revision"]
+        plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(self.state.snapshot(), plan)
+        stop = price_grid(proposed, plan.market, up=plan.side == "long")
+        await self.capture_fills(trade_id)
+        size = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
+        snapshot = self.state.snapshot()
+        trade = snapshot["trades"][trade_id]
+        if trade["management_revision"] != management_revision or self.source_revisions(snapshot, signal.source_refs) != source_revisions:
+            raise AqlaError("Source or management revision changed before stop acceptance")
+        if signal.update_action == "break_even":
+            if trade["entry_vwap"] is None:
+                raise AqlaError("Break-even requires a proved entry VWAP")
+            stop = price_grid(Decimal(trade["entry_vwap"]), plan.market, up=plan.side == "long")
+        self.validate_stop_budget(trade, plan, stop, size)
+        binding = StopSourceBinding(trade_id=trade_id, kind=signal.update_action,
+                                    payload_hash=digest(signal.model_dump(mode="json")))
+        request = PendingStopUpdate(event_id=event_id, operation_id="update:" + event_id, stop=stop,
+            reference_stop=trade["stop_price"], original_budget=min(plan.risk_usdc, Decimal(trade["reserved_risk"])),
+            source_binding=binding, source_revisions=source_revisions,
+            management_revision=trade["management_revision"] + 1,
+            phase="replacing" if size else "waiting_fill", accepted_at=now_ms())
+        def accept(data):
+            row = data["trades"][trade_id]
+            self.assert_plan_binding(data, plan)
+            if row["management_revision"] != trade["management_revision"] or self.source_revisions(data, signal.source_refs) != request.source_revisions:
+                raise AqlaError("Source or management revision changed before stop acceptance")
+            current = row.get("pending_stop_update")
+            if current and current["phase"] in STOP_UPDATE_ACTIVE:
+                operation = data["operations"].get(current["operation_id"])
+                if current["phase"] == "unknown" or operation and operation.get("outcome") != "not_sent":
+                    raise AqlaError("The original stop operation may have been sent; reconcile it first")
+                self.write_stop_phase(data, trade_id, current, "superseded", "A later authorized stop instruction replaced this unsent request")
+            row["management_revision"] = request.management_revision
+            row["pending_stop_update"] = request.model_dump(mode="json", exclude_none=True)
+            data["bindings"][request.operation_id] = binding.model_dump(mode="json")
+            self.write_stop_phase(data, trade_id, row["pending_stop_update"], request.phase)
+        self.state.update(accept)
+        if size:
+            await self.refresh_trade(trade_id)
+        else:
+            await self.resume_pending_stop(trade_id)
+        return self.stop_update_result(self.state.snapshot()["trades"][trade_id]["pending_stop_update"])
+
+    async def management_stop_preflight(self, trade_id, operation_id) -> PendingStopUpdate | None:
+        pending = self.state.snapshot()["trades"][trade_id].get("pending_stop_update")
+        if not pending or pending["phase"] not in STOP_UPDATE_ACTIVE or pending["operation_id"] == operation_id:
+            return None
+        request = PendingStopUpdate.model_validate(pending)
+        operation = self.state.snapshot()["operations"].get(request.operation_id)
+        if request.phase == "unknown" or operation and operation.get("outcome") != "not_sent":
+            if operation and operation["phase"] in ("prepared", "sending", "unknown"):
+                await self.exchange.reconcile(request.operation_id)
+            await self.resume_pending_stop(trade_id)
+            pending = self.state.snapshot()["trades"][trade_id]["pending_stop_update"]
+            if pending["phase"] in STOP_UPDATE_ACTIVE:
+                raise AqlaError("Reconcile the original pending stop before an independent management instruction")
+            return None
+        return request
+
+    def supersede_stop_for_management(self, data, trade_id, request, reason):
+        row = data["trades"][trade_id]
+        current = row.get("pending_stop_update")
+        if current != request.model_dump(mode="json", exclude_none=True):
+            raise AqlaError("Pending stop changed before independent management acceptance")
+        operation = data["operations"].get(request.operation_id)
+        if operation and operation.get("outcome") != "not_sent":
+            raise AqlaError("Pending stop operation may have been sent; reconcile before superseding")
+        self.write_stop_phase(data, trade_id, current, "superseded", reason)
+        row["management_revision"] += 1
+
+    async def resume_pending_stop(self, trade_id):
+        snapshot = self.state.snapshot()
+        trade = snapshot["trades"][trade_id]
+        pending = trade.get("pending_stop_update")
+        if not pending or pending["phase"] not in STOP_UPDATE_ACTIVE:
+            return
+        request = PendingStopUpdate.model_validate(pending)
+        plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(snapshot, plan)
+        operation = snapshot["operations"].get(request.operation_id)
+        if trade["status"] not in OPEN:
+            phase = "rejected" if operation and operation["phase"] == "rejected" else "closed_without_application"
+            reason = "Stop replacement was rejected; own exposure closure is confirmed" if phase == "rejected" else "Trade ended without a confirmed application of the requested stop"
+            self.stop_phase(trade_id, phase, reason)
+            return
+        if trade["status"] in ("closing", "cleanup"):
+            self.stop_phase(trade_id, "unknown", "Own exposure closure is not yet confirmed")
+            return
+        binding = snapshot["bindings"].get(request.operation_id)
+        revision_changed = (trade["management_revision"] != request.management_revision
+                            or binding != request.source_binding.model_dump(mode="json")
+                            or self.source_revisions(snapshot, request.source_revisions) != request.source_revisions)
+        if revision_changed:
+            if operation and operation["phase"] in ("prepared", "sending", "unknown"):
+                await self.exchange.reconcile(request.operation_id)
+                operation = self.state.snapshot()["operations"][request.operation_id]
+                if operation["phase"] in ("prepared", "sending", "unknown"):
+                    self.stop_phase(trade_id, "unknown", "Original stop operation must be reconciled before superseding")
+                    return
+            self.stop_phase(trade_id, "superseded", "Source or independent management revision superseded this request")
+            return
+        if not Decimal(trade["filled_quantity"]):
+            entry = await self.exchange.order_status(trade["entry_cloid"])
+            total, _ = await self.capture_fills(trade_id, entry)
+            if not total:
+                if entry.get("order", {}).get("status") in TERMINAL_ORDER:
+                    self.stop_phase(trade_id, "closed_without_application", "Entry ended without any own fill; requested stop was not sent")
+                return
+        self.stop_phase(trade_id, "replacing")
+        try:
+            result = await self.replace_stop(trade_id, request.stop, request.operation_id)
+        except ExternalInterference:
+            raise
+        except StopEvidencePending as error:
+            self.stop_phase(trade_id, "waiting_fill", str(error))
+            return
+        except AqlaError as error:
+            operation = self.state.snapshot()["operations"].get(request.operation_id)
+            phase = "unknown" if operation and operation["phase"] in ("prepared", "sending", "unknown") else "rejected"
+            self.stop_phase(trade_id, phase, str(error))
+            return
+        current = self.state.snapshot()["trades"][trade_id]
+        if current["status"] in ("closing", "cleanup"):
+            self.stop_phase(trade_id, "unknown", "Own exposure closure is not yet confirmed")
+        elif result.get("replacement_confirmed"):
+            self.stop_phase(trade_id, "confirmed", "Matching open replacement stop confirmed")
+        elif result.get("already_closed"):
+            self.stop_phase(trade_id, "closed_without_application", "Own exposure ended before stop application")
+        elif result.get("outcome") == "not_sent":
+            self.stop_phase(trade_id, "rejected", result.get("result", {}).get("error", "Replacement was not sent"))
+        else:
+            self.stop_phase(trade_id, "unknown", "Replacement stop is not yet confirmed; original protection retained")
+
+    async def replace_stop(self, trade_id, proposed: Decimal, operation_id=None, *, initialize_backup=False, initial_protection=False):
+        if operation_id:
+            operation = self.state.snapshot()["operations"].get(operation_id)
+            if operation and operation["phase"] in ("prepared", "sending", "unknown"):
+                await self.exchange.reconcile(operation_id)
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
         self.assert_plan_binding(self.state.snapshot(), plan)
@@ -980,23 +1243,27 @@ class Trading:
             return {"already_closed": True}
         remaining = Decimal(trade["remaining_quantity"])
         if not remaining:
-            return {"already_closed": True}
+            return {"waiting_for_fill": True}
+        if not initialize_backup and not initial_protection:
+            request = await self.management_stop_preflight(trade_id, operation_id)
+            if request:
+                self.state.update(lambda data: self.supersede_stop_for_management(data, trade_id, request,
+                    "An independent stop management instruction replaced this unsent request"))
+                trade = self.state.snapshot()["trades"][trade_id]
         stop = price_grid(proposed, plan.market, up=plan.side == "long")
-        old_stop = Decimal(trade["stop_price"])
-        widening = stop < old_stop if plan.side == "long" else stop > old_stop
         if initialize_backup:
             final = trade.get("backup_finalization") or {}
             if (final.get("phase") != "prepared" or "stop_loss" not in plan.backup_fields or str(proposed) != final.get("stop_loss")
                     or operation_id != final.get("stop_operation_id") or any(order["kind"] == "tp" for order in trade["orders"])):
                 raise AqlaError("Only the durable initial Backup SL may be finalized")
-        if widening and not plan.policy.allow_stop_widening and not initialize_backup:
-            raise AqlaError("Stop widening is not permitted")
-        if widening and remaining * abs(Decimal(trade["entry_vwap"]) - stop) > Decimal(trade["reserved_risk"]):
-            raise AqlaError("Stop widening exceeds the original loss budget")
+        self.validate_stop_budget(trade, plan, stop, initialize_backup=initialize_backup)
         await self.cancel_entry(trade_id)
         await self.capture_fills(trade_id)
         signed = self.position_size(await self.positions(plan.market), plan.market)
         remaining = self.owned_remaining(trade_id, signed)
+        trade = self.state.snapshot()["trades"][trade_id]
+        self.validate_final_stop_quantity(trade)
+        self.validate_stop_budget(trade, plan, stop, remaining, initialize_backup=initialize_backup)
         if not remaining:
             return {"already_closed": True}
         market = await self.exchange.market(plan.market.symbol, plan.market.product)
@@ -1007,18 +1274,57 @@ class Trading:
         limit = price_grid(stop * (Decimal("0.95") if plan.side == "long" else Decimal("1.05")), plan.market, up=plan.side == "short")
         existing = self.state.snapshot()["operations"].get(operation_id)
         replacement = self.order(plan, remaining, limit, reduce=True, trigger=("sl", stop), cloid=cloid)
+        entry_fingerprint = None
+        def final_guard(data):
+            self.assert_plan_binding(data, plan)
+            row = data["trades"][trade_id]
+            if row["status"] not in OPEN or row["status"] in ("closing", "cleanup", "conflicted"):
+                raise AqlaError("Own exposure no longer permits this stop replacement")
+            facts = {key: fill for key, fill in row["fill_events"].items() if fill["kind"] == "entry"}
+            if digest(facts) != entry_fingerprint:
+                raise AqlaError("Own entry facts changed before stop replacement")
+            self.validate_stop_budget(row, plan, stop, remaining, initialize_backup=initialize_backup)
+            self.validate_final_stop_quantity(row)
+            pending = row.get("pending_stop_update")
+            if pending and pending["operation_id"] == operation_id:
+                if pending["phase"] not in STOP_UPDATE_ACTIVE or pending["management_revision"] != row["management_revision"]:
+                    raise AqlaError("Pending stop management revision changed before replacement")
+                if data["bindings"].get(operation_id) != pending["source_binding"] or self.source_revisions(data, pending["source_revisions"]) != pending["source_revisions"]:
+                    raise AqlaError("Pending stop source binding changed before replacement")
+                if pending["source_binding"]["kind"] == "break_even" and price_grid(Decimal(row["entry_vwap"]), plan.market, up=plan.side == "long") != stop:
+                    raise AqlaError("Break-even reference changed after acceptance; original price identity will not be rebound")
+        async def live_guard():
+            nonlocal entry_fingerprint
+            await self.capture_fills(trade_id)
+            current_size = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
+            row = self.state.snapshot()["trades"][trade_id]
+            self.validate_final_stop_quantity(row)
+            self.validate_stop_budget(row, plan, stop, current_size, initialize_backup=initialize_backup)
+            if current_size != remaining:
+                raise AqlaError("Final own position changed; reconcile before stop replacement")
+            entry_fingerprint = digest({key: fill for key, fill in row["fill_events"].items() if fill["kind"] == "entry"})
+            final_guard(self.state.snapshot())
         if not any(order["cloid"] == cloid for order in trade["orders"]):
             self.state.update(lambda state: state["trades"][trade_id]["orders"].append(
                 {"kind": "sl", "cloid": cloid, "quantity": str(remaining), "price": str(stop)}))
-        result = existing or await self.exchange.mutate(operation_id, {"type": "order", "orders": [replacement], "grouping": "na"})
+        result = existing or await self.exchange.mutate(operation_id, {"type": "order", "orders": [replacement], "grouping": "na"},
+                                                       async_prepare_guard=live_guard, prepare_guard=final_guard)
         confirmed = await self.exchange.order_status(cloid)
         if confirmed.get("order", {}).get("status") == "open" and self._stop_matches(confirmed, plan, remaining, stop):
-            self._patch(trade_id, stop_price=str(stop), management_revision=trade["management_revision"] + 1)
+            pending = self.state.snapshot()["trades"][trade_id].get("pending_stop_update")
+            preserve = initialize_backup or initial_protection or pending and pending["operation_id"] == operation_id
+            self._patch(trade_id, stop_price=str(stop), management_revision=trade["management_revision"] + 1,
+                        preserve_pending_stop=preserve)
             old = [order for order in trade["orders"] if order["kind"] == "sl" and order["cloid"] != cloid]
+            if pending and pending["phase"] in STOP_UPDATE_ACTIVE and (initialize_backup or initial_protection):
+                pending_cloid = self.exchange.cloid(pending["operation_id"])
+                old = [order for order in old if order["cloid"] != pending_cloid]
             for order in old:
                 await self.exchange.mutate("cancel:" + operation_id + ":" + order["cloid"],
                                            {"type": "cancelByCloid", "cancels": [{"asset": plan.market.asset_id, "cloid": order["cloid"]}]})
             self._patch(trade_id, status="open")
+            return {**result, "replacement_confirmed": True}
+        if result.get("outcome") == "not_sent":
             return result
         if result["phase"] == "rejected":
             if getattr(self.exchange, "fail_closed_protection", False):
@@ -1065,6 +1371,11 @@ class Trading:
             return await self.dispatch_close_intent(trade_id, staged)
         if any(key not in snapshot["operations"] for key in trade.get("close_intents", {})):
             raise AqlaError("Finish the saved close intention before another reduction")
+        if not operation_id.startswith(("stop-crossed:", "emergency:", "protection-failure:")):
+            request = await self.management_stop_preflight(trade_id, operation_id)
+            if request:
+                self.state.update(lambda data: self.supersede_stop_for_management(data, trade_id, request,
+                    "An authorized close or reduction replaced this unsent stop request"))
         await self.cancel_entry(trade_id)
         await self.capture_fills(trade_id)
         size = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
@@ -1122,6 +1433,7 @@ class Trading:
             if any(row.get("order", {}).get("status") not in TERMINAL_ORDER for row in observations):
                 raise AqlaError("Owned exit cancellation is unconfirmed; market ownership remains reserved")
         self._patch(trade_id, status=trade["cleanup_target"], cleanup_complete=True, reserved_risk="0", cleanup_observed_at=now_ms())
+        await self.resume_pending_stop(trade_id)
         return self.state.snapshot()["trades"][trade_id]
 
     def update_candidates(self, event_id, signal: Interpretation):
@@ -1159,6 +1471,15 @@ class Trading:
                     raise AqlaError("Update source is already bound to another trade or action")
                 trade = snapshot["trades"][previous["trade_id"]]
                 self.assert_plan_binding(snapshot, TradePlan.model_validate(trade["plan"]))
+                stop_request = trade.get("pending_stop_update")
+                if stop_request and stop_request["event_id"] != event_id:
+                    stop_request = trade.get("stop_update_history", {}).get("update:" + event_id)
+                if stop_request and stop_request["event_id"] == event_id:
+                    if stop_request["phase"] in STOP_UPDATE_ACTIVE:
+                        await self.resume_pending_stop(trade["trade_id"])
+                        stop_request = self.state.snapshot()["trades"][trade["trade_id"]]["pending_stop_update"]
+                    return {"trade_id": trade["trade_id"], "result": self.stop_update_result(stop_request),
+                            "duplicate": stop_request["phase"] not in STOP_UPDATE_ACTIVE}
                 if snapshot["events"][event_id]["status"] == "updated":
                     return {"duplicate": True, "trade": trade}
                 if trade["status"] not in OPEN:
@@ -1194,7 +1515,8 @@ class Trading:
                 if signal.stop_loss is None:
                     raise AqlaError("Stop update needs a source-backed price")
                 old = Decimal(trade["stop_price"])
-                if not plan.policy.allow_stop_widening and (signal.stop_loss < old if plan.side == "long" else signal.stop_loss > old):
+                requested_stop = price_grid(signal.stop_loss, plan.market, up=plan.side == "long")
+                if not plan.policy.allow_stop_widening and (requested_stop < old if plan.side == "long" else requested_stop > old):
                     raise AqlaError("Stop widening is not permitted")
             update_targets = signal.take_profits
             update_spec = {"unit": "price"}
@@ -1220,9 +1542,25 @@ class Trading:
                 self.validate_targets(trade, plan, update_targets)
             if trade["status"] == "waiting_entry" and signal.update_action in ("break_even", "reduce"):
                 raise AqlaError("Waiting entry has no filled position for this update")
-            if not previous:
-                self.state.update(lambda state: state["bindings"].__setitem__("update:" + event_id, binding))
+            if trade["status"] != "waiting_entry" and signal.update_action in ("move_stop", "break_even"):
+                price = Decimal(trade["entry_vwap"]) if signal.update_action == "break_even" and trade["entry_vwap"] else signal.stop_loss
+                if not price:
+                    raise AqlaError("Stop update needs a price or proved entry VWAP")
+                result = await self.queue_stop_update(trade["trade_id"], event_id, signal, price)
+                return {"trade_id": trade["trade_id"], "result": result}
             operation = "update:" + event_id
+            update_revisions = self.source_revisions(self.state.snapshot(), signal.source_refs)
+            pending_request = await self.management_stop_preflight(trade["trade_id"], operation)
+            if not previous:
+                def accept_update(data):
+                    self.assert_plan_binding(data, plan)
+                    if self.source_revisions(data, signal.source_refs) != update_revisions:
+                        raise AqlaError("Source revision changed before independent management acceptance")
+                    if pending_request:
+                        self.supersede_stop_for_management(data, trade["trade_id"], pending_request,
+                            "A later authorized " + signal.update_action + " instruction replaced this unsent stop request")
+                    data["bindings"][operation] = binding
+                self.state.update(accept_update)
             if trade["status"] == "waiting_entry":
                 if signal.update_action in ("close", "cancel_entry"):
                     result = await self.cancel_entry(trade["trade_id"])
@@ -1270,6 +1608,10 @@ class Trading:
         prior = self.state.snapshot()["operations"].get(operation_id)
         if prior:
             return prior
+        request = await self.management_stop_preflight(trade_id, operation_id)
+        if request:
+            self.state.update(lambda data: self.supersede_stop_for_management(data, trade_id, request,
+                "An authorized target update replaced this unsent stop request"))
         staged = trade.get("target_updates", {}).get(operation_id)
         if staged is None:
             staged = {"prices": [str(price) for price in target_prices],

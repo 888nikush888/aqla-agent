@@ -218,6 +218,16 @@ def trade_block(data, trade, notices):
         lines.append("**Grund:** " + literal(ERRORS.get(trade["unsent_reason"], trade["unsent_reason"])))
     if trade.get("external_conflict"):
         lines.append("**Verwaltung angehalten:** " + literal(trade['external_conflict']))
+    stop_requests = [notice["stop_update"] for notice in notices if notice.get("stop_update")]
+    if not stop_requests and trade.get("pending_stop_update"):
+        stop_requests = [trade["pending_stop_update"]]
+    stop_labels = {"waiting_fill": "⏳ SL-Update wartet auf eigenen Fill", "replacing": "⏳ SL-Ersatz wird geprüft",
+                   "unknown": "⏳ SL-Update noch nicht bestätigt", "confirmed": "✅ SL-Update bestätigt",
+                   "rejected": "⚠️ SL-Update abgelehnt", "superseded": "↪️ SL-Update durch neue Anweisung ersetzt",
+                   "closed_without_application": "⚪ SL-Update ohne Anwendung beendet"}
+    for request in stop_requests:
+        lines.append("**" + stop_labels[request["phase"]] + ":** " + number(request["stop"]) + " " + quote
+                     + ("\n**Grund:** " + literal(request["reason"]) if request.get("reason") else ""))
     return "\n\n".join(lines)
 
 

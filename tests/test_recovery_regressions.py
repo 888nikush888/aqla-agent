@@ -1,9 +1,39 @@
 from decimal import Decimal
 
 import pytest
+from test_updates import stop_update, waiting_gtc
 
+from aqla_agent.trading import Trading
 from aqla_hyperliquid_mcp.models import AqlaError
 from aqla_hyperliquid_mcp.server import close_server, create_server
+from aqla_hyperliquid_mcp.state import State
+
+
+@pytest.mark.asyncio
+async def test_pending_stop_survives_restart(setup, signal):
+    settings, state, fake, exchange, trading = setup
+    trade = await waiting_gtc(setup, signal)
+    source, interpretation = stop_update(trading)
+    await trading.update_trade(source.event_id, interpretation)
+    pending = state.snapshot()["trades"][trade["trade_id"]]["pending_stop_update"]
+    state.close()
+    restarted = State(settings)
+    try:
+        exchange.state = restarted
+        trading = Trading(exchange, restarted)
+        assert restarted.snapshot()["trades"][trade["trade_id"]]["pending_stop_update"] == pending
+        fake.mid = "100"
+        fake.fill(trade["entry_cloid"], trade["plan"]["quantity"])
+        await trading.recover()
+        await trading.recover()
+        current = restarted.snapshot()["trades"][trade["trade_id"]]
+        assert current["pending_stop_update"]["phase"] == "confirmed"
+        assert current["pending_stop_update"]["operation_id"] == pending["operation_id"]
+        assert current["plan"] == trade["plan"]
+        assert restarted.snapshot()["events"][source.event_id]["status"] == "updated"
+        assert len([action for action in fake.actions if action["type"] == "order" and any(order["t"].get("trigger", {}).get("triggerPx") == "95" for order in action["orders"])]) == 1
+    finally:
+        restarted.close()
 
 
 @pytest.mark.asyncio

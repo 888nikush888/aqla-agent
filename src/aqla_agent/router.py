@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from typing import Literal
 
 from aqla_hyperliquid_mcp.models import AqlaError, Market, SymbolUnavailable, TradePlan, digest, now_ms
 
 from .accounting import inventory_view
 from .pipelines import ConfigurationChanged, VenueState, validate_ranking_binding
-from .trading import OPEN, Trading
+from .trading import OPEN, PendingStopUpdate, StopUpdatePhase, Trading
 from .venues import VenueAdapter, adapter_settings, execution_settings
 
 
@@ -356,8 +357,34 @@ class Router:
                 results.append({"exchange": name, "result": self.public_operation(result)})
             except Exception as error:
                 results.append({"exchange": name, "error": str(error) if isinstance(error, AqlaError) else "Trade update unavailable"})
-        self.state.update(lambda data: data["events"][event_id].update(status="updated", update_targets=results))
+        def finish_update(data):
+            event = data["events"][event_id]
+            event["update_targets"] = results
+            stop_statuses = self.stop_event_statuses(data)
+            for identity, status in stop_statuses.items():
+                if identity in data["events"] and data["events"][identity].get("update_targets"):
+                    data["events"][identity]["status"] = status
+            stop_status = stop_statuses.get(event_id)
+            uncertain = any(row.get("result", {}).get("result", {}).get("phase") in ("prepared", "sending", "unknown") for row in results)
+            event["status"] = stop_status or ("needs_reconciliation" if uncertain else "rejected" if all(row.get("error") for row in results) else "updated")
+        self.state.update(finish_update)
         return results[0]["result"] if len(results) == 1 and "result" in results[0] else {"targets": results}
+
+    @staticmethod
+    def stop_event_statuses(data) -> dict[str, Literal["needs_reconciliation", "updated", "superseded", "rejected"]]:
+        phases: dict[str, list[StopUpdatePhase]] = {}
+        for trade in data["trades"].values():
+            requests = dict(trade.get("stop_update_history", {}))
+            if pending := trade.get("pending_stop_update"):
+                requests[pending["operation_id"]] = pending
+            for saved in requests.values():
+                request = PendingStopUpdate.model_validate(saved)
+                phases.setdefault(request.event_id, []).append(request.phase)
+        result = {}
+        for event_id, values in phases.items():
+            result[event_id] = ("needs_reconciliation" if any(phase in ("waiting_fill", "replacing", "unknown") for phase in values)
+                                else "updated" if "confirmed" in values else "superseded" if all(phase == "superseded" for phase in values) else "rejected")
+        return result
 
     async def recover(self):
         from .ranking import evaluate
@@ -387,6 +414,10 @@ class Router:
                 rows = await engine.recover()
             reports.extend({"exchange": venue, **row} for row in rows)
         def expire(data):
+            stop_statuses = self.stop_event_statuses(data)
+            for event_id, event in data["events"].items():
+                if event.get("update_targets") and (status := stop_statuses.get(event_id)):
+                    event["status"] = status
             for event in data["events"].values():
                 for target in event.get("targets", {}).values():
                     if target.get("trade_id") in data["trades"]:

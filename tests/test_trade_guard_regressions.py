@@ -7,6 +7,7 @@ import pytest
 
 from aqla_agent.router import Router
 from aqla_hyperliquid_mcp.models import AqlaError, Interpretation
+from aqla_hyperliquid_mcp.storage import read_snapshot
 
 
 async def admitted_without_entry(trading, source, interpretation, monkeypatch):
@@ -28,8 +29,50 @@ def entry_actions(fake):
 
 
 @pytest.mark.asyncio
+async def test_exchange_send_observes_committed_sending_record(setup):
+    _, state, fake, exchange, _ = setup
+    observed = []
+    original = fake.handle
+
+    def boundary(request):
+        if request.url.path == "/exchange":
+            row = read_snapshot(state.path)["operations"].get("persist-oracle")
+            assert row is not None, "Transport must observe a committed operation before send"
+            assert row["phase"] == "sending", "Sending checkpoint must already be committed"
+            assert row["wire_action"] == json.loads(request.content)["action"]
+            observed.append(row)
+        return original(request)
+
+    exchange.client._transport = httpx.MockTransport(boundary)
+    result = await exchange.mutate("persist-oracle", {"type": "updateLeverage", "asset": 0, "isCross": False, "leverage": 2})
+    assert len(observed) == 1 and result["phase"] == "acknowledged"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["reduceOnly", "isTrigger", "triggerPx", "sz", "side"])
+async def test_malformed_live_stop_is_not_accepted_as_effective_protection(setup, signal, field):
+    _, state, fake, exchange, trading = setup
+    exchange.fail_closed_protection = True
+    source, interpretation = signal
+    plan = await trading.preview(source.event_id, interpretation)
+    trade = await trading.execute(plan["plan_id"])
+    initial = next(row for row in trade["orders"] if row["kind"] == "sl")
+    corrupt = {"reduceOnly": False, "isTrigger": False, "triggerPx": "80", "sz": "0.01", "side": "B"}
+    fake.orders[initial["cloid"]]["order"][field] = corrupt[field]
+    await trading.refresh_trade(trade["trade_id"])
+    final = state.snapshot()["trades"][trade["trade_id"]]
+    effective = [row for row in fake.orders.values() if row["status"] == "open"
+                 and row["order"].get("isTrigger") is True and row["order"].get("reduceOnly") is True
+                 and row["order"].get("side") == "A" and Decimal(row["order"].get("triggerPx", "0")) == Decimal(final["stop_price"])
+                 and Decimal(row["order"].get("sz", "0")) >= Decimal(final["remaining_quantity"])]
+    assert effective or Decimal(str(fake.position)) == 0, "Own exposure needs actual valid stop evidence or confirmed closure"
+    assert fake.orders[initial["cloid"]]["status"] == "canceled", "Malformed stop must not count as effective protection"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("late_evidence", [False, True], ids=["coherent", "late"])
-async def test_cancel_fill_race_rechecks_stop_widening_budget(setup, signal, late_evidence):
+@pytest.mark.parametrize("reveal_at", ["before_update", "after_prepared"])
+async def test_cancel_fill_race_rechecks_stop_widening_budget(setup, signal, late_evidence, reveal_at):
     _, state, fake, exchange, trading = setup
     exchange.fail_closed_protection = True
     state.update(lambda data: data["policy"].update(allow_stop_widening=True, sizing_mode="fixed_notional", fixed_notional_usdc="480"))
@@ -53,9 +96,20 @@ async def test_cancel_fill_race_rechecks_stop_widening_budget(setup, signal, lat
                 injected = True
                 delayed = late_evidence
         if request.url.path == "/info" and payload.get("type") == "orderStatus" and update_started and delayed:
-            delayed = False
+            operation = state.snapshot()["operations"].get("widen-late-evidence")
+            if reveal_at == "before_update" or operation and operation["phase"] == "prepared":
+                delayed = False
         response = original(request)
         if request.url.path == "/info" and delayed:
+            if reveal_at == "after_prepared" and payload.get("type") == "orderStatus":
+                data = response.json()
+                detail = data.get("order", {})
+                if detail.get("order", {}).get("reduceOnly") is False:
+                    # Keep all three cached observations coherent until preparation;
+                    # the terminal quantity, fills and position then advance together.
+                    detail["status"] = "canceled"
+                    detail["order"]["sz"] = "2.40"
+                    return httpx.Response(200, json=data)
             if payload.get("type") == "userFillsByTime":
                 return httpx.Response(200, json=partial_fills)
             if payload.get("type") == "clearinghouseState":
@@ -72,8 +126,14 @@ async def test_cancel_fill_race_rechecks_stop_widening_budget(setup, signal, lat
     initial_stop = next(row for row in trade["orders"] if row["kind"] == "sl")
     before = len(fake.actions)
     update_started = True
-    with pytest.raises(AqlaError, match="original loss budget"):
-        await trading.replace_stop(trade["trade_id"], Decimal("80"), "widen-late-evidence")
+    if late_evidence and reveal_at == "after_prepared":
+        result = await trading.replace_stop(trade["trade_id"], Decimal("80"), "widen-late-evidence")
+        assert result["phase"] == "rejected" and result["outcome"] == "not_sent"
+        assert "original loss budget" in result["result"]["error"]
+        assert state.snapshot()["operations"]["widen-late-evidence"] == result
+    else:
+        with pytest.raises(AqlaError, match="original loss budget"):
+            await trading.replace_stop(trade["trade_id"], Decimal("80"), "widen-late-evidence")
     assert fake.orders[initial_stop["cloid"]]["status"] == "open"
     assert Decimal(state.snapshot()["trades"][trade["trade_id"]]["stop_price"]) == 90
     assert len(fake.actions) == before
