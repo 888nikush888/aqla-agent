@@ -1,6 +1,8 @@
 """Small Sheets API adapter. Stable row IDs make uncertain writes retry-safe."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import math
 import threading
@@ -27,7 +29,51 @@ MAX_INDEX_REQUESTS = 12
 BODY_CHUNK_ROWS = 100
 TEXT_CHUNK_ROWS = 10
 MAX_BODY_REQUESTS = 12
+MAX_SCAN_CURSOR_LENGTH = 2048
 TEXT_TABLES = {"Signale", "Vorgänge", "Regeln", "Handelsparameter", "Ereignisse", "Pipelines"}
+
+
+def _scan_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+def _cursor_object(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("Duplicate cursor fields")
+    return result
+
+
+def _decode_scan_cursor(token):
+    try:
+        if not isinstance(token, str) or not 0 < len(token) <= MAX_SCAN_CURSOR_LENGTH:
+            raise ValueError("Invalid cursor length")
+        if any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for character in token):
+            raise ValueError("Invalid cursor encoding")
+        raw = base64.b64decode(token + "=" * (-len(token) % 4), altchars=b"-_", validate=True)
+        cursor = json.loads(raw, object_pairs_hook=_cursor_object)
+        if not isinstance(cursor, dict) or set(cursor) != {"v", "binding", "index", "next"}:
+            raise ValueError("Invalid cursor fields")
+        if type(cursor["v"]) is not int or cursor["v"] != 1:
+            raise ValueError("Unknown cursor version")
+        if type(cursor["next"]) is not int or cursor["next"] < 0:
+            raise ValueError("Invalid cursor position")
+        for key in ("binding", "index"):
+            value = cursor[key]
+            if not isinstance(value, str) or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError("Invalid cursor digest")
+        return cursor
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise AqlaError("Invalid journal scan cursor; restart at offset 0") from None
+
+
+def _encode_scan_cursor(binding, index, position):
+    raw = json.dumps({"v": 1, "binding": binding, "index": index, "next": position}, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _stale_scan_cursor():
+    return AqlaError("stale_cursor: journal scope, schema or index changed; restart at offset 0")
 
 
 def column(index):
@@ -306,16 +352,50 @@ class SheetsClient:
                     "startIndex": 0, "endIndex": existing["Handelsparameter"][1]}}}]})
             return {"accepted": accepted, "synced": len(accepted)}
 
-    def read(self, table, offset=0, limit=100, filters=None):
+    def read(self, table, offset=0, limit=100, filters=None, *, scan_cursor: str | None = None):
         with self.lock:
             headers = HEADERS[table]
-            filters = filters or {}
+            filters = dict(filters or {})
             if any(key not in headers for key in filters):
                 raise AqlaError("Unknown journal filter column")
-            properties = self.layout(create=False)
-            found, _ = self.existing([table], properties)[table]
-            selected = list(found.items()) if filters else list(found.items())[offset:offset + limit]
+            cursor = None
+            if scan_cursor is not None:
+                if offset != 0 or not filters:
+                    raise AqlaError("A journal scan cursor requires offset 0 and nonempty filters")
+                if not 1 <= limit <= 500:
+                    raise AqlaError("Journal page limit must be between 1 and 500")
+                cursor = _decode_scan_cursor(scan_cursor)
+            try:
+                properties = self.layout(create=False)
+                found, _ = self.existing([table], properties)[table]
+            except AqlaError as error:
+                if cursor is not None and str(error).startswith(("This Google spreadsheet", "Google Sheets journal", "Duplicate journal IDs")):
+                    raise _stale_scan_cursor() from None
+                raise
+            items = list(found.items())
+            start = 0
+            binding = index_digest = None
+            if filters:
+                binding = _scan_digest({"spreadsheet": self.settings.spreadsheet_id, "scope": self.scope,
+                                        "scope_key": self.scope_key, "prefix": self.prefix,
+                                        "sheet_id": properties[self.prefix + table]["sheetId"], "table": table,
+                                        "headers": [*headers, *META_HEADERS], "filters": filters})
+                index_digest = _scan_digest([[identity, index, *meta] for identity, (index, meta) in items])
+                if cursor is not None:
+                    if cursor["binding"] != binding or cursor["index"] != index_digest:
+                        raise _stale_scan_cursor()
+                    start = cursor["next"]
+                    if start >= len(items):
+                        raise AqlaError("Invalid journal scan cursor position; restart at offset 0")
+            selected = items[start:] if filters else items[offset:offset + limit]
             loaded = self.bodies(table, [item[1][0] for item in selected], [MAX_BODY_REQUESTS])
+            if cursor is not None:
+                for identity, (index, meta) in selected:
+                    cells = loaded.get(index)
+                    if cells is None:
+                        break
+                    if str(cells[0]) != identity or _scan_digest(cells[len(headers):len(headers) + 2]) != _scan_digest(meta):
+                        raise _stale_scan_cursor()
             rows = []
             invalid = matched = scanned = 0
             for identity, (index, _) in selected:
@@ -333,13 +413,27 @@ class SheetsClient:
                     if not filters or offset <= matched < offset + limit:
                         rows.append({**row, "_verified": valid})
                     matched += 1
+                    if cursor is not None and len(rows) == limit:
+                        break
             complete = scanned == len(selected)
+            if cursor is not None:
+                return {"table": table, "rows": rows, "total": None, "total_complete": False,
+                        "unverified_rows": invalid, "unverified_rows_scope": "scan", "scanned_rows": scanned,
+                        "matched_rows_scanned": matched, "complete": complete, "scan_complete": complete,
+                        "scan_truncated": not complete, "next_offset": None,
+                        "next_scan_cursor": None if complete else _encode_scan_cursor(binding, index_digest, start + scanned)}
             total = matched if filters and complete else None if filters else len(found)
             next_offset = offset + len(rows) if (matched if filters else len(found)) > offset + len(rows) else None
-            return {"table": table, "rows": rows, "total": total, "total_complete": not filters or complete,
+            if filters and not complete and offset > matched:
+                raise AqlaError("Filtered offset exceeds the scanned prefix; start at offset 0, follow next_offset, then next_scan_cursor")
+            result = {"table": table, "rows": rows, "total": total, "total_complete": not filters or complete,
                     "unverified_rows": invalid, "unverified_rows_scope": "scan" if filters else "page",
                     "scanned_rows": scanned, "matched_rows_scanned": matched, "complete": complete,
                     "scan_truncated": not complete, "next_offset": next_offset}
+            if filters:
+                result.update(scan_complete=complete, next_scan_cursor=(
+                    _encode_scan_cursor(binding, index_digest, scanned) if not complete and next_offset is None else None))
+            return result
 
     def statistics(self, group_by="gesamt"):
         with self.lock:
