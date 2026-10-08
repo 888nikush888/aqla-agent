@@ -86,7 +86,7 @@ def main():
         event = MessageEvent(text='Status', source=source, message_id='4242')
         runner = SimpleNamespace(_delivery_adapter_for=lambda _: adapter, _should_send_voice_reply=lambda *_args, **_kwargs: False)
         completed = []
-        labels = ['[Daten](https://example.invalid/image.png)', 'MEDIA:/not-existing/synthetic.pdf', '<img src="https://example.invalid/x.png">', 'VIP_`[] 🚀 Ä \\']
+        labels = ['[Daten](https://example.invalid/image.png)', 'MEDIA:/not-existing/synthetic.pdf', '<img src="https://example.invalid/x.png">', 'VIP_`[] 🚀 Ä \\', 'Ä🚀[]`\\{}' * 150]
         for label in labels:
             data['source_names']['-100123'] = label
             view = telegram_view(data, {'hyperliquid': {'network':'testnet','configured':True,'enabled':True}})

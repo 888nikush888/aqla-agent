@@ -218,6 +218,10 @@ Preis-/Mengenraster, Signerrollen, Netzwerk-, Deployer- und Testnet-Grenzen blei
 
 WebSocket-Posts unterstützen Info, SDK-Aktionen und native Aktionen. Reconnects abonnieren Reads erneut, senden Writes aber niemals erneut.
 
+Der Stream begrenzt standardmäßig 128 einzigartige gewünschte Abonnements, 4096 Ereignisse und 8 MiB tatsächliche UTF-8-Ereignisbytes im Ring. Doppelte Abonnements verbrauchen kein weiteres Budget; eine Überschreitung wird vor Änderung der gewünschten Auswahl abgewiesen. `hl_stream`-Reads begrenzen die vollständige native Antwort auf 600.000 UTF-8-Bytes und setzen den Cursor ausschließlich bis zum letzten ausgegebenen Ereignis fort. Die Konstruktorbudgets sind konfigurierbar; die Antwortgrenze darf nicht erhöht werden.
+
+Count-/Byteverlust und einzelne übergroße Ereignisse zeigen eine Lücke mit notwendigem REST-Abgleich. Ein übergroßer Einzelwert wird als begrenzter Gapmarker mit derselben Sequenz sichtbar, damit das Lesen fortschreitet. Decode-, Transport- und Timeoutdiagnosen enthalten nur Kategorie, Zeitpunkt und Zähler; keine Payloads oder Credentialtexte. Fehler beim Decodieren verhindern spätere gültige Ereignisse nicht. Info- und Action-Postantworten werden nach ihrer erwarteten Art korreliert; ein Reconnect bestätigt oder wiederholt keinen verlorenen Auftrag.
+
 Die unabhängige Manifestdatei enthält Dokumentprüfsummen und Quellcommits. `--check-coverage` vergleicht diese erwarteten Verträge mit den vorhandenen Handlern und Eingabeschemas; Contracttests prüfen deren tatsächliche Wire-/Signingpfade.
 
 Primärquellen: [Hyperliquid API](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api), [HIP-3](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions), [HIP-4](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-4-deployer-actions), [Python-SDK](https://github.com/hyperliquid-dex/hyperliquid-python-sdk/tree/2fdb18f9517675ea03695a0962bd19eece9c83f0).
