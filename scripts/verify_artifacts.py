@@ -1,18 +1,25 @@
 """Verify shipping contents, source completeness and the VPS archive checksum."""
 import hashlib
 import json
+import sys
 import tarfile
 import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from check_repository import forbidden
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from aqla_agent.artifact_rules import (  # noqa: E402
+    forbidden,
+    validate_member,
+    validate_tar_members,
+    validate_zip_members,
+)
 
 
 def verify_names(names):
     for name in names:
-        if PurePosixPath(name).is_absolute() or ".." in PurePosixPath(name).parts:
-            raise SystemExit("Unsafe artifact member path: " + name)
+        validate_member(name)
         relative = name.split("/", 1)[1] if "/" in name else name
         if forbidden(relative):
             raise SystemExit("Forbidden artifact member: " + name)
@@ -21,10 +28,11 @@ def verify_names(names):
 def main():
     dist = Path("dist")
     bundle = dist / "aqla-agent-vps.zip"
-    expected = bundle.with_suffix(".zip.sha256").read_text(encoding="utf-8").split()[0]
-    if hashlib.sha256(bundle.read_bytes()).hexdigest() != expected:
+    expected = bundle.with_suffix(".zip.sha256").read_text(encoding="utf-8")
+    if expected != f"{hashlib.sha256(bundle.read_bytes()).hexdigest()}  {bundle.name}\n":
         raise SystemExit("VPS archive checksum mismatch")
     with zipfile.ZipFile(bundle) as archive:
+        validate_zip_members(archive)
         if archive.testzip() is not None:
             raise SystemExit("VPS archive integrity failed")
         names = archive.namelist()
@@ -47,7 +55,6 @@ def main():
             root = Path(target) / "aqla-agent"
             from aqla_agent.install import prepare
             prepare(root, Path(target) / "deployment", "12345", "ci-only", "https://example.invalid/v1")
-            import sys
             from subprocess import run
             run([sys.executable, "-m", "ruff", "check", "src", "tests", "hermes_plugin", "scripts"], cwd=root, check=True)
     wheels = list(dist.glob("*.whl"))
@@ -55,11 +62,13 @@ def main():
     if len(wheels) != 1 or len(sources) != 1:
         raise SystemExit("Expected one wheel and one source distribution")
     with zipfile.ZipFile(wheels[0]) as archive:
+        validate_zip_members(archive)
         verify_names(archive.namelist())
         for asset in ("aqla_hyperliquid_mcp/info_specs.json", "aqla_hyperliquid_mcp/api_manifest.json", "aqla_sheets_mcp/server.py", "aqla_sheets_mcp/parameters.py"):
             if asset not in archive.namelist():
                 raise SystemExit("Wheel is missing API contracts")
     with tarfile.open(sources[0]) as archive:
+        validate_tar_members(archive)
         verify_names(archive.getnames())
     print("Wheel, source distribution, VPS contents and SHA-256 passed")
 

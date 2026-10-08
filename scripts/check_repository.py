@@ -1,16 +1,11 @@
 """Reject committed local credentials, installation state and QA outputs."""
 import subprocess
-from pathlib import PurePosixPath
+import sys
+from pathlib import Path
 
-FORBIDDEN_PARTS = {".cache", ".venv", "__pycache__", "secrets", "hermes-home", "hermes-source", "hermes-venv", ".python", "reports", "dist"}
-FORBIDDEN_NAMES = {"vps.env", "config.yaml", "state.json", ".coverage"}
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-
-def forbidden(name):
-    path = PurePosixPath(name)
-    return bool(FORBIDDEN_PARTS.intersection(path.parts) or path.name in FORBIDDEN_NAMES
-                or path.suffix in (".secret", ".session", ".pyc", ".db", ".sqlite", ".sqlite3")
-                or path.name.startswith(".env") and path.name != ".env.example")
+from aqla_agent.artifact_rules import forbidden  # noqa: E402
 
 
 def main():
