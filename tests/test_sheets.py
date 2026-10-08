@@ -247,6 +247,66 @@ async def test_actual_sheets_mcp_registration_reading_and_internal_auth(setup, s
     client.close()
 
 
+@pytest.mark.asyncio
+async def test_journal_read_mcp_schema_exposes_bounded_scan_cursor(setup, sheets):
+    settings, *_ = setup
+    selected, google, client = sheets
+    settings.google_sheets = selected
+    server = create_server(settings, client=client)
+    tool = next(tool for tool in await server.list_tools() if tool.name == "journal_read")
+    schema = tool.input_schema
+    cursor = schema["properties"]["scan_cursor"]
+    assert cursor["default"] is None
+    assert {"type": "null"} in cursor["anyOf"]
+    assert {"type": "string", "maxLength": 2048} in cursor["anyOf"]
+    assert "scan_cursor" not in schema.get("required", [])
+    assert schema["properties"]["limit"]["minimum"] == 1
+    assert schema["properties"]["limit"]["maximum"] == 500
+    with pytest.raises(ToolError):
+        await server.call_tool("journal_read", {"table": "Trades", "filters": {"Quelle": "channel"}, "scan_cursor": "a" * 2049})
+    assert google.calls == []
+
+
+@pytest.mark.asyncio
+async def test_journal_read_mcp_forwards_scoped_cursor_and_rejects_nonzero_offset(setup, sheets, monkeypatch):
+    from aqla_hyperliquid_mcp.models import ExecutionSettings
+
+    settings, *_ = setup
+    selected, google, client = sheets
+    settings.google_sheets = selected
+    account = "0x" + "1" * 40
+    settings.execution_accounts["aster:mainnet"] = ExecutionSettings(exchange="aster", network="mainnet", account=account)
+    scoped = SheetsClient(selected, session=google, scope="mainnet:" + account)
+    scoped.prefix, scoped.scope_key = "aqla Aster Mainnet ", "aqla.scope.aster.mainnet"
+    scoped.allowed_tables = {"Trades", "Orders", "Fills", "Vorgänge"}
+    scoped.layout()
+    expected = [f"scoped-trade-{index:04d}" for index in range(1205)]
+    rows = [record("Trades", identity, "channel", "BTC", "long", "closed", "now", 100, 100, 1, 1, 0, 90, "[]", 10, 0, 1, 0, 1, "[]")
+            for identity in expected]
+    google.tables[scoped.prefix + "Trades"][1:] = [[*row["values"], row["fingerprint"], 1] for row in rows]
+    google.properties[scoped.prefix + "Trades"]["gridProperties"]["rowCount"] = len(rows) + 1
+    original, calls = SheetsClient.read, []
+
+    def observe_read(self, *args, **kwargs):
+        calls.append((self.prefix, args, kwargs))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SheetsClient, "read", observe_read)
+    server = create_server(settings, client=client)
+    args = {"table": "Trades", "offset": 1200, "filters": {"Quelle": "channel"}, "account_key": "aster:mainnet"}
+    first = json.loads((await server.call_tool("journal_read", args)).content[0].text)
+    assert first["rows"] == [] and first["next_scan_cursor"] is not None
+    args.update(offset=0, limit=2, scan_cursor=first["next_scan_cursor"])
+    second = json.loads((await server.call_tool("journal_read", args)).content[0].text)
+    assert [row["ID"] for row in second["rows"]] == expected[1200:1202]
+    assert second["total"] is None and second["total_complete"] is False
+    assert calls[-1] == (scoped.prefix, ("Trades", 0, 2, {"Quelle": "channel"}), {"scan_cursor": first["next_scan_cursor"]})
+    with pytest.raises(ToolError, match="requires offset 0"):
+        await server.call_tool("journal_read", {**args, "offset": 1})
+    with pytest.raises(ToolError, match="stale_cursor:"):
+        await server.call_tool("journal_read", {**args, "account_key": "hyperliquid:testnet"})
+
+
 def test_google_credentials_error_is_safe_and_cell_limits_are_respected(sheets):
     selected, _, _ = sheets
     with pytest.raises(AqlaError, match="credentials"):

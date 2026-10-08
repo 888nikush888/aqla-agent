@@ -72,6 +72,28 @@ Der Abgleich liest zunächst schmale ID-/Digest-/Versionsindizes und prüft nur 
 
 Gefilterte Abfragen und Statistiken prüfen vollständige Zeilen in kleinen Paketen, höchstens zwölf Leseanfragen je Aufruf. Bei erreichtem Budget melden sie `complete: false` und `scan_truncated: true`. Ein gefiltertes `total` bleibt dann `null`; `matched_rows_scanned` und `scanned_rows` beschreiben nur den geprüften Ausschnitt. Teilstatistiken nennen `scanned_trades` und `total_trades` und dürfen nicht als Gesamtergebnis verwendet werden. Ein vollständiger ID-Scan ist auf zwölf Pakete mit je 10.000 Rasterzeilen begrenzt; größere Raster melden einen Fehler und lassen die Übertragung ausstehend. Es wird kein zusätzlicher Dateicache angelegt.
 
+Bei gefiltertem `journal_read` ohne Cursor wird zunächst derselbe begrenzte Präfix wie bisher geprüft. Solange dessen Treffer über `next_offset` erreichbar sind, folgt der nächste Aufruf diesem Offset und `next_scan_cursor` bleibt `null`. Erst nach diesen Treffern zeigt `next_scan_cursor` auf die erste noch nicht ausgewertete Indexposition. Bei 125 passenden Signalzeilen sind das beispielsweise 100 Treffer, dann mit Offset 100 weitere 20 und anschließend fünf über den Cursor. Ein Offset größer als die Trefferzahl eines unvollständig gescannten Präfixes wird abgewiesen; bei Offset 0 beginnen und den ausgegebenen Fortsetzungen folgen. Ein Offset genau auf dieser Trefferzahl darf eine leere Seite mit Cursor liefern. Kleine vollständig gescannte Filterbestände behalten ihre belegbare Trefferzahl in `total`.
+
+Eine Cursorfortsetzung verlangt dieselben nichtleeren Filter, dieselbe Tabelle und denselben Kontoscope sowie `offset=0`; `limit` darf zwischen 1 und 500 geändert werden. Sie stoppt bei diesem Trefferlimit, dem Lesebudget oder dem Indexende. Auch eine Seite ohne Treffer kann `next_scan_cursor` enthalten. Jede Cursorseite meldet `total=null`, `total_complete=false` und `next_offset=null`, einschließlich der letzten Seite. `scan_complete=true` bestätigt nur das Ende des restlichen Indexscans; dann ist der nächste Cursor `null`. Auf Cursorseiten entspricht `complete` diesem Wert und `scan_truncated` seinem Gegenteil. Auf Legacyseiten beschreibt `scan_complete` das Indexende, während `complete` und `total` ihre bisherigen Bedeutungen behalten.
+
+```python
+offset, scan_cursor = 0, None
+while True:
+    page = journal_read(table="Signale", filters={"Quelle": "channel"},
+                        offset=offset, limit=100, scan_cursor=scan_cursor)
+    consume(page["rows"])
+    if page["next_offset"] is not None:
+        offset = page["next_offset"]
+    elif page["next_scan_cursor"] is not None:
+        offset, scan_cursor = 0, page["next_scan_cursor"]
+    else:
+        break
+```
+
+Der Cursor enthält ausschließlich Version, Bindungs-/Indexdigests und die nächste Position; er verwendet keinen persistenten Zustand. Jeder Folgeaufruf liest Layout und vollständigen schmalen Index erneut. Änderungen an Spreadsheet, Kontoscope, Tabnamespace, Worksheet-ID, Headern, Filterwerten oder geordneten IDs/Zeilenpositionen/Digests/Revisionen ergeben `stale_cursor:`. Dann die gesamte Abfrage bei Offset 0 neu beginnen. Auch während des Bodyreads sichtbare ID- oder Metadatenänderungen werden abgewiesen. Die Legacyoffset-Seiten vor Cursorübergabe behalten ihre Best-effort-Semantik bei gleichzeitig veränderter Tabelle.
+
+Der schmale Index garantiert keinen global unveränderten historischen Bodybestand und keine kryptografische Herkunft. Manuelle Bodyänderungen ohne aktualisierte Metadaten können den Cursor unverändert lassen; gelesene inkonsistente Zeilen bleiben durch `_verified=false` erkennbar und werden weiterhin aus Statistikwerten ausgeschlossen.
+
 Gewinnwerte sind **realisierte Ergebnisse vor Funding**. USDC-Gebühren werden aus eigenen Fills berücksichtigt; bei fehlender Gebühreninformation oder fremder Gebührenwährung bleibt Netto unbestimmt. Trefferquoten nennen nur bekannte abgeschlossene Ergebnisse. Ungeschlossene Positionen erhalten keine erfundene Mark-to-Market-PnL. Funding und die volle Hermes-Gesprächshistorie werden nicht gespiegelt.
 
 ## Prüfungen und API-Grenzen
