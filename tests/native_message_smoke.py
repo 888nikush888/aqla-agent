@@ -19,7 +19,10 @@ def main():
     os.environ['HERMES_SKIP_CONFIG_MIGRATION'] = '1'
     os.environ['HERMES_SKIP_UPDATE_CHECK'] = '1'
     sys.path[:0] = [str(Path(__file__).resolve().parents[1] / 'src'), str(Path(args.hermes_source).resolve())]
-    from gateway.config import PlatformConfig
+    from gateway.config import Platform, PlatformConfig
+    from gateway.platforms.event import MessageEvent
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.session import SessionSource
     from hermes_state import SessionDB
     from plugins.platforms.telegram.adapter import TelegramAdapter
     from telegram.constants import ParseMode
@@ -57,6 +60,10 @@ def main():
             return SimpleNamespace(message_id=len(delivered))
         async def send_chat_action(self, **kwargs):
             return True
+        async def send_document(self, **kwargs):
+            raise AssertionError("Unexpected document from formatter label")
+        async def send_photo(self, **kwargs):
+            raise AssertionError("Unexpected image from formatter label")
     adapter._bot = Bot()
     async def verify():
         first = await adapter.send('12345', card, metadata={'notify': True})
@@ -74,6 +81,35 @@ def main():
         assert result.success and len(delivered) > before + 1
         return long
     long = asyncio.run(verify())
+    async def normal_gateway_route():
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id='12345', user_id='12345')
+        event = MessageEvent(text='Status', source=source, message_id='4242')
+        runner = SimpleNamespace(_delivery_adapter_for=lambda _: adapter, _should_send_voice_reply=lambda *_args, **_kwargs: False)
+        completed = []
+        labels = ['[Daten](https://example.invalid/image.png)', 'MEDIA:/not-existing/synthetic.pdf', '<img src="https://example.invalid/x.png">', 'VIP_`[] 🚀 Ä \\']
+        for label in labels:
+            data['source_names']['-100123'] = label
+            view = telegram_view(data, {'hyperliquid': {'network':'testnet','configured':True,'enabled':True}})
+            response = '\n\n'.join(view['messages'][0]['texts'])
+            response = '\n\n'.join(response for _ in range(12))
+            routed = await GatewayTurnMixin._hmwa_deliver_turn_response(
+                runner, event, source, SimpleNamespace(session_id='synthetic-route'), 'synthetic-route', 1,
+                {'final_response':response}, [], response, None, False)
+            assert routed == response
+            extracted = await adapter._extract_response_content(routed, event, 'synthetic-route', is_ephemeral_response=False)
+            assert not extracted.images and not extracted.media_files and not extracted.local_files
+            assert extracted.text_content == response.strip()
+            before = len(delivered)
+            await adapter._send_final_text(event, 'synthetic-route', extracted.text_content, {}, False, 0, completed.append)
+            await adapter._deliver_attachments(event, extracted, {}, anything_sent=True, record_delivery=completed.append)
+            assert len(delivered) > before and all(result.success for result in completed)
+            assert all('](https://example.invalid' not in message['text'] or '\\[' in message['text'] or '`' in message['text'] for message in delivered[before:])
+        assert 'zum Belegzeitpunkt nicht bestätigt' in entry_card
+        assert 'PnL nicht vollständig bestätigt' in closed_card
+        intended = await adapter._extract_response_content('Eigener Auftrag ![Owner](https://example.invalid/owner.png)', event,
+                                                           'synthetic-owner-media', is_ephemeral_response=False)
+        assert intended.images == [('https://example.invalid/owner.png', 'Owner')]
+    asyncio.run(normal_gateway_route())
     db = SessionDB(db_path=home / 'state.db')
     try:
         db.create_session('message-view', 'telegram')
@@ -86,6 +122,8 @@ def main():
     finally:
         db.close()
     print(json.dumps({'native_markdown_send': True, 'native_split': True, 'saved_reply_matches': True,
+                      'normal_gateway_response_router': True, 'no_unexpected_media_or_label_links': True, 'owner_media_extraction_preserved': True,
+                      'unknown_fill_price_not_inferred': True,
                       'chunks': len(delivered), 'exchange_actions': 0, 'telegram_network_calls': 0, 'input_chars': len(long)}))
 
 

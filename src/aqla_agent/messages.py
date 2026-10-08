@@ -22,8 +22,10 @@ MAX_NOTIFICATIONS = 100
 def literal(value):
     text = re.sub(r"[\x00-\x1f\x7f]", " ", str(value)).strip()
     # Protect dynamic labels from becoming links, HTML, emphasis or code fences.
-    if any(char in text for char in "*_`[]<>~|#\\"):
-        return "`" + text.replace("`", "ˋ").replace("\\", "⧵") + "`"
+    if any(char in text for char in "*_`[]<>~|#\\") or "MEDIA:" in text.upper():
+        # The pinned native HTML-image extractor also scans inline code. Keep
+        # dynamic angle brackets visible without leaving an executable HTML tag.
+        return "`" + text.replace("`", "ˋ").replace("\\", "⧵").replace("<", "‹").replace(">", "›") + "`"
     return text
 
 

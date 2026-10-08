@@ -182,6 +182,9 @@ def test_unsafe_names_are_literal_not_links_or_instructions():
     assert literal('[VIP](https://invalid)')=='`[VIP](https://invalid)`'
     assert '\n' not in literal('VIP\n**test**')
     assert '`' not in literal('foo`bar')[1:-1]
+    assert literal('MEDIA:/not-existing/synthetic.pdf') == '`MEDIA:/not-existing/synthetic.pdf`'
+    assert literal('media:/not-existing/synthetic.pdf') == '`media:/not-existing/synthetic.pdf`'
+    assert literal('<img src="https://example.invalid/x.png">') == '`‹img src="https://example.invalid/x.png"›`'
 
 
 def test_long_messages_split_without_loss_or_broken_lines():
