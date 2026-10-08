@@ -74,6 +74,8 @@ class VenueAdapter:
 
     async def mutate(self, operation_id, action, *, deadline=None, prepare_guard=None, async_prepare_guard=None):
         async with self.mutations:
+            if invalidate := getattr(self, "invalidate_order_observations", None):
+                invalidate()
             request = {"network": self.settings.network, "account": self.account, "action": action, "deadline": deadline}
             existing = self.state.snapshot()["operations"].get(operation_id)
             if existing:

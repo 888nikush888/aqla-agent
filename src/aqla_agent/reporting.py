@@ -6,7 +6,7 @@ from decimal import Decimal
 
 from aqla_hyperliquid_mcp.models import AqlaError, Market, TradePlan, digest, now_ms
 
-from .evidence import market_fills
+from .evidence import market_fills, order_observations
 from .funding import bounded_history
 from .monthly import CLOSED, accounting_facts, entry_quantity_evidence, fill_identity
 
@@ -20,6 +20,10 @@ class Reporting:
         self.state, self.router = state, router
 
     async def hydrate(self, trade_id, engine):
+        with order_observations(engine.exchange):
+            return await self._hydrate(trade_id, engine)
+
+    async def _hydrate(self, trade_id, engine):
         """Backfill only fills belonging to stored own order identities; never adopt manual exits."""
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])

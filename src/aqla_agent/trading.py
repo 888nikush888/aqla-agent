@@ -36,7 +36,7 @@ from aqla_hyperliquid_mcp.state import State
 
 from .accounting import foreign_entry_orders, occupied_markets
 from .entry import execution_limit, gate_state, validate_entry_prices
-from .evidence import market_fills
+from .evidence import market_fills, order_observations
 from .pipelines import ConfigurationChanged, validate_ranking_binding
 
 OPEN = {"waiting_entry", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
@@ -619,6 +619,10 @@ class Trading:
         return list(result.values())
 
     async def capture_fills(self, trade_id, entry_status=None):
+        with order_observations(self.exchange):
+            return await self._capture_fills(trade_id, entry_status)
+
+    async def _capture_fills(self, trade_id, entry_status=None):
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
         self.assert_plan_binding(self.state.snapshot(), plan)
@@ -1691,6 +1695,10 @@ class Trading:
         return result
 
     async def recover(self):
+        with order_observations(self.exchange):
+            return await self._recover()
+
+    async def _recover(self):
         snapshot = self.state.snapshot()
         reports = []
         for operation_id, row in snapshot["operations"].items():

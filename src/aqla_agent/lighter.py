@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 import httpx
@@ -28,6 +32,31 @@ def integer_price(value, step):
     if result > 2**31 - 1:
         raise AqlaError("Lighter price exceeds the supported native ABI integer range")
     return result
+
+
+@dataclass
+class TerminalOrderIndex:
+    generation: int
+    rows: list[dict] = field(default_factory=list)
+    by_client: dict[int, tuple[int, dict]] = field(default_factory=dict)
+    by_oid: dict[int, tuple[int, dict]] = field(default_factory=dict)
+
+    def add(self, rows: list[dict]) -> None:
+        for row in rows:
+            if row.get("status") not in ("filled", "canceled", "cancelled", "expired", "rejected"):
+                continue
+            if row["order_index"] in self.by_oid:
+                continue
+            fact = copy.deepcopy(row)
+            item = (len(self.rows), fact)
+            self.rows.append(fact)
+            self.by_oid.setdefault(fact["order_index"], item)
+            if fact.get("client_order_index") not in (None, 0):
+                self.by_client.setdefault(fact["client_order_index"], item)
+
+    def lookup(self, identity, index) -> dict | None:
+        candidates = [item for item in (self.by_client.get(index), self.by_oid.get(identity) if isinstance(identity, int) else None) if item is not None]
+        return min(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
 class Lighter(VenueAdapter):
@@ -80,6 +109,22 @@ class Lighter(VenueAdapter):
             raise AqlaError("Configure a dedicated Lighter API key index from 4 through 254")
         self.client = client or httpx.AsyncClient(base_url=BASE_URLS[settings.network], timeout=settings.timeout_seconds)
         self.signer = signer
+        self._order_generation = 0
+        self._order_context: ContextVar[TerminalOrderIndex | None] = ContextVar("lighter_order_observations", default=None)
+
+    @contextmanager
+    def order_observations(self):
+        if self._order_context.get() is not None:
+            yield
+            return
+        token = self._order_context.set(TerminalOrderIndex(self._order_generation))
+        try:
+            yield
+        finally:
+            self._order_context.reset(token)
+
+    def invalidate_order_observations(self) -> None:
+        self._order_generation += 1
 
     def sdk(self):
         if self.signer is None:
@@ -215,6 +260,7 @@ class Lighter(VenueAdapter):
         return {"tx_type": kind, "tx_info": body, "tx_hash": tx_hash, "nonce": nonce}
 
     async def send(self, request):
+        self.invalidate_order_observations()
         chunks = request.get("batch", [request])
         if "batch" in request:
             response = await self.client.post("/api/v1/sendTxBatch", data={"tx_types": json.dumps([item["tx_type"] for item in chunks]), "tx_infos": json.dumps([item["tx_info"] for item in chunks])})
@@ -266,23 +312,14 @@ class Lighter(VenueAdapter):
                 return {"status": "unknownOid"}
             parent_oid = parent["order"]["order"]["oid"]
             child = next(order for order in group["orders"][1:] if order["c"] == identity)
-        active = await self.read("accountActiveOrders", {"account_index": self.account}, private=True)
-        rows = active.get("orders", [])
-        cursor = None
-        for page in range(64):
-            if group:
-                row = next((row for row in rows if row.get("parent_order_index") == parent_oid and row["market_index"] == child["a"]
-                            and Decimal(row.get("trigger_price", "0")) == Decimal(child["t"]["trigger"]["triggerPx"]) and row.get("reduce_only") is True), None)
-            else:
-                row = next((row for row in rows if row["client_order_index"] == index or row["order_index"] == identity), None)
-            if row:
-                break
-            if page and not cursor:
-                return {"status": "unknownOid"}
-            historical = await self.read("accountInactiveOrders", {"account_index": self.account, "limit": 100, **({"cursor": cursor} if page else {})}, private=True)
-            rows, cursor = historical.get("orders", []), historical.get("next_cursor")
+        context = getattr(self, "_order_context", None)
+        selected = context.get() if context else None
+        if selected is not None:
+            row = await self._scoped_order_row(identity, index, group, parent_oid, child if group else None)
         else:
-            raise AqlaError("Lighter order history exceeded the bounded cursor budget")
+            row = await self._fresh_order_row(identity, index, group, parent_oid, child if group else None)
+        if row is None:
+            return {"status": "unknownOid"}
         market = self.native_market(row["market_index"])
         if str(row.get("owner_account_index")) != self.account:
             raise AqlaError("Lighter order belongs to another account")
@@ -294,6 +331,68 @@ class Lighter(VenueAdapter):
             "side": "A" if row["is_ask"] else "B", "sz": row["remaining_base_amount"], "origSz": row["initial_base_amount"],
             "reduceOnly": row["reduce_only"], "isTrigger": Decimal(row.get("trigger_price", "0")) != 0,
             "triggerPx": row.get("trigger_price", "0"), "triggerCondition": "Price below" if row["is_ask"] else "Price above"}}}
+
+    @staticmethod
+    def _matching_order(rows, identity, index, group, parent_oid, child) -> dict | None:
+        if group:
+            return next((row for row in rows if row.get("parent_order_index") == parent_oid and row["market_index"] == child["a"]
+                and Decimal(row.get("trigger_price", "0")) == Decimal(child["t"]["trigger"]["triggerPx"]) and row.get("reduce_only") is True), None)
+        return next((row for row in rows if row["client_order_index"] == index or row["order_index"] == identity), None)
+
+    async def _fresh_order_row(self, identity, index, group, parent_oid, child) -> dict | None:
+        active = await self.read("accountActiveOrders", {"account_index": self.account}, private=True)
+        rows = active.get("orders", [])
+        cursor = None
+        for page in range(64):
+            row = self._matching_order(rows, identity, index, group, parent_oid, child)
+            if row:
+                break
+            if page and not cursor:
+                return None
+            historical = await self.read("accountInactiveOrders", {"account_index": self.account, "limit": 100, **({"cursor": cursor} if page else {})}, private=True)
+            rows, cursor = historical.get("orders", []), historical.get("next_cursor")
+        else:
+            raise AqlaError("Lighter order history exceeded the bounded cursor budget")
+        return row
+
+    async def _scoped_order_row(self, identity, index, group, parent_oid, child) -> dict | None:
+        selected = self._order_context.get()
+        if selected.generation != self._order_generation:
+            selected = TerminalOrderIndex(self._order_generation)
+            self._order_context.set(selected)
+        cached = (self._matching_order(selected.rows, identity, index, group, parent_oid, child) if group else selected.lookup(identity, index))
+        if cached is not None:
+            return cached
+        generation = self._order_generation
+        active = await self.read("accountActiveOrders", {"account_index": self.account}, private=True)
+        rows = active.get("orders", [])
+        found = self._matching_order(rows, identity, index, group, parent_oid, child)
+        if found is not None:
+            if generation != self._order_generation:
+                raise AqlaError("Lighter order evidence changed during observation")
+            return found
+        all_rows, cursor, seen = list(rows), None, set()
+        for _ in range(64):
+            historical = await self.read("accountInactiveOrders", {"account_index": self.account, "limit": 100, **({"cursor": cursor} if cursor else {})}, private=True)
+            rows = historical.get("orders", [])
+            if not isinstance(rows, list):
+                raise AqlaError("Lighter returned no complete order history list")
+            all_rows.extend(rows)
+            if found is None:
+                found = self._matching_order(rows, identity, index, group, parent_oid, child)
+            cursor = historical.get("next_cursor")
+            if found is not None or not cursor:
+                if generation != self._order_generation:
+                    raise AqlaError("Lighter order evidence changed during observation")
+                fresh = TerminalOrderIndex(generation)
+                fresh.add(all_rows)
+                fresh.add(selected.rows)
+                self._order_context.set(fresh)
+                return found
+            if cursor in seen:
+                raise AqlaError("Lighter order history cursor repeated; coverage is incomplete")
+            seen.add(cursor)
+        raise AqlaError("Lighter order history exceeded the bounded cursor budget")
 
     async def fills(self, start, end):
         result, cursor = [], None

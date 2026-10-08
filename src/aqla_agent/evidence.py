@@ -1,6 +1,7 @@
 """Internal read contracts; public venue information payloads remain unchanged."""
 from __future__ import annotations
 
+from contextlib import AbstractContextManager, nullcontext
 from typing import NotRequired, TypedDict
 
 from aqla_hyperliquid_mcp.models import Market
@@ -15,6 +16,12 @@ class FillObservation(TypedDict):
     tid: NotRequired[int | str]
     fee: NotRequired[str | None]
     feeToken: NotRequired[str | None]
+
+
+def order_observations(adapter) -> AbstractContextManager[None]:
+    """Share immutable terminal evidence only inside this explicit account pass."""
+    scope = getattr(adapter, "order_observations", None)
+    return scope() if scope is not None else nullcontext()
 
 
 async def market_fills(adapter, market: Market, start: int, end: int) -> list[FillObservation]:

@@ -151,6 +151,144 @@ def lighter(setup):
     return adapter, boundary, signer, Trading(adapter, view)
 
 
+def terminal_order(index, *, status="filled", owner=42):
+    return {"order_index": index + 100, "client_order_index": index + 10, "owner_account_index": owner, "market_index": 1,
+        "initial_base_amount": "1", "remaining_base_amount": "0", "is_ask": False, "trigger_price": "0",
+        "reduce_only": False, "status": status}
+
+
+def count_order_reads(adapter, boundary, monkeypatch):
+    calls = []
+    def observed(request):
+        path = request.url.path.rsplit("/", 1)[-1]
+        if path in ("accountActiveOrders", "accountInactiveOrders"):
+            calls.append(path)
+        return boundary.handle(request)
+    monkeypatch.setattr(adapter.client, "_transport", httpx.MockTransport(observed))
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_ten_terminal_order_reads_share_one_explicit_scan_and_new_pass_reads_again(lighter, monkeypatch):
+    adapter, boundary, _, _ = lighter
+    await adapter.market("BTC")
+    boundary.orders = {index + 10: terminal_order(index) for index in range(10)}
+    calls = count_order_reads(adapter, boundary, monkeypatch)
+    with adapter.order_observations():
+        for index in range(10):
+            row = await adapter.order_status(index + 100)
+            assert row["order"]["status"] == "filled" and row["order"]["order"]["oid"] == index + 100
+    assert calls == ["accountActiveOrders", "accountInactiveOrders"]
+    with adapter.order_observations():
+        assert (await adapter.order_status(100))["order"]["status"] == "filled"
+    assert calls == ["accountActiveOrders", "accountInactiveOrders"] * 2
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_order_scope_never_caches_unknown_absence_or_open_state(lighter, monkeypatch):
+    adapter, boundary, _, _ = lighter
+    await adapter.market("BTC")
+    calls = count_order_reads(adapter, boundary, monkeypatch)
+    with adapter.order_observations():
+        assert (await adapter.order_status(100))["status"] == "unknownOid"
+        boundary.orders[10] = terminal_order(0, status="open")
+        assert (await adapter.order_status(100))["order"]["status"] == "open"
+        boundary.orders[10]["status"] = "canceled"
+        assert (await adapter.order_status(100))["order"]["status"] == "canceled"
+    assert calls.count("accountActiveOrders") == 3 and calls.count("accountInactiveOrders") == 2
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_mutation_invalidates_scoped_terminal_order_evidence(lighter, monkeypatch):
+    adapter, boundary, _, _ = lighter
+    market = await adapter.market("BTC")
+    boundary.orders[10] = terminal_order(0)
+    calls = count_order_reads(adapter, boundary, monkeypatch)
+    with adapter.order_observations():
+        assert (await adapter.order_status(100))["order"]["status"] == "filled"
+        result = await adapter.mutate("scope-invalidation", {"type": "updateLeverage", "asset": market.asset_id, "isCross": False, "leverage": 3})
+        assert result["phase"] == "acknowledged"
+        boundary.orders[10]["owner_account_index"] = 43
+        with pytest.raises(AqlaError, match="another account"):
+            await adapter.order_status(100)
+    assert calls.count("accountActiveOrders") == 2 and calls.count("accountInactiveOrders") == 2
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_scoped_order_history_repeated_cursor_is_incomplete(lighter, monkeypatch):
+    adapter, _, _, _ = lighter
+    calls = []
+    async def repeated(path, params=None, **kwargs):
+        calls.append(path)
+        return {"orders": [], **({"next_cursor": "same"} if path == "accountInactiveOrders" else {})}
+    monkeypatch.setattr(adapter, "read", repeated)
+    with adapter.order_observations(), pytest.raises(AqlaError, match="cursor repeated"):
+        await adapter.order_status(100)
+    assert calls == ["accountActiveOrders", "accountInactiveOrders", "accountInactiveOrders"]
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_positive_terminal_order_does_not_require_unrelated_later_history_pages(lighter, monkeypatch):
+    adapter, _, _, _ = lighter
+    await adapter.market("BTC")
+    calls = []
+    async def positive(path, params=None, **kwargs):
+        calls.append(path)
+        return {"orders": []} if path == "accountActiveOrders" else {"orders": [terminal_order(0)], "next_cursor": "unrelated-broken-page"}
+    monkeypatch.setattr(adapter, "read", positive)
+    assert (await adapter.order_status(100))["order"]["status"] == "filled"
+    calls.clear()
+    with adapter.order_observations():
+        assert (await adapter.order_status(100))["order"]["status"] == "filled"
+    assert calls == ["accountActiveOrders", "accountInactiveOrders"]
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [None, "parent", "market", "owner", "missing_parent"])
+async def test_scoped_nil_client_stop_requires_its_parent_market_and_original_owner(lighter, signal, monkeypatch, damage):
+    adapter, boundary, _, engine = lighter
+    source, interpretation = signal
+    plan = await engine.preview(source.event_id, interpretation)
+    trade = await engine.execute(plan["plan_id"])
+    stop = next(order for order in trade["orders"] if order["kind"] == "sl")
+    child = next(row for row in boundary.orders.values() if row.get("parent_order_index") is not None)
+    assert child["client_order_index"] == 0
+    parent_oid = child["parent_order_index"]
+    if damage == "parent":
+        child["parent_order_index"] += 1000
+    elif damage == "market":
+        child["market_index"] = 999
+    elif damage == "owner":
+        child["owner_account_index"] = 43
+    if damage == "missing_parent":
+        original = adapter.read
+        async def hidden(path, params=None, **kwargs):
+            response = await original(path, params, **kwargs)
+            if path in ("accountActiveOrders", "accountInactiveOrders"):
+                response["orders"] = [row for row in response["orders"] if row["order_index"] != parent_oid]
+            return response
+        monkeypatch.setattr(adapter, "read", hidden)
+    before = len(boundary.posts)
+    with adapter.order_observations():
+        if damage == "owner":
+            with pytest.raises(AqlaError, match="another account"):
+                await adapter.order_status(stop["cloid"])
+        else:
+            result = await adapter.order_status(stop["cloid"])
+            if damage:
+                assert result["status"] == "unknownOid"
+            else:
+                assert result["order"]["order"]["oid"] == child["order_index"]
+                assert result["order"]["order"]["cloid"] == stop["cloid"]
+    assert len(boundary.posts) == before
+    await adapter.close()
+
+
 @pytest.mark.asyncio
 async def test_lighter_grouped_entry_stop_targets_integer_sizes_and_close(lighter, signal):
     adapter, boundary, signer, engine = lighter
