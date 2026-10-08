@@ -89,9 +89,11 @@ class Hyperliquid:
 
     async def info(self, kind: str, **params):
         # Callers use catalog-validated public inputs or fixed internal requests.
-        response = await self.client.post("/info", json={"type": kind, **params})
-        response.raise_for_status()
-        return response.json()
+        from aqla_agent.read_budget import observed_request
+        with observed_request(self.client, "POST", "/info"):
+            response = await self.client.post("/info", json={"type": kind, **params})
+            response.raise_for_status()
+            return response.json()
 
     async def fill_history(self, market: Market, start: int, end: int):
         return await self.info("userFillsByTime", user=self.account, startTime=start, endTime=end)

@@ -160,10 +160,12 @@ class Lighter(VenueAdapter):
         return token
 
     async def read(self, path, params=None, *, private=False):
-        headers = {"Authorization": self.auth()} if private else {}
-        response = await self.client.get("/api/v1/" + path, params=params, headers=headers)
-        response.raise_for_status()
-        result = response.json()
+        from .read_budget import observed_request
+        with observed_request(self.client, "GET", "/api/v1/" + path):
+            headers = {"Authorization": self.auth()} if private else {}
+            response = await self.client.get("/api/v1/" + path, params=params, headers=headers)
+            response.raise_for_status()
+            result = response.json()
         if result.get("code", 200) != 200:
             raise AqlaError("Lighter rejected the requested observation")
         return result

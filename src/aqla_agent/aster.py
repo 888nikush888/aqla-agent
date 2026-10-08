@@ -11,6 +11,7 @@ from eth_account.messages import encode_typed_data
 
 from aqla_hyperliquid_mcp.models import AqlaError, Market, digest, now_ms
 
+from .read_budget import observed_request
 from .venues import VenueAdapter
 
 DOMAIN = {"name": "AsterSignTransaction", "version": "1", "chainId": 1666, "verifyingContract": "0x" + "0" * 40}
@@ -76,12 +77,13 @@ class Aster(VenueAdapter):
         return result
 
     async def read(self, path, params=None, *, private=False):
-        if private:
-            result = await self.send(self.signed("GET", "/fapi/v3/" + path, params or {}))
-        else:
-            response = await self.client.get("/fapi/v3/" + path, params=params)
-            response.raise_for_status()
-            result = response.json()
+        with observed_request(self.client, "GET", "/fapi/v3/" + path):
+            if private:
+                result = await self.send(self.signed("GET", "/fapi/v3/" + path, params or {}))
+            else:
+                response = await self.client.get("/fapi/v3/" + path, params=params)
+                response.raise_for_status()
+                result = response.json()
         if self.rejected(result):
             raise AqlaError("Aster rejected the requested account/market observation")
         return result
