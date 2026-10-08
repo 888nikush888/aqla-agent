@@ -30,7 +30,30 @@ def main():
     from aqla_agent.hermes_runtime import install_strict_profile
     from aqla_agent.skill_review import REVIEW_FOCUS
 
+    import gateway.run as native_gateway
+    from gateway.run_turn import GatewayTurnMixin
+    from tools import write_approval as approval_before
+    before_factory = native_gateway._start_gateway_start_cron_and_housekeeping
+    before_stage = approval_before.stage_write
+    before_turn = GatewayTurnMixin._run_agent
+    async def incompatible_turn(self, wrong_argument):
+        pass
+    GatewayTurnMixin._run_agent = incompatible_turn
+    try:
+        try:
+            install_strict_profile()
+        except RuntimeError as error:
+            assert "compatibility contract" in str(error)
+        else:
+            raise AssertionError("Changed native signature was accepted")
+        assert native_gateway._start_gateway_start_cron_and_housekeeping is before_factory
+        assert approval_before.stage_write is before_stage
+        assert GatewayTurnMixin._run_agent is incompatible_turn
+    finally:
+        GatewayTurnMixin._run_agent = before_turn
     undo = install_strict_profile()
+    undo_twice = install_strict_profile()
+    undo_twice()
     from agent import background_review as review
     from gateway.config import GatewayConfig, Platform
     from gateway.run import GatewayRunner
@@ -45,6 +68,17 @@ def main():
     EXTENSIONS.add(extension)
     master = destination / "hermes-home" / "skills" / "aqla-master" / "SKILL.md"
     original = master.read_bytes()
+    fork_starts = []
+    original_fork = review.build_cache_parity_fork
+    def counted_fork(*args, **kwargs):
+        fork_starts.append(True)
+        raise RuntimeError("synthetic stop at actual native fork boundary; no model request")
+    review.build_cache_parity_fork = counted_fork
+    reviewer = SimpleNamespace(client=SimpleNamespace(SUPPORTS_HERMES_TOOL_CALLS=True), provider="custom", model="synthetic",
+                               _safe_print=lambda _: None, _emit_auxiliary_failure=lambda *_: None, background_review_callback=None)
+    def automatic_review(*, explicit=False):
+        target, _ = review.spawn_background_review_thread(reviewer, [], review_skills=True, task_cfg={}, explicit=explicit)
+        target()
     operation = {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.",
                  "new_string": "Du bist aqla Agent. Prüfe Replies besonders sorgfältig."}
     runner = GatewayRunner(GatewayConfig())
@@ -72,6 +106,10 @@ def main():
             assert staged["staged"] is True and master.read_bytes() == original
             assert propose(operation)["pending_id"] == staged["pending_id"]
             assert len(approval.list_pending(approval.SKILLS)) == 1
+            automatic_review()
+            assert len(fork_starts) == 0
+            automatic_review(explicit=True)
+            assert len(fork_starts) == 1
             with_change = {**operation, "new_string": "Du bist aqla Agent. Andere Verbesserung."}
             try:
                 propose(with_change)
@@ -110,6 +148,8 @@ def main():
         assert "Prüfe Replies" in asyncio.run(command("diff " + staged["pending_id"]))
         assert "Rejected" in asyncio.run(command("reject " + staged["pending_id"]))
         assert master.read_bytes() == original and not approval.list_pending(approval.SKILLS)
+        automatic_review()
+        assert len(fork_starts) == 2
         # A later master edit invalidates the exact proposal the owner originally inspected.
         with extension.claim_scope(("operator", "request")):
             stale = propose(operation)
@@ -123,15 +163,20 @@ def main():
         assert "Approved 1" in asyncio.run(command("approve " + accepted["pending_id"]))
         assert "Prüfe Replies besonders sorgfältig." in master.read_text(encoding="utf-8")
         assert not approval.list_pending(approval.SKILLS)
+        automatic_review()
+        assert len(fork_starts) == 3
         assert hashlib.sha256(master.read_bytes()).digest() != hashlib.sha256(original).digest()
         # Native Hermes may open its session DB; no trading state is created by
         # drafting, approving or rejecting a skill.
         assert not (destination / "data" / "state.sqlite3").exists()
         print(json.dumps({"background_proposal": True, "native_telegram_approval": True, "rejection": True,
                           "stale_proposal_blocked": True, "source_approval_blocked": True, "always_ask": True,
-                          "native_approval_question": True, "exchange_actions": 0, "model_calls": 0}))
+                          "native_approval_question": True, "pending_blocks_native_fork": True, "explicit_review_available": True,
+                          "review_resumes_after_reject_and_approve": True, "compatibility_failure_has_no_partial_patch": True,
+                          "double_install_undo": True, "counted_native_fork_starts": len(fork_starts), "exchange_actions": 0, "model_calls": 0}))
     finally:
         EXTENSIONS.discard(extension)
+        review.build_cache_parity_fork = original_fork
         undo()
 
 

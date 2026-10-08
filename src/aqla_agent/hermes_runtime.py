@@ -8,9 +8,15 @@ from pathlib import Path
 def install_strict_profile():
     """Keep Aqla authority boundaries while using native SQLite session storage."""
     originals = []
+    from .hermes_contract import check_native_contract
+    check_native_contract()
 
     def replace(target, name, value):
-        originals.append((target, name, getattr(target, name)))
+        previous = getattr(target, name)
+        originals.append((target, name, previous))
+        if callable(value):
+            value.__aqla_contract_original__ = previous
+            value.__wrapped__ = previous
         setattr(target, name, value)
 
     import gateway.run as native_gateway

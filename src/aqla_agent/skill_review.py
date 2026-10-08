@@ -1,5 +1,6 @@
 """Bounded master-skill proposals through Hermes' native approval store."""
 import hashlib
+import inspect
 import json
 from contextlib import suppress
 
@@ -96,8 +97,20 @@ def install_skill_review(replace):
             return apply(payload)
 
     def spawn_review(*args, **kwargs):
+        bound = inspect.signature(spawn).bind(*args, **kwargs)
+        explicit = bool(bound.arguments.get("explicit", False))
+        def pending():
+            return any(record.get("payload", {}).get("aqla_base_sha256") or record.get("payload", {}).get("name") == "aqla-master"
+                       for record in approval.list_pending(approval.SKILLS))
+        if not explicit and pending():
+            return lambda: None, REVIEW_FOCUS
         kwargs["focus"] = REVIEW_FOCUS + "\n" + (kwargs.get("focus") or "")
-        return spawn(*args, **kwargs)
+        target, prompt = spawn(*args, **kwargs)
+        def guarded_target():
+            if explicit or not pending():
+                return target()
+            return None
+        return guarded_target, prompt
 
     def proposal_lines(data, detail, verbose):
         if data.get("staged") and detail.get("tool") == "skill_manage":
