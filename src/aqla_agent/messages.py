@@ -231,13 +231,17 @@ def trade_block(data, trade, notices):
     return "\n\n".join(lines)
 
 
+def _berlin_time(timestamp):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.fromtimestamp(timestamp / 1000, ZoneInfo("Europe/Berlin")).strftime("%d.%m.%Y %H:%M:%S")
+
+
 def lifecycle_block(data, event):
     trade = event["facts"]
     plan = trade["plan"]
     plan = {**plan, "source_tp": trade.get("source_tp_override", plan.get("source_tp"))}
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    time = datetime.fromtimestamp(event["time"] / 1000, ZoneInfo("Europe/Berlin")).strftime("%d.%m.%Y %H:%M:%S")
+    time = _berlin_time(event["time"])
     if event["kind"] == "closed":
         result = trade_block(data, trade, [{"change": {"status": "closed"}}]) + "\n\n**Schließung:** " + time + " · Berlin"
         exits = [row for row in trade.get("fill_events", {}).values() if row["kind"] != "entry"]
@@ -319,7 +323,11 @@ def monthly_message(report):
 def summary_block(notice):
     title = {"entry_fill": "✅ **Einstieg ausgeführt**", "closed": "🏁 **Trade geschlossen**", "protection": "🚨 **Schutzvorfall**"}.get(notice["kind"], "ℹ️ **Systemmeldung**")
     lines = [title]
-    labels = {"time": "Belegzeitpunkt (Millisekunden)", "trade_id": "Trade", "account_key": "Konto", "account": "Handelskonto",
+    timestamp = notice.get("observed_at") if notice["kind"] == "protection" else notice.get("time", notice.get("observed_at"))
+    if timestamp is not None:
+        label = {"entry_fill": "Ausführung", "closed": "Schließung", "protection": "Beobachtet"}.get(notice["kind"], "Belegzeitpunkt")
+        lines.append(f"**{label}:** " + _berlin_time(timestamp) + " · Berlin")
+    labels = {"trade_id": "Trade", "account_key": "Konto", "account": "Handelskonto",
               "exchange": "Börse", "network": "Netzwerk", "market": "Markt", "direction": "Richtung", "status": "Status"}
     for name, label in labels.items():
         if name in notice:

@@ -1,11 +1,13 @@
 import copy
 import json
+from datetime import UTC, datetime
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from aqla_agent.lifecycle import record_lifecycle
-from aqla_agent.notifications import NATIVE_BYTE_BUDGET, canonical_json, native_response_bytes
+from aqla_agent.messages import summary_block
+from aqla_agent.notifications import NATIVE_BYTE_BUDGET, _summary, canonical_json, native_response_bytes
 from aqla_hyperliquid_mcp.models import Market, Policy, SourceEvent, TradePlan, digest
 from aqla_hyperliquid_mcp.server import close_server, create_server
 from aqla_hyperliquid_mcp.state import State
@@ -377,3 +379,27 @@ async def test_notification_pages_reach_400_and_10000_ids(notification_server, c
         if cursor is None:
             break
     assert found == [f"notice-{index:05}" for index in range(count)]
+
+
+@pytest.mark.parametrize("kind,label", [("entry_fill", "Ausführung"), ("closed", "Schließung"), ("protection", "Beobachtet")])
+def test_summary_preserves_account_binding_and_berlin_date(setup, kind, label):
+    settings, state, *_ = setup
+    snapshot = state.snapshot()
+    lifecycle_fixture(snapshot, settings, count=1)
+    plan = TradePlan.model_validate(snapshot["trades"]["trade-0"]["plan"]).model_copy(update={"account_key": "aster:mainnet", "exchange": "aster", "network": "mainnet"})
+    timestamp = int(datetime(2026, 10, 8, 8, tzinfo=UTC).timestamp() * 1000)
+    if kind == "protection":
+        identity = "protection:aster:mainnet"
+        notice = {"account_key": "aster:mainnet", "exchange": "aster", "network": "mainnet", "observed_at": timestamp, "error": "saved incident"}
+    else:
+        identity = "lifecycle:trade-0:" + kind
+        notice = {"trade_id": "trade-0", "lifecycle": {"kind": kind, "time": timestamp, "facts": {"plan": plan.model_dump(mode="json"), "status": "closed"}}}
+    original = copy.deepcopy(notice)
+    summary = _summary(identity, notice)
+    assert summary["account_key"] == "aster:mainnet"
+    text = summary_block(summary)
+    assert f"**{label}:** 08.10.2026 10:00:00 · Berlin" in text
+    assert "**Konto:** aster:mainnet" in text and str(timestamp) not in text
+    assert "Millisekunden" not in text
+    assert native_response_bytes({"notifications": {identity: summary}, "text": text}) <= NATIVE_BYTE_BUDGET
+    assert notice == original

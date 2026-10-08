@@ -124,7 +124,7 @@ def _summary(identity: str, notice) -> Notice:
     result = {"detail_level": "summary", "details_available": True,
               "kind": event.get("kind", notice.get("kind", "protection" if identity.startswith("protection:") else "system"))}
     values = {"time": event.get("time"), "observed_at": notice.get("observed_at"), "trade_id": notice.get("trade_id"),
-              "account_key": notice.get("account_key", plan.get("execution_account_key")), "account": plan.get("account"),
+              "account_key": notice.get("account_key", plan.get("account_key")), "account": plan.get("account"),
               "exchange": notice.get("exchange", plan.get("exchange")), "network": notice.get("network", plan.get("network")),
               "market": plan.get("market", {}).get("symbol"), "direction": plan.get("side"), "status": facts.get("status")}
     result.update({name: value for name, value in values.items() if value is not None})
