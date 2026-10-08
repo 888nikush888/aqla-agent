@@ -31,7 +31,7 @@ def release_project(tmp_path):
 
 
 @pytest.mark.parametrize("suffix", [".db", ".sqlite", ".sqlite3", ".session"])
-@pytest.mark.parametrize("sidecar", ["", "-journal", "-wal", "-shm", "-mj123", ".lock", ".initialized"])
+@pytest.mark.parametrize("sidecar", ["", "-journal", "-wal", "-shm", "-mj123", ".lock", ".initialized", "-wal.lock", "-journal.initialized", "-shm.lock.initialized"])
 def test_artifact_rules_reject_local_state_and_all_sqlite_sidecars(suffix, sidecar):
     assert forbidden("src/LOCAL" + suffix.upper() + sidecar.upper())
 
@@ -361,6 +361,25 @@ def test_post_publish_verification_failure_rolls_back_pair(release_project, tmp_
     monkeypatch.setattr(release, "_verify_pair", verify)
     with pytest.raises(OSError, match="post-publication"):
         build(release_project, output)
+    _assert_pair(output, sha, previous)
+
+
+@pytest.mark.parametrize("phase", ["staging", "final"])
+def test_directory_sync_failure_preserves_previous_pair(release_project, tmp_path, monkeypatch, phase):
+    output, sha, previous = _previous_pair(release_project, tmp_path)
+    original = release._sync_directory
+    failed = False
+    def sync(path):
+        nonlocal failed
+        should_fail = path != output.parent if phase == "staging" else path == output.parent and output.read_bytes() != previous[0]
+        if should_fail and not failed:
+            failed = True
+            raise OSError("synthetic directory sync failure")
+        original(path)
+    monkeypatch.setattr(release, "_sync_directory", sync)
+    with pytest.raises(OSError, match="directory sync"):
+        build(release_project, output)
+    assert failed
     _assert_pair(output, sha, previous)
 
 

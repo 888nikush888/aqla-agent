@@ -37,6 +37,8 @@ def main():
             raise SystemExit("VPS archive integrity failed")
         names = archive.namelist()
         verify_names(names)
+        if "aqla-agent/src/aqla_agent/artifact_rules.py" not in names:
+            raise SystemExit("Missing VPS artifact path rules")
         for required in ("README.md", "uv.lock", "config.example.yaml", "hermes-runtime-overrides.txt", "src/aqla_agent/install.py", "src/aqla_agent/session_history.py", "src/aqla_agent/sources.py", "src/aqla_hyperliquid_mcp/storage.py", "src/aqla_sheets_mcp/server.py", "src/aqla_sheets_mcp/parameters.py", "docs/google-sheets.md", "docs/hermes-tools-and-storage.md", "docs/gold-backup-and-names.md", "skills/aqla-master/SKILL.md", "hermes_plugin/aqla-events/plugin.yaml", "scripts/verify_artifacts.py", "tests/native_pipeline_smoke.py", "tests/native_lifecycle_smoke.py", "tests/native_interaction_smoke.py"):
             if "aqla-agent/" + required not in names:
                 raise SystemExit("Missing VPS asset: " + required)
@@ -64,12 +66,16 @@ def main():
     with zipfile.ZipFile(wheels[0]) as archive:
         validate_zip_members(archive)
         verify_names(archive.namelist())
+        if "aqla_agent/artifact_rules.py" not in archive.namelist():
+            raise SystemExit("Wheel is missing artifact path rules")
         for asset in ("aqla_hyperliquid_mcp/info_specs.json", "aqla_hyperliquid_mcp/api_manifest.json", "aqla_sheets_mcp/server.py", "aqla_sheets_mcp/parameters.py"):
             if asset not in archive.namelist():
                 raise SystemExit("Wheel is missing API contracts")
     with tarfile.open(sources[0]) as archive:
         validate_tar_members(archive)
         verify_names(archive.getnames())
+        if not any(name.endswith("/src/aqla_agent/artifact_rules.py") for name in archive.getnames()):
+            raise SystemExit("Source distribution is missing artifact path rules")
     print("Wheel, source distribution, VPS contents and SHA-256 passed")
 
 

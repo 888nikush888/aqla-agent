@@ -8,7 +8,7 @@ FORBIDDEN_PARTS = {
     "hermes-venv", ".python", "reports", "dist",
 }
 FORBIDDEN_NAMES = {"vps.env", "config.yaml", "state.json", "state.json.lock", ".coverage"}
-LOCAL_DATABASE = re.compile(r"\.(?:db|sqlite|sqlite3|session)(?:-(?:journal|wal|shm|mj.*)|\.lock|\.initialized)?$")
+LOCAL_DATABASE = re.compile(r"\.(?:db|sqlite|sqlite3|session)(?:-(?:journal|wal|shm|mj.*))?(?:\.lock|\.initialized)*$")
 
 
 def unsafe_member_reason(name: str) -> str | None:
