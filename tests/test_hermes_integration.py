@@ -5,7 +5,7 @@ import pytest
 import yaml
 
 from aqla_agent.events import HermesExtension
-from aqla_agent.telegram import SourceAccessError
+from aqla_agent.telegram import ReaderRetry, SourceAccessError
 
 
 class Context:
@@ -104,6 +104,35 @@ def test_monthly_request_answered_owner_source_and_diagnostics_contract(extensio
         assert len(requests) == 1  # Finalized claim cannot create another request.
     finally:
         EXTENSIONS.discard(ext)
+
+
+@pytest.mark.asyncio
+async def test_reader_worker_auth_backoff_avoids_three_second_reconnect_loop(extension, tmp_path, monkeypatch):
+    ext, _ = extension
+    clock, starts = [0.0], []
+    ext.settings.telegram_session_file = tmp_path / "missing-session.secret"
+    ext.reader_retry = ReaderRetry(clock=lambda: clock[0], wall_clock=lambda: 1000, jitter=lambda: 0.5)
+    class Reader:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def start(self):
+            starts.append(clock[0])
+            raise SourceAccessError("reader_session_unauthorized")
+        async def close(self):
+            pass
+    async def snapshot(*args, **kwargs):
+        return {"sources": ["channel"]}
+    async def sleep(seconds):
+        clock[0] += seconds
+        if clock[0] >= 100:
+            raise asyncio.CancelledError
+    monkeypatch.setattr("aqla_agent.events.TelegramReader", Reader)
+    monkeypatch.setattr("aqla_agent.events.asyncio", SimpleNamespace(sleep=sleep, CancelledError=asyncio.CancelledError))
+    ext.call = snapshot
+    with pytest.raises(asyncio.CancelledError):
+        await ext.reader_worker()
+    assert starts == [0.0, 30.0, 90.0]
+    assert ext.reader_error["attempt"] == 3
 
 
 @pytest.mark.asyncio
@@ -595,7 +624,9 @@ async def test_missing_reader_session_reports_status_and_preserves_pending_wake(
     tasks = [asyncio.create_task(extension.reader_worker()), asyncio.create_task(extension.worker())]
     try:
         await asyncio.wait_for(woke.wait(), 1)
-        assert extension.reader_error == {"code": "reader_session_missing", "sources": []}
+        assert extension.reader_error["code"] == "reader_session_missing" and extension.reader_error["sources"] == []
+        assert extension.reader_error["attempt"] == 1 and isinstance(extension.reader_error["next_retry_at"], int)
+        assert set(extension.reader_error) == {"code", "sources", "attempt", "next_retry_at"}
         assert "reader_session_missing" in wakes[0]
         assert "test-only-api-hash" not in wakes[0]
     finally:

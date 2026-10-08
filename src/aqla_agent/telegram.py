@@ -3,16 +3,77 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import math
 import os
+import random
 import time
 from pathlib import Path
+from typing import Literal
 
-from aqla_hyperliquid_mcp.models import AqlaError, Settings, SourceEvent
+from typing_extensions import TypedDict
+
+from aqla_hyperliquid_mcp.models import AqlaError, Settings, SourceEvent, now_ms
+
+ReaderErrorCode = Literal["reader_session_unauthorized", "reader_api_credentials_invalid", "reader_rate_limited", "sources_access_denied",
+                          "reader_unavailable", "reader_configuration_missing", "reader_dependency_missing", "reader_session_missing",
+                          "reader_configuration_unreadable", "reader_session_invalid", "sources_unavailable"]
+
+
+class ReaderRetryStatus(TypedDict):
+    code: ReaderErrorCode
+    sources: list[str]
+    attempt: int
+    next_retry_at: int
+
+
+class ReaderRetry:
+    """Private monotonic deadlines; public diagnostics contain only safe fields."""
+    def __init__(self, *, clock=None, wall_clock=now_ms, jitter=random.random):
+        self.clock, self.wall_clock, self.jitter = clock or time.monotonic, wall_clock, jitter
+        self.attempts = 0
+        self.deadline = 0.0
+        self.status: ReaderRetryStatus | None = None
+
+    def reset(self):
+        self.attempts, self.deadline, self.status = 0, 0.0, None
+
+    def ready(self):
+        return self.clock() >= self.deadline
+
+    def failed(self, failure) -> ReaderRetryStatus:
+        self.attempts += 1
+        durable = failure.code in {"reader_session_unauthorized", "reader_api_credentials_invalid", "reader_configuration_missing",
+                                   "reader_dependency_missing", "reader_session_missing", "reader_configuration_unreadable", "reader_session_invalid"}
+        base, cap = (30, 300) if durable else (5, 120)
+        delay = min(cap, base * 2 ** min(self.attempts - 1, 10))
+        delay = min(cap, delay * (0.8 + 0.4 * self.jitter()))
+        if failure.retry_after is not None:
+            delay = max(delay, failure.retry_after + min(5, failure.retry_after * 0.1) * self.jitter())
+        self.deadline = self.clock() + delay
+        self.status = {"code": failure.code, "sources": list(failure.sources), "attempt": self.attempts,
+                       "next_retry_at": self.wall_clock() + math.ceil(delay * 1000)}
+        return self.status
+
+
+def reader_metadata_token(settings: Settings, configuration: Path):
+    """Internal-only metadata observation, never reads credential contents."""
+    result = []
+    for path in (configuration, settings.telegram_api_hash_file, settings.telegram_session_file):
+        if path is None:
+            result.append(None)
+            continue
+        try:
+            value = Path(path).stat()
+            result.append((str(path), value.st_ino, value.st_size, value.st_mtime_ns))
+        except OSError:
+            result.append((str(path), "unavailable"))
+    return tuple(result)
 
 
 class SourceAccessError(AqlaError):
-    def __init__(self, code, sources=()):
+    def __init__(self, code: ReaderErrorCode, sources=(), *, retry_after=None):
         self.code, self.sources = code, list(sources)
+        self.retry_after = retry_after
         super().__init__(code)
 
     @classmethod
@@ -26,13 +87,19 @@ class SourceAccessError(AqlaError):
                  "ChannelInvalidError": "sources_access_denied", "PeerIdInvalidError": "sources_access_denied",
                  "ChatIdInvalidError": "sources_access_denied", "UserBannedInChannelError": "sources_access_denied"}
         code = next((codes[base.__name__] for base in type(error).__mro__ if base.__name__ in codes), "reader_unavailable")
-        return cls(code)
+        seconds = None
+        if code == "reader_rate_limited":
+            value = getattr(error, "seconds", None)
+            if type(value) in (int, float) and math.isfinite(value) and 0 < value <= 2**31 - 1:
+                seconds = float(value)
+        return cls(code, retry_after=seconds)
 
 
 class TelegramReader:
     """Read-only Telegram user session. Operator messages stay entirely in Hermes."""
 
-    def __init__(self, settings: Settings, deliver, snapshot, *, resolve=None, bootstrap=None, client_factory=None):
+    def __init__(self, settings: Settings, deliver, snapshot, *, resolve=None, bootstrap=None, client_factory=None,
+                 clock=None, history_interval=30.0, dialog_interval=30.0):
         self.settings, self.deliver, self.snapshot = settings, deliver, snapshot
         self.client_factory = client_factory
         self.client = None
@@ -47,6 +114,14 @@ class TelegramReader:
         self.unavailable_sources = []
         self.missing_sources = []
         self.failed_sources = {}
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 1 <= value <= 86400
+               for value in (history_interval, dialog_interval)):
+            raise ValueError("Reader history/dialog intervals must be finite seconds between 1 and 86400")
+        self.clock = clock or time.monotonic
+        self.history_interval, self.dialog_interval = history_interval, dialog_interval
+        self.last_dialog_scan = None
+        self.history_reads = {}
+        self.last_delivered_versions = set()
 
     def status_error(self):
         return {"code": "sources_unavailable", "sources": list(self.unavailable_sources)} if self.unavailable_sources else None
@@ -63,12 +138,13 @@ class TelegramReader:
         async with self.intake_lock:
             return await self._sync_sources(force=force)
 
-    async def _sync_sources(self, *, force=False, chat_id=None):
-        configuration = await self.snapshot()
+    async def _sync_sources(self, *, force=False, chat_id=None, configuration=None, through=None):
+        configuration = await self.snapshot() if configuration is None else configuration
         selected = configuration["sources"]
-        if selected == self.selected and not force and time.monotonic() - self.last_backfill < 30:
-            return configuration
-        if selected != self.selected or self.unavailable_sources:
+        now = self.clock()
+        changed = selected != self.selected
+        resolve_due = changed or force or (self.missing_sources and (self.last_dialog_scan is None or now - self.last_dialog_scan >= self.dialog_interval))
+        if resolve_due:
             dialogs = {}
             async for dialog in self.client.iter_dialogs():
                 dialogs[str(dialog.id)] = (str(dialog.id), dialog.entity)
@@ -91,12 +167,21 @@ class TelegramReader:
             self.missing_sources = unavailable
             self.failed_sources = {chat: names for chat, names in self.failed_sources.items() if chat in self.entities}
             self.update_source_status()
+            self.last_dialog_scan = now
+            if changed:
+                self.history_reads.clear()
         configuration["source_aliases"] = self.aliases
+        delivered = set()
         for chat, entity in self.entities.items():
             if chat_id is not None and chat != chat_id:
                 continue
             try:
-                await self.sync_source(chat, entity, configuration)
+                reread = force or chat not in self.history_reads or now - self.history_reads[chat] >= self.history_interval
+                if chat_id is None and not reread:
+                    continue
+                delivered.update(await self.sync_source(chat, entity, configuration, reread=reread, through=through))
+                if reread:
+                    self.history_reads[chat] = now
             except Exception as error:
                 if SourceAccessError.from_error(error).code != "sources_access_denied":
                     raise
@@ -105,7 +190,8 @@ class TelegramReader:
                 self.failed_sources.pop(chat, None)
             self.update_source_status()
         if chat_id is None:
-            self.last_backfill = time.monotonic()
+            self.last_backfill = now
+        self.last_delivered_versions = delivered
         return configuration
 
     def update_source_status(self):
@@ -113,7 +199,12 @@ class TelegramReader:
         failed.update(name for names in self.failed_sources.values() for name in names)
         self.unavailable_sources = [name for name in self.selected or [] if name in failed]
 
-    async def sync_source(self, chat, entity, configuration):
+    async def sync_source(self, chat, entity, configuration, *, reread=True, through=None):
+        delivered = set()
+        async def deliver(message, *, historical=False):
+            source = self.source(message, historical=historical)
+            await self.deliver(source)
+            delivered.add((source.chat_id, source.message_id, source.edited_at))
         cursor = configuration["cursors"].get(chat)
         cutoff = configuration.get("context_cutoffs", {}).get(chat, 0)
         context_ids = configuration.get("context_ids", {}).get(chat)
@@ -128,7 +219,7 @@ class TelegramReader:
             # Persist the bounded selection before the first delivery. A retry
             # must not replace this with an unbounded min_id=0 history scan.
             for message in reversed(history):
-                await self.deliver(self.source(message, historical=True))
+                await deliver(message, historical=True)
             cursor = cutoff
         else:
             cursor = cursor if cursor is not None else cutoff
@@ -139,12 +230,17 @@ class TelegramReader:
                 if self.bootstrap:
                     await self.bootstrap({chat: cutoff}, {chat: context_ids})
             ids = sorted(set([*(context_ids or []), *configuration.get("tracked_ids", {}).get(chat, [])]))
-            if ids:
+            if ids and reread:
                 messages = await self.client.get_messages(entity, ids=ids)
                 for message in sorted((message for message in messages if message is not None), key=lambda item: item.id):
-                    await self.deliver(self.source(message, historical=message.id <= cutoff))
-        async for message in self.client.iter_messages(entity, min_id=max(cursor, cutoff), reverse=True):
-            await self.deliver(self.source(message))
+                    await deliver(message, historical=message.id <= cutoff)
+        options = {"min_id": max(cursor, cutoff), "reverse": True}
+        if through is not None:
+            options["max_id"] = through + 1
+        async for message in self.client.iter_messages(entity, **options):
+            if through is None or message.id <= through:
+                await deliver(message)
+        return delivered
 
     async def received(self, event):
         chat = str(event.message.chat_id)
@@ -153,13 +249,14 @@ class TelegramReader:
             return
         async with self.intake_lock:
             # Backfill ordered IDs first. A failed low ID prevents a later cursor advance.
-            configuration = await self._sync_sources(force=True, chat_id=chat)
+            configuration = await self._sync_sources(chat_id=chat, through=event.message.id)
             if chat in self.failed_sources:
                 return
             message = self.source(event.message)
             message.historical = message.message_id <= configuration.get("context_cutoffs", {}).get(message.chat_id, 0)
             if message.chat_id in {*configuration["sources"], *self.aliases.values()}:
-                await self.deliver(message)
+                if (message.chat_id, message.message_id, message.edited_at) not in self.last_delivered_versions:
+                    await self.deliver(message)
 
     @staticmethod
     def source(message, *, historical=False):

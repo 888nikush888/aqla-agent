@@ -3,13 +3,101 @@ from types import SimpleNamespace
 
 import pytest
 
-from aqla_agent.telegram import SourceAccessError, TelegramReader
+from aqla_agent.telegram import ReaderRetry, SourceAccessError, TelegramReader, reader_metadata_token
 from aqla_hyperliquid_mcp.models import Settings
 
 
 def message(identity, *, edited=False):
     return SimpleNamespace(chat_id=-100123, id=identity, date=datetime.now(UTC), edit_date=datetime.now(UTC) if edited else None,
                            reply_to=None, grouped_id=None, message="Updated SL" if edited else "Historical setup", fwd_from=None, photo=None, media=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [False, True])
+async def test_100_live_events_do_not_repeat_dialog_or_history_work(missing):
+    clock = [0.0]
+    configuration = {"sources": ["@signala"] + (["@missing"] if missing else []), "cursors": {"-100123": 20},
+                     "context_cutoffs": {"-100123": 20}, "context_ids": {"-100123": list(range(1, 21))}, "tracked_ids": {}}
+    counts = {"dialogs": 0, "rereads": 0}
+    delivered = []
+    class Client(ReaderClient):
+        async def iter_dialogs(self):
+            counts["dialogs"] += 1
+            async for item in super().iter_dialogs():
+                yield item
+        async def get_messages(self, entity, ids):
+            counts["rereads"] += 1
+            return [message(identity) for identity in ids]
+        async def iter_messages(self, entity, **kwargs):
+            if False:
+                yield None
+    async def snapshot():
+        return configuration
+    async def deliver(source):
+        delivered.append(source)
+        configuration["cursors"][source.chat_id] = max(configuration["cursors"].get(source.chat_id, 0), source.message_id)
+    reader = TelegramReader(Settings(network="testnet", account="0x" + "0" * 40), deliver, snapshot, clock=lambda: clock[0])
+    reader.client = Client()
+    await reader.sync_sources()
+    counts.update(dialogs=0, rereads=0)
+    delivered.clear()
+    for identity in range(21, 121):
+        await reader.received(SimpleNamespace(message=message(identity)))
+    assert counts == {"dialogs": 0, "rereads": 0}
+    assert [row.message_id for row in delivered] == list(range(21, 121))
+    await reader.received(SimpleNamespace(message=message(25, edited=True)))
+    assert delivered[-1].message_id == 25 and delivered[-1].edited_at is not None
+    assert counts == {"dialogs": 0, "rereads": 0}
+    clock[0] = 31
+    await reader.received(SimpleNamespace(message=message(121)))
+    assert counts == {"dialogs": int(missing), "rereads": 1}
+    assert "_delivered_live_versions" not in configuration
+
+
+@pytest.mark.parametrize("code", ["reader_session_unauthorized", "reader_dependency_missing", "reader_unavailable"])
+def test_reader_retry_exponential_caps_and_success_reset(code):
+    clock = [0.0]
+    retry = ReaderRetry(clock=lambda: clock[0], wall_clock=lambda: 1000, jitter=lambda: 0.5)
+    delays = []
+    for attempt in range(1, 20):
+        status = retry.failed(SourceAccessError(code, ["-100123"]))
+        assert status["code"] == code and status["attempt"] == attempt and status["sources"] == ["-100123"]
+        assert set(status) == {"code", "sources", "attempt", "next_retry_at"}
+        delays.append(retry.deadline - clock[0])
+        assert not retry.ready()
+        clock[0] = retry.deadline
+        assert retry.ready()
+    assert delays == sorted(delays)
+    assert max(delays) == (120 if code == "reader_unavailable" else 300)
+    retry.reset()
+    assert retry.ready() and retry.status is None and retry.attempts == 0
+
+
+@pytest.mark.parametrize("seconds", [90, 3600, "credential-text", float("inf"), float("nan"), -1, True])
+def test_reader_floodwait_uses_only_safe_numeric_duration(seconds):
+    class FloodError(Exception):
+        pass
+    error = FloodError("do not publish RPC or credentials")
+    error.seconds = seconds
+    failure = SourceAccessError.from_error(error)
+    assert failure.code == "reader_rate_limited"
+    numeric = type(seconds) is int and seconds > 0
+    assert failure.retry_after == (seconds if numeric else None)
+    retry = ReaderRetry(clock=lambda: 0, wall_clock=lambda: 1000, jitter=lambda: 0.5)
+    status = retry.failed(failure)
+    if numeric:
+        assert retry.deadline >= seconds
+    assert "credential" not in str(status) and "RPC" not in str(status)
+
+
+def test_reader_secret_repair_metadata_never_reads_contents(tmp_path, monkeypatch):
+    settings = Settings(network="testnet", account="0x" + "0" * 40, telegram_session_file=tmp_path / "session.secret")
+    configuration = tmp_path / "config.yaml"
+    configuration.write_text("synthetic public config", encoding="utf-8")
+    before = reader_metadata_token(settings, configuration)
+    settings.telegram_session_file.write_text("synthetic session", encoding="utf-8")
+    monkeypatch.setattr(type(configuration), "read_text", lambda *args, **kwargs: pytest.fail("Metadata fingerprint read contents"))
+    assert reader_metadata_token(settings, configuration) != before
 
 
 class ReaderClient:
@@ -194,6 +282,7 @@ async def test_unsubscribed_live_message_does_no_snapshot_or_history_io():
 async def test_live_recovery_only_queries_affected_subscribed_source():
     configuration = {"sources": ["@signala", "@signalb"], "cursors": {"-100123": 10, "-100456": 20}, "tracked_ids": {}}
     queries = []
+    clock = [0.0]
     async def snapshot():
         return configuration
     async def deliver(source):
@@ -203,7 +292,7 @@ async def test_live_recovery_only_queries_affected_subscribed_source():
             queries.append(entity)
             if False:
                 yield
-    reader = TelegramReader(Settings(network="testnet", account="0x" + "0" * 40), deliver, snapshot)
+    reader = TelegramReader(Settings(network="testnet", account="0x" + "0" * 40), deliver, snapshot, clock=lambda: clock[0])
     reader.client = Client()
     reader.selected = list(configuration["sources"])
     reader.aliases = {"@signala": "-100123", "@signalb": "-100456"}
@@ -212,7 +301,10 @@ async def test_live_recovery_only_queries_affected_subscribed_source():
     assert queries == ["source-a"]
     assert reader.last_backfill == 0
     await reader.sync_sources()
-    assert queries == ["source-a", "source-a", "source-b"]
+    assert queries == ["source-a", "source-b"]
+    clock[0] = 31
+    await reader.sync_sources()
+    assert queries == ["source-a", "source-b", "source-a", "source-b"]
 
 
 @pytest.mark.asyncio
