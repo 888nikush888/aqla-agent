@@ -38,6 +38,8 @@ SQLite verwendet `synchronous=FULL` und ein normales Rollback-Journal. Bei Schre
 
 `hermes-home/state.db` gehört zur nativen Hermes-Laufzeit: Gespräche, Tool-Ergebnisse und Volltextindex. Diese Datenbank autorisiert keine Trades. Google Sheets bleibt die Analyseansicht und wird aus der dauerhaft gespeicherten Journal-Queue aktualisiert.
 
+Der interne Reportingabgleich speichert seine Versuchsreihenfolge dauerhaft am Trade, bevor er Börsenhistorien liest. Mehrere fällige Jobs teilen ein begrenztes Zeit-/Requestbudget; einzelne langsame oder fehlerhafte Jobs haben eigene kleinere Grenzen. Die bestehenden generischen Statewriter-/Rollbackregeln bleiben maßgeblich. Zeit- oder Requestende löscht keine positiven Finanzbelege; Details und konfigurierbare Grenzen stehen im [Monatsreportvertrag](monthly-reports.md#begrenzter-und-fairer-belegabgleich).
+
 ## Migration und Sicherung
 
 Beim ersten Start importiert Aqla eine vorhandene `state.json` im gleichen Ordner. Die Kontobindung und gespeicherte Ausführungsidentitäten werden vor dem Import geprüft. Alte `state_path: .../state.json`-Konfigurationen werden weiterhin erkannt, verwenden aber die gleichnamige `.sqlite3`-Datei. Sobald sie existiert, wird die alte JSON-Datei nie erneut als aktive Quelle geladen.

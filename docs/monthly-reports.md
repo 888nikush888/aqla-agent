@@ -104,3 +104,15 @@ Ein stündlicher, fair verteilter lesender Abgleich ergänzt verfügbare Belege;
 Die Veröffentlichung hat keine Orderfunktion. Profile, Kontolimits, Börsenfreigaben,
 SL und TP bleiben unverändert. Ein gedeckelter Hebel ändert die Margin/ROE,
 aber weder absolute Signalpreise noch Backup-Kursprozente.
+
+## Begrenzter und fairer Belegabgleich
+
+Der interne Reporting-Tick verarbeitet mehrere stündlich fällige geschlossene Trades seriell außerhalb der Ausführungssperre. Standardmäßig gelten höchstens acht Jobs, 32 tatsächliche HTTPX-Leseanfragen und zehn Sekunden je Tick; ein Job erhält höchstens acht Anfragen und zwei Sekunden beziehungsweise die kleinere verbleibende Tickzeit. Konstruktorparameter `max_jobs`, `max_requests`, `time_budget_seconds`, `job_requests` und `job_time_seconds` sind validiert. Jobgrenzen dürfen Tickgrenzen nicht überschreiten; Zeiten müssen positiv, endlich und höchstens 40 Sekunden sein. Bestehende History-/Cursorcaps jeder Börse gelten zusätzlich.
+
+Das Requestbudget zählt tatsächliche ausgehende HTTPX-Anfragen für Order-, Fill- und Fundinghistorien einschließlich Pagination, Redirects, Authfolgeanfragen und fehlgeschlagener Transportversuche. Es zählt keine Jobs oder bloßen Funktionsaufrufe. Requests nach Ausschöpfen des Budgets werden vor dem nächsten Transport verhindert. Budgetmarker bleiben lokal; Schreibpfade erhalten sie nicht und der originale Auth-/Signer-/Noncevertrag wird nicht geändert.
+
+Vor jedem Versuch speichert der vorhandene generische Statewriter `reporting_attempt_sequence` und `reporting_attempted_at` am Trade. Noch nicht versuchte Jobs haben Vorrang; auch ein Abbruch und Neustart in derselben Millisekunde behält die Reihenfolge. Ein langsamer oder dauerhaft fehlerhafter Job beendet nicht die gesamte Runde, solange Tickbudget übrig bleibt. Cancellation und Shutdown werden weitergereicht. Scheitert die dauerhafte Reservierung, beginnt kein Reportingread.
+
+Zeit-/Requestende meldet den aktuellen Abgleich unvollständig mit sicherem Grund. Gespeicherte eigene Fills, Gebühren und Fundingbelege bleiben erhalten; bereits verifizierte Coverage bleibt gültig, solange die zugehörigen Fingerprints weiterhin passen. Es werden keine fehlenden Gebühren oder Fundingwerte geschätzt. Die typisierten internen Tick-/Refreshresultate beschreiben den Belegabgleich; berechenbare Finanzwerte bleiben von den vollständigen Monatsreportprüfungen abhängig. Umfangreiche Historien können größere konfigurierte Jobbudgets benötigen und bleiben bis zu einem vollständigen belegbaren Abgleich unvollständig.
+
+Fakeclock-/MockTransporttests belegen getrennt Zeit, tatsächliche Requests und Fairness: zwei einfache Jobs benötigen vier Transportanfragen in einer Runde; die eingefrorene alte Einjob-Basis verarbeitet im gleichen kontrollierten Zweijobfall nur einen Job. Slow-/Fast-/Errorfälle, verbleibende Zeitslices, SQLite-Neustart, Persistenzfehler, Cancellation und unveränderte Finanz-/Coverage-/Fingerprint-/Report-/JSON-Typeoracles werden geprüft. Diese gezählte Arbeit ist kein VPS-Benchmark und keine Zusage zur Live-Laufzeit oder Backlogdauer.
