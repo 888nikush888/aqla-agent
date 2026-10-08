@@ -56,3 +56,14 @@ def test_invalid_session_is_not_partially_imported_or_silently_skipped(tmp_path)
         migrate_session_history(tmp_path, db=DB())
     assert failure.value.issue["line"] == 2 and failure.value.issue["code"] == "json_decode"
     assert "secret" not in str(failure.value) and path.read_bytes() == before
+
+
+def test_native_validation_diagnosis_locates_message_line_without_echoing_error(tmp_path):
+    directory = tmp_path / "sessions/transcripts"
+    directory.mkdir(parents=True)
+    (directory / "session.jsonl").write_text('\n{"role":"user","content":"valid","timestamp":"1791397511"}\n\n{"role":"assistant","content":7}\n', encoding="utf-8")
+    def validate(payloads):
+        return ([], [{"error": "synthetic-private-body"}]) if any(type(row["content"]) is int for row in payloads[0]["messages"]) else (payloads, [])
+    result = diagnose_session_history(tmp_path, validator=validate)
+    assert result["issues"][0]["line"] == 4 and result["issues"][0]["code"] == "native_validation"
+    assert "synthetic-private-body" not in json.dumps(result)

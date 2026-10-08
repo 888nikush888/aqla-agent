@@ -52,6 +52,8 @@ def _routing_entries(home: Path):
     if not isinstance(values, dict) or any(not isinstance(value, dict) or not isinstance(value.get("session_id"), str) or
                                           value.get("source") is not None and not isinstance(value["source"], dict) for value in values.values()):
         raise HistoryImportError(_issue(path, 1, "routing_metadata"))
+    for value in values.values():
+        _timestamp(value.get("created_at"), path, 1)
     return {value["session_id"]: value for value in values.values()}
 
 
@@ -60,7 +62,10 @@ def _timestamp(value, path: Path, line: int):
         return None
     try:
         if isinstance(value, str):
-            return datetime.fromisoformat(value).timestamp()
+            try:
+                value = float(value)
+            except ValueError:
+                value = datetime.fromisoformat(value).timestamp()
         if type(value) not in (int, float) or not math.isfinite(value):
             raise ValueError("timestamp")
         return value
@@ -92,6 +97,10 @@ def _history_payload(path: Path, entries):
         line = locations.pop(0)
         if set(header) - {"role", "tools", "model", "platform", "timestamp"}:
             raise HistoryImportError(_issue(path, line, "metadata"))
+        if any(header.get(name) is not None and not isinstance(header[name], str) for name in ("model", "platform")) or (
+            header.get("tools") is not None and (not isinstance(header["tools"], list) or any(not isinstance(tool, str) for tool in header["tools"]))
+        ):
+            raise HistoryImportError(_issue(path, line, "metadata"))
         _timestamp(header.get("timestamp"), path, line)
     for row, line in zip(rows, locations, strict=True):
         if not isinstance(row, dict) or row.get("role") not in ("user", "assistant", "tool", "system"):
@@ -105,7 +114,22 @@ def _history_payload(path: Path, entries):
     payload = {"id": path.stem, "source": source.get("platform") or header.get("platform") or "telegram",
                "started_at": started, "chat_id": str(source.get("chat_id", "")), "user_id": str(source.get("user_id", "")),
                "title": "Aqla Telegram-Verlauf", "model": header.get("model"), "messages": rows}
-    return payload, header, original
+    return payload, header, original, locations
+
+
+def _validate_native(payload, path: Path, locations: list[int], validator):
+    normalized, errors = validator([payload])
+    if errors:
+        # Native errors may include message bodies or tool arguments. Use only
+        # their presence and locate a rejected row by another read-only check.
+        line = 1
+        for row, location in zip(payload["messages"], locations, strict=True):
+            _, row_errors = validator([{**payload, "messages": [row]}])
+            if row_errors:
+                line = location
+                break
+        raise HistoryImportError(_issue(path, line, "native_validation"))
+    return normalized
 
 
 def diagnose_session_history(home: Path, *, validator=None) -> HistoryDiagnosis:
@@ -126,11 +150,9 @@ def diagnose_session_history(home: Path, *, validator=None) -> HistoryDiagnosis:
     for path in sorted((home / "sessions/transcripts").glob("*.jsonl")):
         result["files"] += 1
         try:
-            payload, _, _ = _history_payload(path, entries)
+            payload, _, _, locations = _history_payload(path, entries)
             if validator is not None:
-                _, errors = validator([payload])
-                if errors:
-                    raise HistoryImportError(_issue(path, 1, "native_validation"))
+                _validate_native(payload, path, locations, validator)
             result["valid"] += 1
         except HistoryImportError as error:
             result["issues"].append(error.issue)
@@ -162,11 +184,9 @@ def migrate_session_history(home: Path, *, db=None):
             if db._read_one("SELECT 1 FROM aqla_jsonl_imports WHERE session_id = ?", (session_id,)):
                 result["skipped"] += 1
                 continue
-            payload, header, original = _history_payload(path, entries)
+            payload, header, original, locations = _history_payload(path, entries)
             rows = payload["messages"]
-            normalized, errors = db._validate_import_payload([payload])
-            if errors:
-                raise HistoryImportError(_issue(path, 1, "native_validation"))
+            normalized = _validate_native(payload, path, locations, db._validate_import_payload)
             item = normalized[0]
             fingerprint = hashlib.sha256(original).hexdigest()
             count = len(rows)

@@ -36,7 +36,11 @@ def main():
     from aqla_agent.conversation import Conversations
     from aqla_agent.events import EXTENSIONS, HermesExtension
     from aqla_agent.hermes_runtime import install_strict_profile
-    from aqla_agent.session_history import migrate_session_history
+    from aqla_agent.session_history import (
+        HistoryImportError,
+        diagnose_session_history,
+        migrate_session_history,
+    )
     from aqla_hyperliquid_mcp.models import Settings
 
     legacy=Conversations(home/'sessions/transcripts')
@@ -76,7 +80,12 @@ def main():
         secret.write_text('local-interaction-test-only-'*3)
         settings=Settings(network='testnet',account='0x'+'0'*40,state_path=home/'unused-trading.json',integration_key_file=secret)
         configuration.write_text(yaml.safe_dump(settings.model_dump(mode='json')))
-        ctx=SimpleNamespace(get_config=lambda key,default=None:{'owner_id':'12345','config_path':str(configuration)}.get(key,default))
+        requests=[]
+        def call_mcp(server,tool,arguments):
+            assert tool=='integration' and arguments['action']=='monthly_request'
+            requests.append(arguments['month'])
+            return {'ok':True}
+        ctx=SimpleNamespace(get_config=lambda key,default=None:{'owner_id':'12345','config_path':str(configuration)}.get(key,default),call_mcp=call_mcp)
         extension=HermesExtension(ctx)
         EXTENSIONS.add(extension)
         adapter=object.__new__(TelegramAdapter)
@@ -100,13 +109,24 @@ def main():
             reply=json.loads(clarify_tool([{'question':'Welches Profil?','choices':['Profil A','Profil B']}],callback=runner._clarify_callback_sync))
             assert 'Profil A' in json.dumps(reply),reply
             assert extension.turn_claim.get().can_change()
+            extension.before_tool('mcp_aqla_monthly_report',{'month':'2026-10'})
+            assert requests==['2026-10']
         assert cards and len(cards[0][1].inline_keyboard)==3
         with extension.claim_scope(('source','channel-message')):
             assert all(extension.before_tool(name,{})['action']=='block' for name in ('clarify','todo_list','session_search'))
+            extension.before_tool('mcp_aqla_monthly_report',{'month':'2026-10'})
+            assert requests==['2026-10']
         runner._ask_clarify_question=lambda *args,**kwargs:('[user did not respond]',False)
         with extension.claim_scope(('operator','timeout-question')):
             clarify_tool([{'question':'Welches Profil?','choices':['Profil A','Profil B']}],callback=runner._clarify_callback_sync)
             assert not extension.turn_claim.get().can_change()
+            extension.before_tool('mcp_aqla_monthly_report',{'month':'2026-10'})
+            assert requests==['2026-10']
+        with extension.claim_scope(('operator','fresh-month-request')):
+            extension.before_tool('mcp_aqla_monthly_report',{'month':'2026-10','diagnostics_only':True})
+            assert requests==['2026-10']
+            extension.before_tool('mcp_aqla_monthly_report',{'month':'2026-10'})
+            assert requests==['2026-10','2026-10']
         extension.session_key='owner'
         pending=clarify_gateway.register('question-2','owner','Risk?',None)
         started=threading.Event()
@@ -141,9 +161,41 @@ def main():
         finally:
             db._import_session_row=original_import
         assert migrate_session_history(home,db=db)['imported']==1
+        # Real pinned validation, every original file inspected, no SessionDB
+        # opened or written by the diagnostic path, and no partial bad import.
+        diagnostic_home=home/'diagnosis-only'
+        records=Conversations(diagnostic_home/'sessions/transcripts')
+        records.append('good',{'role':'user','content':'synthetic valid'})
+        records.path('bad').write_text('\n{private-synthetic-body\n',encoding='utf-8')
+        records.append('native_bad',{'role':'session_meta','platform':'telegram'})
+        records.append('native_bad',{'role':'user','content':'private-synthetic-body','token_count':'private-synthetic-body'})
+        routing=diagnostic_home/'sessions/sessions.json'
+        routing.write_text('{private-routing-body',encoding='utf-8')
+        originals={path:path.read_bytes() for path in diagnostic_home.rglob('*') if path.is_file()}
+        diagnosis=diagnose_session_history(diagnostic_home)
+        assert diagnosis['files']==3 and diagnosis['valid']==1,diagnosis
+        assert {(issue['code'],issue['line']) for issue in diagnosis['issues']}=={('routing_metadata',1),('json_decode',2),('native_validation',2)},diagnosis
+        assert 'private-synthetic-body' not in json.dumps(diagnosis) and 'private-routing-body' not in json.dumps(diagnosis)
+        assert originals=={path:path.read_bytes() for path in diagnostic_home.rglob('*') if path.is_file()}
+        assert not (diagnostic_home/'state.db').exists()
+        routing.unlink()
+        bad_db=SessionDB(db_path=diagnostic_home/'state.db')
+        try:
+            try:
+                migrate_session_history(diagnostic_home,db=bad_db)
+            except HistoryImportError as error:
+                assert error.issue['code']=='json_decode' and error.issue['line']==2
+            else:
+                raise AssertionError('Corrupt session was silently skipped')
+            assert bad_db.get_session('bad') is None
+            assert not bad_db._read_one('SELECT 1 FROM aqla_jsonl_imports WHERE session_id=?',('bad',))
+        finally:
+            bad_db.close()
         print(json.dumps({'native_sqlite_import_search':True,'migration_idempotent':True,'old_files_preserved':True,
                          'import_rollback':True,'planning_persisted':True,'native_telegram_question_card':True,'source_tools_blocked':True,
-                         'timeout_not_authorization':True,'trading_work_cancels_question':True,'exchange_actions':0}))
+                         'timeout_not_authorization':True,'monthly_request_claim_and_question_lifecycle':True,
+                         'diagnosis_has_exact_safe_lines_and_no_dbwrite':True,'corrupt_session_has_no_partial_import':True,
+                         'trading_work_cancels_question':True,'exchange_actions':0}))
     finally:
         db.close()
         undo()
