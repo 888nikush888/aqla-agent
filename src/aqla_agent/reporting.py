@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from aqla_hyperliquid_mcp.models import AqlaError, Market, TradePlan, digest, now_ms
 
+from .evidence import market_fills
 from .funding import bounded_history
 from .monthly import CLOSED, accounting_facts, entry_quantity_evidence, fill_identity
 
@@ -40,7 +41,7 @@ class Reporting:
                 mapping[oid] = order
                 observations[order["cloid"]] = {"oid": oid, "status": detail["status"]}
         async def fetch(low, high):
-            return await adapter.info("userFillsByTime", user=adapter.account, startTime=low, endTime=high)
+            return await market_fills(adapter, plan.market, low, high)
         rows = await bounded_history(fetch, plan.created_at, trade.get("closed_at") or trade.get("cleanup_observed_at") or now_ms(), limit=2000)
         additions = {}
         for row in rows:
@@ -95,7 +96,7 @@ class Reporting:
                 adapter.market_cache.setdefault(market.symbol, market)
             fills = trade["fill_events"]
             async def fetch(low, high):
-                return await adapter.info("userFillsByTime", user=adapter.account, startTime=low, endTime=high)
+                return await market_fills(adapter, market, low, high)
             observed = await bounded_history(fetch, trade["plan"]["created_at"], end, limit=2000)
             observed = {fill_identity(row): row for row in observed if row.get("coin") == market.symbol
                         and trade["plan"]["created_at"] <= row["time"] <= end}

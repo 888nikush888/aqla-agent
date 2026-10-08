@@ -10,7 +10,7 @@ from test_sdk_actions import CASES
 
 from aqla_hyperliquid_mcp.api import SDK_PRINCIPAL_L1, SDK_TRADING_L1, SDK_USER_SIGNED, Hyperliquid
 from aqla_hyperliquid_mcp.catalog import SDK_METHODS
-from aqla_hyperliquid_mcp.models import AqlaError, digest
+from aqla_hyperliquid_mcp.models import AqlaError, Market, digest
 from aqla_hyperliquid_mcp.state import State
 
 VAULT = "0x" + "4" * 40
@@ -23,6 +23,20 @@ def scoped_exchange(setup, vault=VAULT):
                                            "state_path": settings.state_path.with_name("scoped.json")})
     state = State(settings)
     return settings, state, Hyperliquid(settings, state, exchange.client)
+
+
+@pytest.mark.asyncio
+async def test_internal_market_fill_history_keeps_public_info_payload_unchanged(setup, monkeypatch):
+    exchange = setup[3]
+    payloads = []
+    def capture(request):
+        assert request.url.path == "/info"
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200, json=[])
+    monkeypatch.setattr(exchange.client, "_transport", httpx.MockTransport(capture))
+    market = Market(symbol="BTC", native_symbol="unused-native-contract", asset_id=0, product="perp", size_decimals=2, mid="100")
+    assert await exchange.fill_history(market, 10, 20) == []
+    assert payloads == [{"type": "userFillsByTime", "user": exchange.account, "startTime": 10, "endTime": 20}]
 
 
 def test_every_sdk_handler_has_exactly_one_signing_contract():

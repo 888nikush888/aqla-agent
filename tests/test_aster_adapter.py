@@ -11,7 +11,7 @@ from eth_account.messages import encode_typed_data
 from aqla_agent.aster import DOMAIN, Aster
 from aqla_agent.pipelines import VenueState
 from aqla_agent.trading import Trading
-from aqla_hyperliquid_mcp.models import AqlaError
+from aqla_hyperliquid_mcp.models import AqlaError, Market, TradePlan
 
 
 class AsterBoundary:
@@ -103,6 +103,72 @@ def aster(setup):
     boundary = AsterBoundary(wallet)
     adapter = Aster(selected, view, httpx.AsyncClient(base_url="https://fapi.asterdex-testnet.com", transport=httpx.MockTransport(boundary.handle)))
     return adapter, boundary, Trading(adapter, view)
+
+
+@pytest.mark.asyncio
+async def test_ten_trade_fill_reads_use_only_their_immutable_aster_markets(aster, signal, monkeypatch):
+    adapter, _, engine = aster
+    source, interpretation = signal
+    plan = TradePlan.model_validate(await engine.preview(source.event_id, interpretation))
+    markets = [plan.market.model_copy(update={"symbol": "M" + str(index), "native_symbol": "M" + str(index) + "USDT", "asset_id": 1000 + index}) for index in range(100)]
+    adapter.market_cache = {market.symbol: market for market in markets}
+    calls = []
+    async def read(path, params=None, **kwargs):
+        assert path == "userTrades" and kwargs == {"private": True}
+        calls.append(params["symbol"])
+        return []
+    monkeypatch.setattr(adapter, "read", read)
+    for market in markets[:10]:
+        assert await engine._fills(plan.model_copy(update={"market": market})) == []
+    assert calls == [market.native_symbol for market in markets[:10]]
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_aster_selected_fill_read_preserves_saturation_guard_and_general_read(aster, signal, monkeypatch):
+    adapter, _, engine = aster
+    source, interpretation = signal
+    plan = TradePlan.model_validate(await engine.preview(source.event_id, interpretation))
+    calls = []
+    async def saturated(path, params=None, **kwargs):
+        calls.append(params["symbol"])
+        return [{}] * 1000
+    monkeypatch.setattr(adapter, "read", saturated)
+    with pytest.raises(AqlaError, match="saturated within one millisecond"):
+        await adapter.fills(1, 1)
+    assert calls == [plan.market.native_symbol]
+    other = plan.market.model_copy(update={"symbol": "ETH", "native_symbol": "ETHUSDT", "asset_id": 1000})
+    adapter.market_cache[other.symbol] = other
+    calls.clear()
+    async def complete(path, params=None, **kwargs):
+        calls.append(params["symbol"])
+        return [{"orderId": 1, "id": 2, "qty": "1", "price": "100", "time": 1, "commission": ".01", "commissionAsset": "USDT"}]
+    monkeypatch.setattr(adapter, "read", complete)
+    rows = await adapter.fills(1, 2)
+    assert calls == [plan.market.native_symbol, other.native_symbol]
+    assert [row["coin"] for row in rows] == [plan.market.symbol, other.symbol]
+    assert all(row["fee"] == ".01" and row["feeToken"] == "USDT" for row in rows)
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scoped", [False, True])
+@pytest.mark.parametrize("native_symbol", [None, "BTCUSDT", "ETHUSDT"])
+async def test_aster_fill_response_cannot_relabel_an_explicit_foreign_market(scoped, native_symbol):
+    market = Market(symbol="BTC", native_symbol="BTCUSDT", asset_id=0, product="perp", size_decimals=2, mid="100")
+    adapter = object.__new__(Aster)
+    adapter.market_cache = {market.symbol: market}
+    async def read(path, params, **kwargs):
+        assert path == "userTrades" and params["symbol"] == "BTCUSDT"
+        return [{"orderId": 42, "id": 7, "qty": "1", "price": "100", "time": 50,
+            "commission": ".1", "commissionAsset": "USDT", **({"symbol": native_symbol} if native_symbol is not None else {})}]
+    adapter.read = read
+    if native_symbol == "ETHUSDT":
+        with pytest.raises(AqlaError, match="another native market"):
+            await (adapter.fill_history(market, 0, 100) if scoped else adapter.fills(0, 100))
+    else:
+        rows = await (adapter.fill_history(market, 0, 100) if scoped else adapter.fills(0, 100))
+        assert len(rows) == 1 and rows[0]["coin"] == "BTC" and rows[0]["oid"] == 42
 
 
 @pytest.mark.asyncio

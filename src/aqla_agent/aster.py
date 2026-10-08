@@ -211,9 +211,15 @@ class Aster(VenueAdapter):
             "origSz": row["origQty"], "reduceOnly": row.get("reduceOnly") is True, "isTrigger": trigger,
             "triggerPx": row.get("stopPrice", "0"), "triggerCondition": "Price below" if row["side"] == "SELL" else "Price above"}}}
 
-    async def fills(self, start, end):
+    async def fill_history(self, market: Market, start: int, end: int):
+        if not market.native_symbol:
+            raise AqlaError("Aster fill history requires the immutable native market identity")
+        return await self.fills(start, end, market=market)
+
+    async def fills(self, start, end, *, market: Market | None = None):
         result = []
-        for market in self.market_cache.values():
+        markets = (market,) if market is not None else tuple(self.market_cache.values())
+        for market in markets:
             async def window(low, high, budget, selected=market):
                 if budget <= 0:
                     raise AqlaError("Aster fill history exceeded its bounded request budget")
@@ -225,6 +231,8 @@ class Aster(VenueAdapter):
                     return await window(low, middle, budget - 1) + await window(middle + 1, high, budget - 1)
                 return rows
             for row in await window(start, end, 6):
+                if row.get("symbol") is not None and row["symbol"] != market.native_symbol:
+                    raise AqlaError("Aster returned a fill from another native market")
                 result.append({"oid": int(row["orderId"]), "tid": row["id"], "coin": market.symbol, "sz": row["qty"], "px": row["price"],
                                "time": int(row["time"]), "fee": row["commission"], "feeToken": row["commissionAsset"]})
         return result

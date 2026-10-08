@@ -873,6 +873,30 @@ async def test_saved_verified_evidence_survives_temporary_exchange_outage(monkey
 
 
 @pytest.mark.asyncio
+async def test_reporting_uses_the_trade_market_for_native_fill_history(monkeypatch):
+    snapshot = data(trade())
+    row = snapshot["trades"]["trade"]
+    calls = []
+    async def selected(market, start, end):
+        assert market == Market.model_validate(row["plan"]["market"])
+        assert start == row["plan"]["created_at"] and end == row["closed_at"]
+        calls.append(market)
+        return list(row["fill_events"].values())
+    async def general(*args, **kwargs):
+        pytest.fail("Native historical reads must select the immutable trade market")
+    async def payments(*args):
+        return []
+    adapter = SimpleNamespace(fill_history=selected, info=general, funding_payments=payments, account="owner")
+    fake_state = SimpleNamespace(snapshot=lambda: copy.deepcopy(snapshot), update=lambda fn: fn(snapshot))
+    engine = SimpleNamespace(state=fake_state, exchange=adapter, assert_plan_binding=lambda *_: None)
+    monkeypatch.setattr("aqla_agent.reporting.TradePlan.model_validate", lambda plan: plan)
+    original_facts = copy.deepcopy(row["fill_events"])
+    await Reporting(fake_state, SimpleNamespace(engines={"hyperliquid": engine})).refresh("trade")
+    assert len(calls) == 1 and row["funding_coverage"]["complete"] is True
+    assert row["fill_events"] == original_facts
+
+
+@pytest.mark.asyncio
 async def test_actual_monthly_mcp_read_internal_authority_and_publication_ack(setup):
     from mcp.server.mcpserver.exceptions import ToolError
 

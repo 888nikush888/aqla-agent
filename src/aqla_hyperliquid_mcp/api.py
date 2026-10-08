@@ -93,6 +93,9 @@ class Hyperliquid:
         response.raise_for_status()
         return response.json()
 
+    async def fill_history(self, market: Market, start: int, end: int):
+        return await self.info("userFillsByTime", user=self.account, startTime=start, endTime=end)
+
     async def markets(self, product="perp", dex=""):
         mids = await self.info("allMids", **({"dex": dex} if dex else {}))
         result = {}

@@ -36,6 +36,7 @@ from aqla_hyperliquid_mcp.state import State
 
 from .accounting import foreign_entry_orders, occupied_markets
 from .entry import execution_limit, gate_state, validate_entry_prices
+from .evidence import market_fills
 from .pipelines import ConfigurationChanged, validate_ranking_binding
 
 OPEN = {"waiting_entry", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
@@ -603,7 +604,7 @@ class Trading:
             pages += 1
             if pages > 64:
                 raise AqlaError("Fill history requires more than the bounded page budget")
-            rows = await self.exchange.info("userFillsByTime", user=self.exchange.account, startTime=start, endTime=end)
+            rows = await market_fills(self.exchange, plan.market, start, end)
             if len(rows) >= 2000:
                 if start >= end:
                     raise AqlaError("Fill history is saturated within one millisecond; absence is not proved")

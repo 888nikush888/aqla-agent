@@ -57,6 +57,9 @@ class VenueAdapter:
             return await self.fills(params["startTime"], params["endTime"])
         raise AqlaError("Unsupported internal venue observation")
 
+    async def fill_history(self, market, start, end):
+        return await self.fills(start, end)
+
     async def account_snapshot(self, market):
         raw = await self.positions()
         row = next((item["position"] for item in raw["assetPositions"] if item["position"]["coin"] == market.symbol), None)
