@@ -161,12 +161,14 @@ def _restore_pair(output, sha, recovery_zip, recovery_sha, staging):
 def build(project: Path, output: Path):
     project, output = _lexical_path(project), _lexical_path(output)
     sha = output.with_suffix(output.suffix + ".sha256")
-    _check_chain(project)
     for target in (output, sha):
         if any(target.is_relative_to(project / name) for name in SHIPPING_DIRS) or target in (
             project / name for name in SHIPPING_FILES
         ):
             raise ValueError(f"Output overlaps a shipping path: {target}")
+    if output.suffix.casefold() != ".zip":
+        raise ValueError(f"Release output must have a .zip suffix: {output}")
+    _check_chain(project)
     _check_chain(output.parent, create=True)
     previous = []
     for target in (output, sha):
@@ -184,6 +186,7 @@ def build(project: Path, output: Path):
     staged_zip, staged_sha = staging / "new.zip", staging / "new.sha256"
     recovery_zip, recovery_sha = staging / "previous.zip", staging / "previous.sha256"
     published = {}
+    publication_started = False
     keep_recovery = False
     try:
         with zipfile.ZipFile(staged_zip, "x", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -210,11 +213,17 @@ def build(project: Path, output: Path):
             if (current is None) != (expected is None) or current and _identity(current) != _identity(expected):
                 raise ValueError(f"Output changed before publication: {target}")
             staged_info = _checked_stat(staged)
+            publication_started = True
             os.replace(staged, target)
             published[target] = _identity(staged_info)
         _verify_pair(output, sha, output.name, members)
         _sync_directory(output.parent)
-    except Exception:
+    except BaseException as error:
+        if not isinstance(error, Exception):
+            # Interruptions can leave a mixed pair, including during os.replace().
+            # Retain the durable old pair until a caller explicitly recovers it.
+            keep_recovery = publication_started
+            raise
         if published:
             try:
                 if all(previous):
@@ -226,7 +235,7 @@ def build(project: Path, output: Path):
                             raise ValueError(f"Published target changed during rollback: {target}")
                         target.unlink()
                     _sync_directory(output.parent)
-            except Exception as rollback_error:
+            except BaseException as rollback_error:
                 keep_recovery = True
                 raise RuntimeError(f"Publication and rollback failed; recovery retained at {staging}") from rollback_error
         raise

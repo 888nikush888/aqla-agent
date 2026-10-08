@@ -251,6 +251,12 @@ def test_output_inside_shipping_tree(release_project, name):
         build(release_project, release_project / name)
 
 
+def test_non_zip_output_before_filesystem_use(release_project, tmp_path, monkeypatch):
+    monkeypatch.setattr(release, "_check_chain", lambda *args, **kwargs: pytest.fail("Filesystem access before ZIP suffix validation"))
+    with pytest.raises(ValueError, match=".zip suffix"):
+        build(release_project, tmp_path / "out.tar")
+
+
 @pytest.mark.parametrize("name", ["src/.env", "tests/local.sqlite3", "docs/local.db", "scripts/state.json.lock", "skills/setup.initialized"])
 def test_synthetic_local_state_before_archive_open(release_project, tmp_path, monkeypatch, name):
     (release_project / name).write_text("synthetic forbidden sentinel", encoding="utf-8")
@@ -285,8 +291,8 @@ def test_preserves_all_allowed_source_assets(tmp_path):
     assert result["files"] == len(expected)
 
 
-def _previous_pair(root, tmp_path):
-    output = tmp_path / "out.zip"
+def _previous_pair(root, tmp_path, name="out.zip"):
+    output = tmp_path / name
     build(root, output)
     sha = output.with_suffix(".zip.sha256")
     previous = output.read_bytes(), sha.read_bytes()
@@ -421,6 +427,29 @@ def test_rollback_failure_retains_recovery_pair(release_project, tmp_path, monke
     assert str(staging) in str(failure.value)
     assert ((staging / "previous.zip").read_bytes(), (staging / "previous.sha256").read_bytes()) == previous
     assert release._verify_pair(staging / "previous.zip", staging / "previous.sha256", output.name)
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_interruption_retains_recovery_pair_and_verifier_rejects_mixed_pair(release_project, tmp_path, monkeypatch, interruption):
+    output, sha, previous = _previous_pair(release_project, tmp_path / "dist", "aqla-agent-vps.zip")
+    original = release.os.replace
+    def replace(source, target):
+        if Path(source).name == "new.sha256":
+            raise interruption("synthetic interruption between replacements")
+        original(source, target)
+    monkeypatch.setattr(release.os, "replace", replace)
+    with pytest.raises(interruption):
+        build(release_project, output)
+    staging, = output.parent.glob(".aqla-agent-vps.zip-*")
+    assert ((staging / "previous.zip").read_bytes(), (staging / "previous.sha256").read_bytes()) == previous
+    assert release._verify_pair(staging / "previous.zip", staging / "previous.sha256", output.name)
+    assert output.read_bytes() != previous[0] and sha.read_bytes() == previous[1]
+    with pytest.raises(ValueError, match="Invalid ZIP/checksum pair"):
+        release._verify_pair(output, sha, output.name)
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/verify_artifacts.py")], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "VPS archive checksum mismatch" in result.stderr
+    assert "passed" not in result.stdout
 
 
 @pytest.mark.parametrize("kind", ["missing_sha", "bad_sha", "bad_zip"])
