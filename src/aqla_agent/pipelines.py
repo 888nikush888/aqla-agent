@@ -192,6 +192,26 @@ def route_control(data, action, *, expected_revision, profile=None, pipeline=Non
     return {key: data[key] for key in ("configuration_revision", "profiles", "pipelines", "venue_limits", "venue_enabled")}
 
 
+class ConfigurationChanged(AqlaError):
+    """The immutable entry configuration no longer matches its preview basis."""
+
+
+def validate_ranking_binding(data, plan):
+    if plan.ranking_policy_revision is None or plan.ranking_enabled is None:
+        raise AqlaError("Legacy ranking binding is incomplete; create a fresh preview before any new send")
+    if data["ranking_revision"] != plan.ranking_policy_revision or data["ranking_policy"]["enabled"] != plan.ranking_enabled:
+        raise AqlaError("Ranking policy changed; create a new unsent plan")
+    if plan.ranking_enabled and not plan.rank_snapshot:
+        raise AqlaError("Ranked entry requires a source rank snapshot; create a fresh routed preview")
+    if plan.rank_snapshot:
+        from .ranking import snapshot_rank
+        current = snapshot_rank(data, plan.rank_snapshot["source_id"])
+        if (not plan.ranking_enabled or plan.rank_snapshot["policy_revision"] != plan.ranking_policy_revision
+                or current["source_revision"] != plan.rank_revision
+                or current["policy_revision"] != plan.rank_snapshot["policy_revision"] or current["network"] != plan.network):
+            raise AqlaError("Source rank/risk/network changed; old unsent entry is no longer eligible")
+
+
 class VenueState:
     """A filtered view, never a second writer or state file."""
     def __init__(self, root, exchange, settings, *, legacy=True):
@@ -199,13 +219,16 @@ class VenueState:
         self.account_key = exchange + ":" + settings.network
         self.legacy = legacy
         self.route = ContextVar("aqla_route_" + exchange, default=None)
+        self.preview_basis = ContextVar("aqla_preview_" + exchange, default=None)
 
     @contextmanager
-    def scope(self, route):
+    def scope(self, route, *, preview_snapshot=None):
         token = self.route.set(route)
+        basis_token = self.preview_basis.set(preview_snapshot)
         try:
             yield
         finally:
+            self.preview_basis.reset(basis_token)
             self.route.reset(token)
 
     def project(self, data):
@@ -247,6 +270,12 @@ class VenueState:
 
     def snapshot(self):
         return copy.deepcopy(self.project(self.root.snapshot()))
+
+    def preview_snapshot(self):
+        basis = self.preview_basis.get()
+        result = self.project(copy.deepcopy(basis) if basis is not None else self.root.snapshot())
+        result["preview_route"] = copy.deepcopy(self.route.get())
+        return copy.deepcopy(result)
 
     def update(self, callback):
         def change(data):
@@ -290,19 +319,19 @@ class VenueState:
         if record["request"].get("network") != settings.network or record["request"].get("account", "").lower() != target.lower():
             raise AqlaError("Operation belongs to another venue account/network")
 
-    def stamp_plan(self, plan):
-        route = self.route.get()
+    def stamp_plan(self, plan, snapshot):
+        route = snapshot["preview_route"]
         plan.exchange = self.exchange
         if route:
             plan.pipeline_id, plan.profile_id = route["pipeline_id"], route["profile_id"]
-            plan.profile_revision = self.root.snapshot()["profiles"][plan.profile_id]["revision"]
-            plan.pipeline_revision = self.root.snapshot()["pipelines"][plan.pipeline_id]["revision"]
+            plan.profile_revision = snapshot["profiles"][plan.profile_id]["revision"]
+            plan.pipeline_revision = snapshot["pipelines"][plan.pipeline_id]["revision"]
             if self.exchange != "hyperliquid" or plan.pipeline_id != "legacy":
                 plan.trade_id = digest([self.exchange, plan.network, plan.account, plan.pipeline_id, sorted(plan.source_refs)])[:32]
             if route.get("rank_snapshot"):
                 plan.account_key = self.account_key
                 plan.rank_snapshot = copy.deepcopy(route["rank_snapshot"])
-                plan.base_parameters = copy.deepcopy(self.root.snapshot()["profiles"][plan.profile_id]["parameters"])
+                plan.base_parameters = copy.deepcopy(snapshot["profiles"][plan.profile_id]["parameters"])
                 plan.requested_exchange = route.get("requested_exchange", self.exchange)
                 plan.routing_leg_id = route.get("leg_id", plan.pipeline_id + ":" + plan.requested_exchange)
                 plan.fallback_reason = route.get("fallback_reason")
@@ -311,6 +340,7 @@ class VenueState:
 
     def validate_route(self, plan):
         data = self.root.snapshot()
+        validate_ranking_binding(data, plan)
         if plan.backup_fields and data["profiles"]["backup"]["revision"] != plan.backup_profile_revision:
             raise AqlaError("Backup profile changed; create a new unsent plan")
         enabled = data["venue_enabled"].get(self.exchange) if self.legacy_context(data) else data["account_enabled"].get(self.account_key)
@@ -336,11 +366,6 @@ class VenueState:
                 raise AqlaError("The plan no longer belongs to the configured pipeline target")
         elif data["policy_revision"] != plan.policy_revision:
             raise AqlaError("Policy changed; legacy unsent plan cannot execute")
-        if plan.rank_snapshot and data["ranking_policy"]["enabled"]:
-            from .ranking import snapshot_rank
-            current = snapshot_rank(data, plan.rank_snapshot["source_id"])
-            if current["source_revision"] != plan.rank_revision or current["policy_revision"] != plan.rank_snapshot["policy_revision"] or current["network"] != plan.network:
-                raise AqlaError("Source rank/risk/network changed; old unsent entry is no longer eligible")
 
     def limits(self, plan=None):
         data = self.root.snapshot()

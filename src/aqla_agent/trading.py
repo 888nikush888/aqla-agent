@@ -32,6 +32,7 @@ from aqla_hyperliquid_mcp.state import State
 
 from .accounting import foreign_entry_orders, occupied_markets
 from .entry import execution_limit, gate_state, validate_entry_prices
+from .pipelines import ConfigurationChanged, validate_ranking_binding
 
 OPEN = {"waiting_entry", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
 UNFINISHED = {"pending", "interpreted", "needs_reconciliation"}
@@ -151,7 +152,7 @@ class Trading:
             return row
         if not interpretation.symbol or not interpretation.side:
             raise AqlaError("New trade needs an evidenced market and direction")
-        snapshot = self.state.snapshot()
+        snapshot = self.state.preview_snapshot() if hasattr(self.state, "preview_snapshot") else self.state.snapshot()
         if snapshot["paused"]:
             raise AqlaError("New entries are paused; existing exits and protection continue")
         if snapshot["policy"] is None:
@@ -188,6 +189,8 @@ class Trading:
                          principal=self.exchange.settings.account.lower(), backup=backup,
                          backup_revision=backup_profile["revision"] if backup_profile else None)
         plan.source_revisions = self.source_revisions(snapshot, interpretation.source_refs)
+        plan.ranking_policy_revision = snapshot["ranking_revision"]
+        plan.ranking_enabled = snapshot["ranking_policy"]["enabled"]
         quote = await self.exchange.price_snapshot(market)
         if plan.entry_timing == "deferred":
             plan.entry_gate.update(origin_mid=str(quote.mid), direction="down" if quote.mid > plan.entry_price else "up" if quote.mid < plan.entry_price else "at_entry",
@@ -195,10 +198,14 @@ class Trading:
         else:
             validate_entry_prices(plan, quote)
         if hasattr(self.state, "stamp_plan"):
-            self.state.stamp_plan(plan)
+            self.state.stamp_plan(plan, snapshot)
         plan.plan_id = digest(plan.model_dump(mode="json", exclude={"plan_id"}))
         def save(state):
             self.assert_plan_binding(state, plan)
+            try:
+                self.validate_configuration(state, plan)
+            except ConfigurationChanged as error:
+                raise ConfigurationChanged("Configuration changed during preview; create a fresh preview: " + str(error)) from error
             state["plans"][plan.plan_id] = {"event_id": event_id, "plan": plan.model_dump(mode="json")}
         self.state.update(save)
         return plan.model_dump(mode="json")
@@ -214,16 +221,23 @@ class Trading:
                 or plan.principal not in (None, self.exchange.settings.account.lower())):
             raise AqlaError("Saved plan belongs to another trading target or network")
 
+    def validate_configuration(self, snapshot, plan):
+        try:
+            validate_ranking_binding(snapshot, plan)
+            if plan.backup_fields and snapshot["profiles"]["backup"]["revision"] != plan.backup_profile_revision:
+                raise AqlaError("Backup profile changed; create a new unsent plan")
+            if hasattr(self.state, "validate_route"):
+                self.state.validate_route(plan)
+            elif snapshot["paused"] or snapshot["policy_revision"] != plan.policy_revision:
+                raise AqlaError("Pause or policy changed; create a new unsent plan")
+        except AqlaError as error:
+            raise ConfigurationChanged(str(error)) from error
+
     def validate_admission(self, snapshot, plan, account=None, *, owned=False, allowed_prepared=()):
         self.assert_plan_binding(snapshot, plan)
-        if plan.backup_fields and snapshot["profiles"]["backup"]["revision"] != plan.backup_profile_revision:
-            raise AqlaError("Backup profile changed; create a new unsent plan")
         if owned and snapshot["trades"][plan.trade_id]["status"] not in OPEN:
             raise AqlaError("Entry was terminated; no unsent exposure may execute")
-        if hasattr(self.state, "validate_route"):
-            self.state.validate_route(plan)
-        elif snapshot["paused"] or snapshot["policy_revision"] != plan.policy_revision:
-            raise AqlaError("Pause or policy changed; create a new unsent plan")
+        self.validate_configuration(snapshot, plan)
         if now_ms() >= plan.deadline_at:
             raise AqlaError("Entry plan deadline expired")
         if self.source_revisions(snapshot, plan.source_refs) != plan.source_revisions:
@@ -348,6 +362,8 @@ class Trading:
         changed = (plan.profile_id is not None and configuration["profiles"].get(plan.profile_id, {}).get("revision") != plan.profile_revision
                    or plan.pipeline_id is not None and configuration["pipelines"].get(plan.pipeline_id, {}).get("revision") != plan.pipeline_revision
                    or plan.profile_id is None and snapshot["policy_revision"] != plan.policy_revision
+                   or plan.ranking_policy_revision != configuration["ranking_revision"]
+                   or plan.ranking_enabled != configuration["ranking_policy"]["enabled"]
                    or plan.backup_fields and configuration["profiles"]["backup"]["revision"] != plan.backup_profile_revision)
         if changed:
             self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Waiting entry configuration changed")

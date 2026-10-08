@@ -4,6 +4,7 @@ from decimal import Decimal
 import httpx
 import pytest
 from conftest import FakeExchange
+from pydantic import ValidationError
 from test_monthly import data as monthly_data
 from test_monthly import trade as monthly_trade
 
@@ -20,6 +21,7 @@ from aqla_hyperliquid_mcp.models import (
     Market,
     SourceEvent,
     SymbolUnavailable,
+    TradePlan,
     now_ms,
 )
 from aqla_hyperliquid_mcp.state import State
@@ -49,8 +51,8 @@ async def test_old_plan_rejected_after_ranking_enable(setup, signal):
     plan = await router.preview(source.event_id, interpretation)
     assert plan.get("rank_snapshot") is None
     change_ranking(state, True, "F")
-    with pytest.raises(AqlaError, match="[Rr]anking.*changed"):
-        await router.execute(plan["plan_id"])
+    result = await router.execute(plan["plan_id"])
+    assert "Ranking policy changed" in result["error"]
     assert fake.actions == []
     assert not state.snapshot()["trades"]
     await router.close()
@@ -66,8 +68,8 @@ async def test_old_ranked_plan_rejected_after_ranking_disable(setup, signal):
     plan = await router.preview(source.event_id, interpretation)
     assert plan["rank_snapshot"]["policy_revision"] == state.snapshot()["ranking_revision"]
     change_ranking(state, False)
-    with pytest.raises(AqlaError, match="[Rr]anking.*changed"):
-        await router.execute(plan["plan_id"])
+    result = await router.execute(plan["plan_id"])
+    assert "Ranking policy changed" in result["error"]
     assert fake.actions == []
     assert not state.snapshot()["trades"]
     await router.close()
@@ -97,18 +99,27 @@ async def test_ranking_toggle_during_preview_invalidates_weighted_context(setup,
         await router.preview(source.event_id, interpretation)
     assert not state.snapshot()["plans"]
     assert fake.actions == []
+    fresh = await router.preview(source.event_id, interpretation)
+    assert fresh["ranking_enabled"] is not enabled
+    assert fresh["ranking_policy_revision"] == state.snapshot()["ranking_revision"]
     await router.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed_component", ["profile", "pipeline"])
-async def test_route_changed_during_preview_cannot_stamp_old_risk_as_current(setup, signal, monkeypatch, changed_component):
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_route_changed_during_preview_cannot_stamp_old_risk_as_current(setup, signal, monkeypatch, changed_component, explicit):
     settings, state, fake, exchange, _ = setup
     router = Router(settings, state, exchange)
     profile = state.snapshot()["profiles"]["standard"]
-    selected = TradingProfile(id="standard", name=profile["name"], parameters={**profile["parameters"], "risk_percent": "2"})
+    profile_id, pipeline_id = ("a", "source-one") if explicit else ("standard", "legacy")
+    selected = TradingProfile(id=profile_id, name=profile["name"], parameters={**profile["parameters"], "risk_percent": "2"})
     state.update(lambda data: route_control(data, "set_profile", expected_revision=data["configuration_revision"], profile=selected))
-    before = state.snapshot()["profiles"]["standard"]["revision"]
+    if explicit:
+        selected_pipeline = Pipeline(id=pipeline_id, name="Explicit", sources=["channel"], enabled=True,
+                                     targets=[{"exchange": "hyperliquid", "profile_id": profile_id}])
+        state.update(lambda data: route_control(data, "set_pipeline", expected_revision=data["configuration_revision"], pipeline=selected_pipeline))
+    before = state.snapshot()["profiles"][profile_id]["revision"]
     original = exchange.market
     changed = False
 
@@ -121,16 +132,198 @@ async def test_route_changed_during_preview_cannot_stamp_old_risk_as_current(set
                 revised = selected.model_copy(update={"parameters": selected.parameters.model_copy(update={"risk_percent": Decimal("0.1")})})
                 state.update(lambda data: route_control(data, "set_profile", expected_revision=data["configuration_revision"], profile=revised))
             else:
-                pipeline = Pipeline.model_validate({key: value for key, value in state.snapshot()["pipelines"]["legacy"].items() if key != "revision"})
+                pipeline = Pipeline.model_validate({key: value for key, value in state.snapshot()["pipelines"][pipeline_id].items() if key != "revision"})
                 state.update(lambda data: route_control(data, "set_pipeline", expected_revision=data["configuration_revision"], pipeline=pipeline))
         return market
 
     monkeypatch.setattr(exchange, "market", revise)
     source, interpretation = signal
-    with pytest.raises(AqlaError, match="changed.*preview|preview.*changed"):
-        await router.preview(source.event_id, interpretation)
-    assert state.snapshot()["profiles"]["standard"]["revision"] == before + (changed_component == "profile")
+    if explicit:
+        result = await router.preview(source.event_id, interpretation)
+        assert result["targets"][0]["status"] == "rejected"
+        assert "Configuration changed during preview" in result["targets"][0]["error"]
+    else:
+        with pytest.raises(AqlaError, match="changed.*preview|preview.*changed"):
+            await router.preview(source.event_id, interpretation)
+    assert state.snapshot()["profiles"][profile_id]["revision"] == before + (changed_component == "profile")
     assert not state.snapshot()["plans"]
+    assert fake.actions == []
+    fresh = await router.preview(source.event_id, interpretation)
+    assert fresh["profile_revision"] == state.snapshot()["profiles"][profile_id]["revision"]
+    assert fresh["policy_revision"] == fresh["profile_revision"]
+    assert Decimal(fresh["policy"]["risk_percent"]) == Decimal("0.1" if changed_component == "profile" else "2")
+    assert fresh["pipeline_revision"] == state.snapshot()["pipelines"][pipeline_id]["revision"]
+    await router.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_explicit_unsent_plan_can_preview_current_configuration(setup, signal):
+    settings, state, fake, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    pipeline = Pipeline(id="source-one", name="Explicit", sources=["channel"], enabled=True,
+                        targets=[{"exchange": "hyperliquid", "profile_id": "standard"}])
+    state.update(lambda data: route_control(data, "set_pipeline", expected_revision=data["configuration_revision"], pipeline=pipeline))
+    await router.recover()
+    source, interpretation = signal
+    plan = await router.preview(source.event_id, interpretation)
+    profile = state.snapshot()["profiles"]["standard"]
+    revised = TradingProfile(id="standard", name=profile["name"], parameters={**profile["parameters"], "risk_percent": "0.1"})
+    state.update(lambda data: route_control(data, "set_profile", expected_revision=data["configuration_revision"], profile=revised))
+    result = await router.execute(plan["plan_id"])
+    assert "pipeline/profile changed" in result["error"]
+    assert not fake.actions and not state.snapshot()["trades"]
+    fresh = await router.preview(source.event_id, interpretation)
+    assert fresh["plan_id"] != plan["plan_id"]
+    assert Decimal(fresh["policy"]["risk_percent"]) == Decimal("0.1")
+    assert fresh["profile_revision"] == state.snapshot()["profiles"]["standard"]["revision"]
+    assert (await router.execute(fresh["plan_id"]))["status"] == "open"
+    assert len([action for action in fake.actions if action["type"] == "order" and any(not order["r"] for order in action["orders"])]) == 1
+    await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", ["subscription", "expiry", "edit", "explicit_route", "operation"])
+async def test_repreview_after_drift_cannot_bypass_entry_guards(setup, signal, monkeypatch, guard):
+    settings, state, fake, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    await router.recover()
+    source, interpretation = signal
+    plan = await router.preview(source.event_id, interpretation)
+    profile = state.snapshot()["profiles"]["standard"]
+    revised = TradingProfile(id="standard", name=profile["name"], parameters={**profile["parameters"], "risk_percent": "0.1"})
+    state.update(lambda data: route_control(data, "set_profile", expected_revision=data["configuration_revision"], profile=revised))
+    assert "error" in await router.execute(plan["plan_id"])
+    if guard == "subscription":
+        state.update(lambda data: data.update(sources=[], source_aliases={}))
+        fresh = await router.preview(source.event_id, interpretation)
+        assert "subscribed" in (await router.execute(fresh["plan_id"]))["error"]
+    elif guard in ("expiry", "edit"):
+        if guard == "expiry":
+            monkeypatch.setattr("aqla_hyperliquid_mcp.rules.now_ms", lambda: source.sent_at + 300001)
+            reason = "deadline expired"
+        else:
+            router.ingest(source.model_copy(update={"edited_at": source.sent_at + 1, "text": source.text + " Edit"}))
+            reason = "latest anchor revision"
+        with pytest.raises(AqlaError, match=reason):
+            await router.preview(source.event_id, interpretation)
+    else:
+        if guard == "explicit_route":
+            pipeline = Pipeline(id="source-one", name="Explicit", sources=["channel"], enabled=True,
+                                targets=[{"exchange": "hyperliquid", "profile_id": "standard"}])
+            state.update(lambda data: route_control(data, "set_pipeline", expected_revision=data["configuration_revision"], pipeline=pipeline))
+        else:
+            state.update(lambda data: data["operations"].__setitem__("entry:" + plan["trade_id"], {"phase": "unknown"}))
+        fresh = await router.preview(source.event_id, interpretation)
+        assert fresh["plan_id"] == plan["plan_id"]
+        assert fresh["targets"][0]["status"] == "rejected"
+        assert "error" in await router.execute(fresh["plan_id"])
+    assert fake.actions == []
+    assert not state.snapshot()["trades"]
+    await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["planned", "unknown", "open"])
+async def test_repreview_never_resets_planned_or_possibly_sent_target(setup, signal, status):
+    settings, state, fake, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    source, interpretation = signal
+    plan = await router.preview(source.event_id, interpretation)
+    state.update(lambda data: data["events"][source.event_id]["targets"]["legacy:hyperliquid"].update(
+        status=status, preview_invalidated=True))
+    fresh = await router.preview(source.event_id, interpretation)
+    assert fresh["plan_id"] == plan["plan_id"] and fresh["targets"][0]["status"] == status
+    assert len(state.snapshot()["plans"]) == 1
+    assert fake.actions == []
+    await router.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_preview_retry_discards_old_rank_metadata(setup, signal, monkeypatch):
+    settings, state, fake, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    change_ranking(state, True, "D")
+    original = exchange.market
+
+    async def unavailable(*args, **kwargs):
+        raise AqlaError("Fresh market observation temporarily unavailable")
+
+    monkeypatch.setattr(exchange, "market", unavailable)
+    source, interpretation = signal
+    with pytest.raises(AqlaError, match="temporarily unavailable"):
+        await router.preview(source.event_id, interpretation)
+    change_ranking(state, False)
+    monkeypatch.setattr(exchange, "market", original)
+    fresh = await router.preview(source.event_id, interpretation)
+    assert fresh["ranking_enabled"] is False and not fresh.get("rank_snapshot")
+    assert Decimal(fresh["policy"]["risk_percent"]) == Decimal("0.5")
+    assert fake.actions == []
+    await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_ranking_toggle_preserves_filled_trade_protection(setup, signal, enabled):
+    settings, state, fake, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    if enabled:
+        change_ranking(state, True, "D")
+    await router.recover()
+    source, interpretation = signal
+    plan = await router.preview(source.event_id, interpretation)
+    assert plan["ranking_enabled"] == enabled
+    assert plan["ranking_policy_revision"] == state.snapshot()["ranking_revision"]
+    assert Decimal(plan["policy"]["risk_percent"]) == Decimal("0.375" if enabled else "0.5")
+    trade = await router.execute(plan["plan_id"])
+    assert trade["status"] == "open"
+    initial_plan = copy.deepcopy(trade["plan"])
+    initial_entry = copy.deepcopy(state.snapshot()["operations"][trade["entry_operation_id"]])
+    change_ranking(state, not enabled, "F")
+    await router.recover()
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert current["status"] == "open" and current["plan"] == initial_plan
+    assert state.snapshot()["operations"][trade["entry_operation_id"]] == initial_entry
+    assert any(fake.orders[order["cloid"]]["status"] == "open" for order in current["orders"] if order["kind"] == "sl")
+    assert len([action for action in fake.actions if action["type"] == "order" and any(not order["r"] for order in action["orders"])]) == 1
+    result = await router.engines["hyperliquid"].close_position(trade["trade_id"])
+    assert result["phase"] == "acknowledged"
+    await router.recover()
+    assert fake.position == 0
+    assert state.snapshot()["trades"][trade["trade_id"]]["status"] == "closed"
+    await router.close()
+
+
+@pytest.mark.asyncio
+async def test_source_rank_revision_remains_an_additional_entry_guard(setup, signal):
+    settings, state, fake, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    change_ranking(state, True, "D")
+    await router.recover()
+    source, interpretation = signal
+    plan = await router.preview(source.event_id, interpretation)
+    def revise_source(data):
+        data["source_ranks"]["channel"].update(tier="F", revision=data["source_ranks"]["channel"]["revision"] + 1)
+    state.update(revise_source)
+    result = await router.execute(plan["plan_id"])
+    assert "Source rank/risk/network changed" in result["error"]
+    assert fake.actions == []
+    await router.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [{"ranking_policy_revision": 0}, {"ranking_policy_revision": "2"},
+                                   {"ranking_enabled": "true"}, {"ranking_enabled": False},
+                                   {"ranking_policy_revision": 3}])
+async def test_new_ranking_binding_schema_rejects_incoherent_snapshot(setup, signal, invalid):
+    settings, state, fake, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    change_ranking(state, True, "D")
+    source, interpretation = signal
+    plan = await router.preview(source.event_id, interpretation)
+    stored = state.snapshot()["plans"][plan["plan_id"]]["plan"]
+    assert TradePlan.model_validate(stored).ranking_enabled is True
+    with pytest.raises(ValidationError):
+        TradePlan.model_validate({**stored, **invalid})
     assert fake.actions == []
     await router.close()
 

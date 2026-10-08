@@ -352,6 +352,8 @@ class TradePlan(Model):
     account_key: str | None = None
     rank_snapshot: dict | None = None
     rank_revision: int | None = None
+    ranking_policy_revision: int | None = Field(default=None, ge=1, strict=True)
+    ranking_enabled: bool | None = Field(default=None, strict=True)
     base_parameters: dict | None = None
     requested_exchange: Literal["hyperliquid", "aster", "lighter"] | None = None
     routing_leg_id: str | None = None
@@ -384,10 +386,18 @@ class TradePlan(Model):
             result.pop("source_exchange", None)
         if self.entry_gate is None:
             result.pop("entry_gate", None)
-        for key in ("account_key", "rank_snapshot", "rank_revision", "base_parameters", "requested_exchange", "routing_leg_id", "setup_id", "fallback_reason", "source_tp", "source_entry_reference"):
+        for key in ("account_key", "rank_snapshot", "rank_revision", "ranking_policy_revision", "ranking_enabled", "base_parameters", "requested_exchange", "routing_leg_id", "setup_id", "fallback_reason", "source_tp", "source_entry_reference"):
             if getattr(self, key) is None:
                 result.pop(key, None)
         return result
+
+    @model_validator(mode="after")
+    def ranking_consistent(self):
+        # Missing/partial legacy bindings remain readable, but admission rejects them.
+        if self.ranking_policy_revision is not None and self.ranking_enabled is not None and self.rank_snapshot:
+            if not self.ranking_enabled or self.rank_snapshot.get("policy_revision") != self.ranking_policy_revision:
+                raise ValueError("Source rank snapshot differs from the plan's global ranking binding")
+        return self
 
     @model_validator(mode="after")
     def leverage_consistent(self):

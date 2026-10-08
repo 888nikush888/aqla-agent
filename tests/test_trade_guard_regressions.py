@@ -2,6 +2,7 @@ from decimal import Decimal
 
 import pytest
 
+from aqla_agent.router import Router
 from aqla_hyperliquid_mcp.models import AqlaError, Interpretation
 
 
@@ -21,6 +22,89 @@ async def admitted_without_entry(trading, source, interpretation, monkeypatch):
 
 def entry_actions(fake):
     return [action for action in fake.actions if action["type"] == "order" and any(not order["r"] for order in action["orders"])]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation_kind", ["leverage", "entry"])
+@pytest.mark.parametrize("await_point", ["account_snapshot", "price_snapshot"])
+async def test_ranking_toggle_after_prepared_proves_not_sent_and_never_reposts(setup, signal, monkeypatch, operation_kind, await_point):
+    _, state, fake, exchange, trading = setup
+    source, interpretation = signal
+    plan = await trading.preview(source.event_id, interpretation)
+    operation_id = operation_kind + ":" + plan["trade_id"]
+    original = getattr(exchange, await_point)
+    toggled = False
+
+    async def toggle_prepared(market):
+        nonlocal toggled
+        observation = await original(market)
+        operation = state.snapshot()["operations"].get(operation_id)
+        if not toggled and operation and operation["phase"] == "prepared":
+            toggled = True
+            def change(data):
+                data["ranking_policy"]["enabled"] = True
+                data["ranking_revision"] += 1
+            state.update(change)
+        return observation
+
+    monkeypatch.setattr(exchange, await_point, toggle_prepared)
+    trade = await trading.execute(plan["plan_id"])
+    assert toggled and trade["status"] == "rejected"
+    operation = state.snapshot()["operations"][operation_id]
+    assert operation["phase"] == "rejected" and operation["outcome"] == "not_sent"
+    assert "Ranking policy changed" in operation["result"]["error"]
+    assert not entry_actions(fake)
+    before_actions = list(fake.actions)
+    await trading.recover()
+    await trading.recover()
+    repeated = await trading.execute(plan["plan_id"])
+    assert repeated["status"] == "rejected" and repeated["reserved_risk"] == "0"
+    assert state.snapshot()["operations"][operation_id] == operation
+    assert fake.actions == before_actions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_ranking_toggle_unknown_entry_keeps_original_identity_and_protection(setup, signal, monkeypatch, legacy):
+    settings, state, fake, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    await router.recover()
+    trading = router.engines["hyperliquid"]
+    source, interpretation = signal
+    plan = await router.preview(source.event_id, interpretation)
+    original = trading.refresh_trade
+    fake.lose_entry_response = True
+
+    async def crash(*args):
+        raise RuntimeError("Crash before unknown entry reconciliation")
+
+    monkeypatch.setattr(trading, "refresh_trade", crash)
+    result = await router.execute(plan["plan_id"])
+    assert result.get("error")
+    operation_id = "entry:" + plan["trade_id"]
+    before = state.snapshot()["operations"][operation_id]
+    assert before["phase"] == "unknown" and len(entry_actions(fake)) == 1
+
+    def change(data):
+        data["ranking_policy"]["enabled"] = True
+        data["ranking_revision"] += 1
+        if legacy:
+            for stored in (data["trades"][plan["trade_id"]]["plan"], data["plans"][plan["plan_id"]]["plan"]):
+                stored.pop("ranking_enabled")
+                stored.pop("ranking_policy_revision")
+    state.update(change)
+    saved_plan = state.snapshot()["trades"][plan["trade_id"]]["plan"]
+    monkeypatch.setattr(trading, "refresh_trade", original)
+    await router.recover()
+    await router.recover()
+    trade = await router.execute(plan["plan_id"])
+    assert trade["status"] == "open" and trade["plan"] == saved_plan
+    after = state.snapshot()["operations"][operation_id]
+    assert all(after[key] == before[key] for key in ("operation_id", "request_hash", "request", "nonce", "wire_action"))
+    assert trade["plan"]["plan_id"] == plan["plan_id"]
+    assert len(entry_actions(fake)) == 1
+    assert any(fake.orders[order["cloid"]]["status"] == "open" for order in trade["orders"] if order["kind"] == "sl")
+    await router.close()
 
 
 @pytest.mark.asyncio

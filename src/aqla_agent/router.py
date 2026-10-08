@@ -4,10 +4,10 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 
-from aqla_hyperliquid_mcp.models import AqlaError, Market, SymbolUnavailable, digest, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, Market, SymbolUnavailable, TradePlan, digest, now_ms
 
 from .accounting import inventory_view
-from .pipelines import VenueState
+from .pipelines import ConfigurationChanged, VenueState, validate_ranking_binding
 from .trading import OPEN, Trading
 from .venues import VenueAdapter, adapter_settings, execution_settings
 
@@ -95,8 +95,8 @@ class Router:
     def engine_for_plan(self, plan):
         return self.engine_for(plan.get("exchange", "hyperliquid"), plan["network"])
 
-    def accounts_ready(self):
-        data = self.state.snapshot()
+    def accounts_ready(self, data=None):
+        data = self.state.snapshot() if data is None else data
         result = {}
         for venue in ("hyperliquid", "aster", "lighter"):
             for network in ("mainnet", "testnet"):
@@ -169,7 +169,17 @@ class Router:
                 result[key] = {**target, "pipeline_id": pipeline["id"], "status": "pending"}
         return result
 
+    @staticmethod
+    def target_started(data, target):
+        saved = data["plans"].get(target.get("plan_id"))
+        if target.get("plan_id") and saved is None:
+            return True
+        trade_id = target.get("trade_id") or (saved["plan"]["trade_id"] if saved else None)
+        return bool(trade_id and (trade_id in data["trades"] or "entry:" + trade_id in data["operations"]
+                                  or "leverage:" + trade_id in data["operations"]))
+
     async def preview(self, event_id, interpretation):
+        from .ranking import snapshot_rank
         self.record_interpretation(event_id, interpretation)
         if interpretation.kind != "new_signal":
             return self.state.snapshot()["events"][event_id]
@@ -177,15 +187,20 @@ class Router:
             row = data["events"][event_id]
             if "targets" not in row:
                 row["targets"] = self.selected_targets(row, data)
-            if set(row["targets"]) == {"legacy:hyperliquid"} and row["targets"]["legacy:hyperliquid"]["status"] == "rejected":
-                row["targets"]["legacy:hyperliquid"]["status"] = "pending"
-            return row["targets"]
-        targets = self.state.update(select)
-        ranked = self.state.snapshot()["ranking_policy"]["enabled"]
-        rank = None
-        if ranked:
-            from .ranking import snapshot_rank
-            rank = self.state.update(lambda data: snapshot_rank(data, data["events"][event_id]["source"]["chat_id"]))
+            current = self.selected_targets(row, data)
+            for identity, target in list(row["targets"].items()):
+                if target["status"] == "rejected" and target.get("preview_invalidated") and not self.target_started(data, target):
+                    if identity in current:
+                        row["targets"][identity] = current[identity]
+            if set(row["targets"]) == {"legacy:hyperliquid"}:
+                legacy = row["targets"]["legacy:hyperliquid"]
+                if legacy["status"] == "rejected" and not legacy.get("preview_invalidated") and not self.target_started(data, legacy):
+                    if "legacy:hyperliquid" in current:
+                        row["targets"]["legacy:hyperliquid"] = current["legacy:hyperliquid"]
+            rank = snapshot_rank(data, row["source"]["chat_id"]) if data["ranking_policy"]["enabled"] else None
+            return row["targets"], data, rank
+        targets, preview_basis, rank = self.state.update(select)
+        ranked = preview_basis["ranking_policy"]["enabled"]
         if not targets:
             self.state.update(lambda data: data["events"][event_id].update(status="unrouted", last_error="No enabled pipeline matches this source"))
             return {"event_id": event_id, "targets": [], "error": "No enabled pipeline matches this source"}
@@ -211,12 +226,12 @@ class Router:
                     except SymbolUnavailable as missing:
                         if requested != "hyperliquid":
                             raise
-                        pipeline_target = next(row for row in self.state.snapshot()["pipelines"][target["pipeline_id"]]["targets"] if row["exchange"] == requested)
+                        pipeline_target = next(row for row in preview_basis["pipelines"][target["pipeline_id"]]["targets"] if row["exchange"] == requested)
                         replacements = pipeline_target.get("fallback_exchanges")
                         replacements = ["aster", "lighter"] if replacements is None else replacements
                         reasons = []
                         replacement = None
-                        readiness = self.accounts_ready()
+                        readiness = self.accounts_ready(preview_basis)
                         for venue in replacements:
                             candidate = self.engine_for(venue, network)
                             key = venue + ":" + network
@@ -238,13 +253,15 @@ class Router:
                             raise AqlaError("No replacement market/account in " + network + ": " + "; ".join(reasons)) from missing
                         engine = replacement
                 async with engine.lock:
-                    with engine.state.scope(target):
+                    with engine.state.scope(target, preview_snapshot=preview_basis):
                         plan = await engine.preview(event_id, interpretation)
                 row = {**target, "status": "planned", "plan_id": plan["plan_id"]}
                 outputs.append({**row, "plan": plan})
                 reserved.add((engine.state.account_key, interpretation.symbol.upper()))
             except Exception as error:
                 row = {**target, "status": "rejected", "error": str(error) if isinstance(error, AqlaError) else "Exchange preview unavailable"}
+                if isinstance(error, ConfigurationChanged):
+                    row["preview_invalidated"] = True
                 outputs.append(row)
             self.state.update(lambda data, key=identity, value=row: data["events"][event_id]["targets"].__setitem__(key, value))
         self.finish_event(event_id)
@@ -290,6 +307,8 @@ class Router:
             outcome = {"status": trade["status"] if trade else "rejected", "error": result["error"]}
             if trade:
                 outcome["trade_id"] = trade["trade_id"]
+            elif isinstance(error, ConfigurationChanged):
+                outcome["preview_invalidated"] = True
         def record(data):
             for row in data["events"][saved["event_id"]].get("targets", {}).values():
                 if row.get("plan_id") == plan_id:
@@ -354,12 +373,11 @@ class Router:
                 engine.exchange.market_cache[market.symbol] = market
             async with engine.lock:
                 for row in engine.state.snapshot()["trades"].values():
-                    saved_rank = row["plan"].get("rank_snapshot")
-                    if not saved_rank or row["status"] not in OPEN or Decimal(row["filled_quantity"]) > 0:
+                    if row["status"] not in OPEN or Decimal(row["filled_quantity"]) > 0:
                         continue
-                    from .ranking import snapshot_rank
-                    current_rank = snapshot_rank(self.state.snapshot(), saved_rank["source_id"])
-                    if current_rank["source_revision"] != saved_rank["source_revision"] or current_rank["policy_revision"] != saved_rank["policy_revision"]:
+                    try:
+                        validate_ranking_binding(self.state.snapshot(), TradePlan.model_validate(row["plan"]))
+                    except AqlaError:
                         try:
                             await engine.cancel_entry(row["trade_id"])
                             if engine.state.snapshot()["trades"][row["trade_id"]]["status"] in OPEN:

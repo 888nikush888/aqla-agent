@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from aqla_hyperliquid_mcp.models import AqlaError, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, TradePlan, digest, now_ms
 
 
 def change_admission(state, trading, source, plan, change):
@@ -23,10 +23,56 @@ def change_admission(state, trading, source, plan, change):
         state.update(lambda row: row.update(policy_revision=row["policy_revision"] + 1))
     elif change == "pause":
         state.update(lambda row: row.update(paused=True))
+    elif change in ("ranking", "ranking_status"):
+        def toggle(row):
+            row["ranking_policy"]["enabled"] = not row["ranking_policy"]["enabled"]
+            if change == "ranking":
+                row["ranking_revision"] += 1
+        state.update(toggle)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["pause", "policy", "source", "binding", "capacity", "risk", "subscription"])
+@pytest.mark.parametrize("change", ["ranking", "ranking_status", "ranking_revision"])
+async def test_direct_trading_checks_ranking_binding(setup, signal, change):
+    _, state, fake, _, trading = setup
+    source, interpretation = signal
+    preview = await trading.preview(source.event_id, interpretation)
+    plan = TradePlan.model_validate(preview)
+    assert plan.ranking_enabled is False
+    assert plan.ranking_policy_revision == state.snapshot()["ranking_revision"]
+    assert plan.plan_id == digest(plan.model_dump(mode="json", exclude={"plan_id"}))
+    assert trading.validate_admission(state.snapshot(), plan) is None
+    if change == "ranking_revision":
+        state.update(lambda row: row.update(ranking_revision=row["ranking_revision"] + 1))
+    else:
+        change_admission(state, trading, source, preview, change)
+    with pytest.raises(AqlaError, match="Ranking policy changed"):
+        trading.validate_admission(state.snapshot(), plan)
+    with pytest.raises(AqlaError, match="Ranking policy changed"):
+        await trading.execute(plan.plan_id)
+    assert fake.actions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [("ranking_enabled",), ("ranking_policy_revision",), ("ranking_enabled", "ranking_policy_revision")])
+async def test_partial_legacy_ranking_binding_is_rejected(setup, signal, missing):
+    _, state, fake, _, trading = setup
+    source, interpretation = signal
+    preview = await trading.preview(source.event_id, interpretation)
+    legacy = {key: value for key, value in preview.items() if key not in missing}
+    plan = TradePlan.model_validate(legacy)
+    assert all(key not in plan.model_dump(mode="json") for key in missing)
+    assert plan.plan_id == preview["plan_id"]
+    state.update(lambda data: data["plans"][plan.plan_id].update(plan=legacy))
+    with pytest.raises(AqlaError, match="Legacy ranking binding.*fresh preview"):
+        await trading.execute(plan.plan_id)
+    assert state.snapshot()["plans"][plan.plan_id]["plan"] == legacy
+    assert not state.snapshot()["trades"]
+    assert fake.actions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["pause", "policy", "source", "binding", "capacity", "risk", "subscription", "ranking", "ranking_status"])
 async def test_final_admission_rechecks_state_changed_during_account_read(setup, signal, monkeypatch, change):
     _, state, fake, exchange, trading = setup
     source, interpretation = signal
@@ -66,7 +112,7 @@ async def test_final_admission_requires_fresh_account_budget(setup, signal, monk
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["pause", "policy", "source", "binding", "capacity", "risk", "subscription", "vault", "principal", "stale", "deadline"])
+@pytest.mark.parametrize("change", ["pause", "policy", "source", "binding", "capacity", "risk", "subscription", "vault", "principal", "stale", "deadline", "ranking", "ranking_status"])
 async def test_unsent_entry_rechecks_after_dispatch_signer_await(setup, signal, monkeypatch, change):
     settings, state, fake, exchange, trading = setup
     source, interpretation = signal
