@@ -212,7 +212,7 @@ class Hyperliquid:
             raise AqlaError("Shared account entries require Standard or Unified Account mode; portfolio margin is unsupported")
         dexes = await self.info("perpDexs")
         metas = await self.info("allPerpMetas")
-        if not isinstance(dexes, list) or not dexes or dexes[0] is not None or len(dexes) > 64:
+        if not isinstance(dexes, list) or not dexes or dexes[0] is not None or len(dexes) > 512:
             raise AqlaError("Complete DEX inventory is unavailable")
         names = [""] + [row["name"] for row in dexes[1:] if isinstance(row, dict) and isinstance(row.get("name"), str)]
         if len(names) != len(dexes) or len(set(names)) != len(names):
@@ -229,7 +229,11 @@ class Hyperliquid:
                 if not isinstance(raw, dict) or not isinstance(raw.get("assetPositions"), list) or not isinstance(orders, list):
                     raise AqlaError("Account positions or orders are incomplete")
                 return dex, raw, orders
-        observations = await asyncio.gather(*(observe(dex) for dex in names))
+        if len(names) > 64:
+            from aqla_agent.inventory_stream import observe as observe_large_inventory
+            observations = await observe_large_inventory(self, names)
+        else:
+            observations = await asyncio.gather(*(observe(dex) for dex in names))
         positions, entries, seen_positions = {}, [], set()
         states = {}
         for dex, raw, orders in observations:

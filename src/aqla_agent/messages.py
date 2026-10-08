@@ -100,13 +100,18 @@ def risk_block(trade):
     if equity is not None:
         text += " · " + number(decimal(equity) * decimal(plan["policy"]["risk_percent"]) / 100) + " " + quote
     risk = trade.get("initial_sl_risk", {}).get("amount")
+    provisional = risk is None and decimal(trade.get("filled_quantity")) and decimal(trade.get("entry_vwap")) and decimal(trade.get("stop_price"))
+    if provisional:
+        risk = decimal(trade["filled_quantity"]) * abs(decimal(trade["entry_vwap"]) - decimal(trade["stop_price"]))
     text += "\n**Anfängliches SL-Risiko:** " + (number(risk) + " " + quote if risk is not None else "noch nicht finalisiert")
+    if provisional:
+        text += " · vorläufig für bestätigte Fills"
     return text
 
 
 def target_label(plan, index):
     spec = plan.get("source_tp")
-    if spec and index < len(spec["values"]):
+    if spec and spec.get("unit") != "price" and index < len(spec["values"]):
         return " · " + number(spec["values"][index]) + (" % ROI vor Kosten" if spec["unit"] == "roi_percent" else " % Kursbewegung")
     return ""
 
@@ -130,6 +135,7 @@ def pnl(trade):
 
 def trade_block(data, trade, notices):
     plan, stage = trade["plan"], trade["status"]
+    plan = {**plan, "source_tp": trade.get("source_tp_override", plan.get("source_tp"))}
     market = literal(plan["market"]["symbol"])
     direction = "LONG" if plan["side"] == "long" else "SHORT"
     changes = {key: value for notice in notices for key, value in notice.get("change", {}).items()}
@@ -218,6 +224,7 @@ def trade_block(data, trade, notices):
 def lifecycle_block(data, event):
     trade = event["facts"]
     plan = trade["plan"]
+    plan = {**plan, "source_tp": trade.get("source_tp_override", plan.get("source_tp"))}
     from datetime import datetime
     from zoneinfo import ZoneInfo
     time = datetime.fromtimestamp(event["time"] / 1000, ZoneInfo("Europe/Berlin")).strftime("%d.%m.%Y %H:%M:%S")

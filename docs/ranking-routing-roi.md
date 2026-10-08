@@ -60,6 +60,8 @@ Der originale Dezimalhebel gilt auch nach Abrundung/Deckelung. Kein Profil-/Back
 
 ## Analyse und Einführung
 
+Bei vielen HL-DEXs erfasst eine frische [native WebSocket-Kontoübersicht](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions) alle Positionen und jede DEX-Orderliste. Nichtleere Orderlisten werden mit vollständigen Reduce-only-Belegen gelesen. Fehlende, fremde oder veraltete Teilansichten erlauben keinen Entry. Damit sind auch Testnet-Konten mit mehr als 64 DEX-Kontexten vollständig prüfbar.
+
 Sheets ergänzt Ränge/Ranghistorie und Herkunfts-/Risikospalten, ohne bestehende Zeilen-IDs zu ersetzen. Primäre HL-Mainnet-Tabs bleiben erhalten; weitere Konten erhalten eigene Börsen-/Netzwerktabs. `journal_read`/`journal_statistics` können `account_key` auswählen. Monatsberichte bleiben auf tatsächliche Mainnet-Abschlüsse beschränkt. Telegram zeigt Rang, Netzwerk, Risikofaktor, RPR und belegtes SL-Risiko, ROI mit Kurs sowie Ersatz. Leere Läufe bleiben stumm.
 
 Die Migration bewahrt frühere Order-/Trade-IDs, Nonces, Historie und Quellen-Cursor. Alte Testnet-Archive werden nicht importiert oder wieder ausgespielt. Vor Veröffentlichung: Gesamtprüfungen, Adapterverträge, native Hermes-Autorität/Telegram, Paketprüfung und Datensicherung. Konten werden lesend geprüft; keine synthetischen Mainnet-Testorders.

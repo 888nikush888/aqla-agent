@@ -51,7 +51,8 @@ def record_lifecycle(data, trade_id, kind):
         trade["close_reason"] = reason
     frozen = {key: copy.deepcopy(value) for key, value in trade.items() if key in (
         "trade_id", "event_id", "chat_id", "plan", "status", "filled_quantity", "remaining_quantity", "entry_vwap", "stop_price", "targets", "target_budgets", "tp_filled",
-        "order_observations", "orders", "close_reason", "fill_events", "backup_finalization")}
+        "order_observations", "orders", "close_reason", "fill_events", "backup_finalization",
+        "entry_equity_snapshot", "initial_sl_risk", "source_tp_override", "percent_finalization")}
     event = {"kind": kind, "time": timestamp, "observed_at": now_ms(), "facts": frozen}
     if kind == "entry_fill":
         frozen["entry_stop_confirmed"] = trade.get("entry_stop_confirmed", False)

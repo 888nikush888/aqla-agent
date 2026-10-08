@@ -150,6 +150,8 @@ def outcomes(data):
                 valid = Decimal(stop) < reference if trade["plan"]["side"] == "long" else Decimal(stop) > reference
                 if valid and reference > 0:
                     initial = {"amount": str(Decimal(trade["filled_quantity"]) * abs(reference - Decimal(stop)))}
+                elif reference > 0:
+                    reasons.append("Systemfehler: bestätigter Einstieg außerhalb der ursprünglichen SL-Struktur")
             incident = (trade.get("external_conflict") or trade.get("manual_closure") or trade.get("execution_incident")
                         or any(order.get("reason") == "operator_close" for order in trade.get("exit_orders", [])))
             if incident or not initial or Decimal(initial["amount"]) <= 0:

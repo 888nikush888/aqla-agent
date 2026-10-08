@@ -175,7 +175,8 @@ def project(data):
             row["values"][-len(RANK_DETAILS):] = [plan.get("account_key", venue + ":" + plan["network"]), plan.get("setup_id", ""), plan.get("requested_exchange", venue), plan.get("routing_leg_id", ""),
                        plan.get("fallback_reason", ""), rank.get("tier", ""), number(rank.get("score")), rank.get("factor", ""),
                        number(base.get("risk_percent")), number(plan["policy"]["risk_percent"]), number(trade.get("initial_sl_risk", {}).get("amount")),
-                       plan.get("source_tp", {}).get("unit", "price"), text(trade.get("percent_finalization") or plan.get("source_tp") or {})]
+                       trade.get("source_tp_override", plan.get("source_tp", {})).get("unit", "price"),
+                       text({"original": plan.get("source_tp"), "final": trade.get("percent_finalization"), "updates": trade.get("percent_updates", {}), "current": trade.get("source_tp_override")} if plan.get("source_tp") or trade.get("percent_updates") else {})]
         row["fingerprint"] = fingerprint(row["values"])
     for row in data.get("journal_history", {}).values():
         add(row)

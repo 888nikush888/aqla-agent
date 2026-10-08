@@ -199,6 +199,39 @@ async def test_percent_preview_execution_and_frozen_reference(setup, source_entr
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("waiting", [False, True])
+async def test_roi_update_freezes_original_base_preserves_evidence_and_survives_entry(waiting, setup):
+    _, state, fake, _, trading = setup
+    source, value = percentage_signal(trading, entry=waiting)
+    if waiting:
+        fake.mid = "110"
+        state.update(lambda data: data["events"][source.event_id]["source"].update(text=data["events"][source.event_id]["source"]["text"] + " Deferred entry"))
+        value.entry_timing = "deferred"
+        value.evidence.append(Evidence(field="entry_timing", quote="Deferred entry", source_id=source.source_id))
+    plan = await trading.preview(source.event_id, value)
+    trade = await trading.execute(plan["plan_id"])
+    message = SourceEvent(chat_id="channel", message_id=2, reply_to_id=1, sent_at=now_ms(), text="BTC long TP ROI 30% and ROI 60%")
+    trading.ingest(message)
+    update = Interpretation(kind="trade_update", source_refs=[message.source_id], symbol="BTC", side="long",
+                            update_action="replace_targets", take_profits=[30, 60], take_profit_unit="roi_percent",
+                            evidence=[Evidence(field=field, quote=quote, source_id=message.source_id) for field, quote in (
+                                ("take_profit_unit", "TP ROI 30%"), ("take_profits.0", "ROI 30%"), ("take_profits.1", "ROI 60%"))])
+    await trading.update_trade(message.event_id, update)
+    saved = state.snapshot()["trades"][trade["trade_id"]]
+    assert list(map(Decimal, saved["targets"])) == [103, 106]
+    assert saved["source_tp_override"]["values"] == ["30", "60"]
+    assert state.snapshot()["events"][message.event_id]["interpretation"]["take_profits"] == ["30", "60"]
+    if waiting:
+        fake.mid = "100"
+        await trading.recover()
+        assert state.snapshot()["trades"][trade["trade_id"]]["targets"] == ["103.00", "106.00"]
+    else:
+        sends = len(fake.actions)
+        await trading.update_trade(message.event_id, update)
+        assert len(fake.actions) == sends
+
+
+@pytest.mark.asyncio
 async def test_six_account_identity_network_nonce_and_rank_selection(setup):
     settings, state, primary_fake, exchange, _ = setup
     secondary = settings.model_copy(update={"network": "mainnet"})

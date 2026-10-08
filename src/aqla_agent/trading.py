@@ -803,8 +803,8 @@ class Trading:
     async def finalize_source_targets(self, trade_id):
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
-        specification = plan.source_tp
-        if not specification:
+        specification = trade.get("source_tp_override", plan.source_tp)
+        if not specification or specification.get("unit") == "price":
             return True
         final = trade.get("percent_finalization")
         if final:
@@ -1181,6 +1181,7 @@ class Trading:
                 if not plan.policy.allow_stop_widening and (signal.stop_loss < old if plan.side == "long" else signal.stop_loss > old):
                     raise AqlaError("Stop widening is not permitted")
             update_targets = signal.take_profits
+            update_spec = {"unit": "price"}
             if signal.update_action == "replace_targets":
                 if signal.take_profit_unit != "price":
                     from .percent_targets import prices
@@ -1194,6 +1195,8 @@ class Trading:
                     converted = prices(reference, plan.side, plan.market, signal.take_profit_unit, selected_targets(signal.take_profits, plan.policy), specification.get("signal_leverage"))
                     original = signal.model_dump(mode="json")
                     update_targets = converted
+                    update_spec = {"unit": signal.take_profit_unit, "values": [str(value) for value in selected_targets(signal.take_profits, plan.policy)],
+                                   "reference_entry": str(reference), "signal_leverage": specification.get("signal_leverage")}
                     # Validate the quoted update before converting; computed prices
                     # have no invented price quotations.
                     self.state.update(lambda data: data["trades"][trade["trade_id"]].setdefault("percent_updates", {}).__setitem__(event_id,
@@ -1213,7 +1216,7 @@ class Trading:
                     result = {"waiting_stop_updated": True}
                 else:
                     targets = self.validate_targets(trade, plan, update_targets)
-                    self._patch(trade["trade_id"], targets=[str(price) for price in targets], management_revision=trade["management_revision"] + 1)
+                    self._patch(trade["trade_id"], targets=[str(price) for price in targets], source_tp_override=update_spec, management_revision=trade["management_revision"] + 1)
                     result = {"waiting_targets_updated": True}
                 self.state.update(lambda data: data["events"][event_id].update(status="updated"))
                 return {"trade_id": trade["trade_id"], "result": result}
@@ -1227,7 +1230,7 @@ class Trading:
                     raise AqlaError("Stop update needs a price or proved entry VWAP")
                 result = await self.replace_stop(trade["trade_id"], price, operation)
             else:
-                result = await self.replace_targets(trade["trade_id"], update_targets, operation)
+                result = await self.replace_targets(trade["trade_id"], update_targets, operation, source_tp=update_spec)
             uncertain = result.get("phase") in ("prepared", "sending", "unknown") or result.get("replacement_unconfirmed")
             self.state.update(lambda state: state["events"][event_id].update(status="needs_reconciliation" if uncertain else "updated"))
             return {"trade_id": trade["trade_id"], "result": result}
@@ -1243,7 +1246,7 @@ class Trading:
             raise AqlaError("Targets must be strictly ordered on the profitable side of the actual entry")
         return target_prices
 
-    async def replace_targets(self, trade_id, prices, operation_id):
+    async def replace_targets(self, trade_id, prices, operation_id, source_tp=None):
         trade = self.state.snapshot()["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
         self.assert_plan_binding(self.state.snapshot(), plan)
@@ -1255,7 +1258,7 @@ class Trading:
         if staged is None:
             staged = {"prices": [str(price) for price in target_prices],
                       "original_orders": [order for order in trade["orders"] if order["kind"] == "tp" and not order.get("retired")],
-                      "action": None}
+                      "action": None, "source_tp": source_tp}
             self.state.update(lambda state: state["trades"][trade_id].setdefault("target_updates", {}).__setitem__(operation_id, staged))
         elif staged["prices"] != [str(price) for price in target_prices]:
             raise AqlaError("Target update ID already identifies different prices")
@@ -1297,6 +1300,8 @@ class Trading:
 
         def record(data):
             row = data["trades"][trade_id]
+            if staged.get("source_tp") is not None:
+                row["source_tp_override"] = staged["source_tp"]
             for old in row["orders"]:
                 if old["kind"] == "tp":
                     old["retired"] = True
