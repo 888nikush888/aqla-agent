@@ -16,7 +16,6 @@ from aqla_agent.notifications import (
     NotificationDetailsResult,
     NotificationReadResult,
     acknowledge_notifications,
-    notification_details,
     notification_page,
 )
 from aqla_agent.pipelines import (
@@ -144,7 +143,9 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         """Read source tiers, net-R performance, proof/exclusions, policy and rank history. Never consumes new proof or changes ranks."""
         from aqla_agent.ranking import source_key
         from aqla_agent.sources import resolve_source
-        data = state.snapshot()
+        data = state.read("ranking_policy", "ranking_revision", "source_ranks", "ranking_history", "source_names",
+                          "sources", "source_aliases", "network", "venue_accounts", "venue_enabled", "account_enabled",
+                          "venue_limits", "account_limits")
         if not 1 <= history_limit <= 100:
             raise AqlaError("Ranking history limit must be 1–100")
         selected = source_key(data, resolve_source(data, source)) if source else None
@@ -152,7 +153,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "sources": {identity: {**row, "source_id": identity, "name": data.get("source_names", {}).get(identity, identity)}
                             for identity, row in status_view(data).items() if selected is None or identity == selected},
                 "history": sorted([row for row in data["ranking_history"].values() if selected is None or row["source_id"] == selected], key=lambda row: row["time"], reverse=True)[:history_limit],
-                "execution_accounts": trading.accounts_ready(), "basis": "net_R_per_original_signal_setup"}
+                "execution_accounts": trading.accounts_ready(data), "basis": "net_R_per_original_signal_setup"}
 
     @server.tool(annotations=read)
     async def monthly_report(month: str, offset: int = 0, limit: int = 100, diagnostics_only: bool = False) -> dict:
@@ -265,12 +266,12 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         """Read a bounded versioned page; after ACK/stale begin again with no cursor."""
         # Notification messages use saved account/plan facts; no inventory/status
         # overview is rendered here, so another complete readiness snapshot is unnecessary.
-        return notification_page(state.snapshot(), authority.key if authority else None, {}, cursor=cursor, limit=limit)
+        return state.notification_page(authority.key if authority else None, cursor=cursor, limit=limit)
 
     @server.tool(annotations=read)
     async def notifications_details(notification_id: str, version: str, cursor: str | None = None, limit: int = 16384) -> NotificationDetailsResult:
         """Read lossless canonical JSON fragments of the exact saved notification version."""
-        return notification_details(state.snapshot(), authority.key if authority else None, notification_id, version, cursor=cursor, limit=limit)
+        return state.notification_details(authority.key if authority else None, notification_id, version, cursor=cursor, limit=limit)
 
     @server.tool(annotations=write)
     async def notifications_ack(notification_ids: list[str], context_auth: str = "", versions: dict[str, str] | None = None) -> NotificationAckResult:
@@ -278,7 +279,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         authorize(context_auth)
         def acknowledge(data):
             return acknowledge_notifications(data, notification_ids, versions)
-        return state.update(acknowledge)
+        return state.update_metadata(("notifications",), acknowledge)
 
     @server.tool(annotations=write)
     async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "set_source_name", "close_trade", "clear_notification", "set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled", "set_ranking_policy", "set_account_limits", "set_account_enabled"],
@@ -400,15 +401,14 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 raise AqlaError("Zukünftige Monate haben noch keinen Monatsbericht")
             return state.monthly_transaction("request", month=month)
         if action == "monthly_ack":
-            from aqla_agent.monthly import acknowledge_publication
             if publication is None or job is None:
                 raise AqlaError("Confirmed Sheets publication and selected monthly job are required")
             import re
             expected = settings.google_sheets.spreadsheet_id
             if not re.fullmatch(r"https://docs\.google\.com/spreadsheets/d/" + re.escape(expected or "") + r"/edit#gid=\d+", publication.url):
                 raise AqlaError("Monthly publication URL does not match the configured spreadsheet")
-            return state.update(lambda data: acknowledge_publication(data, month, publication.fingerprint,
-                                publication.url, publication.revision, job=job))
+            return state.monthly_transaction("ack", month=month, fingerprint=publication.fingerprint,
+                url=publication.url, revision=publication.revision, job=job)
         if action == "journal_snapshot":
             return state.journal_batch(settings.google_sheets.batch_size)
         if action == "journal_ack":
@@ -416,7 +416,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 raise AqlaError("Missing journal acknowledgements")
             return state.acknowledge_journal(accepted)
         if action == "seed_context":
-            snapshot = state.snapshot()
+            snapshot = state.read("sources", "source_aliases")
             allowed = {*snapshot["sources"], *snapshot.get("source_aliases", {}).values()}
             if cutoffs is None or any(chat not in allowed or cutoff < 0 for chat, cutoff in cutoffs.items()):
                 raise AqlaError("Context cutoffs must identify subscribed source messages")
@@ -435,7 +435,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 return data["context_cutoffs"]
             return {"context_cutoffs": state.update(seed)}
         if action == "resolve_sources":
-            selected = state.snapshot()["sources"]
+            selected = state.read("sources")["sources"]
             if aliases is None or any(key not in selected or not value.lstrip("-").isdigit() for key, value in aliases.items()):
                 raise AqlaError("Reader source resolution must bind only configured sources to actual Telegram IDs")
             def resolve(data):
@@ -449,22 +449,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             if source is None:
                 raise AqlaError("Missing source event")
             return trading.ingest(source, native_forward=action == "native_forward")
-        snapshot = state.snapshot()
-        tracked = {}
-        active_refs = {ref for trade in snapshot["trades"].values() if trade["status"] in OPEN for ref in trade["plan"]["source_refs"]}
-        for row in snapshot["events"].values():
-            chat = row["source"]["chat_id"]
-            tracked.setdefault(chat, []).append(row["source"]["message_id"])
-        for chat, values in tracked.items():
-            recent = sorted(set(values))[-settings.max_context_messages:]
-            active = [row["source"]["message_id"] for row in snapshot["events"].values() if row["source"]["chat_id"] == chat and row["source_id"] in active_refs]
-            tracked[chat] = sorted(set([*recent, *active]))
-        return {"sources": snapshot["sources"], "cursors": snapshot["cursors"],
-                "context_cutoffs": snapshot.get("context_cutoffs", {}),
-                "context_ids": snapshot.get("context_ids", {}),
-                "source_aliases": snapshot.get("source_aliases", {}), "tracked_ids": tracked,
-                "pending": [row["event_id"] for row in snapshot["events"].values() if row["status"] in UNFINISHED][:50],
-                "notification_pending": len(snapshot["notifications"])}
+        return state.reader_snapshot(settings.max_context_messages)
 
     if profile == "full":
         @server.tool(annotations=read)

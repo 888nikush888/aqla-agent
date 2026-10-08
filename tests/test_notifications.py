@@ -37,6 +37,32 @@ async def ack(server, ids, versions=None):
     return await call(server, "notifications_ack", **arguments)
 
 
+@pytest.mark.asyncio
+async def test_notification_consumers_use_detached_bounded_views_without_full_snapshot(notification_server, setup, monkeypatch):
+    from aqla_agent.notifications import acknowledge_notifications, notification_details, notification_page
+
+    _, state, *_ = setup
+    server = notification_server
+    add_notices(state, 5)
+    before = state.snapshot()
+    expected = notification_page(before, server.aqla_authority.key, {}, limit=2)
+    monkeypatch.setattr(state, "snapshot", lambda: pytest.fail("Notification consumer copied the full state"))
+    actual = await call(server, "notifications_read", limit=2)
+    assert actual == expected
+    identity = next(iter(actual["notifications"]))
+    version = actual["notification_versions"][identity]
+    expected_details = notification_details(before, server.aqla_authority.key, identity, version)
+    assert await call(server, "notifications_details", notification_id=identity, version=version) == expected_details
+    actual["notifications"][identity]["error"] = "changed returned view"
+    assert state.read("notifications")["notifications"] == before["notifications"]
+    expected_state = copy.deepcopy(before)
+    expected_ack = acknowledge_notifications(expected_state, [identity], {identity: version})
+    expected_state["sequence"] += 1
+    assert await ack(server, [identity], {identity: version}) == expected_ack
+    from aqla_hyperliquid_mcp.storage import read_snapshot
+    assert read_snapshot(state.path) == expected_state
+
+
 def add_notices(state, count):
     state.update(lambda data: data["notifications"].update({f"notice-{index:05}": {"error": "synthetic fact", "observed_at": index}
                                                          for index in range(count)}))
@@ -172,11 +198,11 @@ async def test_ack_missing_and_duplicate_ids_are_idempotent(notification_server,
     page = await call(server, "notifications_read")
     versions = {**page["notification_versions"], "missing": "unknown"}
     calls = []
-    original = server.aqla_state.update
-    def update(function):
-        calls.append(function)
-        return original(function)
-    monkeypatch.setattr(server.aqla_state, "update", update)
+    original = server.aqla_state._write
+    def write(data):
+        calls.append(data["sequence"])
+        return original(data)
+    monkeypatch.setattr(server.aqla_state, "_write", write)
     result = await ack(server, ["missing", "notice-00000", "missing", "notice-00000"], versions)
     assert len(calls) == 1
     assert result["processed"] == ["notice-00000"] and result["missing"] == ["missing"]

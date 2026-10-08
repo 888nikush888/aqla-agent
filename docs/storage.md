@@ -10,6 +10,10 @@ sind dort nicht beschreibbar. Zusätzliche Wurzeln oder falsche Wurzeltypen werd
 vor dem Commit abgewiesen. Die geänderten Wurzeln werden JSONnormalisiert;
 unveränderte Daten bleiben erhalten. Persistenz erfolgt vollständig atomar vor
 RAMveröffentlichung und vor einem nachfolgenden Exchange-Send.
+Die erste Noncenutzung einer noch nicht initialisierten Accountview verwendet
+deren vorhandenen vollständigen Fallback, damit auch ihre bisherigen leeren
+Namespacewurzeln exakt erhalten bleiben. Bereits initialisierte Noncepfade
+mutieren ausschließlich die tatsächlich verwendeten Noncewurzeln.
 
 `read` kopiert nur benannte Wurzeln beziehungsweise ausgewählte Dictionaryeinträge.
 Es gibt keine Callbackansicht mit mutable Stateinternals. Zurückgegebene nested
@@ -26,8 +30,11 @@ vorhandene Pendingreihenfolge bleiben erhalten.
 
 Feste Monatsjoboperationen lesen aktuelle Finanzbelege unter demselben Lock. Sie
 stellen nur die geprüften Job-/Requestfunktionen bereit, keinen beliebigen Callback
-mit Journalbypass. Der bestehende vollständige Monats-ACK mit Notificationerzeugung
-bleibt bis zur Integration seines Notificationvertrags auf dem Genericpfad.
+mit Journalbypass. Nach Integration des geprüften Notificationvertrags verwendet
+auch der feste Monats-ACK diesen Pfad mit detached Publication-/Notificationwurzeln.
+Versionierter Notification-ACK kopiert ausschließlich die Notificationwurzel.
+Notificationseiten und Readerstatus sind feste read-only-Projektionen unter Lock;
+nur ihre begrenzten berechneten Ergebnisse werden detached zurückgegeben.
 
 `update_if_changed` vermeidet ausschließlich einen tatsächlichen JSONgleichen
 Generic-No-op. Typen, Einfügereihenfolge und explizite Revisionseffekte bleiben

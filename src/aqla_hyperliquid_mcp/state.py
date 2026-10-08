@@ -177,6 +177,39 @@ class State:
         with self._thread_lock:
             return copy.deepcopy(batch(self.data, limit))
 
+    def notification_page(self, key, *, cursor=None, limit=100):
+        from aqla_agent.notifications import notification_page
+
+        with self._thread_lock:
+            return copy.deepcopy(notification_page(self.data, key, {}, cursor=cursor, limit=limit))
+
+    def notification_details(self, key, identity, version, *, cursor=None, limit=16384):
+        from aqla_agent.notifications import notification_details
+
+        with self._thread_lock:
+            return copy.deepcopy(notification_details(self.data, key, identity, version, cursor=cursor, limit=limit))
+
+    def reader_snapshot(self, max_context_messages):
+        """Fixed read-only projection; no full state/body snapshot leaves the lock."""
+        from aqla_agent.trading import OPEN, UNFINISHED
+
+        with self._thread_lock:
+            data, tracked = self.data, {}
+            active_refs = {ref for trade in data["trades"].values() if trade["status"] in OPEN for ref in trade["plan"]["source_refs"]}
+            for row in data["events"].values():
+                chat = row["source"]["chat_id"]
+                tracked.setdefault(chat, []).append(row["source"]["message_id"])
+            for chat, values in tracked.items():
+                recent = sorted(set(values))[-max_context_messages:]
+                active = [row["source"]["message_id"] for row in data["events"].values()
+                          if row["source"]["chat_id"] == chat and row["source_id"] in active_refs]
+                tracked[chat] = sorted(set([*recent, *active]))
+            return copy.deepcopy({"sources": data["sources"], "cursors": data["cursors"],
+                "context_cutoffs": data.get("context_cutoffs", {}), "context_ids": data.get("context_ids", {}),
+                "source_aliases": data.get("source_aliases", {}), "tracked_ids": tracked,
+                "pending": [row["event_id"] for row in data["events"].values() if row["status"] in UNFINISHED][:50],
+                "notification_pending": len(data["notifications"])})
+
     def acknowledge_journal(self, accepted):
         """The only partial path allowed to release digest-confirmed history rows."""
         from aqla_sheets_mcp.journal import acknowledge
@@ -197,12 +230,21 @@ class State:
 
     def monthly_transaction(self, action, **arguments):
         """Fixed job operations inspect current financial evidence under the lock."""
-        from aqla_agent.monthly import fail_publication, monthly_page, next_job, request_publication
+        from aqla_agent.monthly import (
+            acknowledge_publication,
+            fail_publication,
+            monthly_page,
+            next_job,
+            request_publication,
+        )
 
-        functions = {"job": next_job, "page": monthly_page, "failure": fail_publication, "request": request_publication}
+        functions = {"job": next_job, "page": monthly_page, "failure": fail_publication,
+                     "request": request_publication, "ack": acknowledge_publication}
         if action not in functions:
             raise AqlaError("Unknown partial monthly job operation")
         roots = ("monthly_jobs", "monthly_requests", "monthly_request_generations")
+        if action == "ack":
+            roots += ("monthly_reports", "notifications")
         with self._thread_lock:
             proposed = dict(self.data)
             for root in roots:

@@ -197,6 +197,23 @@ def test_selected_read_returns_only_detached_requested_entries(setup):
     assert state.snapshot()["events"]["one"] == {"nested": [1]}
 
 
+def test_reader_projection_matches_full_snapshot_contract_and_detaches_returned_lists(setup):
+    from aqla_hyperliquid_mcp.models import SourceEvent
+
+    _, state, _, _, trading = setup
+    for index in range(4):
+        trading.ingest(SourceEvent(chat_id="channel", message_id=index + 1, sent_at=1_800_000_000_000 + index,
+                                   received_at=1_800_000_000_000 + index, text="reader context", historical=True))
+    before = state.snapshot()
+    expected = {"sources": before["sources"], "cursors": before["cursors"], "context_cutoffs": {}, "context_ids": {},
+                "source_aliases": before["source_aliases"], "tracked_ids": {"channel": [3, 4]}, "pending": [], "notification_pending": 0}
+    result = state.reader_snapshot(2)
+    assert result == expected
+    result["tracked_ids"]["channel"].append(999)
+    result["cursors"]["channel"] = 999
+    assert state.snapshot() == before
+
+
 def test_metadata_commit_and_empty_journal_ack_do_not_project_full_history(setup, monkeypatch):
     from aqla_sheets_mcp import journal
 
@@ -286,7 +303,7 @@ def test_scoped_nonce_matches_generic_metadata_and_selected_view_is_detached(set
     assert state.snapshot() == expected
 
 
-@pytest.mark.parametrize("action", ["job", "request", "failure", "page"])
+@pytest.mark.parametrize("action", ["job", "request", "failure", "page", "ack"])
 def test_fixed_monthly_transaction_whole_state_matches_generic_and_rechecks_financial_binding(setup, monkeypatch, action):
     import copy
 
@@ -303,10 +320,12 @@ def test_fixed_monthly_transaction_whole_state_matches_generic_and_rechecks_fina
     selected = state.monthly_transaction("job")
     state.journal_enabled = True
     functions = {"job": monthly.next_job, "request": monthly.request_publication,
-                 "failure": monthly.fail_publication, "page": monthly.monthly_page}
+                 "failure": monthly.fail_publication, "page": monthly.monthly_page, "ack": monthly.acknowledge_publication}
     arguments = {"job": {}, "request": {"month": "2026-09"},
                  "failure": {"failure": {"job": selected["job"], "error_code": "temporary"}},
-                 "page": {"binding": selected["job"], "section": "rows"}}[action]
+                 "page": {"binding": selected["job"], "section": "rows"},
+                 "ack": {"month": selected["report"]["month"], "fingerprint": selected["report"]["fingerprint"],
+                         "url": "synthetic", "revision": selected["report"]["revision"], "job": selected["job"]}}[action]
     before = state.snapshot()
     expected = copy.deepcopy(before)
     result = functions[action](expected, **arguments)
