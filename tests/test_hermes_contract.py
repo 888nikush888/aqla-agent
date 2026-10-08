@@ -21,3 +21,17 @@ def test_hook_contract_checks_names_parameter_kinds_defaults_and_async_without_m
     with pytest.raises(RuntimeError, match="hook"):
         validate_hooks([contract])
     assert target.hook is changed
+
+
+def test_changed_positional_only_parameters_are_rejected_before_any_mutation():
+    def compatible(self, event, *, enabled=False):
+        pass
+    def changed(self, event, /, *, enabled=False):
+        pass
+    target = SimpleNamespace(hook=compatible)
+    contract = HookContract(target, "hook", "self,event,@enabled=", False)
+    validate_hooks([contract])
+    target.hook = changed
+    with pytest.raises(RuntimeError, match="hook.*|.*hook"):
+        validate_hooks([contract])
+    assert target.hook is changed

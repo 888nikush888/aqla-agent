@@ -18,7 +18,7 @@ Readerfehler enthalten ausschließlich sichere Codes, Quellen-IDs, Versuchszahl 
 
 ## Gepinnte Hermes-Verträge
 
-Die Laufzeit verlangt Hermes-Commit `1a4508e2aff2db5f50409893a2115be777bd5643`. Vor der ersten Ersetzung prüft sie Namen, Parameterarten, Defaults und async/sync-Verträge der 25 benötigten Hooks sowie die verwendeten Attributtypen. Fehlende oder geänderte Verträge beenden die Installation mit verständlichem Fehler, bevor Aqla Attribute ersetzt. Wiederholte Installation und Undo werden gegen den Pin geprüft.
+Die Laufzeit verlangt Hermes-Commit `1a4508e2aff2db5f50409893a2115be777bd5643`. Vor der ersten Ersetzung prüft sie Namen, Parameterarten, Vorhandensein von Defaults und async/sync-Verträge der 25 benötigten Hooks sowie die verwendeten Attributtypen. Die Defaultwerte selbst werden nicht verglichen. Fehlende oder geänderte geprüfte Verträge beenden die Installation mit verständlichem Fehler, bevor Aqla Attribute ersetzt. Wiederholte Installation und Undo werden gegen den Pin geprüft.
 
 Der Vertrag umfasst Gateway-Factory, `_run_agent`, queued followup, Adapterreconnect, Startup-Wiring und Post-connect-Dienste; Telegram-Ingress, Text-/Fotobatch, Mediengruppen und Textdebounce; Clarifycallback; `PluginContext.call_mcp` und `_mcp_envelope`; Skillapproval-Toggle, Staging, Pending-Lesen, Apply, Mutationlock, Adoption und Fuzzypatch; Backgroundreview-Spawn, Aktionszeilen und Zusammenfassung. Betreiber-/Quellenbindung, wartende Fragen, verpflichtende Skillfreigabe und MCP-Resultgrenze bleiben erhalten. Der Pin ist Voraussetzung dieser privaten Verträge, keine automatische Updatefreigabe.
 

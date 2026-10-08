@@ -21,7 +21,7 @@ def parameter_contract(function) -> str:
         function = function.__aqla_contract_original__
     values = []
     for parameter in inspect.signature(function).parameters.values():
-        prefix = {inspect.Parameter.VAR_POSITIONAL: "*", inspect.Parameter.VAR_KEYWORD: "**", inspect.Parameter.KEYWORD_ONLY: "@"}.get(parameter.kind, "")
+        prefix = {inspect.Parameter.POSITIONAL_ONLY: "/", inspect.Parameter.VAR_POSITIONAL: "*", inspect.Parameter.VAR_KEYWORD: "**", inspect.Parameter.KEYWORD_ONLY: "@"}.get(parameter.kind, "")
         values.append(prefix + parameter.name + ("=" if parameter.default is not inspect.Parameter.empty else ""))
     return ",".join(values)
 
