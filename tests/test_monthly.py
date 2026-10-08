@@ -242,6 +242,9 @@ async def test_monthly_public_read_exposes_safe_blocked_job_diagnosis(setup, mon
         assert diagnostic["status"] == "blocked" and diagnostic["last_error"] == "budget"
         assert diagnostic["attempt_count"] == 1 and diagnostic["next_retry_at"] is None
         assert set(diagnostic) == set(jobs.MonthlyJob.model_fields)
+        bounded = json.loads((await server.call_tool("monthly_report", {"month": "2026-10", "diagnostics_only": True})).content[0].text)
+        assert bounded == {"month": "2026-10", "publication_job": diagnostic}
+        assert jobs.native_monthly_bytes(bounded) <= 600_000
         assert state.snapshot() == before and not fake.actions
     finally:
         await close_server(server)

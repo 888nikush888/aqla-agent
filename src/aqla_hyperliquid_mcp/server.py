@@ -144,16 +144,19 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "execution_accounts": trading.accounts_ready(), "basis": "net_R_per_original_signal_setup"}
 
     @server.tool(annotations=read)
-    async def monthly_report(month: str, offset: int = 0, limit: int = 100) -> dict:
+    async def monthly_report(month: str, offset: int = 0, limit: int = 100, diagnostics_only: bool = False) -> dict:
         """Read Aqla Mainnet trades closed in YYYY-MM, fees/funding, initial-margin ROE and completeness. No exchange writes."""
-        from aqla_agent.monthly import MonthlyJob
+        from aqla_agent.monthly import MonthlyJob, month_bounds
         from aqla_agent.monthly import monthly_report as calculate
         if isinstance(offset, bool) or isinstance(limit, bool) or offset < 0 or not 1 <= limit <= 500:
             raise AqlaError("Monthly page requires offset >= 0 and limit between 1 and 500")
+        month_bounds(month)
         snapshot = state.snapshot()
-        report = calculate(snapshot, month)
         stored_job = snapshot.get("monthly_jobs", {}).get(month)
         diagnostic = MonthlyJob.model_validate(stored_job).model_dump(mode="json") if stored_job else None
+        if diagnostics_only:
+            return {"month": month, "publication_job": diagnostic}
+        report = calculate(snapshot, month)
         totals = {key: len(report[key]) for key in ("rows", "open_trades", "undated_closed_trades")}
         return {**report, **{key: report[key][offset:offset + limit] for key in totals},
                 "page": {"offset": offset, "limit": limit, "totals": totals}, "publication_job": diagnostic}

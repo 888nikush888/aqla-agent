@@ -20,7 +20,9 @@ ausschließlich eine sichere Fehlerkategorie. Temporäre Ausfälle werden nach
 60, 120, 240 Sekunden bis höchstens einer Stunde erneut versucht. Schema-,
 Budget-, Inhalts- oder Revisionskonflikte bleiben sichtbar blockiert. Der lesende
 Monatsabruf zeigt diese Diagnose in `publication_job`; Fehlerpayloads und Tokens
-werden dafür nicht gespeichert. Andere fällige Monate werden nach dem letzten
+werden dafür nicht gespeichert. `monthly_report(month="2026-10", diagnostics_only=True)`
+liefert ausschließlich den Monat und diesen begrenzten Diagnoseblock, auch wenn
+ein einzelner Berichtseintrag zu groß für den Datentransfer ist. Andere fällige Monate werden nach dem letzten
 Versuch fair ausgewählt, auch wenn eine Jobantwort verloren ging und ihre
 60-Sekunden-Lease abläuft. Neue Belege oder eine frische authentifizierte
 Betreiberanfrage erlauben eine neue Prüfung. Failure und ACK müssen zu
