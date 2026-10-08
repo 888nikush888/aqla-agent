@@ -1,6 +1,7 @@
 """Source performance in net R, never channel claims, account ROE or trade counts per leg."""
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Literal
 
@@ -109,34 +110,60 @@ def metrics(results, policy):
             "drawdown_r": str(drawdown), "win_rate": str(Decimal(wins) / len(values) * 100), "net_r_sum": str(sum(values))}
 
 
+FamilyKey = tuple[str, str]
+
+
+@dataclass
+class PendingLegs:
+    total: int = 0
+    families: dict[FamilyKey | None, int] = field(default_factory=dict)
+
+    def add(self, family: FamilyKey | None) -> None:
+        self.total += 1
+        self.families[family] = self.families.get(family, 0) + 1
+
+    def has_other_family(self, family: FamilyKey) -> bool:
+        return self.total > self.families.get(family, 0)
+
+
+@dataclass
+class OutcomeIndex:
+    families: dict[FamilyKey, list[dict]] = field(default_factory=dict)
+    pending_refs: set[str] = field(default_factory=set)
+    pending_legs: dict[tuple[str, frozenset[str]], PendingLegs] = field(default_factory=dict)
+
+
+def outcome_index(data) -> OutcomeIndex:
+    index = OutcomeIndex()
+    for trade in data["trades"].values():
+        plan = trade["plan"]
+        key = None
+        if trade.get("fill_events") or Decimal(trade.get("filled_quantity", "0")) != 0:
+            family = plan.get("setup_id") or digest([trade["chat_id"], sorted(plan["source_refs"])])[:32]
+            key = (plan.get("rank_snapshot", {}).get("source_id") or source_key(data, trade["chat_id"]), family)
+            index.families.setdefault(key, []).append(trade)
+        if not trade.get("fill_events") and trade["status"] not in ("closed", "cancelled", "rejected"):
+            pending_key = (source_key(data, trade["chat_id"]), frozenset(plan["source_refs"]))
+            index.pending_legs.setdefault(pending_key, PendingLegs()).add(key)
+    for event in data.get("events", {}).values():
+        if (source := event.get("source_id")) is not None and any(target.get("status") in ("pending", "planned", "waiting_entry", "opening", "entry_pending", "uncertain")
+               for target in event.get("targets", {}).values()):
+            index.pending_refs.add(source)
+    return index
+
+
 def outcomes(data):
     from .monthly import report_row
-    grouped, excluded = {}, {}
-    for trade in data["trades"].values():
-        if not trade.get("fill_events") and Decimal(trade.get("filled_quantity", "0")) == 0:
-            continue
-        plan = trade["plan"]
-        family = plan.get("setup_id") or digest([trade["chat_id"], sorted(plan["source_refs"])])[:32]
-        key = (plan.get("rank_snapshot", {}).get("source_id") or source_key(data, trade["chat_id"]), family)
-        grouped.setdefault(key, []).append(trade)
-    result = {}
-    for (source, family), trades in grouped.items():
+    index = outcome_index(data)
+    result, excluded = {}, {}
+    for (source, family), trades in index.families.items():
         values, reasons, timestamps = [], [], []
         # An unfilled leg may still open later. Finalize the family only when no
         # original target remains pending, planned or actively waiting for entry.
-        refs = set(trades[0]["plan"]["source_refs"])
-        for event in data.get("events", {}).values():
-            if event.get("source_id") not in refs:
-                continue
-            for target in event.get("targets", {}).values():
-                if target.get("status") in ("pending", "planned", "waiting_entry", "opening", "entry_pending", "uncertain"):
-                    reasons.append("Weitere Ausführung dieses Setups noch nicht abgeschlossen")
-        for leg in data["trades"].values():
-            if leg in trades or leg.get("fill_events"):
-                continue
-            plan = leg["plan"]
-            if set(plan["source_refs"]) == refs and source_key(data, leg["chat_id"]) == source and leg["status"] not in ("closed", "cancelled", "rejected"):
-                reasons.append("Weitere Ausführung dieses Setups noch nicht abgeschlossen")
+        refs = frozenset(trades[0]["plan"]["source_refs"])
+        pending = index.pending_legs.get((source, refs))
+        if refs & index.pending_refs or pending and pending.has_other_family((source, family)):
+            reasons.append("Weitere Ausführung dieses Setups noch nicht abgeschlossen")
         for trade in trades:
             if trade["status"] not in ("closed", "cancelled", "rejected"):
                 reasons.append("Trade noch offen")

@@ -64,6 +64,8 @@ Der originale Dezimalhebel gilt auch nach Abrundung/Deckelung. Kein Profil-/Back
 
 ## Analyse und Einführung
 
+Jede Rangbewertung baut einmal einen lesenden Index aus den Tradefamilien, offenen Zielbezügen und noch ungefüllten Legs auf. Der Index verändert weder die vollständige Proofhistorie noch das konfigurierte Bewertungsfenster; spätere Fundingbelege und alte Rang-/Netzwerkbindungen bleiben maßgeblich. Die vollständigen Ergebnis- und Ausschlussdaten werden gegen die eingefrorene bisherige Funktion geprüft. Scan-Zählungen für 5.000 Familien belegen einen Durchlauf je Trade-/Ereignismapping; lokale Zeitmessungen sind keine Zusage einer VPS- oder Börsenlatenz.
+
 Bei vielen HL-DEXs erfasst eine frische [native WebSocket-Kontoübersicht](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions) alle Positionen und jede DEX-Orderliste. Nichtleere Orderlisten werden mit vollständigen Reduce-only-Belegen gelesen. Fehlende, fremde oder veraltete Teilansichten erlauben keinen Entry. Damit sind auch Testnet-Konten mit mehr als 64 DEX-Kontexten vollständig prüfbar.
 
 Sheets ergänzt Ränge/Ranghistorie und Herkunfts-/Risikospalten, ohne bestehende Zeilen-IDs zu ersetzen. Primäre HL-Mainnet-Tabs bleiben erhalten; weitere Konten erhalten eigene Börsen-/Netzwerktabs. `journal_read`/`journal_statistics` können `account_key` auswählen. Monatsberichte bleiben auf tatsächliche Mainnet-Abschlüsse beschränkt. Telegram zeigt Rang, Netzwerk, Risikofaktor, RPR und belegtes SL-Risiko, ROI mit Kurs sowie Ersatz. Leere Läufe bleiben stumm.
