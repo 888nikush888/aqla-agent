@@ -1,3 +1,7 @@
+import os
+import shutil
+import stat
+import subprocess
 from pathlib import Path
 from sys import argv
 from types import SimpleNamespace
@@ -71,3 +75,78 @@ def test_native_dependency_recipe_is_shared_and_security_versions_are_exact():
     assert recipe[recipe.index("--overrides") + 1] == str(override)
     contents = override.read_text()
     assert {"PyJWT==2.15.1", "httpx2==2.13.1", "httpcore2==2.13.1"} <= set(contents.splitlines())
+
+
+@pytest.mark.parametrize("character", [chr(value) for value in range(32)] + [chr(127), "'", '"'])
+def test_destination_rejects_control_characters_and_quotes_before_filesystem_use(tmp_path, monkeypatch, character):
+    target = tmp_path / ("invalid" + character + "destination")
+    project = Path(__file__).parents[1]
+    with monkeypatch.context() as local:
+        local.setattr(Path, "resolve", lambda *args, **kwargs: pytest.fail("resolve before destination validation"))
+        local.setattr(Path, "mkdir", lambda *args, **kwargs: pytest.fail("mkdir before destination validation"))
+        with pytest.raises(ValueError, match="control character|unsupported in systemd"):
+            prepare(project, target, "12345")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Backslash is a normal Windows path separator")
+def test_destination_rejects_literal_posix_backslash_before_filesystem_use(tmp_path, monkeypatch):
+    with monkeypatch.context() as local:
+        local.setattr(Path, "resolve", lambda *args, **kwargs: pytest.fail("resolve before destination validation"))
+        with pytest.raises(ValueError, match="unsupported in systemd"):
+            prepare(Path(__file__).parents[1], tmp_path / "literal\\backslash", "12345")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["normal", "with spaces", "percent%H%", "dollar${HOME}$HOME{literal}", "mixed space%H${HOME}"])
+def test_prepare_supported_paths_keep_configuration_and_unit_paths(tmp_path, name):
+    target = prepare(Path(__file__).resolve().parents[1], tmp_path / name, "12345")
+    unit = (target / "aqla-agent.service").read_text(encoding="utf-8")
+    settings = dict(line.split("=", 1) for line in unit.splitlines() if "=" in line)
+    # The two path settings are raw systemd values. Percent is the sole specifier escape.
+    assert settings["WorkingDirectory"].removesuffix("/").replace("%%", "%") == target.as_posix()
+    assert settings["EnvironmentFile"].replace("%%", "%") == (target / "vps.env").as_posix()
+    # Colon disables environment expansion; the full quoted executable is one token.
+    executable, arguments = settings["ExecStart"].split('" ', 1)
+    assert executable.startswith(':"')
+    assert executable[2:].replace("%%", "%") == (target / "hermes-venv/bin/python").as_posix()
+    assert arguments == "-m aqla_agent.hermes_runtime"
+    config = yaml.safe_load((target / "hermes-home/config.yaml").read_text(encoding="utf-8"))
+    assert config["mcp_servers"]["aqla"]["cwd"] == str(target)
+    assert config["mcp_servers"]["aqla"]["command"] == str(target / ".venv/bin/python")
+
+
+@pytest.mark.parametrize("character", ["\0", "\n", chr(127), '"'])
+def test_cli_rejects_invalid_destination_before_resolve(tmp_path, monkeypatch, character):
+    monkeypatch.setattr("sys.argv", [argv[0], "--destination", str(tmp_path / ("invalid" + character)), "--owner-id", "12345", "--prepare-only"])
+    with monkeypatch.context() as local:
+        local.setattr(Path, "resolve", lambda *args, **kwargs: pytest.fail("CLI resolve before destination validation"))
+        with pytest.raises(ValueError, match="control character|unsupported in systemd"):
+            install.main()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name == "nt" or shutil.which("systemd-analyze") is None, reason="Native Linux systemd parser required")
+@pytest.mark.parametrize("name", ["normal", "with spaces", "percent%H%", "dollar${HOME}$HOME{literal}", "mixed space%H${HOME}", "trailing space "])
+def test_native_systemd_finds_actual_full_executable_and_preserves_modes(tmp_path, name):
+    previous_mask = os.umask(0o022)
+    try:
+        target = prepare(Path(__file__).resolve().parents[1], tmp_path / name, "12345")
+    finally:
+        os.umask(previous_mask)
+    for relative, expected in (("secrets", 0o700), ("hermes-home", 0o700), ("secrets/integration.secret", 0o600), ("vps.env", 0o600)):
+        assert stat.S_IMODE((target / relative).stat().st_mode) == expected
+    executable = target / "hermes-venv/bin/python"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    executable.chmod(0o700)
+    command = ["systemd-analyze", "verify", "--generators=no", "--man=no", str(target / "aqla-agent.service")]
+    environment = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+    result = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
+    assert result.returncode == 0 and not result.stderr, result.stderr
+    # A passing syntax check alone is insufficient: removing only this executable
+    # must identify its full real path and fail, proving the parser selected it.
+    executable.unlink()
+    result = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
+    assert result.returncode != 0
+    assert str(executable) in result.stderr and "is not executable" in result.stderr

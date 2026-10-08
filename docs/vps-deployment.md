@@ -2,6 +2,14 @@
 
 Stand: 03.10.2026. Tatsächliche Installation auf Debian 13 x86_64, getrennt unter `/opt/aqla`; Quellpaket unter `/opt/aqla-source`. Vorher vorhandene ungenutzte Docker-/Containerd-Pakete und Caches wurden auf ausdrücklichen Nutzerauftrag entfernt. Debian, SSH, Netzwerk und Provider-Systemdienste bleiben erhalten.
 
+## Vorbereitungspfade — Offlineabnahme 08.10.2026
+
+Der Installer kodiert Zielpfade für die jeweilige systemd-Einstellung. Normale Pfade, Leerzeichen sowie literale Prozentzeichen, Dollarzeichen und geschweifte Klammern werden unterstützt. `WorkingDirectory` und `EnvironmentFile` verwenden rohe Pfadwerte mit maskierten Prozent-Spezifizierern; der vollständige Interpreterpfad ist ein einzelner gequoteter `ExecStart`-Token mit deaktivierter Environment-Substitution. Es wird keine Shell ausgeführt. Auch ein Linux-Verzeichnisname mit einem abschließenden Leerzeichen bleibt erhalten.
+
+Ziele mit C0-/DEL-Kontrollzeichen oder einfachen/doppelten Anführungszeichen werden vor `resolve`, Verzeichnisanlage und Dateikopien abgewiesen. Unter POSIX gilt dies zusätzlich für einen literalen Backslash im Dateinamen: Der native systemd-Parser lehnt diese Executablezeichen auch nach korrekter Tokendekodierung ab. Normale Windows-Pfadseparatoren bleiben für `--prepare-only` zulässig. Wähle einen neuen oder leeren Zielordner; bestehende nichtleere Installationen werden weiterhin unverändert abgewiesen.
+
+Die lokale Linuxprüfung verwendet vorhandene WSL-/systemd-Werkzeuge in einem isolierten Netzwerknamespace und frische synthetische Ziele. `systemd-analyze verify --generators=no --man=no` prüft einen tatsächlich vorhandenen ausführbaren Interpreterpfad; ohne genau diese Datei muss die Gegenprobe den vollständigen Pfad als nicht ausführbar melden. Secret-/Homeverzeichnisse bleiben 0700, Integrationsdatei und `vps.env` 0600. Diese statische Abnahme startet keinen Dienst und ist keine neue Liveabnahme des VPS.
+
 ## Nachgewiesen
 
 - Release-ZIP per verschlüsseltem SFTP übertragen, SHA-256 vor Extraktion verglichen.

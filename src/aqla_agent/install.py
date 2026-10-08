@@ -15,6 +15,25 @@ DEFAULT_MODEL = "deepseek-v4.1-flash"
 DEFAULT_MODEL_URL = "https://opencode.ai/zen/go/v1"
 
 
+def _validate_systemd_destination(destination: Path) -> None:
+    # as_posix keeps a literal POSIX backslash while converting Windows separators.
+    value = destination.as_posix()
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("Deployment destination contains a control character")
+    if any(character in value for character in ("'", '"', "\\")):
+        raise ValueError("Deployment destination contains a quote or literal backslash unsupported in systemd executable paths")
+
+
+def _systemd_path_value(path: Path) -> str:
+    """WorkingDirectory and EnvironmentFile take raw paths, with % specifiers."""
+    return path.as_posix().replace("%", "%%")
+
+
+def _systemd_executable(path: Path) -> str:
+    """One quoted systemd token; ':' preserves literal dollars without a shell."""
+    return ':"' + _systemd_path_value(path) + '"'
+
+
 def hermes_dependency_command(uv, source, python, overrides):
     """One tested minimal runtime recipe for the VPS installer and CI."""
     return [str(uv), "pip", "install", "--python", str(python), "--overrides", str(overrides),
@@ -23,7 +42,9 @@ def hermes_dependency_command(uv, source, python, overrides):
 
 def prepare(project: Path, destination: Path, owner: str,
             model: str = DEFAULT_MODEL, model_url: str = DEFAULT_MODEL_URL):
+    _validate_systemd_destination(destination)
     project, destination = project.resolve(), destination.resolve()
+    _validate_systemd_destination(destination)
     if destination.exists() and any(destination.iterdir()):
         raise ValueError("Deployment destination must be new and empty; existing Hermes installations are never overwritten")
     destination.mkdir(parents=True, exist_ok=True)
@@ -71,6 +92,10 @@ def prepare(project: Path, destination: Path, owner: str,
     env_path = destination / "vps.env"
     env_path.write_text(env, encoding="utf-8")
     os.chmod(env_path, 0o600)
+    directory = _systemd_path_value(destination)
+    if directory.endswith(" "):
+        # The unit reader trims line-end whitespace; a final slash preserves it.
+        directory += "/"
     unit = f"""[Unit]
 Description=aqla Agent (native Hermes Telegram gateway)
 After=network-online.target
@@ -80,9 +105,9 @@ Wants=network-online.target
 Type=simple
 KillMode=mixed
 User=aqla
-WorkingDirectory={destination}
-EnvironmentFile={env_path}
-ExecStart={destination}/hermes-venv/bin/python -m aqla_agent.hermes_runtime
+WorkingDirectory={directory}
+EnvironmentFile={_systemd_path_value(env_path)}
+ExecStart={_systemd_executable(destination / 'hermes-venv/bin/python')} -m aqla_agent.hermes_runtime
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=90
@@ -130,6 +155,7 @@ def main():
     args = parser.parse_args()
     if not args.owner_id.isdigit() or "\n" in args.model or "\n" in args.model_url:
         raise SystemExit("Invalid owner/model configuration")
+    _validate_systemd_destination(Path(args.destination))
     project = Path(__file__).resolve().parents[2]
     if not (project / "config.example.yaml").is_file():
         project = Path.cwd()
