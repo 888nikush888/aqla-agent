@@ -8,6 +8,78 @@ import pytest
 
 from aqla_hyperliquid_mcp.models import AqlaError
 from aqla_hyperliquid_mcp.streams import SUBSCRIPTION_ADAPTER, SUBSCRIPTION_MODELS, Streams
+from aqla_agent.notifications import native_response_bytes
+
+
+@pytest.mark.asyncio
+async def test_subscription_cap_is_checked_before_desired_mutation_and_duplicate_costs_nothing(monkeypatch):
+    stream = Streams("https://example.invalid", max_subscriptions=2)
+    monkeypatch.setattr(stream, "start", lambda: None)
+    btc = await stream.subscribe({"type": "trades", "coin": "BTC"})
+    await stream.subscribe({"type": "trades", "coin": "ETH"})
+    assert await stream.subscribe({"type": "trades", "coin": "BTC"}) == btc
+    before = dict(stream.subscriptions)
+    with pytest.raises(AqlaError, match="budget"):
+        await stream.subscribe({"type": "trades", "coin": "SOL"})
+    assert stream.subscriptions == before
+
+
+def test_event_byte_overflow_has_gap_and_exact_utf8_accounting():
+    stream = Streams("https://example.invalid", max_events=100, max_event_bytes=1500)
+    for index in range(10):
+        stream.receive({"channel": "trades", "data": "🚀" * 80, "sequence": -10})
+    assert stream.sequence == 10 and stream.events[-1]["sequence"] == 10
+    actual = sum(len(json.dumps(row, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")) for row in stream.events)
+    assert stream.buffered_bytes == actual <= 1500
+    assert len(stream.events) < 10 and stream.read()["gap"] and stream.read()["rest_reconciliation_required"]
+
+
+def test_oversize_single_event_is_visible_gap_with_bounded_forward_progress():
+    stream = Streams("https://example.invalid", max_read_bytes=2000)
+    stream.receive({"channel": "trades", "data": "private-payload" * 100000})
+    stream.receive({"channel": "trades", "data": {"small": True}})
+    page = stream.read(limit=1)
+    assert native_response_bytes(page) <= 2000 and page["next_cursor"] == 1
+    assert page["events"][0]["channel"] == "gap" and page["rest_reconciliation_required"]
+    assert "private-payload" not in json.dumps(page)
+    assert stream.read(after=page["next_cursor"])["next_cursor"] == 2
+
+
+def test_complete_stream_read_byte_limit_pages_every_emitted_event():
+    stream = Streams("https://example.invalid", max_read_bytes=4000)
+    for index in range(40):
+        stream.receive({"channel": "trades", "data": {"proof": "\\\"🚀" * 80}})
+    cursor, found = 0, []
+    while cursor < stream.sequence:
+        page = stream.read(after=cursor, limit=1000)
+        assert native_response_bytes(page) <= 4000 and page["events"]
+        assert page["next_cursor"] == page["events"][-1]["sequence"]
+        found.extend(row["sequence"] for row in page["events"])
+        cursor = page["next_cursor"]
+    assert found == list(range(1, 41))
+    with pytest.raises(AqlaError, match="future"):
+        stream.read(after=41)
+
+
+@pytest.mark.asyncio
+async def test_info_response_cannot_confirm_pending_action():
+    stream = Streams("https://example.invalid")
+    future = asyncio.get_running_loop().create_future()
+    stream.pending_posts[1], stream.pending_post_kinds[1] = future, "action"
+    stream.receive({"channel": "post", "data": {"id": 1, "response": {"type": "info", "payload": {"untrusted": True}}}})
+    with pytest.raises(AqlaError, match="response type"):
+        await future
+
+
+def test_stream_diagnostics_contain_only_categories_times_and_counts():
+    stream = Streams("https://example.invalid")
+    stream._failure("decode")
+    stream._failure("transport")
+    stream._failure("timeout")
+    page = stream.read()
+    assert set(page["diagnostics"]["last_error"]) == {"category", "observed_at"}
+    assert page["diagnostics"]["error_counts"] == {"decode": 1, "transport": 1, "timeout": 1}
+    assert page["diagnostics"]["last_error"]["category"] == "timeout"
 
 
 def test_all_documented_subscriptions_have_strict_schemas():
@@ -39,6 +111,7 @@ async def test_post_response_is_correlated_not_mistaken_for_a_feed_event():
     stream = Streams("https://example.invalid")
     future = asyncio.get_running_loop().create_future()
     stream.pending_posts[42] = future
+    stream.pending_post_kinds[42] = "action"
     stream.receive({"channel": "post", "data": {"id": 42, "response": {"type": "action", "payload": {"status": "ok"}}}})
     assert await future == {"status": "ok"}
     assert stream.read()["events"] == []

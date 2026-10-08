@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import zlib
 from collections import deque
@@ -10,10 +11,35 @@ from operator import or_
 from typing import Annotated, Literal
 
 from pydantic import Field, TypeAdapter, create_model
+from typing_extensions import TypedDict
 from websockets.asyncio.client import connect
+
+from aqla_agent.notifications import native_response_bytes
 
 from .catalog import Coin, Interval
 from .models import Address, AqlaError, Model, digest, now_ms
+
+
+class StreamFailure(TypedDict):
+    category: Literal["decode", "transport", "timeout"]
+    observed_at: int
+
+
+class StreamDiagnostics(TypedDict):
+    last_error: StreamFailure | None
+    error_counts: dict[str, int]
+    buffered_bytes: int
+    buffered_events: int
+    dropped_events: int
+
+
+class StreamReadResult(TypedDict):
+    events: list[dict]
+    next_cursor: int
+    gap: bool
+    connected: bool
+    rest_reconciliation_required: bool
+    diagnostics: StreamDiagnostics
 
 SUBSCRIPTION_FIELDS = {
     "allMids": {"dex": (str | None, None)},
@@ -50,7 +76,10 @@ SUBSCRIPTION_ADAPTER = TypeAdapter(Subscription)
 class Streams:
     """Bounded feeds and correlated WS posts. Reconnect never repeats a write."""
 
-    def __init__(self, base_url, *, connector=connect, max_events=4096, timeout=15):
+    def __init__(self, base_url, *, connector=connect, max_events=4096, timeout=15, max_subscriptions=128,
+                 max_event_bytes=8 * 2**20, max_read_bytes=600000):
+        if any(type(value) is not int or value < 1 for value in (max_events, max_subscriptions)) or not 1024 <= max_event_bytes or not 1024 <= max_read_bytes <= 600000:
+            raise ValueError("Stream budgets require positive counts, at least 1024 ring/read bytes and at most 600000 read bytes")
         self.url = base_url.replace("https://", "wss://") + "/ws"
         self.connector = connector
         self.timeout = timeout
@@ -61,8 +90,14 @@ class Streams:
         self.subscription_sync = asyncio.Lock()
         self.active_subscriptions = {}
         self.pending_posts = {}
+        self.pending_post_kinds = {}
         self.posts = 0
-        self.events = deque(maxlen=max_events)
+        self.events, self.event_sizes = deque(), deque()
+        self.max_events, self.max_subscriptions = max_events, max_subscriptions
+        self.max_event_bytes, self.max_read_bytes = max_event_bytes, max_read_bytes
+        self.buffered_bytes, self.lost_through, self.dropped_events = 0, 0, 0
+        self.last_error = None
+        self.error_counts = {"decode": 0, "transport": 0, "timeout": 0}
         self.sequence = 0
         self.task = None
         self.closed = False
@@ -88,11 +123,17 @@ class Streams:
                     self.ready.set()
                     retry = 1
                     async for raw in socket:
-                        self.receive(json.loads(raw))
+                        try:
+                            self.receive(json.loads(raw))
+                        except (ValueError, TypeError, KeyError, AttributeError, AqlaError, binascii.Error, zlib.error):
+                            self._failure("decode")
+                            self._event({"channel": "gap", "data": {"reason": "decode_failure", "rest_reconciliation_required": True}})
             except asyncio.CancelledError:
                 raise
+            except TimeoutError:
+                self._failure("timeout")
             except Exception:
-                pass
+                self._failure("transport")
             finally:
                 self.ready.clear()
                 self.socket = None
@@ -103,6 +144,7 @@ class Streams:
                     if not future.done():
                         future.set_exception(AqlaError("WebSocket response lost; no action was retried"))
                 self.pending_posts.clear()
+                self.pending_post_kinds.clear()
             if not self.closed:
                 await asyncio.sleep(retry)
                 retry = min(retry * 2, 30)
@@ -136,11 +178,41 @@ class Streams:
             raise AqlaError("Fast asset context exceeds the bounded decoding limit")
         return json.loads(output.decode("utf-8"))
 
+    def _failure(self, category):
+        self.error_counts[category] += 1
+        self.last_error = {"category": category, "observed_at": now_ms()}
+
+    def _diagnostics(self) -> StreamDiagnostics:
+        return {"last_error": self.last_error, "error_counts": dict(self.error_counts), "buffered_bytes": self.buffered_bytes,
+                "buffered_events": len(self.events), "dropped_events": self.dropped_events}
+
+    def _read_result(self, rows, after) -> StreamReadResult:
+        gap = after < self.lost_through
+        return {"events": rows, "next_cursor": rows[-1]["sequence"] if rows else after, "gap": gap, "connected": self.ready.is_set(),
+                "rest_reconciliation_required": gap or any(row["channel"] in ("connection", "gap") for row in rows), "diagnostics": self._diagnostics()}
+
     def _event(self, value):
         self.sequence += 1
-        self.events.append({"sequence": self.sequence, "observed_at": now_ms(), **value})
+        row = {**value, "sequence": self.sequence, "observed_at": now_ms()}
+        size = len(json.dumps(row, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
+        if size > self.max_event_bytes or native_response_bytes(self._read_result([row], self.sequence - 1)) > self.max_read_bytes:
+            self.lost_through = self.sequence
+            self.dropped_events += 1
+            row = {"sequence": self.sequence, "observed_at": row["observed_at"], "channel": "gap",
+                   "data": {"reason": "oversize_event", "rest_reconciliation_required": True}}
+            size = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        self.events.append(row)
+        self.event_sizes.append(size)
+        self.buffered_bytes += size
+        while len(self.events) > self.max_events or self.buffered_bytes > self.max_event_bytes:
+            lost = self.events.popleft()
+            self.buffered_bytes -= self.event_sizes.popleft()
+            self.lost_through = max(self.lost_through, lost["sequence"])
+            self.dropped_events += 1
 
     def receive(self, value):
+        if not isinstance(value, dict) or not isinstance(value.get("channel"), str):
+            raise AqlaError("Malformed WebSocket event")
         if value.get("channel") == "post":
             data = value.get("data", {})
             future = self.pending_posts.get(data.get("id"))
@@ -148,7 +220,7 @@ class Streams:
                 response = data.get("response", {})
                 if response.get("type") == "error":
                     future.set_exception(AqlaError("WebSocket post rejected by exchange"))
-                elif response.get("type") in ("info", "action"):
+                elif response.get("type") == self.pending_post_kinds.get(data.get("id")):
                     future.set_result(response.get("payload"))
                 else:
                     future.set_exception(AqlaError("Unknown WebSocket post response type"))
@@ -162,6 +234,8 @@ class Streams:
         if subscription.get("mantissa") is not None and subscription.get("nSigFigs") != 5:
             raise AqlaError("Book mantissa requires five significant figures")
         identity = digest(subscription)
+        if identity not in self.subscriptions and len(self.subscriptions) >= self.max_subscriptions:
+            raise AqlaError("WebSocket subscription budget exceeded")
         self.subscriptions[identity] = subscription
         self.start()
         if self.ready.is_set():
@@ -174,13 +248,27 @@ class Streams:
             await self._sync_subscriptions()
         return {"subscription_id": subscription_id, "desired": False}
 
-    def read(self, after=0, limit=100):
-        if not 1 <= limit <= 1000:
+    def read(self, after=0, limit=100) -> StreamReadResult:
+        if type(after) is not int or after < 0 or type(limit) is not int or not 1 <= limit <= 1000:
             raise AqlaError("Stream read limit must be 1..1000")
-        gap = bool(self.events) and after > 0 and after < self.events[0]["sequence"] - 1
-        rows = [row for row in self.events if row["sequence"] > after][:limit]
-        return {"events": rows, "next_cursor": rows[-1]["sequence"] if rows else after,
-                "gap": gap, "connected": self.ready.is_set(), "rest_reconciliation_required": gap or any(row["channel"] == "connection" for row in rows)}
+        if after > self.sequence:
+            raise AqlaError("Stream cursor cannot refer to a future event")
+        rows = []
+        for row in self.events:
+            if row["sequence"] <= after:
+                continue
+            candidate = self._read_result([*rows, row], after)
+            if native_response_bytes(candidate) > self.max_read_bytes:
+                if rows:
+                    break
+                row = {"sequence": row["sequence"], "observed_at": row["observed_at"], "channel": "gap",
+                       "data": {"reason": "oversize_read_event", "rest_reconciliation_required": True}}
+                if native_response_bytes(self._read_result([row], after)) > self.max_read_bytes:
+                    raise AqlaError("Stream metadata exceeds the configured read budget")
+            rows.append(row)
+            if len(rows) == limit:
+                break
+        return self._read_result(rows, after)
 
     async def post(self, kind, payload):
         if kind not in ("info", "action"):
@@ -191,11 +279,13 @@ class Streams:
         identity = self.posts
         future = asyncio.get_running_loop().create_future()
         self.pending_posts[identity] = future
+        self.pending_post_kinds[identity] = kind
         try:
             await self._send({"method": "post", "id": identity, "request": {"type": kind, "payload": payload}})
             return await asyncio.wait_for(future, self.timeout)
         finally:
             self.pending_posts.pop(identity, None)
+            self.pending_post_kinds.pop(identity, None)
 
     async def close(self):
         self.closed = True
