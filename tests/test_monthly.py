@@ -479,6 +479,60 @@ def test_monthly_shrink_clears_old_content_tail():
     assert len(values_writes(google)) == 1
 
 
+@pytest.mark.parametrize("fault", ["tail_edit", "lost_commit_reply", "lost_final_readback"])
+def test_monthly_failed_final_shrink_readback_keeps_owned_tail_on_retry(monkeypatch, fault):
+    google, client = sheet_client()
+    old = report_at(data(*(trade(f"old-{index}") for index in range(15))), 1)
+    assert client.publish_monthly(old)["status"] == "published"
+    old_values, _ = table_values(old)
+    shrunk = report_at(data(), 2)
+    new_values, _ = table_values(shrunk)
+    title, tail_index = "aqla Mainnet Monatsbericht 2026-10", len(new_values) + 1
+    original, edited, lost = google.request, False, False
+
+    def edit_at_confirmation(method, url, **kwargs):
+        nonlocal edited, lost
+        result = original(method, url, **kwargs)
+        for operation in kwargs.get("json", {}).get("requests", []):
+            value = operation.get("updateDeveloperMetadata", {}).get("developerMetadata", {}).get("metadataValue", "")
+            if '"confirmed":' in value:
+                manifest = json.loads(value)
+                if manifest["confirmed"] and manifest["revision"] == 2 and not edited:
+                    edited = True
+                    google.tables[title][tail_index][0] = "previously owned tail changed at confirmation"
+                    if fault == "lost_commit_reply":
+                        lost = True
+                        raise OSError("Confirmation reply lost after metadata commit")
+        if fault == "lost_final_readback" and edited and not lost and method == "GET" and url.endswith("/values:batchGet"):
+            if any(Google.coordinates(query)[4] == len(old_values) for query in kwargs["params"]["ranges"]):
+                lost = True
+                raise OSError("Final old-tail verification reply lost")
+        return result
+
+    monkeypatch.setattr(google, "request", edit_at_confirmation)
+    first = client.publish_monthly(shrunk)
+    assert edited
+    assert first == {"status": "blocked" if fault == "tail_edit" else "retry", "publication": None,
+                     "error_code": "integrity" if fault == "tail_edit" else "temporary"}
+    google.calls.clear()
+    retry = client.publish_monthly(shrunk)
+    assert retry == {"status": "blocked", "publication": None, "error_code": "integrity"}
+    assert google.tables[title][tail_index][0] == "previously owned tail changed at confirmation"
+    assert values_writes(google) == []
+    queries = [Google.coordinates(query) for method, url, kwargs in google.calls
+               if method == "GET" and url.endswith("/values:batchGet") for query in kwargs["params"]["ranges"]]
+    assert any(query[0] == title and query[4] == len(old_values) for query in queries)
+    # Restoring the observed tail permits a fully checked, write-free retry.
+    google.tables[title][tail_index][0] = ""
+    google.calls.clear()
+    assert client.publish_monthly(shrunk)["status"] == "published"
+    assert values_writes(google) == []
+    # A later generation still writes only the old/new actual content length.
+    google.calls.clear()
+    assert client.publish_monthly(report_at(data(), 3))["status"] == "published"
+    assert written_rows(google) == len(new_values)
+
+
 def test_monthly_external_cell_edit_is_not_acknowledged():
     google, client = sheet_client()
     report = report_at(data(trade()), 1)

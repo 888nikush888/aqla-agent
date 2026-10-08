@@ -39,7 +39,7 @@ class MonthlyManifest(Model):
 
     @model_validator(mode="after")
     def valid_extent(self):
-        if self.extent < self.length or self.confirmed and self.extent != self.length:
+        if self.extent < self.length:
             raise ValueError("Invalid monthly content extent")
         return self
 
@@ -182,19 +182,23 @@ def _publish(client, report):
         manifest, metadata_id = _manifest(raw, sheet_id)
         _check_generation(manifest, _read_values(client, title, 4), report)
         if manifest and manifest.confirmed:
-            previous = _read_values(client, title, manifest.length)
-            if digest(previous) != manifest.content_digest:
+            checked = _read_values(client, title, manifest.extent)
+            previous = checked[:manifest.length]
+            if digest(previous) != manifest.content_digest or any(any(row) for row in checked[manifest.length:]):
                 raise PublicationRejected("integrity")
             if manifest.revision == report["revision"]:
                 if manifest.length != len(values) or previous != values:
                     raise PublicationRejected("integrity")
                 _guard(client, title, sheet_id, report, manifest)
-                if _read_values(client, title, manifest.length) != values:
+                expected = values + [[""] * len(HEADERS) for _ in range(manifest.extent - len(values))]
+                if _read_values(client, title, manifest.extent) != expected:
                     raise PublicationRejected("integrity")
                 return MonthlyPublication(month=report["month"], fingerprint=report["fingerprint"], revision=report["revision"],
                     url=f"https://docs.google.com/spreadsheets/d/{client.settings.spreadsheet_id}/edit#gid={sheet_id}")
         # Without a manifest, the old writer could have used every grid row.
-        extent = max(len(values), manifest.extent if manifest else 0 if created else prop["gridProperties"]["rowCount"])
+        write_extent = max(len(values), (manifest.length if manifest.confirmed else manifest.extent)
+                           if manifest else 0 if created else prop["gridProperties"]["rowCount"])
+        extent = max(write_extent, manifest.extent if manifest else 0)
         if extent > 20_000:
             raise PublicationRejected("budget")
         if extent > prop["gridProperties"]["rowCount"]:
@@ -212,8 +216,8 @@ def _publish(client, report):
         from .client import column
         last = column(len(HEADERS))
         if not legacy_confirmed:
-            for offset in range(0, extent, 100):
-                chunk = padded[offset:offset + 100]
+            for offset in range(0, write_extent, 100):
+                chunk = padded[offset:min(offset + 100, write_extent)]
                 client.request("POST", "/values:batchUpdate", json={"valueInputOption": "RAW", "data": [{
                     "range": f"'{title}'!A{offset + 1}:{last}{offset + len(chunk)}", "values": chunk}]})
         # Verify every written cell, not merely a returned digest or a successful first chunk.
@@ -230,7 +234,9 @@ def _publish(client, report):
             {"repeatCell": {"range": {"sheetId": sheet_id}, "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP"}}, "fields": "userEnteredFormat.wrapStrategy"}}
         ]})
         _guard(client, title, sheet_id, report, pending)
-        confirmed = pending.model_copy(update={"confirmed": True, "extent": len(values)})
+        # Retain every formerly owned tail position across commit/readback loss.
+        # Content length bounds writes; extent independently bounds verification.
+        confirmed = pending.model_copy(update={"confirmed": True})
         _store_manifest(client, sheet_id, confirmed, metadata_id)
         _guard(client, title, sheet_id, report, confirmed)
         if _read_values(client, title, extent) != padded:

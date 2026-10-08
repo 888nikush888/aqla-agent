@@ -53,7 +53,12 @@ identische bestätigte Generation wird erst nach Prüfung aller Inhaltszellen
 quittiert und benötigt keine Valueswrites. Unbestätigte gleiche Generationen
 können nach einer verlorenen Antwort repariert werden. Neue und schrumpfende
 Berichte schreiben und prüfen nur die größere alte beziehungsweise neue
-Inhaltslänge; der alte Tail wird gelöscht. Große Rasterkapazität wird nicht als
+Inhaltslänge; der alte Tail wird gelöscht. Der bekannte vormals eigene Prüfumfang
+bleibt im Manifest auch nach einer schrumpfenden bestätigten Generation erhalten.
+Jede spätere Quittierung prüft diesen gesamten Tail auf leere Zellen; verlorene
+Commit- oder Readbackantworten dürfen eine dort festgestellte Änderung nicht
+durch eine verkürzte Prüfung vergessen. Die tatsächliche Inhaltslänge begrenzt
+weiterhin neue Valueswrites. Große Rasterkapazität wird nicht als
 Inhaltslänge behandelt. Legacytabs ohne Manifest werden konservativ im gesamten
 vorhandenen Raster bis zum bisherigen Verifikationsbudget geprüft beziehungsweise
 überführt.
