@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import yaml
 
-SYNTHETIC_PASSWORD = "native-fixture-marker-never-a-user-credential"
+SYNTHETIC_PASSWORD = "/native-fixture-marker-never-a-user-credential"
 
 
 async def grant_fixture(extension):
@@ -42,6 +42,7 @@ def main():
     from aqla_agent.events import EXTENSIONS
     from aqla_agent.hermes_runtime import install_strict_profile
     from aqla_agent.install import prepare
+    from aqla_agent.native_setup import SETUP_PROMPT, NativeSetup
     from aqla_agent.setup import write_password_hash
     from aqla_hyperliquid_mcp.models import AqlaError
     from aqla_hyperliquid_mcp.storage import read_snapshot
@@ -93,7 +94,7 @@ def main():
                 result = [payload(SYNTHETIC_PASSWORD, 2)]
             elif endpoint == "sendMessage":
                 sent.append(request_data.parameters)
-                result = {"message_id": 1001 + len(sent), "date": 1791490000, "chat": {"id": 12345, "type": "private"}, "text": "safe setup reply"}
+                result = {"message_id": 1001 + len(sent), "date": 1791490000, "chat": {"id": 12345, "type": "private"}, "text": request_data.parameters["text"]}
             elif endpoint == "deleteMessage":
                 deleted.append(request_data.parameters)
                 result = True
@@ -132,6 +133,30 @@ def main():
                 pass
             else:
                 raise AssertionError("Revoked native grant was accepted")
+            await app.process_update(Update.de_json(payload("/setup", 4), app.bot))
+            old_prompt = extension.setup.challenge.prompt_id
+            forwarded = payload(SYNTHETIC_PASSWORD, 5)
+            forwarded["message"]["forward_origin"] = {"type": "user", "date": 1791490000,
+                "sender_user": {"id": 6789, "is_bot": False, "first_name": "Synthetic source"}}
+            await app.process_update(Update.de_json(forwarded, app.bot))
+            assert extension.setup.claims() is None and len(deleted) == 2 and admitted == []
+            edited = payload(SYNTHETIC_PASSWORD, 6)
+            edited["edited_message"] = edited.pop("message")
+            edited["edited_message"]["edit_date"] = 1791490001
+            await app.process_update(Update.de_json(edited, app.bot))
+            assert extension.setup.claims() is None and len(deleted) == 3 and admitted == []
+            # Recreate ingress state as after process restart. The reply metadata
+            # is authenticated by the actual PTB Update parser and current bot.
+            extension.revoke_setup()
+            extension.setup = NativeSetup(extension.owner, extension.setup.verifier,
+                                          extension.setup_request, extension.setup_binding)
+            assert extension.setup.challenge is None and extension.setup.old_prompts == set()
+            late = payload(SYNTHETIC_PASSWORD, 7)
+            late["message"]["reply_to_message"] = {"message_id": old_prompt, "date": 1791490000,
+                "chat": {"id": 12345, "type": "private"},
+                "from": {"id": app.bot.id, "is_bot": True, "first_name": "Synthetic"}, "text": SETUP_PROMPT}
+            await app.process_update(Update.de_json(late, app.bot))
+            assert extension.setup.claims() is None and len(deleted) == 4 and admitted == []
             assert SYNTHETIC_PASSWORD not in captured.getvalue()
             assert extension.authority.key.decode() not in captured.getvalue()
             assert SYNTHETIC_PASSWORD not in json.dumps(read_snapshot(home / "data/state.sqlite3"))
@@ -145,7 +170,9 @@ def main():
             await asyncio.gather(*tasks, return_exceptions=True)
             await app.shutdown()
         print(json.dumps({"native_ptb_setup": True, "debug_secret_free": True, "deletion_before_grant": True,
-                          "mcp_revocation": True, "model_admissions": len(admitted)}))
+                          "mcp_revocation": True, "slash_password": True, "forwarded_candidate_deleted": True,
+                          "edited_candidate_deleted": True, "restart_late_reply_deleted": True,
+                          "candidate_deletions": len(deleted), "model_admissions": len(admitted)}))
     try:
         asyncio.run(run())
     finally:

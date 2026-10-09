@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aqla_agent.native_setup import NativeSetup, PrivateTransportLogs
+from aqla_agent.native_setup import SETUP_PROMPT, NativeSetup, PrivateTransportLogs
 from aqla_agent.setup import SetupBinding, SetupGate, SetupVerifier
 from aqla_hyperliquid_mcp.models import AqlaError
 
@@ -13,6 +13,8 @@ MARKER = "synthetic-only-password-not-a-user-secret"
 
 
 class Bot:
+    id = 999
+
     def __init__(self):
         self.deleted, self.sent = [], []
         self.ack = True
@@ -29,10 +31,12 @@ class Bot:
         return self.ack
 
 
-def update(text, *, owner="12345", forwarded=False, reply=None, bot=False, chat_type="private"):
-    return SimpleNamespace(effective_message=SimpleNamespace(text=text, message_id=77,
+def update(text, *, owner="12345", forwarded=False, reply=None, bot=False, chat_type="private", edited=False, via_bot=False):
+    message = SimpleNamespace(text=text, message_id=77,
         from_user=SimpleNamespace(id=owner, is_bot=bot), chat=SimpleNamespace(id="12345", type=chat_type),
-        forward_origin=True if forwarded else None, reply_to_message=SimpleNamespace(message_id=reply) if reply else None))
+        forward_origin=True if forwarded else None, via_bot=True if via_bot else None,
+        reply_to_message=SimpleNamespace(message_id=reply) if reply else None)
+    return SimpleNamespace(effective_message=message, edited_message=message if edited else None)
 
 
 def fixture_controller():
@@ -206,6 +210,60 @@ async def test_old_challenge_answer_never_cancels_new_valid_challenge():
     assert native.claims() is None
     assert native.challenge == current
     assert len(bot.deleted) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("password", ["/private-synthetic-marker", "/setup arbitrary-synthetic-password"])
+async def test_unknown_slash_password_is_deleted_verified_locally_and_never_sent_to_mcp(password):
+    native, bot, _, _, _, calls, checks = fixture_controller()
+    async def verify(text):
+        checks.append(text)
+        assert bot.deleted and native.claims() is None
+        return text == password
+    native.verifier.verify = verify
+    await native.intercept(update("/setup"), bot)
+    assert await native.intercept(update(password), bot)
+    assert checks == [password] and native.claims() is not None
+    assert password not in json.dumps(calls + bot.sent + bot.deleted)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kwargs", [{"forwarded": True}, {"via_bot": True}, {"edited": True}])
+async def test_untrusted_owner_dm_candidates_are_deleted_without_verification_or_grant(kwargs):
+    native, bot, _, _, _, calls, checks = fixture_controller()
+    await native.intercept(update("/setup"), bot)
+    assert await native.intercept(update(MARKER, **kwargs), bot)
+    assert len(bot.deleted) == 1 and checks == [] and native.claims() is None
+    assert not any(row["action"] == "setup_grant" for row in calls)
+    assert MARKER not in json.dumps(calls + bot.sent + bot.deleted)
+
+
+@pytest.mark.asyncio
+async def test_restart_recognizes_exact_own_bot_prompt_and_deletes_late_password():
+    native, bot, _, _, _, calls, checks = fixture_controller()
+    assert native.challenge is None and native.old_prompts == set()
+    candidate = update("/late-synthetic-password")
+    candidate.effective_message.reply_to_message = SimpleNamespace(message_id=2000, text=SETUP_PROMPT,
+        from_user=SimpleNamespace(id=bot.id, is_bot=True), chat=SimpleNamespace(id="12345", type="private"))
+    assert await native.intercept(candidate, bot)
+    assert len(bot.deleted) == 1 and checks == [] and calls == [] and native.claims() is None
+    assert "/late-synthetic-password" not in json.dumps(bot.sent + bot.deleted)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [("bot_id", 998), ("bot", False), ("chat_id", "other"),
+                                        ("chat_type", "group"), ("text", "unrelated bot message")])
+async def test_restart_prompt_recognition_requires_exact_bot_private_chat_and_prompt(field, value):
+    native, bot, _, _, _, calls, checks = fixture_controller()
+    prompt = SimpleNamespace(message_id=2000, text=SETUP_PROMPT,
+        from_user=SimpleNamespace(id=bot.id, is_bot=True), chat=SimpleNamespace(id="12345", type="private"))
+    target, attribute = {"bot_id": (prompt.from_user, "id"), "bot": (prompt.from_user, "is_bot"),
+                         "chat_id": (prompt.chat, "id"), "chat_type": (prompt.chat, "type"), "text": (prompt, "text")}[field]
+    setattr(target, attribute, value)
+    candidate = update("normal owner message")
+    candidate.effective_message.reply_to_message = prompt
+    assert await native.intercept(candidate, bot) is False
+    assert bot.deleted == [] and bot.sent == [] and calls == [] and checks == []
 
 
 @pytest.mark.asyncio
