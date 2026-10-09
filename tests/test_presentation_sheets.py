@@ -1,6 +1,8 @@
 """Actual Sheets HTTP request vectors against a stateful, credential-free boundary."""
 import copy
 import json
+import math
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +14,7 @@ from test_sheets import Google
 from aqla_agent.presentation import PresentationScope
 from aqla_agent.presentation import build_presentation as projection
 from aqla_hyperliquid_mcp.auth import Authority
-from aqla_hyperliquid_mcp.models import AqlaError, GoogleSheetsSettings, Settings
+from aqla_hyperliquid_mcp.models import AqlaError, GoogleSheetsSettings, Settings, digest
 from aqla_sheets_mcp.client import SheetsClient
 from aqla_sheets_mcp.journal import (
     HEADERS,
@@ -39,6 +41,43 @@ class PresentationGoogle(Google):
         self.batch_writes = 0
         self.post_count = 0
         self.lose_post = None
+        self.normalize_charts = False
+
+    def _native_chart(self, chart):
+        chart = copy.deepcopy(chart)
+        if not self.normalize_charts:
+            return chart
+        spec, basic = chart["spec"], chart["spec"]["basicChart"]
+        spec.pop("backgroundColor", None)
+        spec.pop("backgroundColorStyle", None)  # Native Sheets omits default white.
+        series = basic["series"][0]
+        region = series["series"]["sourceRange"]["sources"][0]
+        rows = self.tables[self._props(region["sheetId"])["title"]]
+        values = [row[region["startColumnIndex"]] for row in rows[1:region["endRowIndex"]] if len(row) > region["startColumnIndex"]]
+        numeric = any(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values)
+        domain = basic["domains"][0]["domain"]["sourceRange"]["sources"][0]
+        labels = any(len(row) > domain["startColumnIndex"] and row[domain["startColumnIndex"]] != ""
+                     for row in rows[1:domain["endRowIndex"]])
+        axes = {axis["position"]: copy.deepcopy(axis) for axis in basic["axis"]}
+        for position in ("BOTTOM_AXIS", "LEFT_AXIS"):
+            axes.setdefault(position, {"position": position})
+            axes[position]["viewWindowOptions"] = {}
+            if not numeric:
+                axes[position].pop("title", None)
+        basic["axis"] = [axes[position] for position in ("BOTTOM_AXIS", "LEFT_AXIS")]
+        if not numeric:
+            series.pop("color", None)
+            series.pop("colorStyle", None)
+            if basic["chartType"] == "BAR" and labels:
+                basic.pop("series")
+                basic["axis"] = [axes["LEFT_AXIS"]]
+        else:
+            rgb = series.get("colorStyle", {}).get("rgbColor", series.get("color"))
+            if rgb:
+                quantized = {key: math.floor(value * 255) / 255 for key, value in rgb.items()}
+                series["color"] = quantized
+                series["colorStyle"] = {"rgbColor": copy.deepcopy(quantized)}
+        return chart
 
     def request(self, method, url, **kwargs):
         if method == "GET" and not url.endswith("/values:batchGet"):
@@ -87,14 +126,15 @@ class PresentationGoogle(Google):
                 elif "updateSpreadsheetProperties" in operation:
                     self.title = operation["updateSpreadsheetProperties"]["properties"]["title"]
                 elif "addChart" in operation:
-                    chart = copy.deepcopy(operation["addChart"]["chart"])
+                    chart = self._native_chart(operation["addChart"]["chart"])
                     assert not any(chart["chartId"] == row["chartId"] for rows in self.charts.values() for row in rows)
                     identity = chart["position"]["overlayPosition"]["anchorCell"]["sheetId"]
                     assert self._props(identity)["gridProperties"]["columnCount"] >= 34
                     self.charts.setdefault(identity, []).append(chart)
                 elif "updateChartSpec" in operation:
                     update = operation["updateChartSpec"]
-                    next(row for rows in self.charts.values() for row in rows if row["chartId"] == update["chartId"])["spec"] = copy.deepcopy(update["spec"])
+                    previous = next(row for rows in self.charts.values() for row in rows if row["chartId"] == update["chartId"])
+                    previous["spec"] = self._native_chart({**previous, "spec": update["spec"]})["spec"]
                 elif "updateEmbeddedObjectPosition" in operation:
                     update = operation["updateEmbeddedObjectPosition"]
                     next(row for rows in self.charts.values() for row in rows if row["chartId"] == update["objectId"])["position"] = copy.deepcopy(update["newPosition"])
@@ -209,10 +249,142 @@ def test_google_omitted_zero_defaults_and_float32_colors_do_not_cause_rewrites(w
     chart = google.charts[0][0]
     chart["position"]["overlayPosition"].pop("offsetXPixels")
     chart["position"]["overlayPosition"]["anchorCell"].pop("columnIndex")
-    chart["spec"]["basicChart"]["series"][0]["color"]["red"] = .119999997
+    chart["spec"]["basicChart"]["series"][0]["colorStyle"]["rgbColor"]["red"] = .119999997
     chart["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"][0].pop("startRowIndex")
     google.calls.clear()
     assert publish(client, snapshot, clock=60)["status"] == "unchanged" and writes(google) == []
+
+
+def test_native_styles_default_axes_and_8bit_colors_publish_after_verified_data_without_rewrites(workbook):
+    google, client, source = workbook
+    google.normalize_charts = True
+    snapshot = build_presentation(source, clock=CLOCK)
+    assert publish(client, snapshot, clock=0)["status"] == "published"
+    for index, chart in enumerate(google.charts[0]):
+        spec, basic = chart["spec"], chart["spec"]["basicChart"]
+        assert "backgroundColorStyle" not in spec and "backgroundColor" not in spec
+        assert {axis["position"] for axis in basic["axis"]} == {"LEFT_AXIS", "BOTTOM_AXIS"}
+        rgb = basic["series"][0]["colorStyle"]["rgbColor"]
+        assert rgb == {"red": 30 / 255, "green": 91 / 255, "blue": 173 / 255}
+        assert any(axis.get("title") == ("R" if index == 3 else "USDT") for axis in basic["axis"])
+    posts = writes(google)
+    values_index = max(index for index, (url, _) in enumerate(posts) if url.endswith("/values:batchUpdate"))
+    charts_index = next(index for index, (_, kwargs) in enumerate(posts)
+                        if any("addChart" in request for request in kwargs["json"].get("requests", [])))
+    assert charts_index > values_index
+    assert all("backgroundColorStyle" in request["addChart"]["chart"]["spec"]
+               for _, kwargs in posts for request in kwargs["json"].get("requests", []) if "addChart" in request)
+    journal_id = google.properties["Journal"]["sheetId"]
+    dimensions = [request["updateDimensionProperties"] for _, kwargs in posts
+                  for request in kwargs["json"].get("requests", []) if "updateDimensionProperties" in request]
+    assert any(row["range"] == {"sheetId": journal_id, "dimension": "COLUMNS", "startIndex": 19, "endIndex": 22}
+               and row["properties"] == {"hiddenByUser": True} for row in dimensions)
+    assert any(row["range"] == {"sheetId": journal_id, "dimension": "ROWS", "startIndex": 1, "endIndex": 2}
+               and row["properties"] == {"pixelSize": 48} for row in dimensions)
+    assert google.tables["Journal"][1][20] == "aster"  # Hidden linked identity is retained.
+    google.calls.clear()
+    assert publish(client, snapshot, clock=60)["status"] == "unchanged" and writes(google) == []
+
+
+def test_native_empty_bar_omits_series_and_numeric_axis_only_without_net_r_evidence(workbook):
+    google, client, source = workbook
+    google.normalize_charts = True
+    source["trades"]["aster"]["execution_incident"] = True
+    source["source_ranks"] = {identity: {"tier": "C", "origin": "manual"}
+                              for identity in ["-1001", *[f"synthetic-{index}" for index in range(13)]]}
+    snapshot = build_presentation(source, clock=CLOCK)
+    assert len(snapshot.channels) == 14 and all(row.net_r is None for row in snapshot.channels)
+    assert snapshot.net_pnl.value == Decimal("15.1") and snapshot.funding.value == 0
+    assert publish(client, snapshot, clock=0)["status"] == "published"
+    chart = google.charts[0][3]
+    assert "series" not in chart["spec"]["basicChart"]
+    assert chart["spec"]["basicChart"]["axis"] == [{"position": "LEFT_AXIS", "viewWindowOptions": {}}]
+    assert chart["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"][0]["startColumnIndex"] == 32
+    assert "R je Setup" in chart["spec"]["title"] and chart["spec"]["hiddenDimensionStrategy"] == "SHOW_ALL"
+    assert all(google.tables["Dashboard"][index][33] == "" for index in range(1, 15))
+    google.calls.clear()
+    assert publish(client, snapshot, clock=60)["status"] == "unchanged" and writes(google) == []
+    # A missing default axis or a moved domain is damage, rather than canonical empty-series output.
+    chart["spec"]["basicChart"]["axis"] = []
+    assert publish(client, snapshot, clock=120)["status"] == "published"
+    chart["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"][0]["startColumnIndex"] = 30
+    assert publish(client, snapshot, clock=180)["status"] == "published"
+
+
+def test_known_zero_net_r_requires_series_and_unit_axis_and_can_repair_missing_series(workbook):
+    google, client, source = workbook
+    google.normalize_charts = True
+    trade = source["trades"]["aster"]
+    trade["funding_events"] = {"synthetic-funding": {"amount": "-15.1"}}
+    trade["funding_coverage"]["payments_fingerprint"] = digest(trade["funding_events"])
+    snapshot = build_presentation(source, clock=CLOCK)
+    assert snapshot.net_pnl.value == 0 and snapshot.channels[0].net_r == 0
+    publish(client, snapshot, clock=0)
+    assert google.tables["Dashboard"][1][33] == 0
+    channel = google.charts[0][3]
+    channel["spec"]["basicChart"].pop("series")
+    channel["spec"]["basicChart"]["axis"] = [{"position": "LEFT_AXIS"}]
+    assert publish(client, snapshot, clock=60)["status"] == "published"
+    assert channel["spec"]["basicChart"]["series"][0]["targetAxis"] == "BOTTOM_AXIS"
+    assert next(row for row in channel["spec"]["basicChart"]["axis"] if row["position"] == "BOTTOM_AXIS")["title"] == "R"
+
+
+def test_charts_created_before_cells_are_reapplied_after_data_and_confirmed(workbook):
+    google, client, source = workbook
+    snapshot = build_presentation(source, clock=CLOCK)
+    publish(client, snapshot, clock=0)
+    saved = google.tables["Dashboard"]
+    google.tables["Dashboard"] = []
+    google.normalize_charts = True
+    google.charts[0] = [google._native_chart(chart) for chart in google.charts[0]]
+    google.tables["Dashboard"] = saved
+    assert all("title" not in axis for chart in google.charts[0] for axis in chart["spec"]["basicChart"]["axis"])
+    metadata = next(row for row in google.metadata if row["metadataKey"] == "aqla.presentation.v1")
+    pending = json.loads(metadata["metadataValue"])
+    pending["confirmed"] = False
+    metadata["metadataValue"] = json.dumps(pending)
+    before = raw_content(google)
+    google.calls.clear()
+    assert publish(client, snapshot, clock=60)["status"] == "published"
+    assert json.loads(metadata["metadataValue"])["confirmed"] is True
+    assert raw_content(google) == before and len(google.charts[0]) == 4
+    assert not any(url.endswith("/values:batchUpdate") for url, _ in writes(google))
+    updates = [request["updateChartSpec"] for _, kwargs in writes(google)
+               for request in kwargs["json"].get("requests", []) if "updateChartSpec" in request]
+    assert {row["chartId"] for row in updates} == {104800, 104801, 104802, 104803}
+    assert all(any(axis.get("title") == ("R" if index == 3 else "USDT")
+                   for axis in chart["spec"]["basicChart"]["axis"]) for index, chart in enumerate(google.charts[0]))
+    google.calls.clear()
+    assert publish(client, snapshot, clock=120)["status"] == "unchanged" and writes(google) == []
+
+
+@pytest.mark.parametrize("damage", ["series", "unit", "source", "color", "hidden", "title", "placement"])
+def test_normalized_nonempty_native_charts_still_repair_financial_semantic_damage(workbook, damage):
+    google, client, source = workbook
+    google.normalize_charts = True
+    snapshot = build_presentation(source, clock=CLOCK)
+    before = raw_content(google)
+    publish(client, snapshot, clock=0)
+    chart = google.charts[0][0]
+    basic = chart["spec"]["basicChart"]
+    if damage == "series":
+        basic.pop("series")
+    elif damage == "unit":
+        next(axis for axis in basic["axis"] if axis["position"] == "LEFT_AXIS")["title"] = "USDT+USDC"
+    elif damage == "source":
+        basic["series"][0]["series"]["sourceRange"]["sources"][0]["startColumnIndex"] = 29
+    elif damage == "color":
+        basic["series"][0]["colorStyle"]["rgbColor"]["red"] = .9
+    elif damage == "hidden":
+        chart["spec"]["hiddenDimensionStrategy"] = "SKIP_HIDDEN_COLUMNS"
+    elif damage == "title":
+        chart["spec"]["title"] = "Kontoequity"
+    else:
+        chart["position"]["overlayPosition"]["anchorCell"]["rowIndex"] = 24
+    assert publish(client, snapshot, clock=60)["status"] == "published"
+    assert raw_content(google) == before
+    google.calls.clear()
+    assert publish(client, snapshot, clock=120)["status"] == "unchanged" and writes(google) == []
 
 
 @pytest.mark.parametrize("lost", [":batchUpdate", "/values:batchUpdate"])
@@ -231,7 +403,7 @@ def test_lost_reply_restart_reuses_sheets_charts_and_raw_rows(workbook, lost):
     assert publish(restarted, snapshot, clock=120)["status"] == "unchanged" and writes(google) == []
 
 
-@pytest.mark.parametrize("lost_post", range(1, 11))
+@pytest.mark.parametrize("lost_post", range(1, 12))
 def test_each_publication_stage_recovers_after_accepted_write_and_lost_response(workbook, lost_post):
     google, client, source = workbook
     before = raw_content(google)
@@ -333,7 +505,7 @@ def test_later_chart_write_lost_reply_persists_minute_gate_before_mutation(workb
     first = build_presentation(source, clock=CLOCK)
     publish(client, first, clock=0)
     second = build_presentation(source, {"currency": "USDT", "period": "all"}, CLOCK)
-    google.lose_post = google.post_count + 2  # Durable pending metadata, then native chart edit.
+    google.lose_post = google.post_count + 3  # Durable pending metadata, dashboard cells, then native chart edit.
     with pytest.raises(AqlaError, match="remain pending"):
         publish(client, second, clock=60)
     assert google.charts[0][1]["spec"]["title"] == "Monatsergebnisse · USDT"

@@ -137,10 +137,10 @@ def chart_specs(snapshot: PresentationSnapshot, sheet_id: int) -> list[dict]:
         def source(offset, length=length, start=start):
             return {"sourceRange": {"sources": [{"sheetId": sheet_id, "startRowIndex": 0,
                     "endRowIndex": max(2, length + 1), "startColumnIndex": start + offset, "endColumnIndex": start + offset + 1}]}}
-        spec = {"title": title, "fontName": "Arial", "backgroundColor": {"red": 1, "green": 1, "blue": 1},
+        spec = {"title": title, "fontName": "Arial", "backgroundColorStyle": {"rgbColor": {"red": 1, "green": 1, "blue": 1}},
                 "hiddenDimensionStrategy": "SHOW_ALL",
                 "basicChart": {"chartType": kind, "legendPosition": "NO_LEGEND", "headerCount": 1,
-                               "domains": [{"domain": source(0)}], "series": [{"series": source(1), "targetAxis": "BOTTOM_AXIS" if kind == "BAR" else "LEFT_AXIS", "color": BLUE}],
+                               "domains": [{"domain": source(0)}], "series": [{"series": source(1), "targetAxis": "BOTTOM_AXIS" if kind == "BAR" else "LEFT_AXIS", "colorStyle": {"rgbColor": BLUE}}],
                                "axis": [{"position": "BOTTOM_AXIS" if kind == "BAR" else "LEFT_AXIS", "title": unit}]}}
         result.append({"chartId": 104800 + index, "spec": spec, "position": {"overlayPosition": {
             "anchorCell": {"sheetId": sheet_id, "rowIndex": row, "columnIndex": col}, "widthPixels": 520,
@@ -304,18 +304,78 @@ def _contains(actual, wanted):
     return math.isclose(actual, wanted, rel_tol=1e-6, abs_tol=1e-6) if isinstance(wanted, float) and isinstance(actual, (int, float)) else actual == wanted
 
 
+def _chart_color_matches(actual, field, color, *, missing=False):
+    """Sheets omits default white and serializes RGB as float32 or 8-bit colors."""
+    style = actual.get(field + "Style")
+    observed = style.get("rgbColor") if isinstance(style, dict) else actual.get(field)
+    if observed is None:
+        return missing and style is None and actual.get(field) is None
+    if not isinstance(observed, dict) or observed.get("alpha", 1) != 1:
+        return False
+    quantized = {channel: math.floor(value * 255) / 255 for channel, value in color.items()}
+    return _contains(observed, color) or _contains(observed, quantized)
+
+
+def _chart_has_numbers(snapshot, index):
+    points = snapshot.monthly_pnl if snapshot.scope.period == "all" else snapshot.daily_pnl
+    values = ([row.value for row in snapshot.cumulative_realized_net], [row.value for row in points],
+              [snapshot.fees.value, snapshot.funding.value], [row.net_r for row in snapshot.channels])
+    # Zero is actual numeric evidence. It must retain its series and unit axis.
+    return any(value is not None for value in values[index])
+
+
+def _chart_spec_matches(actual, wanted, *, has_numbers):
+    """Compare financial chart semantics, allowing only observed native defaults."""
+    if not isinstance(actual, dict) or not _contains(actual, {key: wanted[key] for key in ("title", "fontName", "hiddenDimensionStrategy")}):
+        return False
+    if not _chart_color_matches(actual, "backgroundColor", {"red": 1, "green": 1, "blue": 1}, missing=True):
+        return False
+    basic, desired = actual.get("basicChart"), wanted["basicChart"]
+    if not isinstance(basic, dict) or not _contains(basic, {key: desired[key] for key in ("chartType", "legendPosition", "headerCount", "domains")}):
+        return False
+    series = basic.get("series", [])
+    # Native BAR charts with labels but no numeric evidence omit the sole empty
+    # series and its numeric axis. The domain remains bound to our verified cells.
+    empty_bar = not has_numbers and desired["chartType"] == "BAR" and series == []
+    if not empty_bar:
+        if not isinstance(series, list) or len(series) != 1:
+            return False
+        if not _contains(series[0], {key: desired["series"][0][key] for key in ("series", "targetAxis")}):
+            return False
+        if not _chart_color_matches(series[0], "color", BLUE, missing=not has_numbers):
+            return False
+    axes = basic.get("axis", [])
+    if not isinstance(axes, list) or any(not isinstance(axis, dict) for axis in axes):
+        return False
+    positions = [axis.get("position") for axis in axes]
+    if len(set(positions)) != len(positions) or any(position not in ("BOTTOM_AXIS", "LEFT_AXIS") for position in positions):
+        return False
+    if empty_bar and positions != ["LEFT_AXIS"]:
+        return False
+    for axis in desired["axis"]:
+        observed = next((row for row in axes if row.get("position") == axis["position"]), None)
+        if observed is None:
+            if not empty_bar:
+                return False
+        elif observed.get("title") != axis["title"] and (has_numbers or observed.get("title") not in (None, "")):
+            return False
+    # Sheets adds the other default axis. A contradictory unit is not a default.
+    expected_positions = {axis["position"] for axis in desired["axis"]}
+    return all(axis.get("title") in (None, "") for axis in axes if axis["position"] not in expected_positions)
+
+
 def _chart_requests(raw, snapshot, ids):
     sheet = next(row for row in raw["sheets"] if row["properties"]["sheetId"] == ids["Dashboard"])
     existing = {row["chartId"]: row for row in sheet.get("charts", [])}
     requests = []
-    for chart in chart_specs(snapshot, ids["Dashboard"]):
+    for index, chart in enumerate(chart_specs(snapshot, ids["Dashboard"])):
         previous = existing.get(chart["chartId"])
         if previous is None:
             if any(chart["chartId"] == row["chartId"] for sheet in raw["sheets"] for row in sheet.get("charts", [])):
                 raise AqlaError("Presentation chart ID belongs to another worksheet")
             requests.append({"addChart": {"chart": chart}})
         else:
-            if not _contains(previous.get("spec"), chart["spec"]):
+            if not _chart_spec_matches(previous.get("spec"), chart["spec"], has_numbers=_chart_has_numbers(snapshot, index)):
                 requests.append({"updateChartSpec": {"chartId": chart["chartId"], "spec": chart["spec"]}})
             if not _contains(previous.get("position"), chart["position"]):
                 requests.append({"updateEmbeddedObjectPosition": {"objectId": chart["chartId"], "newPosition": chart["position"], "fields": "overlayPosition"}})
@@ -387,7 +447,8 @@ def _format(client, raw, snapshot, ids, values):
             requests.extend([
                 {"repeatCell": {"range": {"sheetId": identity, "startRowIndex": 1, "startColumnIndex": 6, "endColumnIndex": 12}, "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.########"}}}, "fields": "userEnteredFormat.numberFormat"}},
                 {"updateDimensionProperties": {"range": {"sheetId": identity, "dimension": "COLUMNS", "startIndex": 19, "endIndex": 20}, "properties": {"pixelSize": 320}, "fields": "pixelSize"}},
-                {"updateDimensionProperties": {"range": {"sheetId": identity, "dimension": "COLUMNS", "startIndex": 21, "endIndex": 22}, "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}},
+                {"updateDimensionProperties": {"range": {"sheetId": identity, "dimension": "COLUMNS", "startIndex": 19, "endIndex": 22}, "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}},
+                {"updateDimensionProperties": {"range": {"sheetId": identity, "dimension": "ROWS", "startIndex": 1, "endIndex": max(2, len(values[title]))}, "properties": {"pixelSize": 48}, "fields": "pixelSize"}},
             ])
             for col in (0, 4, 5, 17, 20):
                 requests.append({"updateDimensionProperties": {"range": {"sheetId": identity, "dimension": "COLUMNS", "startIndex": col, "endIndex": col + 1}, "properties": {"pixelSize": 180}, "fields": "pixelSize"}})
@@ -490,8 +551,8 @@ def publish(client, snapshot, *, clock=None):
             sheet_ids=ids, extents=extents, attempted_at=clock, options={"currency": snapshot.available_currencies, "period": snapshot.available_periods})
         _store(client, pending, metadata_id)
         raw, metadata_id = _guard(client, pending)
-        if growth or charts:
-            client.request("POST", ":batchUpdate", json={"requests": [*growth, *charts]})
+        if growth:
+            client.request("POST", ":batchUpdate", json={"requests": growth})
         for title in TITLES:
             width = len(values[title][0])
             for start in range(0, extents[title], 100):
@@ -503,6 +564,11 @@ def publish(client, snapshot, *, clock=None):
         if any(_read(client, title, extents[title], len(values[title][0])) != padded[title] for title in TITLES):
             raise AqlaError("Presentation readback failed; retry the derived publication")
         raw, metadata_id = _guard(client, pending)
+        # Google normalizes specs using the current cells; apply after verified
+        # data so actual numeric series retain their unit axis and native styles.
+        charts = _chart_requests(raw, snapshot, ids)
+        if charts:
+            client.request("POST", ":batchUpdate", json={"requests": charts})
         _format(client, raw, snapshot, ids, values)
         raw, metadata_id = _guard(client, pending)
         if _chart_requests(raw, snapshot, ids) or not _format_matches(client, raw, snapshot, ids, values):
