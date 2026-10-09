@@ -19,7 +19,7 @@ BASE_URLS = {"mainnet": "https://fapi.asterdex.com", "testnet": "https://fapi.as
 
 
 def sign_parameters(wallet, parameters, *, network="mainnet"):
-    message = "&".join(f"{key}={value}" for key, value in sorted(parameters.items()))
+    message = urlencode(sorted(parameters.items()))
     domain = {**DOMAIN, "chainId": 714 if network == "testnet" else 1666}
     typed = {"types": {"EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"},
                {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}],
@@ -62,15 +62,19 @@ class Aster(VenueAdapter):
             data["nonces"]["aster"] = nonce
             return nonce
         nonce = self.state.update(reserve)
-        payload = {**params, "nonce": str(nonce), "user": self.account, "signer": self.wallet.address.lower()}
+        payload = dict(sorted({**params, "nonce": str(nonce), "user": self.account, "signer": self.wallet.address.lower()}.items()))
         payload["signature"] = sign_parameters(self.wallet, payload, network=self.settings.network)
-        return {"method": method, "path": path, "params": payload, "nonce": nonce}
+        return {"method": method, "path": path, "params": payload, "nonce": nonce, "wire_query": urlencode(payload)}
 
     async def send(self, request):
-        kwargs = {"params": request["params"]} if request["method"] == "GET" else {"content": urlencode(request["params"]), "headers": {"Content-Type": "application/x-www-form-urlencoded"}}
+        # Persist the exact signed encoding for new requests. Legacy records retain
+        # their saved parameter order and are never re-signed or implicitly sent.
+        wire = request.get("wire_query") or urlencode(request["params"])
+        url = self.client.base_url.join(request["path"]).copy_with(query=wire.encode("ascii")) if request["method"] == "GET" else request["path"]
+        kwargs = {} if request["method"] == "GET" else {"content": wire, "headers": {"Content-Type": "application/x-www-form-urlencoded"}}
         if request["method"] == "GET":
             kwargs["auth"] = observation_auth(self.client)
-        response = await self.client.request(request["method"], request["path"], **kwargs)
+        response = await self.client.request(request["method"], url, **kwargs)
         if response.status_code >= 500 or response.status_code in (408, 429):
             raise AqlaError("Aster response is uncertain; reconcile before any further send")
         result = response.json()

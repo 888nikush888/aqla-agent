@@ -28,11 +28,13 @@ class AsterBoundary:
         self.requests.append((request.method, request.url.path, parameters))
         if "signature" in parameters:
             signature = parameters.pop("signature")
+            wire = request.url.query.decode("ascii") if request.method == "GET" else request.content.decode("ascii")
+            unsigned = "&".join(item for item in wire.split("&") if not item.startswith("signature="))
             assert abs(int(parameters["nonce"]) - time.time_ns() // 1000) < 60_000_000
             assert parameters["user"] == self.wallet.address.lower()
             assert parameters["signer"] == self.wallet.address.lower()
             typed = {"types": {"EIP712Domain": [{"name": name, "type": kind} for name, kind in [("name", "string"), ("version", "string"), ("chainId", "uint256"), ("verifyingContract", "address")]], "Message": [{"name": "msg", "type": "string"}]},
-                     "primaryType": "Message", "domain": {**DOMAIN, "chainId": 714 if "testnet" in request.url.host else 1666}, "message": {"msg": "&".join(f"{key}={value}" for key, value in sorted(parameters.items()))}}
+                     "primaryType": "Message", "domain": {**DOMAIN, "chainId": 714 if "testnet" in request.url.host else 1666}, "message": {"msg": unsigned}}
             assert Account.recover_message(encode_typed_data(full_message=typed), signature=signature) == self.wallet.address
         path = request.url.path.rsplit("/", 1)[-1]
         if request.method != "GET":
