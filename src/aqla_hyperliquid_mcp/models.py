@@ -101,6 +101,7 @@ class Settings(Model):
     state_path: Path = Path("data/state.sqlite3")
     private_key_file: Path | None = None
     integration_key_file: Path | None = None
+    setup_password_hash_file: Path | None = None
     sources: list[str] = Field(default_factory=list)
     policy: Policy | None = None
     timeout_seconds: float = Field(default=15, gt=0, le=120)
@@ -136,7 +137,7 @@ class Settings(Model):
     def load(cls, path: str | Path):
         path = Path(path).resolve()
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        for name in ("state_path", "private_key_file", "integration_key_file", "telegram_session_file", "telegram_api_hash_file"):
+        for name in ("state_path", "private_key_file", "integration_key_file", "setup_password_hash_file", "telegram_session_file", "telegram_api_hash_file"):
             if raw.get(name):
                 raw[name] = str((path.parent / raw[name]).resolve())
         sheets = raw.get("google_sheets") or {}
