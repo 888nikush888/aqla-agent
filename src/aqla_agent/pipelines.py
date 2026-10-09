@@ -8,7 +8,7 @@ from contextvars import ContextVar
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from aqla_hyperliquid_mcp.models import AqlaError, Model, Policy, Positive, digest, now_ms
 
@@ -33,6 +33,8 @@ class Parameters(Model):
     margin_mode: Literal["cross", "isolated"] = "isolated"
     entry_mode: Literal["source", "source_or_market"] = "source_or_market"
     entry_range_choice: Literal["near", "far", "midpoint"] = "midpoint"
+    entry_execution: Literal["standard", "maker_only"] = "standard"
+    take_profit_execution: Literal["standard", "maker_only"] = "standard"
     max_slippage_percent: Positive = Field(default=Decimal("0.3"), le=10)
     max_signal_age_seconds: int = Field(default=300, ge=1, le=86400)
     take_profit_allocation: Literal["equal", "halving", "custom", "adaptive", "first_target"] = "equal"
@@ -42,6 +44,14 @@ class Parameters(Model):
     allowed_updates: list[Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"]] = Field(default_factory=lambda: ["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"])
     allow_stop_widening: bool = False
     cost_reserve_bps: Annotated[Decimal, Field(ge=0, le=1000)] = Decimal("10")
+
+    @model_serializer(mode="wrap")
+    def compatible_execution_defaults(self, handler):
+        values = handler(self)
+        for key in ("entry_execution", "take_profit_execution"):
+            if values.get(key) == "standard":
+                values.pop(key)
+        return values
 
     def policy(self, limits):
         values = self.model_dump()

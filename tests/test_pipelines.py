@@ -221,3 +221,59 @@ async def test_account_limits_apply_to_other_profiles_and_unknown_reservations(r
     assert "Maximum open trade count" in aster["error"]
     assert len([row for row in result["targets"] if row.get("plan_id")]) == 2
     await router.close()
+
+
+@pytest.mark.parametrize("entry,tp", [("standard", "standard"), ("maker_only", "standard"), ("standard", "maker_only"), ("maker_only", "maker_only")])
+def test_profile_parameters_preserve_independent_maker_modes_and_legacy_json(entry, tp):
+    value = Parameters(entry_execution=entry, take_profit_execution=tp)
+    dumped = value.model_dump(mode="json")
+    assert ("entry_execution" in dumped) == (entry != "standard")
+    assert ("take_profit_execution" in dumped) == (tp != "standard")
+    policy = value.policy(AccountLimits(max_open_trades=3, max_total_risk_percent="2"))
+    assert policy.entry_execution == entry and policy.take_profit_execution == tp
+    assert Parameters.from_policy(policy) == value
+    assert Parameters.model_validate(dumped) == value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry,tp", [("maker_only", "standard"), ("standard", "maker_only"), ("maker_only", "maker_only")])
+async def test_profile_maker_modes_through_real_mcp_control_router_plan_and_native_wire(setup, signal, tmp_path, monkeypatch, entry, tp):
+    from dataclasses import asdict
+
+    from test_maker_execution import MakerBoundary
+
+    from aqla_agent.setup import SetupBinding, write_password_hash
+    from aqla_hyperliquid_mcp.server import close_server, create_server
+
+    settings, state, old, exchange, _ = setup
+    verifier = tmp_path / "fixture-verifier.json"
+    write_password_hash(verifier, "fixture-only")
+    settings.setup_password_hash_file, settings.telegram_owner_id = verifier, "12345"
+    fake = MakerBoundary(old.signer)
+    fake.partial = Decimal(".5")
+    monkeypatch.setattr(exchange.client, "_transport", httpx.MockTransport(fake.handle))
+    server = create_server(settings, state=state, exchange=exchange)
+    binding = SetupBinding("12345", "12345", "fixture-gateway", "fixture-session")
+    gate = server._aqla_setup_gate
+    generation = gate.bind(binding)
+    identity = "a" * 64
+    gate.register(binding, identity, None, generation)
+    auth = server.aqla_authority.sign("operator", "native-command", setup={"identity": identity, "binding": asdict(binding)})
+    parameters = {**state.snapshot()["profiles"]["standard"]["parameters"], "entry_execution": entry, "take_profit_execution": tp}
+    result = await server.call_tool("control", {"action": "set_profile", "expected_revision": state.snapshot()["configuration_revision"],
+        "profile": {"id": "standard", "name": "Standard", "parameters": parameters}, "context_auth": auth})
+    assert not result.is_error
+    source, interpretation = signal
+    router = server.aqla_trading
+    plan = await router.preview(source.event_id, interpretation)
+    assert plan.get("entry_execution", "standard") == entry
+    assert plan.get("take_profit_execution", "standard") == tp
+    trade = await router.execute(plan["plan_id"])
+    assert trade["status"] == "open"
+    snapshot = state.snapshot()
+    entry_wire = snapshot["operations"][trade["entry_operation_id"]]["wire_action"]["orders"][0]
+    assert (entry_wire["t"].get("limit", {}).get("tif") == "Alo") == (entry == "maker_only")
+    target_wire = snapshot["operations"]["targets:" + trade["trade_id"] + ":0"]["wire_action"]["orders"]
+    assert all((order["t"].get("limit", {}).get("tif") == "Alo") == (tp == "maker_only") for order in target_wire)
+    assert snapshot["trades"][trade["trade_id"]]["plan"] == plan["targets"][0]["plan"]
+    await close_server(server)
