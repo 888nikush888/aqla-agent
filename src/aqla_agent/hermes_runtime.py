@@ -26,6 +26,8 @@ def install_strict_profile():
     # Native async session/transport watchdogs remain enabled below.
     replace(native_gateway, "_start_gateway_start_cron_and_housekeeping",
             lambda runner: (threading.Event(), None, None, None))
+    import logging
+
     from gateway.platforms.base import BasePlatformAdapter
     from gateway.run import GatewayRunner
     from gateway.run_adapters import GatewayAdapterLifecycleMixin
@@ -37,13 +39,37 @@ def install_strict_profile():
     from .events import (
         gateway_ready,
         ingress_identity,
+        intercept_native_setup,
         rebind_native_adapter,
         record_clarify_outcome,
         run_native_followup,
         run_native_turn,
         stamp_native_event,
     )
+    from .native_setup import PrivateTransportLogs
     from .skill_review import install_skill_review
+    # PTB emits getUpdates bodies and Update.__repr__ before handler dispatch.
+    # These narrow transport filters run before formatting, including DEBUG.
+    filters = []
+    for name in ("telegram.Bot", "telegram.ext.ExtBot", "telegram.ext.Application", "telegram.ext.Updater"):
+        logger = logging.getLogger(name)
+        private_filter = PrivateTransportLogs()
+        logger.addFilter(private_filter)
+        filters.append((logger, private_filter))
+    register_handlers = TelegramAdapter._register_handlers
+
+    def setup_handlers(self, app):
+        from telegram import Update
+        from telegram.ext import ApplicationHandlerStop, TypeHandler
+        async def private_setup(update, context):
+            if await intercept_native_setup(self, update, context):
+                self._accept_update()
+                raise ApplicationHandlerStop
+        # Native PTB registration/lifecycle is retained on rebuild and reconnect.
+        app.add_handler(TypeHandler(Update, private_setup), group=-100)
+        register_handlers(self, app)
+
+    replace(TelegramAdapter, "_register_handlers", setup_handlers)
 
     native_turn = GatewayTurnMixin._run_agent
     native_followup = GatewayTurnMixin._run_agent_queued_followup
@@ -139,6 +165,8 @@ def install_strict_profile():
     install_skill_review(replace)
 
     def undo():
+        for logger, private_filter in filters:
+            logger.removeFilter(private_filter)
         for target, name, original in reversed(originals):
             setattr(target, name, original)
 

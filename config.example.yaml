@@ -5,6 +5,7 @@ signer_role: api_wallet
 state_path: data/state.sqlite3
 private_key_file: secrets/hyperliquid.secret
 integration_key_file: secrets/integration.secret
+setup_password_hash_file: secrets/setup-password.hash.json
 sources: []
 # Rules are set by you through Hermes; none are silently selected for you.
 policy: null

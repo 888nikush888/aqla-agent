@@ -51,6 +51,8 @@ def check_native_contract() -> None:
         ("gateway.run_adapters", "GatewayAdapterLifecycleMixin", "_install_reconnected_adapter", "self,platform,adapter", True),
         ("gateway.run_turn_runner", "TurnRunner", "_clarify_callback_sync", "self,questions", False),
         ("plugins.platforms.telegram.adapter", "TelegramAdapter", "_build_message_event", "self,message,msg_type,update_id=", False),
+        ("plugins.platforms.telegram.adapter", "TelegramAdapter", "_register_handlers", "self,app", False),
+        ("plugins.platforms.telegram.adapter", "TelegramAdapter", "_accept_update", "self", False),
         ("plugins.platforms.telegram.adapter", "TelegramAdapter", "_text_batch_key", "self,event", False),
         ("plugins.platforms.telegram.adapter", "TelegramAdapter", "_photo_batch_key", "self,event,msg", False),
         ("plugins.platforms.telegram.adapter", "TelegramAdapter", "_queue_media_group_event", "self,media_group_id,event", True),

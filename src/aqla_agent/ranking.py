@@ -265,10 +265,14 @@ def evaluate(data):
             rank.update(tier="D", up=None, down=0)
             reason = "Drawdown-Grenze durch ergänzte Belege erreicht"
         if rank["tier"] != old:
+            if "manual_change" in rank:
+                rank["origin"] = "auto"
             rank["revision"] += 1
             event = {"source_id": source, "old": old, "new": rank["tier"], "metrics": current_metrics,
                      "revision": rank["revision"], "time": now_ms(), "network": "mainnet" if TIERS.index(rank["tier"]) >= 3 else "testnet",
                      "reason": reason, "proof_total": len(results), "factor": str(policy.factors[rank["tier"]])}
+            if "manual_change" in rank:
+                event["origin"] = "auto"
             identity = digest([source, event["revision"]])[:32]
             data["ranking_history"][identity] = event
             data["notifications"].setdefault("rank:" + identity, {"rank_change": event})
@@ -282,3 +286,38 @@ def status_view(data):
             | {"proof_total": len(row.get("evidence", [])), "excluded_count": len(row.get("exclusions", [])),
                "evidence": row.get("evidence", [])[-policy.window:], "exclusions": row.get("exclusions", [])[-20:]}
             for source, row in data["source_ranks"].items()}
+
+
+def set_manual_rank(data, selector, tier, revision, operator):
+    from .sources import resolve_source
+    if not selector or tier not in TIERS or type(revision) is not int or not operator:
+        raise AqlaError("Supply a source, valid tier and current source rank revision")
+    source = source_key(data, resolve_source(data, selector))
+    known = {*data.get("sources", []), *data.get("source_aliases", {}).values(), *data.get("source_ranks", {})}
+    if source not in known:
+        raise AqlaError("Select an existing source by name or Telegram ID")
+    rank = source_rank(data, source)
+    previous = rank.get("manual_change", {})
+    if (rank["tier"] == tier and rank.get("origin") == "manual" and previous.get("operator") == operator
+            and revision in (rank["revision"], previous.get("expected_revision"))):
+        return {"source_id": source, "rank": rank, "changed": False}
+    if revision != rank["revision"]:
+        raise AqlaError("Read the current source rank revision before changing its tier")
+    policy = RankingPolicy.model_validate(data["ranking_policy"])
+    complete, exclusions = outcomes(data)
+    evidence = complete.get(source, [])
+    current_metrics = metrics(evidence, policy)
+    if TIERS.index(tier) >= 3 and TIERS.index(tier) > TIERS.index(rank["tier"]) and Decimal(current_metrics["drawdown_r"]) >= policy.hard_drawdown_r:
+        raise AqlaError("Current hard drawdown blocks a manual Mainnet promotion")
+    old = rank["tier"]
+    event = {"source_id": source, "old": old, "new": tier, "operator": operator, "time": now_ms(),
+             "reason": "Manueller Ausgangsrang; normale Bewertung und Drawdown-Schutz bleiben aktiv",
+             "origin": "manual", "expected_revision": revision, "revision": revision + 1, "metrics": current_metrics,
+             "network": "mainnet" if TIERS.index(tier) >= 3 else "testnet", "proof_total": len(evidence), "factor": str(policy.factors[tier])}
+    rank.update(tier=tier, revision=revision + 1, bootstrap=False, origin="manual", up=None, down=0,
+                manual_change=event, metrics=current_metrics, evidence=evidence, exclusions=exclusions.get(source, []))
+    rank["evaluated"] = list(dict.fromkeys([*rank.get("evaluated", []), *(row["setup_id"] for row in evidence)]))
+    identity = digest([source, event["revision"]])[:32]
+    data["ranking_history"][identity] = event
+    data["notifications"].setdefault("rank:" + identity, {"rank_change": event})
+    return {"source_id": source, "rank": rank, "changed": True}

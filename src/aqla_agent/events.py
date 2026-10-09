@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import secrets
 import threading
 import time
 import weakref
@@ -15,6 +16,8 @@ from pathlib import Path
 from aqla_hyperliquid_mcp.auth import Authority
 from aqla_hyperliquid_mcp.models import AqlaError, Settings, SourceEvent, now_ms
 
+from .native_setup import NativeSetup, load_verifier
+from .setup import SetupBinding
 from .telegram import ReaderRetry, SourceAccessError, TelegramReader, reader_metadata_token
 
 LOG = logging.getLogger(__name__)
@@ -67,6 +70,9 @@ class HermesExtension:
         self.last_wake = 0.0
         self.last_journal_sync = 0.0
         self.last_monthly_sync = 0.0
+        self.last_presentation_sync = 0.0
+        self.gateway_identity = secrets.token_hex(32)
+        self.setup = NativeSetup(self.owner, load_verifier(self.settings.setup_password_hash_file), self.setup_request, self.setup_binding)
         self.reader_error = None
         self.reported_reader_error = None
         self.reader_retry = ReaderRetry()
@@ -101,6 +107,8 @@ class HermesExtension:
             self.turn_claim.reset(token)
 
     async def with_event(self, incoming, gateway, callback):
+        if self.setup.lease and self.setup.lease[1] != self.setup_binding():
+            self.revoke_setup()
         self.stamp(incoming)
         token = self.turn_event.set(incoming)
         try:
@@ -161,6 +169,39 @@ class HermesExtension:
             raise AqlaError("Native MCP returned no structured integration result")
         return value
 
+    async def setup_request(self, action, **arguments):
+        return await self.mcp_call(self.server, "integration", {"action": action, "token": self.authority.key.decode(), **arguments})
+
+    def setup_binding(self):
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+        if self.gateway is None or self.binding is None:
+            raise AqlaError("Private native gateway session is unavailable")
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id=self.owner, user_id=self.owner)
+        entry = self.gateway.session_store.get_or_create_session(source)
+        return SetupBinding(self.owner, self.owner, self.gateway_identity, entry.session_id)
+
+    def revoke_setup(self):
+        self.setup.lease = None
+        self.setup.challenge = None
+        self.setup.revision += 1
+        try:
+            self.ctx.call_mcp(self.server, "integration", {"action": "setup_revoke", "token": self.authority.key.decode(),
+                              "setup_binding": {"owner_id": self.owner}}, timeout=10)
+        except Exception:
+            LOG.warning("Private Setup revocation unavailable; local authority removed")
+
+    async def sync_presentation(self):
+        if not self.settings.google_sheets.enabled or self.last_presentation_sync and time.monotonic() - self.last_presentation_sync < 60:
+            return
+        self.last_presentation_sync = time.monotonic()
+        try:
+            selected = await self.mcp_call("sheets", "presentation_selection_internal", {"token": self.authority.key.decode()})
+            snapshot = await self.mcp_call(self.server, "integration", {"action": "presentation_snapshot", "token": self.authority.key.decode(), "selection": selected["selection"]})
+            await self.mcp_call("sheets", "sync_presentation_internal", {"token": self.authority.key.decode(), "snapshot": snapshot})
+        except Exception as error:
+            LOG.warning("aqla presentation sync unavailable (%s)", type(error).__name__)
+
     async def sync_journal(self):
         if not self.settings.google_sheets.enabled or time.monotonic() - self.last_journal_sync < self.settings.google_sheets.sync_interval_seconds:
             return
@@ -179,6 +220,7 @@ class HermesExtension:
         while True:
             await self.sync_journal()
             await self.sync_monthly()
+            await self.sync_presentation()
             await asyncio.sleep(3)
 
     async def sync_monthly(self):
@@ -390,6 +432,7 @@ class HermesExtension:
             return
         if self.binding:
             self.unbind_adapter()
+            self.gateway_identity = secrets.token_hex(32)
         original = adapter._message_handler
 
         async def native_handler(incoming):
@@ -407,6 +450,7 @@ class HermesExtension:
             self.started = True
 
     def unbind_adapter(self):
+        self.revoke_setup()
         if self.binding:
             adapter, original, wrapper = self.binding
             if adapter._message_handler is wrapper:
@@ -451,11 +495,14 @@ class HermesExtension:
         return None
 
     def before_tool(self, tool_name, args, **_):
-        if tool_name in ("mcp__sheets__sync_internal", "mcp_sheets_sync_internal", "mcp__sheets__publish_monthly_internal", "mcp_sheets_publish_monthly_internal"):
+        if tool_name in tuple(prefix + name for prefix in ("mcp__sheets__", "mcp_sheets_") for name in ("sync_internal", "publish_monthly_internal", "sync_presentation_internal", "presentation_selection_internal")):
             return {"action": "block", "message": "Journal delivery is reserved for the native synchronizer"}
         short = tool_name.removeprefix("mcp__aqla__").removeprefix("mcp_aqla_")
         origin = self.active_context
         claim = self.turn_claim.get()
+        if short in ("status", "setup_status"):
+            setup = self.setup.claims() if origin and origin[0] == "operator" else None
+            return {"action": "modify", "args": {"context_auth": self.authority.sign(*origin, setup=setup) if origin and origin[0] == "operator" else ""}}
         if short == "monthly_report" and origin and origin[0] == "operator" and claim.can_change() and not args.get("diagnostics_only", False):
             # The read tool stays read-only. The native owner-request hook asks the
             # internal publisher for an analysis tab, separately from model tools.
@@ -481,7 +528,8 @@ class HermesExtension:
             claim = self.turn_claim.get()
             if not claim.can_change() and short != "notifications_ack":
                 return {"action": "block", "message": "Unanswered or cancelled clarification is not authorization; send a fresh owner request"}
-            return {"action": "modify", "args": {"context_auth": self.authority.sign(*origin)}}
+            setup = self.setup.claims() if origin[0] == "operator" else None
+            return {"action": "modify", "args": {"context_auth": self.authority.sign(*origin, setup=setup)}}
         if tool_name == "skill_manage":
             from .skill_review import master_content, native_background_review
 
@@ -565,6 +613,14 @@ def stamp_native_event(event):
         if extension.origin(event) is not None:
             return extension.stamp(event)
     return event
+
+
+async def intercept_native_setup(adapter, update, context):
+    """Called by a native PTB handler before any Hermes admission work."""
+    for extension in tuple(EXTENSIONS):
+        if extension.binding and extension.binding[0] is adapter:
+            return await extension.setup.intercept(update, context.bot)
+    return False
 
 
 def ingress_identity(event):

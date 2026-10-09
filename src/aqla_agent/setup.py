@@ -7,6 +7,9 @@ import json
 import os
 import secrets
 import stat
+import threading
+import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +22,117 @@ SCRYPT_R = 8
 SCRYPT_P = 1
 SCRYPT_MAXMEM = 256 * 1024 * 1024
 _VERIFY_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aqla-setup-verifier")
+_VERIFY_SLOT = threading.BoundedSemaphore(1)
+CHALLENGE_SECONDS = 120
+GRANT_SECONDS = 300
+LOCKOUT_SECONDS = 900
+
+
+@dataclass(frozen=True)
+class SetupBinding:
+    owner_id: str
+    chat_id: str
+    gateway_id: str
+    session_id: str
+
+    def valid(self) -> bool:
+        return all(type(value) is str and value for value in (self.owner_id, self.chat_id, self.gateway_id, self.session_id)) and self.owner_id == self.chat_id
+
+
+class SetupStatus(TypedDict):
+    configured: bool
+    active: bool
+    remaining_seconds: int
+    locked_seconds: int
+
+
+@dataclass(frozen=True, repr=False)
+class SetupLease:
+    identity: str
+    binding: SetupBinding
+    expires_at: float
+
+
+class SetupGate:
+    """MCP-local registered capabilities; restart/rebinding invalidates old leases."""
+
+    def __init__(self, configured: bool, *, clock: Callable[[], float] = time.monotonic):
+        self.configured = configured
+        self.clock = clock
+        self._last_time = clock()
+        self._lock = threading.RLock()
+        self.generation = secrets.token_hex(32)
+        self._bindings: dict[str, SetupBinding] = {}
+        self._leases: dict[str, SetupLease] = {}
+        self._seen: dict[str, SetupLease] = {}
+        self._failures: dict[str, int] = {}
+        self._locked_until: dict[str, float] = {}
+
+    def _now(self) -> float:
+        self._last_time = max(self._last_time, self.clock())
+        return self._last_time
+
+    def bind(self, binding: SetupBinding) -> str:
+        if not binding.valid():
+            raise AqlaError("Setup requires the actual private owner gateway session")
+        with self._lock:
+            old = self._bindings.get(binding.owner_id)
+            if old != binding:
+                self.revoke(binding.owner_id)
+                self._bindings[binding.owner_id] = binding
+            return self.generation
+
+    def register(self, binding: SetupBinding, identity: str, expires_at: float | None, generation: str) -> None:
+        with self._lock:
+            now = self._now()
+            if expires_at is None:
+                expires_at = now + GRANT_SECONDS
+            if (not self.configured or not binding.valid() or self._bindings.get(binding.owner_id) != binding
+                    or now < self._locked_until.get(binding.owner_id, 0)
+                    or generation != self.generation or type(identity) is not str or len(identity) != 64
+                    or any(char not in "0123456789abcdef" for char in identity)
+                    or type(expires_at) not in (int, float) or not now < expires_at <= now + GRANT_SECONDS):
+                raise AqlaError("Setup registration is unavailable, expired or not bound to the current native session")
+            existing = self._seen.get(identity)
+            lease = SetupLease(identity, binding, expires_at)
+            if existing is not None and (existing != lease or identity not in self._leases):
+                raise AqlaError("An existing setup lease cannot be renewed or rebound")
+            self._leases[identity] = lease
+            self._seen[identity] = lease
+            self._failures[binding.owner_id] = 0
+
+    def failed(self, binding: SetupBinding) -> SetupStatus:
+        with self._lock:
+            if self._bindings.get(binding.owner_id) != binding:
+                raise AqlaError("Setup failure requires the current private native binding")
+            now = self._now()
+            if now >= self._locked_until.get(binding.owner_id, 0):
+                attempts = self._failures.get(binding.owner_id, 0) + 1
+                self._failures[binding.owner_id] = attempts % 5
+                if attempts >= 5:
+                    self._locked_until[binding.owner_id] = now + LOCKOUT_SECONDS
+            return self.status(binding)
+
+    def require(self, identity: str | None, binding: SetupBinding | None) -> None:
+        with self._lock:
+            lease = self._leases.get(identity) if type(identity) is str else None
+            if (not self.configured or lease is None or binding != lease.binding or self._bindings.get(binding.owner_id) != binding
+                    or self._now() >= lease.expires_at):
+                raise AqlaError("A current private owner Setup grant is required for this change")
+
+    def revoke(self, owner_id: str) -> None:
+        with self._lock:
+            self._leases = {key: value for key, value in self._leases.items() if value.binding.owner_id != owner_id}
+            self._bindings.pop(owner_id, None)
+
+    def status(self, binding: SetupBinding | None = None, identity: str | None = None, *, owner_id: str | None = None) -> SetupStatus:
+        with self._lock:
+            now = self._now()
+            lease = self._leases.get(identity) if type(identity) is str else None
+            active = bool(lease and binding == lease.binding and self._bindings.get(binding.owner_id) == binding and now < lease.expires_at)
+            return {"configured": self.configured, "active": active,
+                    "remaining_seconds": max(0, int(lease.expires_at - now)) if active else 0,
+                    "locked_seconds": max(0, int(self._locked_until.get(binding.owner_id if binding else owner_id, 0) - now))}
 
 
 class PasswordHashRecord(TypedDict):
@@ -108,4 +222,12 @@ class SetupVerifier:
             return False
 
     async def verify(self, password: str) -> bool:
-        return await asyncio.get_running_loop().run_in_executor(_VERIFY_WORKER, self.matches, password)
+        if not isinstance(password, str) or not 1 <= len(password) <= 4096 or not _VERIFY_SLOT.acquire(blocking=False):
+            return False
+        def check():
+            try:
+                return self.matches(password)
+            finally:
+                _VERIFY_SLOT.release()
+        # The worker owns the slot until hashing finishes, even if admission is cancelled.
+        return await asyncio.get_running_loop().run_in_executor(_VERIFY_WORKER, check)

@@ -618,16 +618,16 @@ class Hyperliquid:
 
         return request_binding, build
 
-    async def sdk_action(self, operation_id, request, *, sender=None):
+    async def sdk_action(self, operation_id, request, *, sender=None, prepare_guard=None):
         binding, build = await self.prepare_sdk_action(operation_id, request)
         noop = binding["operation"] == "noop"
         requested = binding["params"]["nonce"] if noop else None
-        return await self._dispatch(operation_id, binding, build, sender=sender, nonce_override=requested, allow_existing_nonce=noop)
+        return await self._dispatch(operation_id, binding, build, sender=sender, nonce_override=requested, allow_existing_nonce=noop, prepare_guard=prepare_guard)
 
     async def order_status(self, identity, user=None):
         return await self.info("orderStatus", user=user or self.account, oid=identity)
 
-    async def native_action(self, operation_id, request, *, sender=None):
+    async def native_action(self, operation_id, request, *, sender=None, prepare_guard=None):
         from .actions import native_payload, sign_native
 
         action = native_payload(request)
@@ -639,7 +639,7 @@ class Hyperliquid:
                 order.setdefault("c", self.cloid(operation_id, i))
         request_binding = {"network": self.settings.network, "account": self.account.lower(), "native_action": action}
         return await self._dispatch(operation_id, request_binding,
-                                    lambda nonce, expires: sign_native(self.wallet, action, nonce, expires, self.settings), sender=sender)
+                                    lambda nonce, expires: sign_native(self.wallet, action, nonce, expires, self.settings), sender=sender, prepare_guard=prepare_guard)
 
     async def reconcile(self, operation_id):
         self.state.assert_binding(self.settings)

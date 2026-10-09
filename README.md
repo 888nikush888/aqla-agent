@@ -12,6 +12,8 @@ Eigenständiges Python-Projekt. Ein kontrollierter Handels-MCP, ein kurzer bearb
 
 Kanalränge F–S gewichten das Profilrisiko und wählen Testnet oder Mainnet für neue Entries. Bei einem bestätigten fehlenden Hyperliquid-Markt können Pipelines auf Aster oder Lighter im selben Netzwerk ausweichen. Belegte ROI-/ROE-TPs werden mit dem ursprünglichen Signalhebel in Kursziele übersetzt. [Ranking, Konten, Börsenersatz und Prozentziele](docs/ranking-routing-roi.md).
 
+Betreiberänderungen an Rang, Handelsregeln, Quellen/Pipelines, Limits und Aktivierung sind durch den [privaten Setup-Modus](docs/setup-mode.md) geschützt: `/setup`, native Passwortprüfung und bestätigtes Löschen, dann 300 Sekunden Freigabe. Status, Pause/Disable und Schutz bleiben verfügbar.
+
 Telegram-Handelsmeldungen verwenden kompakte, aus gespeicherten Fakten erzeugte Vorlagen mit getrennten Börsenergebnissen, bestätigten Preisen und klaren Statusüberschriften. [Nachrichtenansichten](docs/telegram-messages.md).
 
 Ausdrücklich verzögerte Entries warten im lokalen Zustand auf ihren belegten Einstieg. Frische ausführbare Kurse und die native SL-Triggerreferenz werden vor Versand und nach Fills geprüft. Einstieg und Schließung bleiben als getrennte Ereignisse sichtbar; `trade_diagnostics` erklärt auch geschlossene Trades anhand ihrer tatsächlichen Orders und Fills. [Verzögerte Entries und Diagnose](docs/deferred-entries.md).

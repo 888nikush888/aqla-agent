@@ -20,10 +20,15 @@ class Authority:
     def from_file(cls, path: Path):
         return cls(path.read_text(encoding="utf-8").strip())
 
-    def sign(self, kind, request_id, *, expires_at=None):
+    def sign(self, kind, request_id, *, expires_at=None, setup=None):
         if kind not in ("operator", "source") or not request_id:
             raise AqlaError("Invalid trusted context")
-        body = json.dumps({"kind": kind, "request_id": request_id, "expires_at": expires_at or now_ms() + 60000}, sort_keys=True, separators=(",", ":"))
+        claims = {"kind": kind, "request_id": request_id, "expires_at": expires_at or now_ms() + 60000}
+        if setup is not None:
+            if kind != "operator":
+                raise AqlaError("Only a native operator claim can carry Setup authority")
+            claims["setup"] = setup
+        body = json.dumps(claims, sort_keys=True, separators=(",", ":"))
         signature = hmac.new(self.key, body.encode(), hashlib.sha256).hexdigest()
         return json.dumps({"body": body, "signature": signature}, separators=(",", ":"))
 

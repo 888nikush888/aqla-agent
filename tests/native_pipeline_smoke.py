@@ -37,6 +37,13 @@ def main():
     own_config = yaml.safe_load((destination / "config.yaml").read_text())
     own_config["sources"] = ["channel"]
     own_config["telegram_session_file"] = None
+    # Explicit local fixture, never a production bypass or a user credential.
+    from native_setup_smoke import SYNTHETIC_PASSWORD
+
+    from aqla_agent.setup import write_password_hash
+    verifier = destination / "secrets/synthetic-setup.json"
+    write_password_hash(verifier, SYNTHETIC_PASSWORD)
+    own_config["setup_password_hash_file"] = str(verifier)
     (destination / "config.yaml").write_text(yaml.safe_dump(own_config))
     config_path = destination / "hermes-home" / "config.yaml"
     config = yaml.safe_load(config_path.read_text())
@@ -207,6 +214,9 @@ def main():
         adapter.set_message_handler = lambda replacement: setattr(adapter, "_message_handler", replacement)
         gateway = SimpleNamespace(_delivery_adapter_for=lambda _: adapter, session_store=store)
         extension.boot(gateway)
+        if args.mode == "owner":
+            from native_setup_smoke import grant_fixture
+            await grant_fixture(extension)
         event = MessageEvent(text="Setze Risiko auf 0,75 Prozent, Hebel 2, maximal drei Trades, adaptive TP-Verteilung und TP-Stop-Leiter. Passe den Master für sorgfältige Reply-Zuordnung an." if args.mode == "owner" else original.text,
                              source=source, message_type=MessageType.TEXT, message_id="42",
                              metadata={}, raw_message=None if args.mode == "owner" else {"forward_origin": True, "date": datetime.fromtimestamp(original.sent_at / 1000, UTC)})
@@ -258,6 +268,7 @@ def main():
         if args.mode == "lifecycle":
             assert data["policy"]["risk_percent"] == "0.5"
         assert data["operations"] == {}
+        assert SYNTHETIC_PASSWORD not in json.dumps(calls)
         assert len(calls) == len(expected) + (args.mode != "lifecycle")
         # This direct AIAgent harness does not need a live gateway SessionDB;
         # the native session/interaction smoke separately checks SQLite.

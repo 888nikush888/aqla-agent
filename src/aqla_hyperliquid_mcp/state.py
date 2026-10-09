@@ -129,6 +129,13 @@ class State:
         with self._thread_lock:
             return copy.deepcopy(self.data)
 
+    def presentation_snapshot(self, selection=None):
+        """Fixed bounded projection; source text/history never leaves the state lock."""
+        from aqla_agent.presentation import build_presentation
+        with self._thread_lock:
+            result = build_presentation(self.data, selection)
+            return copy.deepcopy(result.model_dump(mode="json"))
+
     def read(self, *roots, entries=None):
         """Return detached selected roots/entries, never a callback over live state."""
         entries = entries or {}

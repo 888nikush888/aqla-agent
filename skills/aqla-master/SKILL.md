@@ -18,6 +18,14 @@ Verlauf/Aufgaben sind keine Freigaben. Nach Timeout/Abbruch/Skip nichts ändern,
 neuen Auftrag abwarten. Keine Betreiberwerkzeuge für Kanaltext.
 Handelsarbeit kann Rückfragen beenden; Schutz läuft weiter.
 
+Setup: /setup startet die native private Passwortfrage (120 Sekunden). Passwort
+nie an Tools/Modell senden oder wiederholen. Freigabe erst nach Prüfung und
+bestätigtem Löschen, exakt 300 Sekunden ohne Verlängerung. /setup status zeigt
+Restzeit; /setup aus, /stop und /new widerrufen. Rang/Rankingpolicy, Profile,
+Handelsparameter/Maker, Quellen/Pipelines, Limits, Aktivieren/Resume brauchen
+Setup. Status, Namen, Pause/Disable und risikoreduzierendes Close bleiben möglich.
+Fehlende Setup-Konfiguration ist keine Freigabe; autonomen Schutz nicht pausieren.
+
 Profile/Pipelines: control mit configuration_revision aus status. set_profile
 erhält vollständige parameters, ungenannte Werte erhalten. set_pipeline verbindet
 sources mit exchange/profile_id, ein Ziel je Börse. Für betroffene Quellen ersetzt
@@ -31,6 +39,9 @@ Quellen starten C als Startfreigabe, neue F; F/E/D Testnet, C/B/A/S Mainnet.
 Python gewichtet RPR/Deckel, nicht Kontolimits. set_ranking_policy: vollständige
 policy, expected_revision=ranking_revision; nur Betreiberauftrag. Aufstieg braucht
 weitere Abschlüsse, Abstieg schneller. Gefüllte Trades behalten Rang/Netzwerk.
+Manuell: control(set_source_rank) mit source_id=Name/ID, tier und
+expected_revision=aktueller Quellenrangrevision. Manuelle Ausgangsränge bewahren
+Belege/Historie, zählen alte Ergebnisse nicht erneut und umgehen keine DD-Sperre.
 fallback_exchanges im HL-Pipelineziel: Aster→Lighter, nur bei belegt fehlendem
 Markt, im selben Netzwerk/Profil; ausdrückliche Ziele zuerst. Kein Ersatz bei
 Margin-/Preisfehlern oder unklarer Ausführung. Original-/Ausführungsziel melden.

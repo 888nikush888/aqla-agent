@@ -86,6 +86,8 @@ async def verify_lifecycle(extension, agent, store, source, original):
         return result
     adapter.set_message_handler(handler)
     extension.boot(runner)
+    from native_setup_smoke import grant_fixture
+    await grant_fixture(extension)
     try:
         result = await adapter._message_handler(owner)
         assert turns == [("operator", "1"), ("source", "42"), ("operator", "3"), ("source", "4")], turns

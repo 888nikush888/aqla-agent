@@ -80,7 +80,7 @@ async def prepare(exchange, operation_id, multisig_user: Address, request: SdkRe
             "sent": False, "nonce_reserved": False}
 
 
-async def submit(exchange, operation_id, multisig_user, request, nonce, signatures, expires_after=None):
+async def submit(exchange, operation_id, multisig_user, request, nonce, signatures, expires_after=None, *, prepare_guard=None):
     if nonce is None or not signatures:
         raise AqlaError("Supply the exact prepared nonce and collected multisig signatures")
     if exchange.wallet is None:
@@ -131,4 +131,4 @@ async def submit(exchange, operation_id, multisig_user, request, nonce, signatur
         return {"action": action, "nonce": timestamp, "signature": signature,
                 "vaultAddress": exchange.settings.vault_address, "expiresAfter": expires_after}
 
-    return await exchange._dispatch(operation_id, request_binding, build, deadline=expires_after, nonce_override=nonce)
+    return await exchange._dispatch(operation_id, request_binding, build, deadline=expires_after, nonce_override=nonce, prepare_guard=prepare_guard)

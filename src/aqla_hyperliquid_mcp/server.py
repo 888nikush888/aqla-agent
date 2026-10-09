@@ -11,6 +11,7 @@ from pydantic import Field
 
 from aqla_agent.messages import telegram_view
 from aqla_agent.monthly import MonthlyFailure, MonthlyJobBinding, MonthlyPublication, MonthlySection
+from aqla_agent.native_setup import load_verifier
 from aqla_agent.notifications import (
     NotificationAckResult,
     NotificationDetailsResult,
@@ -26,9 +27,10 @@ from aqla_agent.pipelines import (
     route_control,
     sync_legacy_policy,
 )
-from aqla_agent.ranking import RankingPolicy, status_view
+from aqla_agent.ranking import RankingPolicy, Tier, set_manual_rank, status_view
 from aqla_agent.reporting import Reporting
 from aqla_agent.router import Router, recovery_diagnostics
+from aqla_agent.setup import SetupBinding, SetupGate
 
 from . import __version__
 from .actions import NATIVE_MODELS, NativeRequest
@@ -52,6 +54,18 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     reporting = Reporting(state, trading)
     streams = Streams(settings.base_url, timeout=settings.timeout_seconds)
     authority = Authority.from_file(settings.integration_key_file) if settings.integration_key_file else None
+    setup_gate = SetupGate(authority is not None and bool(settings.telegram_owner_id) and load_verifier(settings.setup_password_hash_file) is not None)
+
+    def setup_context(claims):
+        value = claims.get("setup", {}) if claims else {}
+        try:
+            binding = SetupBinding(**value["binding"])
+            return value["identity"], binding
+        except (KeyError, TypeError):
+            return None, None
+
+    def require_setup(claims):
+        setup_gate.require(*setup_context(claims))
 
     def authorize(token, operator=False):
         if authority is None:
@@ -99,6 +113,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
 
     server = MCPServer("aqla-hyperliquid", version=__version__, lifespan=lifespan,
                        instructions="Hermes interprets received sources. Python enforces user rules. Unknown exchange results are never automatically retried. Keep operation IDs stable.")
+    server._aqla_setup_gate = setup_gate
     read = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)
     write = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True)
 
@@ -117,13 +132,15 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "exchange_atomicity_guaranteed": False, "live_exchange_verified": False}
 
     @server.tool(annotations=read)
-    async def status() -> dict:
+    async def status(context_auth: str = "") -> dict:
         """Read effective user rules, sources, pending work, owned trades and unresolved operations."""
         snapshot = state.snapshot()
         ready = trading.ready()
         inventory = await trading.inventory_status()
         page = notification_page(snapshot, authority.key if authority else None, ready, require_key=False)
-        return {"network": settings.network, "account": exchange.account, "paused": snapshot["paused"],
+        claims = authorize(context_auth, operator=True) if context_auth else None
+        lease_id, binding = setup_context(claims)
+        return {"network": settings.network, "account": exchange.account, "paused": snapshot["paused"], "setup": setup_gate.status(binding, lease_id, owner_id=settings.telegram_owner_id),
                 "policy": snapshot["policy"], "policy_revision": snapshot["policy_revision"], "sources": snapshot["sources"],
                 "source_names": snapshot.get("source_names", {}), "source_names_revision": snapshot.get("source_names_revision", 0),
                 "pending": [row["event_id"] for row in snapshot["events"].values() if row["status"] in UNFINISHED],
@@ -140,6 +157,13 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "telegram_view": {**page["telegram_view"], "status": telegram_view({**snapshot, "notifications": {}}, trading.accounts_ready() if snapshot["ranking_policy"]["enabled"] else ready,
                                                                                  sheets_enabled=settings.google_sheets.enabled, inventory=inventory)["status"]},
                 "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})), "last_synced_at": snapshot.get("journal_synced_at")}}
+
+    @server.tool(annotations=read)
+    async def setup_status(context_auth: str = "") -> dict:
+        """Read Setup availability and remaining fixed lease time; no private credential data."""
+        claims = authorize(context_auth, operator=True) if context_auth else None
+        lease_id, binding = setup_context(claims)
+        return setup_gate.status(binding, lease_id, owner_id=settings.telegram_owner_id)
 
     @server.tool(annotations=read)
     async def ranking_status(source: str | None = None, history_limit: int = 30) -> dict:
@@ -285,19 +309,40 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.update_metadata(("notifications",), acknowledge)
 
     @server.tool(annotations=write)
-    async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "set_source_name", "close_trade", "clear_notification", "set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled", "set_ranking_policy", "set_account_limits", "set_account_enabled"],
+    async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "set_source_name", "set_source_rank", "close_trade", "clear_notification", "set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled", "set_ranking_policy", "set_account_limits", "set_account_enabled"],
                       expected_revision: int | None = None, policy: Policy | None = None, sources: list[str] | None = None,
                       trade_id: str | None = None, notification_id: str | None = None, context_auth: str = "",
                       profile: TradingProfile | None = None, pipeline: Pipeline | None = None, exchange_id: Venue | None = None,
                       limits: AccountLimits | None = None, enabled: bool | None = None, identity: str | None = None,
                       source_id: str | None = None, source_name: str | None = None,
-                      ranking_policy: RankingPolicy | None = None, account_key: str | None = None) -> dict:
+                      ranking_policy: RankingPolicy | None = None, account_key: str | None = None, tier: Tier | None = None) -> dict:
         """Apply an authenticated natural-language user request. Source turns cannot change rules."""
         claims = authorize(context_auth, operator=True)
+        protected = action not in ("pause", "set_source_name", "close_trade", "clear_notification") and not (
+            action in ("set_account_enabled", "set_exchange_enabled") and enabled is False)
+        def commit_check():
+            authorize(context_auth, operator=True)
+            if protected:
+                require_setup(claims)
+        commit_check()
+        if action == "set_source_rank":
+            def set_rank(data):
+                commit_check()
+                return set_manual_rank(data, source_id, tier, expected_revision, setup_context(claims)[1].owner_id)
+            result = state.update_if_changed(set_rank)
+            if result["changed"]:
+                # Existing cancellation/reconciliation handles old unfilled entries;
+                # owned partial fills retain their protection and are never replayed.
+                async with trading.lock:
+                    await trading.recover()
+            return result
         if action == "set_ranking_policy":
             if ranking_policy is None or expected_revision != state.snapshot()["ranking_revision"]:
                 raise AqlaError("Supply the complete ranking policy and its current revision")
             def set_ranking(data):
+                commit_check()
+                if expected_revision != data["ranking_revision"]:
+                    raise AqlaError("Read the current ranking policy revision")
                 data["ranking_policy"] = ranking_policy.model_dump(mode="json")
                 data["ranking_revision"] += 1
                 for row in data["source_ranks"].values():
@@ -315,6 +360,9 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 await engine.exchange.verify_signer()
                 engine.state.assert_binding(engine.exchange.settings)
             def set_account(values):
+                commit_check()
+                if expected_revision != values["configuration_revision"]:
+                    raise AqlaError("Read the current configuration revision")
                 if action == "set_account_limits":
                     if limits is None:
                         raise AqlaError("Complete account limits are required")
@@ -334,7 +382,10 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             return state.update(set_account)
         if action == "set_source_name":
             from aqla_agent.sources import set_source_name
-            return state.update(lambda data: set_source_name(data, source_id, source_name, expected_revision))
+            def rename(data):
+                commit_check()
+                return set_source_name(data, source_id, source_name, expected_revision)
+            return state.update(rename)
         if action == "close_trade":
             if trade_id is None:
                 raise AqlaError("trade_id is required")
@@ -344,10 +395,14 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 raise AqlaError("Read the current configuration revision before activation")
             await trading.activate(exchange_id)
         if action in ("set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled"):
-            return state.update(lambda data: route_control(data, action, expected_revision=expected_revision, profile=profile, pipeline=pipeline,
-                                                          exchange=exchange_id, limits=limits, enabled=enabled, identity=identity))
+            def configure(data):
+                commit_check()
+                return route_control(data, action, expected_revision=expected_revision, profile=profile, pipeline=pipeline,
+                                     exchange=exchange_id, limits=limits, enabled=enabled, identity=identity)
+            return state.update(configure)
 
         def apply(data):
+            commit_check()
             if action == "set_policy":
                 if policy is None or expected_revision != data["policy_revision"]:
                     raise AqlaError("Read current rule revision and supply a complete validated policy")
@@ -373,18 +428,43 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.update(apply)
 
     @server.tool(annotations=write)
-    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack", "monthly_job", "monthly_ack", "monthly_request", "monthly_failure", "monthly_page"], token: str, source: SourceEvent | None = None,
+    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack", "monthly_job", "monthly_ack", "monthly_request", "monthly_failure", "monthly_page", "setup_bind", "setup_grant", "setup_failed", "setup_revoke", "setup_status", "presentation_snapshot"], token: str, source: SourceEvent | None = None,
                           aliases: dict[str, str] | None = None, cutoffs: dict[str, int] | None = None,
                           context_ids: dict[str, list[int]] | None = None,
                           accepted: dict[str, str] | None = None, month: str | None = None,
                           publication: MonthlyPublication | None = None, job: MonthlyJobBinding | None = None,
                           failure: MonthlyFailure | None = None, section: MonthlySection | None = None,
+                          setup_binding: dict | None = None, lease_id: str | None = None,
+                          generation: str | None = None, selection: dict | None = None,
                           offset: Annotated[int, Field(strict=True, ge=0)] = 0,
                           limit: Annotated[int, Field(strict=True, ge=1, le=100)] = 100) -> dict:
         """Internal native-plugin access, filtered out of agent tools; token never enters model context."""
         if authority is None:
             raise AqlaError("Integration key is not configured")
         authority.internal(token)
+        if action == "presentation_snapshot":
+            return state.presentation_snapshot(selection)
+        if action == "setup_revoke":
+            owner_id = (setup_binding or {}).get("owner_id")
+            if not isinstance(owner_id, str) or not owner_id:
+                raise AqlaError("Private owner binding is required")
+            setup_gate.revoke(owner_id)
+            return {"revoked": True}
+        if action.startswith("setup_"):
+            try:
+                binding = SetupBinding(**(setup_binding or {}))
+            except TypeError:
+                raise AqlaError("Private native Setup binding is required") from None
+            if binding.owner_id != settings.telegram_owner_id:
+                raise AqlaError("Setup binding must identify the configured Telegram owner")
+            if action == "setup_bind":
+                return {"generation": setup_gate.bind(binding), "locked_seconds": setup_gate.status(binding)["locked_seconds"]}
+            if action == "setup_failed":
+                return setup_gate.failed(binding)
+            if action == "setup_grant":
+                setup_gate.register(binding, lease_id, None, generation)
+                return {"registered": True, "remaining_seconds": setup_gate.status(binding, lease_id)["remaining_seconds"]}
+            return setup_gate.status(binding, lease_id)
         if action == "monthly_job":
             return state.monthly_transaction("job")
         if action == "monthly_failure":
@@ -455,6 +535,15 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.reader_snapshot(settings.max_context_messages)
 
     if profile == "full":
+        def public_guard(context_auth, request):
+            from aqla_agent.setup_actions import public_action_requires_setup
+            def check(data):
+                claims = authorize(context_auth, operator=True)
+                if public_action_requires_setup(request, data, account_key="hyperliquid:" + settings.network, account=exchange.account, network=settings.network):
+                    require_setup(claims)
+            check(state.read("operations", "trades"))
+            return check
+
         @server.tool(annotations=read)
         async def hl_info(request: InfoRequest) -> dict:
             """Typed public /info requests, including native perps, spot, HIP-3 and outcome data."""
@@ -465,31 +554,34 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                     "history_may_be_truncated": kind in ("userFills", "userFillsByTime", "historicalOrders", "userTwapSliceFills", "userFunding", "userNonFundingLedgerUpdates")}
 
         @server.tool(annotations=write)
-        async def hl_exchange(operation_id: str, request: SdkRequest) -> dict:
+        async def hl_exchange(operation_id: str, request: SdkRequest, context_auth: str = "") -> dict:
             """Typed official SDK operations with durable identities and correct account/signing scope."""
-            return await exchange.sdk_action(operation_id, request)
+            return await exchange.sdk_action(operation_id, request, prepare_guard=public_guard(context_auth, request))
 
         @server.tool(annotations=write)
-        async def hl_action(operation_id: str, request: NativeRequest) -> dict:
+        async def hl_action(operation_id: str, request: NativeRequest, context_auth: str = "") -> dict:
             """Strict native action contracts including non-SDK TWAP, trailing, staking and deployer variants."""
-            return await exchange.native_action(operation_id, request)
+            return await exchange.native_action(operation_id, request, prepare_guard=public_guard(context_auth, request))
 
         @server.tool(annotations=write)
         async def hl_multisig(action: Literal["prepare", "submit"], operation_id: str, multi_sig_user: Address,
                               request: SdkRequest | NativeRequest, nonce: int | None = None,
-                              signatures: list[Signature] | None = None, expires_after: int | None = None) -> dict:
+                              signatures: list[Signature] | None = None, expires_after: int | None = None, context_auth: str = "") -> dict:
             """Prepare typed multisig signing data or verify collected signatures and submit exactly once."""
             from .multisig import prepare, submit
+            guard = public_guard(context_auth, request)
             if action == "prepare":
-                return await prepare(exchange, operation_id, multi_sig_user, request, nonce, expires_after)
-            return await submit(exchange, operation_id, multi_sig_user, request, nonce, signatures, expires_after)
+                result = await prepare(exchange, operation_id, multi_sig_user, request, nonce, expires_after)
+                guard(state.read("operations", "trades"))
+                return result
+            return await submit(exchange, operation_id, multi_sig_user, request, nonce, signatures, expires_after, prepare_guard=guard)
 
         @server.tool(annotations=write)
         async def hl_stream(action: Literal["subscribe", "unsubscribe", "read", "post_info", "post_exchange", "post_action"],
                             subscription: Subscription | None = None, subscription_id: str | None = None,
                             after: int = 0, limit: int = 100, info_request: InfoRequest | None = None,
                             exchange_request: SdkRequest | None = None, operation_id: str | None = None,
-                            native_request: NativeRequest | None = None) -> dict:
+                            native_request: NativeRequest | None = None, context_auth: str = "") -> dict:
             """Typed native feeds, bounded event reads and correlated posts; reconnect never resends actions."""
             if action == "subscribe":
                 if subscription is None:
@@ -508,10 +600,10 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             if action == "post_action":
                 if native_request is None or operation_id is None:
                     raise AqlaError("Typed native request and stable operation_id are required")
-                return await exchange.native_action(operation_id, native_request, sender=lambda payload: streams.post("action", payload))
+                return await exchange.native_action(operation_id, native_request, sender=lambda payload: streams.post("action", payload), prepare_guard=public_guard(context_auth, native_request))
             if exchange_request is None or operation_id is None:
                 raise AqlaError("A typed exchange request and stable operation_id are required")
-            return await exchange.sdk_action(operation_id, exchange_request, sender=lambda payload: streams.post("action", payload))
+            return await exchange.sdk_action(operation_id, exchange_request, sender=lambda payload: streams.post("action", payload), prepare_guard=public_guard(context_auth, exchange_request))
 
     # Test/diagnostic handles, not MCP-exposed methods.
     server.aqla_state, server.aqla_exchange, server.aqla_trading = state, exchange, trading
