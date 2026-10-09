@@ -28,7 +28,8 @@ def test_deployment_is_separate_and_has_native_hermes_transport(tmp_path):
     assert config["plugins"]["entries"]["aqla-events"]["settings"]["owner_id"] == "12345"
     assert config["mcp_servers"]["aqla"]["command"].startswith(str(target))
     assert config["mcp_servers"]["sheets"]["args"][1] == "aqla_sheets_mcp"
-    assert config["mcp_servers"]["sheets"]["tools"]["exclude"] == ["sync_internal", "publish_monthly_internal"]
+    assert config["mcp_servers"]["sheets"]["tools"]["exclude"] == [
+        "sync_internal", "publish_monthly_internal", "sync_presentation_internal", "presentation_selection_internal"]
     assert (target / "hermes-home" / "skills" / "aqla-master" / "SKILL.md").exists()
     assert "aqla_agent.hermes_runtime" in (target / "aqla-agent.service").read_text()
     assert "TimeoutStopSec=90" in (target / "aqla-agent.service").read_text()
