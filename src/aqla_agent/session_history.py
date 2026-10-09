@@ -49,6 +49,12 @@ def _routing_entries(home: Path):
         raise HistoryImportError(_issue(path, error.lineno, "routing_metadata")) from None
     except (OSError, UnicodeError):
         raise HistoryImportError(_issue(path, 1, "read_failed")) from None
+    # The pinned SessionStore writes only this reserved informational sentinel.
+    # Do not treat arbitrary underscore-prefixed data as valid session metadata.
+    if isinstance(values, dict):
+        if any(key.startswith("_") and (key != "_README" or not isinstance(value, str)) for key, value in values.items()):
+            raise HistoryImportError(_issue(path, 1, "routing_metadata"))
+        values = {key: value for key, value in values.items() if key != "_README"}
     if not isinstance(values, dict) or any(not isinstance(value, dict) or not isinstance(value.get("session_id"), str) or
                                           value.get("source") is not None and not isinstance(value["source"], dict) for value in values.values()):
         raise HistoryImportError(_issue(path, 1, "routing_metadata"))

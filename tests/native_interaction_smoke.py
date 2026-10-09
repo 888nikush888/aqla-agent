@@ -3,9 +3,11 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -24,6 +26,7 @@ def main():
     import yaml
     from gateway.platforms.base import SendResult
     from gateway.run_turn_runner import TurnRunner
+    from gateway.session import SessionEntry, SessionStore
     from hermes_state import SessionDB
     from model_tools import get_tool_definitions
     from plugins.platforms.telegram.adapter import TelegramAdapter
@@ -38,10 +41,46 @@ def main():
     from aqla_agent.hermes_runtime import install_strict_profile
     from aqla_agent.session_history import (
         HistoryImportError,
+        _routing_entries,
         diagnose_session_history,
         migrate_session_history,
     )
     from aqla_hyperliquid_mcp.models import Settings
+
+    # The pinned native writer emits a reserved string sentinel alongside entries.
+    # Exercise the real serializer and SessionEntry, without a live user record.
+    routing_home = home / 'native-sessionstore-routing'
+    (routing_home / 'sessions').mkdir(parents=True)
+    native_store = object.__new__(SessionStore)
+    native_store.sessions_dir = routing_home / 'sessions'
+    entry = SessionEntry(session_key='synthetic_native_route', session_id='synthetic_native_owner',
+                         created_at=datetime.now(UTC), updated_at=datetime.now(UTC))
+    native_store._save_sessions_json({entry.session_key: entry.to_dict()})
+    routing_file = routing_home / 'sessions/sessions.json'
+    native_routing = json.loads(routing_file.read_text(encoding='utf-8'))
+    assert isinstance(native_routing['_README'], str) and isinstance(native_routing[entry.session_key], dict)
+    routing_only = routing_file.read_bytes()
+    assert _routing_entries(routing_home) == {entry.session_id: entry.to_dict()}
+    assert diagnose_session_history(routing_home) == {'files': 0, 'valid': 0, 'issues': []}
+    cli = subprocess.run([sys.executable, '-m', 'aqla_agent.session_history', '--home', str(routing_home),
+                          '--hermes-source', args.hermes_source, '--diagnose'], capture_output=True, text=True, check=True)
+    assert json.loads(cli.stdout) == {'files': 0, 'valid': 0, 'issues': []}
+    assert routing_file.read_bytes() == routing_only and not (routing_home / 'state.db').exists()
+    routing_history = Conversations(routing_home / 'sessions/transcripts')
+    routing_history.append('synthetic_native_owner', {'role': 'user', 'content': 'synthetic native routing history'})
+    routing_originals = {path: path.read_bytes() for path in routing_home.rglob('*') if path.is_file()}
+    assert diagnose_session_history(routing_home) == {'files': 1, 'valid': 1, 'issues': []}
+    assert not (routing_home / 'state.db').exists()
+    assert routing_originals == {path: path.read_bytes() for path in routing_home.rglob('*') if path.is_file()}
+    assert migrate_session_history(routing_home) == {'imported': 1, 'skipped': 0, 'messages': 1}
+    assert migrate_session_history(routing_home) == {'imported': 0, 'skipped': 1, 'messages': 0}
+    assert all(path.read_bytes() == data for path, data in routing_originals.items())
+    routing_db = SessionDB(db_path=routing_home / 'state.db')
+    try:
+        assert routing_db.get_session(entry.session_id) is not None
+        assert routing_db._read_one('SELECT imported_messages FROM aqla_jsonl_imports WHERE session_id=?', (entry.session_id,))[0] == 1
+    finally:
+        routing_db.close()
 
     legacy=Conversations(home/'sessions/transcripts')
     legacy.append('legacy_owner',{'role':'session_meta','model':'original-model','platform':'telegram','timestamp':'2026-10-03T18:15:00Z','tools':['todo_list']})
@@ -192,6 +231,7 @@ def main():
         finally:
             bad_db.close()
         print(json.dumps({'native_sqlite_import_search':True,'migration_idempotent':True,'old_files_preserved':True,
+                         'native_sessionstore_routing_metadata_import':True,
                          'import_rollback':True,'planning_persisted':True,'native_telegram_question_card':True,'source_tools_blocked':True,
                          'timeout_not_authorization':True,'monthly_request_claim_and_question_lifecycle':True,
                          'diagnosis_has_exact_safe_lines_and_no_dbwrite':True,'corrupt_session_has_no_partial_import':True,

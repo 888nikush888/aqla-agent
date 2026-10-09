@@ -5,6 +5,53 @@ import pytest
 from aqla_agent.session_history import HistoryImportError, diagnose_session_history, migrate_session_history
 
 
+def routing_home(tmp_path, values):
+    directory = tmp_path / "sessions/transcripts"
+    directory.mkdir(parents=True)
+    (directory / "synthetic_owner.jsonl").write_text('{"role":"user","content":"synthetic native history"}\n', encoding="utf-8")
+    path = tmp_path / "sessions/sessions.json"
+    path.write_text(json.dumps(values), encoding="utf-8")
+    return path
+
+
+def test_known_native_readme_string_is_not_a_session_or_a_routing_error(tmp_path):
+    path = routing_home(tmp_path, {"_README": "synthetic native mirror metadata", "synthetic_route": {
+        "session_id": "synthetic_owner", "created_at": "2026-10-09T00:00:00Z", "origin": {"platform": "telegram"}}})
+    before = {item: item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+    result = diagnose_session_history(tmp_path, validator=lambda values: (values, []))
+    assert result == {"files": 1, "valid": 1, "issues": []}
+    assert path.read_bytes() == before[path]
+    assert before == {item: item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+    assert not (tmp_path / "state.db").exists()
+
+
+@pytest.mark.parametrize("key,value", [("_README", None), ("_README", 1), ("_README", True), ("_README", []),
+    ("_README", {"session_id": "synthetic_owner"}), ("_UNKNOWN", "synthetic private metadata"),
+    ("_readme", "synthetic private metadata"), ("_UNKNOWN", {"session_id": "synthetic_owner"})])
+def test_only_known_native_reserved_metadata_with_string_type_is_accepted(tmp_path, key, value):
+    path = routing_home(tmp_path, {key: value})
+    before = path.read_bytes()
+    result = diagnose_session_history(tmp_path, validator=lambda values: (values, []))
+    assert len(result["issues"]) == 1
+    assert result["issues"][0]["path"] == str(path) and result["issues"][0]["line"] == 1
+    assert result["issues"][0]["code"] == "routing_metadata"
+    assert "synthetic private metadata" not in json.dumps(result)
+    assert path.read_bytes() == before and not (tmp_path / "state.db").exists()
+
+
+@pytest.mark.parametrize("entry,code", [("invalid-session", "routing_metadata"), ({"session_id": None}, "routing_metadata"),
+    ({"session_id": "synthetic_owner", "source": []}, "routing_metadata"),
+    ({"session_id": "synthetic_owner", "created_at": "invalid-time"}, "timestamp")])
+def test_native_readme_does_not_hide_invalid_session_records(tmp_path, entry, code):
+    path = routing_home(tmp_path, {"_README": "synthetic native metadata", "synthetic_route": entry})
+    before = path.read_bytes()
+    result = diagnose_session_history(tmp_path, validator=lambda values: (values, []))
+    assert result["issues"][0]["path"] == str(path) and result["issues"][0]["line"] == 1
+    assert result["issues"][0]["code"] == code
+    assert "invalid-session" not in json.dumps(result) and "invalid-time" not in json.dumps(result)
+    assert path.read_bytes() == before and not (tmp_path / "state.db").exists()
+
+
 @pytest.mark.parametrize("record,code", [("{secret-value", "json_decode"), ('{"role":"bad","content":"secret-value"}', "role"),
                                         ('{"role":"session_meta","secret-value":"content"}', "metadata"),
                                         ('{"role":"user","timestamp":"secret-value","content":"hidden"}', "timestamp")])
