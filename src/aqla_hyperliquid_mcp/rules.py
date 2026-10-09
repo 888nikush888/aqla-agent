@@ -197,7 +197,7 @@ class EntryPrices:
     limit: Decimal
 
 
-def entry_prices(signal: Interpretation, market: Market, policy: Policy) -> EntryPrices:
+def entry_prices(signal: Interpretation, market: Market, policy: Policy, *, maker_price: Decimal | None = None) -> EntryPrices:
     """Pure price selection after the source, product and account guards."""
     long = signal.side == "long"
     kind: Literal["limit", "market"] = "limit" if signal.entry in ("limit", "range") else "market"
@@ -210,18 +210,28 @@ def entry_prices(signal: Interpretation, market: Market, policy: Policy) -> Entr
         else:
             price = (high if long else low) if policy.entry_range_choice == "near" else (low if long else high)
         price = price_grid(price, market, up=not long)
+        if policy.entry_execution == "maker_only" and signal.entry == "range" and not low <= price <= high:
+            raise AqlaError("No maker price grid point satisfies the source entry range")
         limit = price
     else:
-        price = market.mid
-        limit = slippage_price(price, policy.max_slippage_percent, market, buy=long)
-    if signal.entry_timing == "deferred":
+        if policy.entry_execution == "maker_only":
+            if maker_price is None:
+                raise AqlaError("Maker market intent requires a fresh passive book price")
+            price = price_grid(maker_price, market, up=not long)
+            if not market.mid * (1 - policy.max_slippage_percent / 100) <= price <= market.mid * (1 + policy.max_slippage_percent / 100):
+                raise AqlaError("Passive maker price exceeds the source slippage tolerance")
+            limit = price
+        else:
+            price = market.mid
+            limit = slippage_price(price, policy.max_slippage_percent, market, buy=long)
+    if signal.entry_timing == "deferred" and policy.entry_execution == "standard":
         limit = slippage_price(price, policy.max_slippage_percent, market, buy=long)
     return EntryPrices(kind=kind, price=price, limit=limit)
 
 
 def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, policy: Policy,
               revision: int, source_time: int, binding: tuple[str, str], reserved_risk=Decimal(0), stamp=None, principal=None,
-              backup: BackupValues | None = None, backup_revision=None) -> TradePlan:
+              backup: BackupValues | None = None, backup_revision=None, maker_price: Decimal | None = None) -> TradePlan:
     stamp = now_ms() if stamp is None else stamp
     with localcontext() as context:
         context.prec = 50
@@ -253,7 +263,7 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
                 fields.append("entry")
             elif policy.entry_mode != "source_or_market":
                 raise AqlaError("Entry missing and Backup market entry is not configured")
-        selected_entry = entry_prices(signal, market, policy)
+        selected_entry = entry_prices(signal, market, policy, maker_price=maker_price)
         kind, entry, limit = selected_entry.kind, selected_entry.price, selected_entry.limit
         derived_stop, derived_targets = backup_prices(entry, signal.side, market,
             backup.fallback_stop_loss_percent if "stop_loss" in fields else None,
@@ -311,6 +321,10 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
                       source_take_profit_count=len(signal.take_profits),
                       tp_quantities=tp_sizes, risk_usdc=quantity * distance,
                       deadline_at=source_time + policy.max_signal_age_seconds * 1000, created_at=stamp)
+        if policy.entry_execution != "standard":
+            values["entry_execution"] = policy.entry_execution
+        if policy.take_profit_execution != "standard":
+            values["take_profit_execution"] = policy.take_profit_execution
         if signal.entry_timing == "deferred":
             values.update(entry_timing="deferred", entry_gate={"origin_mid": str(market.mid),
                           "direction": "down" if market.mid > entry else "up" if market.mid < entry else "at_entry"})

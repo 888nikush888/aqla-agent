@@ -39,6 +39,7 @@ def execution_settings(root, key):
 class VenueAdapter:
     """Canonical order intents; each signed leg is checkpointed before its only send."""
     fail_closed_protection = True
+    supports_maker_orders = False
 
     def __init__(self, settings, state):
         self.settings, self.state = settings, state

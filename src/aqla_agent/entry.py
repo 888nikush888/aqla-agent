@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from aqla_hyperliquid_mcp.models import AqlaError, Model, Positive, now_ms
-from aqla_hyperliquid_mcp.rules import slippage_price
+from aqla_hyperliquid_mcp.rules import price_grid, slippage_price
 
 
 class PriceSnapshot(Model):
@@ -55,15 +55,30 @@ def gate_state(plan, quote):
 
 
 def execution_limit(plan):
-    return slippage_price(plan.entry_price, plan.policy.max_slippage_percent, plan.market, buy=plan.side == "long") if plan.entry_timing == "deferred" else plan.entry_limit
+    return slippage_price(plan.entry_price, plan.policy.max_slippage_percent, plan.market, buy=plan.side == "long") if plan.entry_timing == "deferred" and plan.entry_execution == "standard" else plan.entry_limit
+
+
+def passive_entry_price(market, side, quote) -> Decimal:
+    quote.fresh()
+    if quote.market != market.symbol:
+        raise AqlaError("Maker entry quote belongs to another market")
+    price = price_grid(quote.bid if side == "long" else quote.ask, market, up=side == "short")
+    if price <= 0 or (price >= quote.ask if side == "long" else price <= quote.bid):
+        raise AqlaError("Fresh maker entry price would cross the executable book")
+    return price
 
 
 def validate_entry_prices(plan, quote, *, stop=None, targets=None):
     quote.fresh()
+    if quote.market != plan.market.symbol:
+        raise AqlaError("Entry price observation belongs to another market")
     stop = Decimal(str(stop)) if stop is not None else plan.stop_loss
     targets = [Decimal(str(value)) for value in targets] if targets is not None else plan.take_profits
     limit = execution_limit(plan)
     price = quote.ask if plan.side == "long" else quote.bid
+    maker = plan.entry_execution == "maker_only"
+    if maker and (limit >= quote.ask if plan.side == "long" else limit <= quote.bid):
+        raise AqlaError("Saved maker entry price would cross the executable book")
     # Resting ordinary limit orders may wait for a retracement; evaluate immediate
     # fill risk only when marketable. Deferred IOC entries must be executable now.
     marketable = price <= limit if plan.side == "long" else price >= limit
@@ -75,9 +90,12 @@ def validate_entry_prices(plan, quote, *, stop=None, targets=None):
         if not low <= price <= high:
             raise AqlaError("Executable entry price exceeds the source slippage tolerance")
     elif plan.entry_kind == "market" and not marketable:
-        raise AqlaError("Executable entry price exceeds the saved market limit")
-    if not marketable:
+        if not maker:
+            raise AqlaError("Executable entry price exceeds the saved market limit")
+    if not marketable and not maker:
         return {"marketable": False, "limit": str(limit)}
+    if maker:
+        price = limit
     safe = (stop < min(price, limit, quote.stop_reference) and all(value > max(price, limit) for value in targets)
             if plan.side == "long" else stop > max(price, limit, quote.stop_reference) and all(value < min(price, limit) for value in targets))
     if not safe:
@@ -88,4 +106,4 @@ def validate_entry_prices(plan, quote, *, stop=None, targets=None):
     risk = plan.quantity * (abs(price - stop) + worst_price * plan.policy.cost_reserve_bps / 10000)
     if risk > plan.risk_usdc:
         raise AqlaError("Live execution would exceed the reserved SL risk")
-    return {"marketable": True, "limit": str(limit), "expected_entry": str(price), "expected_risk": str(risk)}
+    return {"marketable": marketable, "limit": str(limit), "expected_entry": str(price), "expected_risk": str(risk)}

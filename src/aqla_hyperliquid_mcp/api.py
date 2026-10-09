@@ -52,6 +52,8 @@ def wire_number(value) -> str:
 
 
 class Hyperliquid:
+    supports_maker_orders = True
+
     async def price_snapshot(self, market):
         from aqla_agent.entry import PriceSnapshot
         started = now_ms()

@@ -28,6 +28,8 @@ def sign_parameters(wallet, parameters, *, network="mainnet"):
 
 
 class Aster(VenueAdapter):
+    supports_maker_orders = True
+
     async def price_snapshot(self, market):
         from .entry import PriceSnapshot
         started = now_ms()
@@ -158,7 +160,10 @@ class Aster(VenueAdapter):
                 if trigger:
                     parameters.update(type="STOP_MARKET" if trigger["tpsl"] == "sl" else "TAKE_PROFIT_MARKET", stopPrice=trigger["triggerPx"], workingType="CONTRACT_PRICE")
                 else:
-                    parameters.update(type="LIMIT", price=order["p"], timeInForce="IOC" if order["t"]["limit"]["tif"] == "Ioc" else "GTC")
+                    tif = {"Ioc": "IOC", "Gtc": "GTC", "Alo": "GTX"}.get(order["t"]["limit"]["tif"])
+                    if tif is None:
+                        raise AqlaError("Unsupported Aster limit time in force")
+                    parameters.update(type="LIMIT", price=order["p"], timeInForce=tif)
                 requests.append(self.signed("POST", "/fapi/v3/order", parameters))
             return requests
         if action["type"] in ("cancel", "cancelByCloid"):
@@ -242,5 +247,6 @@ class Aster(VenueAdapter):
                 if row.get("symbol") is not None and row["symbol"] != market.native_symbol:
                     raise AqlaError("Aster returned a fill from another native market")
                 result.append({"oid": int(row["orderId"]), "tid": row["id"], "coin": market.symbol, "sz": row["qty"], "px": row["price"],
-                               "time": int(row["time"]), "fee": row["commission"], "feeToken": row["commissionAsset"]})
+                               "time": int(row["time"]), "fee": row.get("commission"), "feeToken": row.get("commissionAsset"),
+                               "execution_role": "maker" if row.get("maker") is True else "taker" if row.get("maker") is False else "unknown"})
         return result

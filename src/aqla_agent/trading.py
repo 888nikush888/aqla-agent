@@ -35,8 +35,9 @@ from aqla_hyperliquid_mcp.rules import (
 from aqla_hyperliquid_mcp.state import State
 
 from .accounting import foreign_entry_orders, occupied_markets
-from .entry import execution_limit, gate_state, validate_entry_prices
+from .entry import execution_limit, gate_state, passive_entry_price, validate_entry_prices
 from .evidence import market_fills, order_observations
+from .execution_roles import merge_role, native_role
 from .pipelines import ConfigurationChanged, validate_ranking_binding
 
 OPEN = {"waiting_entry", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
@@ -203,6 +204,8 @@ class Trading:
             raise AqlaError("User trading rules have not been configured")
         self.state.assert_binding(self.exchange.settings)
         policy = Policy.model_validate(snapshot["policy"])
+        if "maker_only" in (policy.entry_execution, policy.take_profit_execution) and not getattr(self.exchange, "supports_maker_orders", False):
+            raise AqlaError("Selected exchange does not support strict native maker orders")
         if policy.product != "perp":
             raise AqlaError("Automatic source trading requires perpetual markets with native reduce-only protection; Spot remains available through the full MCP")
         active = [trade for trade in snapshot["trades"].values() if trade["status"] in OPEN]
@@ -228,14 +231,19 @@ class Trading:
         risk = sum(Decimal(trade["reserved_risk"]) for trade in active)
         backup_profile = snapshot.get("profiles", {}).get("backup")
         backup = BackupValues.model_validate({key: backup_profile["parameters"][key] for key in BackupValues.model_fields}) if backup_profile else None
+        maker_quote = None
+        maker_price = None
+        if policy.entry_execution == "maker_only" and interpretation.entry not in ("limit", "range"):
+            maker_quote = await self.exchange.price_snapshot(market)
+            maker_price = passive_entry_price(market, interpretation.side, maker_quote)
         plan = make_plan(interpretation, market, account, policy, snapshot["policy_revision"], min(refs),
                          (self.exchange.settings.network, self.exchange.account.lower()), reserved_risk=risk,
                          principal=self.exchange.settings.account.lower(), backup=backup,
-                         backup_revision=backup_profile["revision"] if backup_profile else None)
+                         backup_revision=backup_profile["revision"] if backup_profile else None, maker_price=maker_price)
         plan.source_revisions = self.source_revisions(snapshot, interpretation.source_refs)
         plan.ranking_policy_revision = snapshot["ranking_revision"]
         plan.ranking_enabled = snapshot["ranking_policy"]["enabled"]
-        quote = await self.exchange.price_snapshot(market)
+        quote = maker_quote or await self.exchange.price_snapshot(market)
         if plan.entry_timing == "deferred":
             plan.entry_gate.update(origin_mid=str(quote.mid), direction="down" if quote.mid > plan.entry_price else "up" if quote.mid < plan.entry_price else "at_entry",
                                    origin_snapshot=quote.model_dump(mode="json"))
@@ -337,10 +345,12 @@ class Trading:
         return Decimal(row["szi"]) if row else Decimal(0)
 
     @staticmethod
-    def order(plan, quantity, price, *, reduce=False, trigger=None, cloid=None):
+    def order(plan, quantity, price, *, reduce=False, trigger=None, cloid=None, take_profit=False):
         order = {"a": plan.market.asset_id, "b": (plan.side == "long") != reduce, "p": wire_number(price),
                  "s": wire_number(quantity), "r": reduce if plan.market.product == "perp" else False,
                  "t": {"limit": {"tif": "Ioc" if not reduce and plan.entry_kind == "market" else "Gtc"}}}
+        if not trigger and (not reduce and getattr(plan, "entry_execution", "standard") == "maker_only" or take_profit and getattr(plan, "take_profit_execution", "standard") == "maker_only"):
+            order["t"] = {"limit": {"tif": "Alo"}}
         if trigger:
             order["t"] = {"trigger": {"isMarket": True, "triggerPx": wire_number(trigger[1]), "tpsl": trigger[0]}}
         if cloid:
@@ -509,7 +519,7 @@ class Trading:
         current = self.state.snapshot()["trades"][plan.trade_id]
         stop = Decimal(current["stop_price"])
         entry = self.order(plan, plan.quantity, execution_limit(plan), cloid=trade["entry_cloid"])
-        if plan.entry_timing == "deferred":
+        if plan.entry_timing == "deferred" and plan.entry_execution == "standard":
             entry["t"] = {"limit": {"tif": "Ioc"}}
         initial_stop = self.order(plan, plan.quantity, stop * (Decimal("0.95") if plan.side == "long" else Decimal("1.05")),
                                   reduce=True, trigger=("sl", stop), cloid=self.exchange.cloid(trade["entry_operation_id"], 1))
@@ -577,7 +587,7 @@ class Trading:
                     and state["bindings"].get(pending["operation_id"]) == pending["source_binding"]):
                 pending["management_revision"] = changed["management_revision"]
             row.update(changed)
-            important = {key: value for key, value in changed.items() if key in ("status", "filled_quantity", "remaining_quantity", "stop_price", "tp_filled")}
+            important = {key: value for key, value in changed.items() if key in ("status", "filled_quantity", "remaining_quantity", "stop_price", "tp_filled", "maker_target_rejection")}
             if row.get("lifecycle_version") and row["status"] == "closed":
                 from .lifecycle import record_lifecycle
                 record_lifecycle(state, trade_id, "closed")
@@ -639,6 +649,8 @@ class Trading:
             if oid is not None:
                 mapping[oid] = order
         owned = dict(trade.get("fill_events", {}))
+        roles = dict(trade.get("fill_execution_roles", {}))
+        conflicts = dict(trade.get("fill_execution_role_conflicts", {}))
         for row in await self._fills(plan):
             if row.get("oid") not in mapping or row.get("coin") != plan.market.symbol:
                 continue
@@ -648,6 +660,8 @@ class Trading:
             if identity in owned and owned[identity] != fact:
                 raise AqlaError("An immutable owned fill changed; reconcile before managing quantities")
             owned[identity] = fact
+            if all(row.get(key) is not None for key in ("oid", "tid", "time", "sz", "px")):
+                merge_role(roles, conflicts, identity, native_role(getattr(self.exchange.settings, "venue", "hyperliquid"), row))
         entry_fills = [row for row in owned.values() if row["kind"] == "entry"]
         total = sum((Decimal(row["sz"]) for row in entry_fills), Decimal(0))
         cost = sum((Decimal(row["sz"]) * Decimal(row["px"]) for row in entry_fills), Decimal(0))
@@ -659,6 +673,7 @@ class Trading:
                 if budget is not None and Decimal(budget) > 0 and target_fills[index] >= Decimal(budget):
                     completed_prices.setdefault(str(index), trade.get("targets", plan.take_profits)[index])
         self._patch(trade_id, fill_events=owned, filled_quantity=str(total), tp_filled=[str(size) for size in target_fills],
+                    fill_execution_roles=roles, **({"fill_execution_role_conflicts": conflicts} if conflicts else {}),
                     entry_vwap=str(cost / total) if total else trade["entry_vwap"],
                     **({"completed_target_prices": completed_prices} if plan.policy.stop_management == "tp_ladder" else {}))
         self.observe_orders(trade_id, observed)
@@ -849,7 +864,7 @@ class Trading:
         if not any(order["kind"] == "tp" for order in trade["orders"]):
             sizes = split_targets(Decimal(trade["filled_quantity"]), len(plan.take_profits), plan.policy, plan.market)
             operation = "targets:" + trade_id + ":0"
-            orders = [self.order(plan, size, price, reduce=True, cloid=self.exchange.cloid(operation, i))
+            orders = [self.order(plan, size, price, reduce=True, take_profit=True, cloid=self.exchange.cloid(operation, i))
                       for i, (size, price) in enumerate(zip(sizes, trade.get("targets", plan.take_profits), strict=True))]
             def stage_initial(state):
                 row = state["trades"][trade_id]
@@ -860,17 +875,24 @@ class Trading:
         staged = self.state.snapshot()["trades"][trade_id].get("initial_targets")
         if staged and staged["operation_id"] not in self.state.snapshot()["operations"]:
             result = await self.exchange.mutate(staged["operation_id"], staged["action"])
-            if result["phase"] == "rejected" and "take_profits" in plan.backup_fields:
+            if result["phase"] == "rejected" and "take_profits" in plan.backup_fields and plan.take_profit_execution != "maker_only":
                 raise AqlaError("Backup TP order was rejected")
             if result["phase"] not in ("acknowledged", "reconciled"):
+                self.record_maker_target_rejection(trade_id, plan, result)
                 self._patch(trade_id, status="protecting")
                 return
+        if staged:
+            self.record_maker_target_rejection(trade_id, plan, self.state.snapshot()["operations"].get(staged["operation_id"], {}))
+        for operation in self.state.snapshot()["trades"][trade_id].get("target_updates", {}):
+            self.record_maker_target_rejection(trade_id, plan, self.state.snapshot()["operations"].get(operation, {}))
         active_targets = [order for order in self.state.snapshot()["trades"][trade_id]["orders"] if order["kind"] == "tp" and not order.get("retired")]
         if active_targets:
             observations = [await self.exchange.order_status(order["cloid"]) for order in active_targets]
-            if "take_profits" in plan.backup_fields and any(row.get("order", {}).get("status") == "rejected" for row in observations):
+            if "take_profits" in plan.backup_fields and plan.take_profit_execution != "maker_only" and any(row.get("order", {}).get("status") == "rejected" for row in observations):
                 raise AqlaError("Backup TP could not be installed")
             if any(row.get("order", {}).get("status") not in {"open", "filled", "triggered"} for row in observations):
+                if plan.take_profit_execution == "maker_only" and any(row.get("order", {}).get("status") == "rejected" for row in observations):
+                    self._patch(trade_id, maker_target_rejection="Native maker TP was rejected; target remains unfilled and stop protection is retained")
                 self._patch(trade_id, status="protecting")
                 return
         self._patch(trade_id, status="open")
@@ -1012,7 +1034,8 @@ class Trading:
         order = status.get("order", {}).get("order", {})
         return (order.get("coin") == plan.market.symbol and order.get("isTrigger") is True
                 and order.get("reduceOnly") is (plan.market.product == "perp")
-                and Decimal(order.get("sz", "0")) >= size and Decimal(order.get("triggerPx", "0")) == stop
+                and (Decimal(order.get("sz", "0")) == size if plan.entry_execution == "maker_only" else Decimal(order.get("sz", "0")) >= size)
+                and Decimal(order.get("triggerPx", "0")) == stop
                 and order.get("side") == ("A" if plan.side == "long" else "B"))
 
     async def cancel_entry(self, trade_id):
@@ -1642,7 +1665,9 @@ class Trading:
         elif staged["prices"] != [str(price) for price in target_prices]:
             raise AqlaError("Target update ID already identifies different prices")
         if staged["action"] is not None:
-            return await self.exchange.mutate(operation_id, staged["action"]) if staged["action"]["orders"] else {"no_unfilled_targets": True}
+            result = await self.exchange.mutate(operation_id, staged["action"]) if staged["action"]["orders"] else {"no_unfilled_targets": True}
+            self.record_maker_target_rejection(trade_id, plan, result)
+            return result
         old_orders = staged["original_orders"]
         cancels = [{"asset": plan.market.asset_id, "cloid": order["cloid"]} for order in old_orders]
         if cancels:
@@ -1674,7 +1699,7 @@ class Trading:
             if size <= 0:
                 continue
             price = target_prices[index]
-            new.append((index, self.order(plan, size, price, reduce=True, cloid=self.exchange.cloid(operation_id, index))))
+            new.append((index, self.order(plan, size, price, reduce=True, take_profit=True, cloid=self.exchange.cloid(operation_id, index))))
             quantity_left -= size
 
         def record(data):
@@ -1691,8 +1716,13 @@ class Trading:
 
         self.state.update(record)
         result = await self.exchange.mutate(operation_id, {"type": "order", "orders": [order for _, order in new], "grouping": "na"}) if new else {"no_unfilled_targets": True}
+        self.record_maker_target_rejection(trade_id, plan, result)
         self._patch(trade_id, management_revision=trade["management_revision"] + 1)
         return result
+
+    def record_maker_target_rejection(self, trade_id, plan, result):
+        if plan.take_profit_execution == "maker_only" and (result.get("phase") == "rejected" or any(leg.get("disposition") == "rejected" for leg in result.get("legs", []))):
+            self._patch(trade_id, maker_target_rejection="Native maker TP was rejected; target remains unfilled and stop protection is retained")
 
     async def recover(self):
         with order_observations(self.exchange):

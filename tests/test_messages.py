@@ -106,6 +106,36 @@ def test_view_is_pure_and_opening_has_only_confirmed_values(opened):
     assert set(result['messages'][0]['notification_ids'])==set(opened['notifications'])
 
 
+def test_maker_modes_and_native_role_are_distinct_from_intent(opened):
+    trade = next(iter(opened['trades'].values()))
+    trade['plan'].update(entry_execution='maker_only', take_profit_execution='maker_only')
+    trade['fill_execution_roles'] = {identity: 'taker' for identity in trade['fill_events']}
+    rendered = text(telegram_view(opened, READY))
+    assert 'Entry Maker only · TP Maker only' in rendered
+    assert '**Fillrolle belegt:** Taker' in rendered
+    trade['fill_execution_roles'] = {}
+    rendered = text(telegram_view(opened, READY))
+    assert '**Fillrolle belegt:** unbekannt' in rendered
+
+
+def test_maker_target_rejection_remains_visible_with_live_stop(opened):
+    trade = next(iter(opened['trades'].values()))
+    trade.update(status='protecting', maker_target_rejection='Native maker TP rejected')
+    rendered = text(telegram_view(opened, READY))
+    assert '**TP abgelehnt:**' in rendered and 'vorhandener SL bleibt aktiv' in rendered
+
+
+def test_lifecycle_displays_role_enrichment_without_rewriting_frozen_facts(opened):
+    from aqla_agent.messages import lifecycle_block
+
+    trade = next(iter(opened['trades'].values()))
+    event = trade['lifecycle_events']['entry_fill']
+    before = copy.deepcopy(event)
+    trade['fill_execution_roles'] = {identity: 'maker' for identity in trade['fill_events']}
+    assert '**Fillrolle belegt:** Maker' in lifecycle_block(opened, event)
+    assert event == before
+
+
 @pytest.mark.parametrize('value,expected',[('86032.125','86.032,125'),('0.0000123','0,0000123'),('-1234.5','−1.234,5'),('1.000','1'),('NaN','nicht bestätigt')])
 def test_german_numbers_keep_precision(value,expected):
     assert number(value)==expected

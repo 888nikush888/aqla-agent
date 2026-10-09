@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from decimal import Decimal, InvalidOperation
 
+from .execution_roles import observed_roles
+
 VENUES = {"hyperliquid": "Hyperliquid", "aster": "Aster", "lighter": "Lighter"}
 OPEN = {"waiting_entry", "entry_pending", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
 ERRORS = {
@@ -17,6 +19,18 @@ ERRORS = {
 }
 CHUNK_UNITS = 3000
 MAX_NOTIFICATIONS = 100
+
+
+def execution_lines(trade):
+    plan = trade["plan"]
+    labels = {"standard": "Standard", "maker_only": "Maker only"}
+    line = "**Ausführungsmodus:** Entry " + labels[plan.get("entry_execution", "standard")] + " · TP " + labels[plan.get("take_profit_execution", "standard")]
+    roles = observed_roles(trade)
+    if roles:
+        line += "\n**Fillrolle belegt:** " + ", ".join({"maker": "Maker", "taker": "Taker", "unknown": "unbekannt"}[role] for role in roles)
+    if trade.get("fill_execution_role_conflicts"):
+        line += " · widersprüchliche Börsenbelege"
+    return line
 
 
 def literal(value):
@@ -165,6 +179,7 @@ def trade_block(data, trade, notices):
     else:
         title = "✅ **Trade eröffnet**" if opening else "🔄 **Trade aktualisiert**"
     lines = [f"{title} · {market} {direction}", context(data, plan)]
+    lines.append(execution_lines(trade))
     if risk_block(trade):
         lines.append(risk_block(trade))
     if stage == "waiting_entry":
@@ -218,6 +233,8 @@ def trade_block(data, trade, notices):
             lines.append("**Ergebnis:** PnL nicht vollständig bestätigt")
     if trade.get("unsent_reason"):
         lines.append("**Grund:** " + literal(ERRORS.get(trade["unsent_reason"], trade["unsent_reason"])))
+    if trade.get("maker_target_rejection"):
+        lines.append("**TP abgelehnt:** Maker-Ziel bleibt unausgeführt; vorhandener SL bleibt aktiv.")
     if trade.get("external_conflict"):
         lines.append("**Verwaltung angehalten:** " + literal(trade['external_conflict']))
     stop_requests = [notice["stop_update"] for notice in notices if notice.get("stop_update")]
@@ -241,6 +258,12 @@ def _berlin_time(timestamp):
 
 def lifecycle_block(data, event):
     trade = event["facts"]
+    current = data.get("trades", {}).get(trade["trade_id"], {})
+    # Native-role enrichment is a read-only sidecar, never a rewrite of the
+    # immutable lifecycle facts or their financial fill fingerprints.
+    trade = {**trade, **{key: {identity: role for identity, role in current.get(key, {}).items()
+                             if identity in trade.get("fill_events", {})}
+                        for key in ("fill_execution_roles", "fill_execution_role_conflicts")}}
     plan = trade["plan"]
     plan = {**plan, "source_tp": trade.get("source_tp_override", plan.get("source_tp"))}
     time = _berlin_time(event["time"])
@@ -266,6 +289,7 @@ def lifecycle_block(data, event):
         lines.append(risk_block(trade))
     if plan.get("source_exchange"):
         lines.append("**Signalbörse:** " + literal(plan["source_exchange"]))
+    lines.append(execution_lines(trade))
     targets = trade.get("targets", plan.get("take_profits", []))
     budgets = trade.get("target_budgets") or plan.get("tp_quantities", [])
     total = sum((decimal(value) or Decimal(0) for value in budgets), Decimal(0))

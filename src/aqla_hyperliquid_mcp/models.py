@@ -53,6 +53,8 @@ class Policy(Model):
     max_open_trades: int = Field(default=3, ge=1, le=100)
     max_total_risk_percent: Positive = Field(default=Decimal("1.5"), le=100)
     entry_mode: Literal["source", "source_or_market"] = "source_or_market"
+    entry_execution: Literal["standard", "maker_only"] = Field(default="standard", repr=False)
+    take_profit_execution: Literal["standard", "maker_only"] = Field(default="standard", repr=False)
     entry_range_choice: Literal["near", "far", "midpoint"] = "midpoint"
     max_slippage_percent: Positive = Field(default=Decimal("0.3"), le=10)
     max_signal_age_seconds: int = Field(default=300, ge=1, le=86400)
@@ -63,6 +65,14 @@ class Policy(Model):
     allowed_updates: list[Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"]] = Field(default_factory=lambda: ["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"])
     allow_stop_widening: bool = False
     cost_reserve_bps: Nonnegative = Field(default=Decimal("10"), le=1000)
+
+    @model_serializer(mode="wrap")
+    def compatible_execution_fields(self, handler):
+        result = handler(self)
+        for key in ("entry_execution", "take_profit_execution"):
+            if getattr(self, key) == "standard":
+                result.pop(key, None)
+        return result
 
     @model_validator(mode="after")
     def consistent(self):
@@ -347,6 +357,8 @@ class TradePlan(Model):
     market: Market
     side: Literal["long", "short"]
     entry_kind: Literal["market", "limit"]
+    entry_execution: Literal["standard", "maker_only"] = Field(default="standard", repr=False)
+    take_profit_execution: Literal["standard", "maker_only"] = Field(default="standard", repr=False)
     entry_timing: Literal["standard", "deferred"] = "standard"
     source_exchange: str | None = None
     entry_gate: dict | None = None
@@ -381,6 +393,9 @@ class TradePlan(Model):
     @model_serializer(mode="wrap")
     def compatible_entry_fields(self, handler):
         result = handler(self)
+        for key in ("entry_execution", "take_profit_execution"):
+            if getattr(self, key) == "standard":
+                result.pop(key, None)
         if self.entry_timing == "standard":
             result.pop("entry_timing", None)
         if self.source_exchange is None:
@@ -391,6 +406,12 @@ class TradePlan(Model):
             if getattr(self, key) is None:
                 result.pop(key, None)
         return result
+
+    @model_validator(mode="after")
+    def execution_consistent(self):
+        if self.entry_execution != self.policy.entry_execution or self.take_profit_execution != self.policy.take_profit_execution:
+            raise ValueError("Saved execution modes differ from the immutable policy")
+        return self
 
     @model_validator(mode="after")
     def ranking_consistent(self):

@@ -79,6 +79,8 @@ class TerminalOrderIndex:
 
 
 class Lighter(VenueAdapter):
+    supports_maker_orders = True
+
     async def price_snapshot(self, market):
         from .entry import PriceSnapshot
         started = now_ms()
@@ -228,6 +230,21 @@ class Lighter(VenueAdapter):
     def client_index(identity):
         return int(identity.removeprefix("0x"), 16) & ((1 << 48) - 1)
 
+    @staticmethod
+    def limit_tif(sdk, intent):
+        if intent["t"].get("trigger"):
+            return sdk.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
+        tif = intent["t"]["limit"]["tif"]
+        if tif == "Alo":
+            if getattr(sdk, "ORDER_TIME_IN_FORCE_POST_ONLY", None) != 2:
+                raise AqlaError("Lighter signer does not support native post-only orders")
+            return sdk.ORDER_TIME_IN_FORCE_POST_ONLY
+        if tif == "Ioc":
+            return sdk.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
+        if tif == "Gtc":
+            return sdk.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+        raise AqlaError("Unsupported Lighter limit time in force")
+
     async def build_requests(self, action, deadline):
         self._build_next_nonce = None
         sdk = self.sdk()
@@ -240,7 +257,7 @@ class Lighter(VenueAdapter):
                 orders.append(self.grouped_order_type(MarketIndex=market.asset_id, ClientOrderIndex=0 if trigger else self.client_index(item["c"]),
                     BaseAmount=0 if trigger else integer_amount(item["s"], market.quantity_step), Price=integer_price(item["p"], market.price_tick),
                     IsAsk=int(not item["b"]), Type=sdk.ORDER_TYPE_STOP_LOSS if trigger else sdk.ORDER_TYPE_LIMIT,
-                    TimeInForce=sdk.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL if trigger or item["t"]["limit"]["tif"] == "Ioc" else sdk.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                    TimeInForce=self.limit_tif(sdk, item),
                     ReduceOnly=int(item["r"]), TriggerPrice=integer_price(trigger["triggerPx"], market.price_tick) if trigger else 0,
                     OrderExpiry=sdk.DEFAULT_28_DAY_ORDER_EXPIRY if trigger or item["t"]["limit"]["tif"] != "Ioc" else sdk.DEFAULT_IOC_EXPIRY))
             nonce = await self.next_nonce()
@@ -259,7 +276,7 @@ class Lighter(VenueAdapter):
                 signed = sdk.sign_create_order(market_index=market.asset_id, client_order_index=self.client_index(intent["c"]),
                     base_amount=integer_amount(intent["s"], market.quantity_step), price=integer_price(intent["p"], market.price_tick), is_ask=not intent["b"],
                     order_type=(sdk.ORDER_TYPE_STOP_LOSS if trigger["tpsl"] == "sl" else sdk.ORDER_TYPE_TAKE_PROFIT) if trigger else sdk.ORDER_TYPE_LIMIT,
-                    time_in_force=sdk.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL if trigger or intent["t"]["limit"]["tif"] == "Ioc" else sdk.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                    time_in_force=self.limit_tif(sdk, intent),
                     reduce_only=intent["r"], trigger_price=integer_price(trigger["triggerPx"], market.price_tick) if trigger else 0,
                     order_expiry=sdk.DEFAULT_28_DAY_ORDER_EXPIRY if trigger or intent["t"]["limit"]["tif"] != "Ioc" else sdk.DEFAULT_IOC_EXPIRY, **kwargs)
             elif action["type"] in ("cancel", "cancelByCloid"):
@@ -428,12 +445,15 @@ class Lighter(VenueAdapter):
                 if stamp > end:
                     continue
                 is_ask = str(row["ask_account_id"]) == self.account
-                if not is_ask and str(row["bid_account_id"]) != self.account:
+                is_bid = str(row["bid_account_id"]) == self.account
+                if not is_ask and not is_bid:
                     raise AqlaError("Lighter returned another account's fill")
                 market = self.native_market(row["market_id"])
                 result.append({"oid": int(row["ask_id"] if is_ask else row["bid_id"]), "tid": row["trade_id"], "coin": market.symbol,
                                "sz": row["size"], "px": row["price"], "time": stamp, "fee": "0" if row.get("maker_fee") == row.get("taker_fee") == 0 else None, "feeToken": "USDC",
-                               "native_fee": {"maker_fee": row.get("maker_fee"), "taker_fee": row.get("taker_fee"), "is_maker_ask": row.get("is_maker_ask")}})
+                               "native_fee": {"maker_fee": row.get("maker_fee"), "taker_fee": row.get("taker_fee"), "is_maker_ask": row.get("is_maker_ask")},
+                               "execution_role": ("maker" if is_ask == row["is_maker_ask"] else "taker")
+                               if type(row.get("is_maker_ask")) is bool and is_ask != is_bid else "unknown"})
             cursor = raw.get("next_cursor")
             if not cursor:
                 return result
