@@ -232,7 +232,7 @@ async def test_actual_sheets_mcp_registration_reading_and_internal_auth(setup, s
     selected, _, client = sheets
     settings.google_sheets = selected
     server = create_server(settings, client=client)
-    assert {tool.name for tool in await server.list_tools()} == {"journal_status", "journal_read", "journal_statistics", "sync_internal", "publish_monthly_internal"}
+    assert {tool.name for tool in await server.list_tools()} == {"journal_status", "journal_read", "journal_statistics", "sync_internal", "publish_monthly_internal", "sync_presentation_internal", "presentation_selection_internal"}
     with pytest.raises(ToolError, match="denied"):
         await server.call_tool("sync_internal", {"token": "untrusted-source", "records": []})
     row = record("Regeln", "aktuell", "testnet", "ci-account", 1, False, "[]", "null")
@@ -389,9 +389,9 @@ def test_parameter_page_covers_every_rule_without_activating_defaults(setup):
     data["policy_revision"] = 0
     original = copy.deepcopy(data)
     rows = {row["record_id"]: row for row in project(data).values() if row["table"] == "Handelsparameter"}
-    assert set(PARAMETERS) == set(Policy.model_fields)
-    assert len(rows) == len(Policy.model_fields) + 6 + 2 * len(data["venue_limits"]) + len(data["profiles"]["backup"]["parameters"]) + 11 + 2 * len(data["account_limits"])
-    assert all(rows[name]["values"][3] == "Nicht festgelegt" for name in Policy.model_fields)
+    assert set(PARAMETERS) == set(Policy.model_fields) | {"entry_execution", "take_profit_execution"}
+    assert len(rows) == len(PARAMETERS) + 6 + 2 * len(data["venue_limits"]) + len(data["profiles"]["backup"]["parameters"]) + 11 + 2 * len(data["account_limits"])
+    assert all(rows[name]["values"][3] == "Nicht festgelegt" for name in PARAMETERS)
     assert rows["risk_percent"]["values"][6] == 0.5
     assert rows["policy_selected"]["values"][3] == "Nein"
     assert data == original
@@ -400,7 +400,7 @@ def test_parameter_page_covers_every_rule_without_activating_defaults(setup):
 
 
 @pytest.mark.asyncio
-async def test_parameter_page_tracks_authenticated_rule_changes_and_stale_ack(setup, sheets):
+async def test_parameter_page_tracks_authenticated_rule_changes_and_stale_ack(setup, sheets, tmp_path):
     from aqla_hyperliquid_mcp.server import close_server
     from aqla_hyperliquid_mcp.server import create_server as core_server
     from aqla_sheets_mcp.journal import seed
@@ -412,14 +412,32 @@ async def test_parameter_page_tracks_authenticated_rule_changes_and_stale_ack(se
     state.journal_enabled = True
     state.update(seed)
     old = client.sync(batch(state.snapshot(), 500)["records"])["accepted"]
+    if "setup_password_hash_file" in Settings.model_fields:
+        from aqla_agent.setup import write_password_hash
+
+        settings.setup_password_hash_file = tmp_path / "synthetic-setup.json"
+        write_password_hash(settings.setup_password_hash_file, "synthetic-only-fixture")
+        settings.telegram_owner_id = "12345"
     server = core_server(settings, state=state, exchange=exchange)
     try:
+        context_auth = server.aqla_authority.sign("operator", "rules")
+        if "setup_password_hash_file" in Settings.model_fields:
+            from dataclasses import asdict
+
+            from aqla_agent.setup import SetupBinding
+
+            binding = SetupBinding("12345", "12345", "synthetic-sheets-gateway", "synthetic-sheets-session")
+            gate = server._aqla_setup_gate
+            generation = gate.bind(binding)
+            identity = "b" * 64
+            gate.register(binding, identity, None, generation)
+            context_auth = server.aqla_authority.sign("operator", "rules", setup={"identity": identity, "binding": asdict(binding)})
         policy = Policy(risk_percent="1.25", sizing_mode="fixed_notional", fixed_notional_usdc="250",
                         leverage=3, margin_mode="cross", take_profit_allocation="custom",
                         take_profit_weights=[60, 40], break_even_after_tp=2,
                         allowed_updates=[], allow_stop_widening=True, cost_reserve_bps="12")
         result = await server.call_tool("control", {"action": "set_policy", "expected_revision": 0,
-            "policy": policy.model_dump(mode="json"), "context_auth": server.aqla_authority.sign("operator", "rules")})
+            "policy": policy.model_dump(mode="json"), "context_auth": context_auth})
         assert result.is_error is not True
         state.update(lambda data: acknowledge(data, old))
         assert "Handelsparameter:leverage" in state.snapshot()["journal_pending"]

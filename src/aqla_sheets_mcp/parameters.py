@@ -5,6 +5,8 @@ from aqla_hyperliquid_mcp.models import Policy
 
 # Field -> category, label, unit, allowed values, explanation.
 PARAMETERS = {
+    "entry_execution": ("Ausführung", "Entry-Ausführung", "", "standard / maker_only", "Maker-only platziert ausschließlich Post-only-Limits; kein Taker-Fallback."),
+    "take_profit_execution": ("Ausführung", "TP-Ausführung", "", "standard / maker_only", "Maker-only nutzt Post-only-Limits für Take Profits. Schutz-Stops bleiben unverändert."),
     "fallback_stop_loss_percent": ("Backup", "SL bei fehlender Angabe", "% Kursbewegung", "> 0 bis < 100 oder nicht gesetzt", "Nur das globale Backup ergänzt fehlende SLs; Referenz ist der tatsächliche Entry-VWAP, unabhängig vom Hebel."),
     "fallback_take_profit_percentages": ("Backup", "TPs bei fehlender Angabe", "% Kursbewegung", "1–20 eindeutige aufsteigende Werte zwischen 0 und 100", "Nur das globale Backup ergänzt eine vollständig fehlende TP-Liste. Vorhandene Signalziele bleiben erhalten."),
     "product": ("Markt", "Handelsprodukt", "", "USDC-Perpetuals", "Die automatische Signalstrecke handelt USDC-Perpetuals; Spot wird dort nicht ausgeführt."),
@@ -31,6 +33,7 @@ PARAMETERS = {
 }
 
 VALUE_LABELS = {
+    "standard": "Standard", "maker_only": "Nur Maker (Post-only)",
     "fixed": "Fest", "signal": "Aus Signal, am Börsenmaximum gedeckelt",
     "perp": "Perpetuals", "spot": "Spot (automatisch nicht unterstützt)",
     "risk_percent": "Nach Risiko", "fixed_notional": "Fester Positionswert",
@@ -71,14 +74,14 @@ def parameter_values(data):
     yield "policy_revision", "Betrieb", "Regelstand", data["policy_revision"], "Revision", "Automatisch", "0", "Version der aktiven Handelsregeln; wird beim Ändern der Regeln erhöht."
     defaults = Policy().model_dump()
     for field, (category, label, unit, allowed, description) in PARAMETERS.items():
-        value = display(current[field], field) if current is not None else "Nicht festgelegt"
+        value = display(current.get(field, "standard"), field) if current is not None else "Nicht festgelegt"
         if field == "leverage" and current is not None and current["leverage_mode"] == "signal":
             value = "Nicht verwendet (Signalmodus)"
         if field == "break_even_after_tp" and current is not None and current["stop_management"] == "tp_ladder":
             value = "Nicht verwendet (TP-Leiter)"
         if field == "take_profit_weights" and current is not None and current["take_profit_allocation"] != "custom":
             value = "Nicht verwendet"
-        yield field, category, label, value, unit, allowed, display(defaults[field], field), description, "standard", "hyperliquid", "USDC", data.get("profiles", {}).get("standard", {}).get("revision", data["policy_revision"])
+        yield field, category, label, value, unit, allowed, display(defaults.get(field, "standard"), field), description, "standard", "hyperliquid", "USDC", data.get("profiles", {}).get("standard", {}).get("revision", data["policy_revision"])
     for identity, profile in data.get("profiles", {}).items():
         if identity == "standard" or profile.get("parameters") is None:
             continue

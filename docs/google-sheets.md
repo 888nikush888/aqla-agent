@@ -2,6 +2,14 @@
 
 aqla enthält einen zweiten Python-MCP für Google Sheets. Der native Hermes-Gateway lädt ihn als `sheets`; ein eigener Hintergrundtask liefert automatisch die Geschäftsdaten. Das Modell muss keine Logzeilen schreiben. Ohne Konfiguration bleibt die Funktion deaktiviert, der MCP kann seinen Einrichtungsstatus melden.
 
+Die Arbeitsmappe heißt **aqla Trade Journal**. Ihre sichtbaren Einstiege sind **Dashboard**, **Journal**, **Kanäle**, **Parameter** und **Monatsberichte**. Börse, Netzwerk, Währung und Zeitraum lassen sich im Dashboard auswählen; Mainnet, USDC für die bestehende primäre Journalhistorie und der laufende Berliner Monat sind voreingestellt. USDT und Testnet bleiben ausdrücklich auswählbar. Die Auswahl steuert ausschließlich die Auswertung. Parameter, Ränge und Trades werden weiterhin aus dem verbindlichen lokalen Zustand gelesen.
+
+Das Dashboard verwendet dieselben belegten Finanzfakten wie die Monatsberichte, einschließlich bestätigtem Funding. Fehlende Gebühren, Funding-Belege oder Währungsumrechnung bleiben unbestimmt und werden als unvollständig angezeigt. USDT und USDC werden getrennt ausgewertet. Die Kurve zeigt kumulierte bekannte realisierte Netto-PnL. Kanal-Netto-R zählt vollständige ursprüngliche Setup-Familien wie das Ranking; bei mehreren Ausführungen verwendet es deren mittleres Netto-R.
+
+Die technischen Tabs werden ausgeblendet und behalten ihre Namen, Sheet-IDs, Datensätze und Metadaten. Der Mainnet-Monatsclient behält den technischen Präfix `aqla Mainnet `. Journal-IDs verweisen auf die zugehörigen technischen Tabs; die Monatsübersicht verlinkt veröffentlichte Berichte. Entry-/TP-Modi und die tatsächlich belegte Maker-/Taker-Rolle stehen getrennt von den unveränderten finanziellen Fillbelegen.
+
+Nur der authentifizierte native Publisher darf die abgeleiteten Ansichten schreiben. Seine beiden internen Werkzeuge sind vom Modellzugriff ausgeschlossen. Er prüft Auswahl, Zustandsscope, Inhaltsfingerprint, Revision und Schreibbestätigung, veröffentlicht höchstens einmal je Minute und schreibt bei identischem Inhalt und intakter Struktur keine Zellen erneut. Nach einer verlorenen Antwort verwendet er dieselben Sheet- und Chart-IDs. Er leert ausschließlich früher von ihm belegte Bereiche der abgeleiteten Ansichten.
+
 ## Welche Daten erscheinen?
 
 | Tab | Inhalt |

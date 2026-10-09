@@ -13,6 +13,7 @@ from aqla_hyperliquid_mcp.models import AqlaError
 from .journal import (
     HEADERS,
     LEGACY_HEADERS,
+    PRE_PRESENTATION_HEADERS,
     PRE_RANK_HEADERS,
     TARGET_COLUMNS,
     JournalRecord,
@@ -85,6 +86,14 @@ def column(index):
 
 
 class SheetsClient:
+    def publish_presentation(self, snapshot):
+        from .presentation import publish
+        return publish(self, snapshot)
+
+    def presentation_selection(self):
+        from .presentation import selection
+        return selection(self)
+
     def publish_monthly(self, report):
         from .monthly import publish
         return publish(self, report)
@@ -138,15 +147,18 @@ class SheetsClient:
                 continue
             title = self.prefix + table
             if title in properties:
-                if create and table in PRE_RANK_HEADERS:
-                    cells = self.values([f"'{title}'!A1:{column(len(headers) + 2)}1"])
-                    previous = [PRE_RANK_HEADERS[table]]
+                if create and table in PRE_PRESENTATION_HEADERS:
+                    width = min(len(headers) + 2, properties[title]["gridProperties"]["columnCount"])
+                    cells = self.values([f"'{title}'!A1:{column(width)}1"])
+                    previous = [PRE_PRESENTATION_HEADERS[table]]
+                    if table in PRE_RANK_HEADERS:
+                        previous.append(PRE_RANK_HEADERS[table])
                     if table in LEGACY_HEADERS:
                         previous.append(LEGACY_HEADERS[table])
                     if table in ("Trades", "Orders", "Fills", "Vorgänge"):
                         previous.append([*LEGACY_HEADERS[table], *TARGET_COLUMNS])
                     old = next((headers for headers in previous if cells and cells[0] and cells[0][0] == [*headers, *META_HEADERS]), None)
-                    if old is not None:
+                    if old is not None and len(old) < len(headers):
                         identity = properties[title]["sheetId"]
                         start = len(old)
                         extra = len(headers) - start

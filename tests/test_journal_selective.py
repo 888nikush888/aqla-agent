@@ -90,6 +90,24 @@ async def test_trade_order_fill_operation_rank_mixed_ack_complete_state_oracle(s
     await trading.recover()
     monkeypatch.setattr(journal, "now_ms", lambda: 1_800_000_000_000)
     monkeypatch.setattr(oracle, "now_ms", lambda: 1_800_000_000_000)
+    legacy_project = oracle.project
+
+    def additive_oracle(data):
+        # Keep the frozen oracle source and its complete-state ACK algorithm;
+        # extend only its wire body for the independently specified new columns.
+        records = legacy_project(data)
+        for row in records.values():
+            if row["table"] == "Trades":
+                plan = data["trades"][row["record_id"]]["plan"]
+                row["values"] += [plan.get("entry_execution", "standard"), plan.get("take_profit_execution", "standard")]
+            elif row["table"] == "Fills":
+                trade = data["trades"][row["values"][1]]
+                role = trade.get("fill_execution_roles", {}).get(row["record_id"], "unknown")
+                row["values"] += [role if role in ("maker", "taker", "unknown") else "unknown"]
+            row["fingerprint"] = oracle.fingerprint(row["values"])
+        return records
+
+    monkeypatch.setattr(oracle, "project", additive_oracle)
     data = state.snapshot()
     data["ranking_history"] = {"rank-history": {"source_id": "channel", "time": 1_800_000_000_000, "old": "F", "new": "E",
         "metrics": {"score": "40", "drawdown_r": "0"}, "network": "testnet", "revision": 2}}

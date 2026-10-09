@@ -38,6 +38,9 @@ HEADERS["Trades"] += RANK_DETAILS
 HEADERS["Pipelines"] += ["Ersatzbörsen", "Netzwerkregel"]
 HEADERS["Ränge"] = ["ID", "Quellenname", "Rang", "Startfreigabe", "Score", "Nachweise gesamt", "Setups im Fenster", "Durchschnitt Netto-R", "Profit-Faktor", "Drawdown R", "Gewinnquote (%)", "Risikofaktor", "Netzwerk", "Rangrevision", "Regelrevision", "Ausgeschlossene Setups"]
 HEADERS["Ranghistorie"] = ["ID", "Quelle", "Quellenname", "Zeit (UTC)", "Von", "Nach", "Score", "Drawdown R", "Netzwerk", "Revision", "Grund", "Nachweise", "Risikofaktor"]
+PRE_PRESENTATION_HEADERS = {table: list(headers) for table, headers in HEADERS.items()}
+HEADERS["Trades"] += ["Entry-Ausführung", "TP-Ausführung"]
+HEADERS["Fills"] += ["Ausführungsrolle"]
 TABLES = tuple(HEADERS)
 Table = Literal["Trades", "Signale", "Orders", "Fills", "Vorgänge", "Regeln", "Handelsparameter", "Ereignisse", "Pipelines", "Ränge", "Ranghistorie"]
 
@@ -82,6 +85,8 @@ def fingerprint(values):
 
 def record(table, identity, *values):
     cells = [fit_cell(value if value is not None else "") for value in [identity, *values]]
+    if table in PRE_PRESENTATION_HEADERS and len(cells) == len(PRE_PRESENTATION_HEADERS[table]):
+        cells += [""] * (len(HEADERS[table]) - len(cells))
     if table in PRE_RANK_HEADERS and len(cells) == len(PRE_RANK_HEADERS[table]):
         cells += [""] * (len(HEADERS[table]) - len(cells))
     if table in LEGACY_HEADERS and len(cells) == len(LEGACY_HEADERS[table]):
@@ -191,11 +196,16 @@ def project(data):
                 text(plan.get("backup_fields", [])), number(final.get("reference_entry")), number(backup.get("fallback_stop_loss_percent")), text(backup.get("fallback_take_profit_percentages", []))]
             rank = plan.get("rank_snapshot") or {}
             base = plan.get("base_parameters") or {}
-            row["values"][-len(RANK_DETAILS):] = [plan.get("account_key", venue + ":" + plan["network"]), plan.get("setup_id", ""), plan.get("requested_exchange", venue), plan.get("routing_leg_id", ""),
+            rank_start = HEADERS[table].index(RANK_DETAILS[0])
+            row["values"][rank_start:rank_start + len(RANK_DETAILS)] = [plan.get("account_key", venue + ":" + plan["network"]), plan.get("setup_id", ""), plan.get("requested_exchange", venue), plan.get("routing_leg_id", ""),
                        plan.get("fallback_reason", ""), rank.get("tier", ""), number(rank.get("score")), rank.get("factor", ""),
                        number(base.get("risk_percent")), number(plan["policy"]["risk_percent"]), number(trade.get("initial_sl_risk", {}).get("amount")),
                        trade.get("source_tp_override", plan.get("source_tp", {})).get("unit", "price"),
                        text({"original": plan.get("source_tp"), "final": trade.get("percent_finalization"), "updates": trade.get("percent_updates", {}), "current": trade.get("source_tp_override")} if plan.get("source_tp") or trade.get("percent_updates") else {})]
+            row["values"][-2:] = [plan.get("entry_execution", "standard"), plan.get("take_profit_execution", "standard")]
+        elif table == "Fills":
+            role = trade.get("fill_execution_roles", {}).get(identity, "unknown")
+            row["values"][-1] = role if role in ("maker", "taker", "unknown") else "unknown"
         row["fingerprint"] = fingerprint(row["values"])
     for row in data.get("journal_history", {}).values():
         add(row)
