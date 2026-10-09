@@ -64,9 +64,40 @@ def main():
         assert "_run_agent" not in GatewayTurnMixin.__dict__
     finally:
         GatewayTurnMixin._run_agent = before_turn
+    from agent import background_review as review_before
+    from gateway.platforms.base import BasePlatformAdapter
+    from gateway.run import GatewayRunner
+    from gateway.run_adapters import GatewayAdapterLifecycleMixin
+    from gateway.run_startup import GatewayStartupMixin
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.slash_commands import GatewaySlashCommandsMixin
+    from hermes_cli import commands as commands_before
+    from hermes_cli.plugins import PluginContext
+    from tools import skill_manager_tool as manager_before
+
+    native_targets = (
+        (native_gateway, ("_start_gateway_start_cron_and_housekeeping",)),
+        (GatewayTurnMixin, ("_run_agent", "_run_agent_queued_followup")),
+        (GatewayAdapterLifecycleMixin, ("_create_adapter", "_install_reconnected_adapter")),
+        (TurnRunner, ("_clarify_callback_sync",)),
+        (BasePlatformAdapter, ("_can_merge_text_debounce_events",)),
+        (GatewayRunner, ("_SECURITY_METADATA_KEYS",)),
+        (GatewayStartupMixin, ("_start_finish_wiring", "_start_post_connect_services", "_PRE_RECONNECT_WATCHERS", "_POST_RECONNECT_WATCHERS")),
+        (PluginContext, ("_MCP_RESULT_CHAR_CAP",)),
+        (approval_before, ("write_approval_enabled", "stage_write")),
+        (manager_before, ("apply_skill_pending",)),
+        (review_before, ("spawn_background_review_thread", "_action_lines", "_publish_review_summary")),
+        (GatewaySlashCommandsMixin, ("_handle_help_command", "_handle_commands_command")),
+        (commands_before, ("gateway_help_lines",)),
+    )
+    native_callbacks = [(target, name, getattr(target, name)) for target, names in native_targets for name in names]
     undo = install_strict_profile()
     undo_twice = install_strict_profile()
+    assert undo_twice is undo
     undo_twice()
+    assert all(getattr(target, name) is callback for target, name, callback in native_callbacks)
+    undo = install_strict_profile()
+    assert undo is not undo_twice
     from agent import background_review as review
     from gateway.config import GatewayConfig, Platform
     from gateway.run import GatewayRunner
