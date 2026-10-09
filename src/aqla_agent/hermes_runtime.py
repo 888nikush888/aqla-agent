@@ -3,11 +3,19 @@ import os
 import sys
 import threading
 from pathlib import Path
+from types import MethodType
+
+_ACTIVE_UNDO = None
 
 
 def install_strict_profile():
     """Keep Aqla authority boundaries while using native SQLite session storage."""
+    global _ACTIVE_UNDO
+    if _ACTIVE_UNDO is not None:
+        return _ACTIVE_UNDO
     originals = []
+    adapters = []
+    applications = []
     from .hermes_contract import check_native_contract
     check_native_contract()
 
@@ -34,7 +42,6 @@ def install_strict_profile():
     from gateway.run_startup import GatewayStartupMixin
     from gateway.run_turn import GatewayTurnMixin
     from gateway.run_turn_runner import TurnRunner
-    from plugins.platforms.telegram.adapter import TelegramAdapter
 
     from .events import (
         gateway_ready,
@@ -56,21 +63,6 @@ def install_strict_profile():
         private_filter = PrivateTransportLogs()
         logger.addFilter(private_filter)
         filters.append((logger, private_filter))
-    register_handlers = TelegramAdapter._register_handlers
-
-    def setup_handlers(self, app):
-        from telegram import Update
-        from telegram.ext import ApplicationHandlerStop, TypeHandler
-        async def private_setup(update, context):
-            if await intercept_native_setup(self, update, context):
-                self._accept_update()
-                raise ApplicationHandlerStop
-        # Native PTB registration/lifecycle is retained on rebuild and reconnect.
-        app.add_handler(TypeHandler(Update, private_setup), group=-100)
-        register_handlers(self, app)
-
-    replace(TelegramAdapter, "_register_handlers", setup_handlers)
-
     native_turn = GatewayTurnMixin._run_agent
     native_followup = GatewayTurnMixin._run_agent_queued_followup
     reconnect = GatewayAdapterLifecycleMixin._install_reconnected_adapter
@@ -102,41 +94,102 @@ def install_strict_profile():
 
     replace(TurnRunner, "_clarify_callback_sync", clarify_callback)
 
-    # Classify native Telegram events before any text, photo or busy-queue merge.
-    # The transport and normal owner command handlers remain entirely native.
-    build_event = TelegramAdapter._build_message_event
-    text_key = TelegramAdapter._text_batch_key
-    photo_key = TelegramAdapter._photo_batch_key
-    media_group = TelegramAdapter._queue_media_group_event
+    # Every lifecycle path uses this factory before connect, including registry plugins.
+    # Bind to the product itself so import aliases cannot leave ingress unprotected.
+    create_adapter = GatewayAdapterLifecycleMixin._create_adapter
+
+    def bind_telegram(adapter):
+        from .hermes_contract import check_telegram_contract
+        check_telegram_contract(adapter)
+        if getattr(adapter, "_aqla_runtime_bound", False):
+            return
+        saved = []
+
+        def instance_replace(name, function):
+            previous = getattr(adapter, name)
+            function.__aqla_contract_original__ = getattr(previous, "__func__", previous)
+            saved.append((name, name in adapter.__dict__, adapter.__dict__.get(name)))
+            setattr(adapter, name, MethodType(function, adapter))
+
+        register_handlers = adapter._register_handlers
+        build_event = adapter._build_message_event
+        text_key = adapter._text_batch_key
+        photo_key = adapter._photo_batch_key
+        media_group = adapter._queue_media_group_event
+
+        def setup_handlers(self, app):
+            from telegram import Update
+            from telegram.ext import ApplicationHandlerStop, TypeHandler
+
+            async def private_setup(update, context):
+                try:
+                    handled = await intercept_native_setup(self, update, context)
+                except Exception as error:
+                    logging.getLogger(__name__).warning("Private native admission unavailable (%s)", type(error).__name__)
+                    handled = True
+                if handled:
+                    self._accept_update()
+                    raise ApplicationHandlerStop
+
+            # Handler ownership is explicit; re-registration cannot duplicate admission.
+            table = getattr(app, "handlers", {})
+            if not any(getattr(getattr(handler, "callback", None), "_aqla_admission", False) for handler in table.get(-100, [])):
+                handler = TypeHandler(Update, private_setup)
+                private_setup._aqla_admission = True
+                app.add_handler(handler, group=-100)
+                applications.append((app, handler))
+            register_handlers(app)
+            from .native_commands import COMMANDS
+            present = any(getattr(getattr(handler, "callback", None), "_aqla_admission", False) for handler in app.handlers.get(-100, []))
+            if not present or not getattr(self, "_aqla_runtime_bound", False):
+                raise RuntimeError("Private native Telegram admission is unavailable")
+            logging.getLogger(__name__).info(
+                "aqla native Telegram ready module=%s hooks=true setup_handler=%s system_handler=%s catalog_count=%d",
+                type(self).__module__, present, present, len(COMMANDS))
+
+        def build_message_event(self, *args, **kwargs):
+            return stamp_native_event(build_event(*args, **kwargs))
+
+        def text_batch_key(self, event):
+            key = text_key(event)
+            kind, identity = ingress_identity(event)
+            return f"{key}:aqla-source:{identity}" if kind == "source" else key
+
+        def photo_batch_key(self, event, message):
+            key = photo_key(event, message)
+            kind, identity = ingress_identity(event)
+            return f"{key}:aqla-source:{identity}" if kind == "source" else key
+
+        async def queue_media_group(self, group_id, event):
+            kind, identity = ingress_identity(event)
+            if kind == "source":
+                group_id = f"{group_id}:aqla-source:{identity}"
+            await media_group(group_id, event)
+
+        from .events import EXTENSIONS
+        from .native_commands import install_menu
+        adapter._aqla_owners = tuple(extension.owner for extension in EXTENSIONS)
+        instance_replace("_register_handlers", setup_handlers)
+        instance_replace("_build_message_event", build_message_event)
+        instance_replace("_text_batch_key", text_batch_key)
+        instance_replace("_photo_batch_key", photo_batch_key)
+        instance_replace("_queue_media_group_event", queue_media_group)
+        install_menu(adapter, instance_replace)
+        adapter._aqla_runtime_bound = True
+        adapters.append((adapter, saved))
+
+    def actual_adapter(self, platform, config):
+        adapter = create_adapter(self, platform, config)
+        if adapter is not None and getattr(platform, "value", platform) == "telegram":
+            bind_telegram(adapter)
+        return adapter
+
+    replace(GatewayAdapterLifecycleMixin, "_create_adapter", actual_adapter)
     can_merge = BasePlatformAdapter._can_merge_text_debounce_events
-
-    def build_message_event(self, *args, **kwargs):
-        return stamp_native_event(build_event(self, *args, **kwargs))
-
-    def text_batch_key(self, event):
-        key = text_key(self, event)
-        kind, identity = ingress_identity(event)
-        return f"{key}:aqla-source:{identity}" if kind == "source" else key
-
-    def photo_batch_key(self, event, message):
-        key = photo_key(self, event, message)
-        kind, identity = ingress_identity(event)
-        return f"{key}:aqla-source:{identity}" if kind == "source" else key
-
-    async def queue_media_group(self, group_id, event):
-        kind, identity = ingress_identity(event)
-        if kind == "source":
-            # Keep native hold, acknowledgement and flush behavior for each item.
-            group_id = f"{group_id}:aqla-source:{identity}"
-        await media_group(self, group_id, event)
 
     def can_merge_text(self, existing, event):
         return ingress_identity(existing) == ingress_identity(event) and can_merge(self, existing, event)
 
-    replace(TelegramAdapter, "_build_message_event", build_message_event)
-    replace(TelegramAdapter, "_text_batch_key", text_batch_key)
-    replace(TelegramAdapter, "_photo_batch_key", photo_batch_key)
-    replace(TelegramAdapter, "_queue_media_group_event", queue_media_group)
     replace(BasePlatformAdapter, "_can_merge_text_debounce_events", can_merge_text)
     replace(GatewayRunner, "_SECURITY_METADATA_KEYS", (*GatewayRunner._SECURITY_METADATA_KEYS, "aqla_origin", "aqla_source_message_id"))
 
@@ -163,13 +216,30 @@ def install_strict_profile():
     # native 2 MB flood limit; bounded journal batches stay below it after wrapping.
     replace(PluginContext, "_MCP_RESULT_CHAR_CAP", 2_000_000)
     install_skill_review(replace)
+    from .native_commands import install_catalog
+    install_catalog(replace)
 
     def undo():
+        global _ACTIVE_UNDO
+        if _ACTIVE_UNDO is not undo:
+            return
+        _ACTIVE_UNDO = None
+        for app, handler in applications:
+            app.remove_handler(handler, group=-100)
+        for adapter, saved in reversed(adapters):
+            for name, existed, value in reversed(saved):
+                if existed:
+                    setattr(adapter, name, value)
+                else:
+                    adapter.__dict__.pop(name, None)
+            adapter.__dict__.pop("_aqla_runtime_bound", None)
+            adapter.__dict__.pop("_aqla_owners", None)
         for logger, private_filter in filters:
             logger.removeFilter(private_filter)
         for target, name, original in reversed(originals):
             setattr(target, name, original)
 
+    _ACTIVE_UNDO = undo
     return undo
 
 

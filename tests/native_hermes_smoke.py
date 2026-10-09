@@ -13,9 +13,8 @@ import yaml
 async def verify_native_ingress(home, runner):
     from datetime import UTC, datetime
 
-    from gateway.config import PlatformConfig
+    from gateway.config import Platform, PlatformConfig
     from gateway.platforms.event import MessageType
-    from plugins.platforms.telegram.adapter import TelegramAdapter
     from telegram import Message
 
     from aqla_agent.events import EXTENSIONS, HermesExtension
@@ -29,7 +28,8 @@ async def verify_native_ingress(home, runner):
     values = {"owner_id": "12345", "config_path": str(configuration)}
     extension = HermesExtension(SimpleNamespace(get_config=lambda key, default=None: values.get(key, default)))
     EXTENSIONS.add(extension)
-    adapter = TelegramAdapter(PlatformConfig(extra={"allow_from": ["12345"]}))
+    adapter = runner._create_adapter(Platform.TELEGRAM, PlatformConfig(extra={"allow_from": ["12345"]}))
+    assert type(adapter).__module__ == "hermes_plugins.platforms__telegram.adapter" and adapter._aqla_runtime_bound
     adapter._should_drop_delayed_delivery = lambda: False
     adapter._accept_update = lambda: None
     adapter._text_batch_delay_seconds = adapter._text_batch_split_delay_seconds = 0
@@ -49,6 +49,8 @@ async def verify_native_ingress(home, runner):
         if forwarded:
             payload["forward_origin"] = {"type": "user", "date": payload["date"],
                                          "sender_user": {"id": 99, "is_bot": False, "first_name": "Source"}}
+        if body.startswith("/") and not photo:
+            payload["entities"] = [{"type": "bot_command", "offset": 0, "length": len(body.split()[0])}]
         raw = Message.de_json(payload, None)
         return adapter._build_message_event(raw, MessageType.PHOTO if photo else MessageType.TEXT)
 

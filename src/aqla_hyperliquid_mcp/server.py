@@ -403,6 +403,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
 
         def apply(data):
             commit_check()
+            previous_paused = data["paused"]
             if action == "set_policy":
                 if policy is None or expected_revision != data["policy_revision"]:
                     raise AqlaError("Read current rule revision and supply a complete validated policy")
@@ -423,7 +424,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 data["source_aliases"] = {key: value for key, value in data.get("source_aliases", {}).items() if key in data["sources"]}
             elif action == "clear_notification":
                 data["notifications"].pop(notification_id, None)
-            return {"policy": data["policy"], "policy_revision": data["policy_revision"], "paused": data["paused"], "sources": data["sources"]}
+            return {"policy": data["policy"], "policy_revision": data["policy_revision"], "paused": data["paused"], "sources": data["sources"],
+                    **({"previous_paused": previous_paused} if action in ("pause", "resume") else {})}
 
         return state.update(apply)
 

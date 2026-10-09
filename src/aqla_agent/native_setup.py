@@ -12,6 +12,15 @@ from .setup import CHALLENGE_SECONDS, GRANT_SECONDS, LOCKOUT_SECONDS, SetupBindi
 SETUP_PROMPT = "Sende das Setup-Passwort innerhalb von 120 Sekunden. Deine Antwort wird sofort gelöscht."
 
 
+def addressed_to_bot(head, bot):
+    if "@" not in head:
+        return True
+    try:
+        return head.rsplit("@", 1)[1].casefold() == bot.username.casefold()
+    except (AttributeError, RuntimeError):
+        return False
+
+
 @dataclass(frozen=True)
 class Challenge:
     binding: SetupBinding
@@ -88,20 +97,24 @@ class NativeSetup:
         if not self.owner_dm(message):
             return False
         text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
-        command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
+        head = text.split(maxsplit=1)[0] if text else ""
+        addressed = addressed_to_bot(head, bot)
+        command = head.split("@", 1)[0].lower() if text.startswith("/") else ""
         authentic = self.private_owner(message) and not any(
             getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))
-        if authentic and command in ("/stop", "/new", "/reset", "/restart"):
+        if authentic and addressed and command == "/aqla_pause":
+            return False
+        if authentic and addressed and command in ("/stop", "/new", "/reset", "/restart"):
             try:
                 await self.revoke()
             except Exception:
                 pass  # Local authority was already removed; MCP expiry still fails closed.
             return False
         suffix = text.split(maxsplit=1)[1].strip().lower() if len(text.split(maxsplit=1)) == 2 else ""
-        setup_command = authentic and command == "/setup" and suffix in ("", "status", "aus")
+        setup_command = authentic and addressed and command == "/setup" and suffix in ("", "status", "aus")
         old_reply = self.old_prompt_reply(message, bot)
         candidate = bool(self.challenge or old_reply) and not setup_command
-        if not candidate and not (authentic and command == "/setup"):
+        if not candidate and not (authentic and addressed and command == "/setup"):
             return False
         # Delete BEFORE waiting for serialized admission or the bounded hash worker.
         deleted = False

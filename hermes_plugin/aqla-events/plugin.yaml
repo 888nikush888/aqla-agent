@@ -1,4 +1,4 @@
 name: aqla-events
-version: 0.1.0
-description: Read-only Telegram sources and trusted wakeups for the native Hermes bot.
+version: 0.2.0
+description: Private native Telegram controls, read-only sources and trusted wakeups for Hermes.
 author: aqla Agent

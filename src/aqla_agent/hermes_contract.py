@@ -4,6 +4,7 @@ import inspect
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 PIN = "1a4508e2aff2db5f50409893a2115be777bd5643"
 
@@ -49,13 +50,11 @@ def check_native_contract() -> None:
         ("gateway.run_turn", "GatewayTurnMixin", "_run_agent", "self,message,context_prompt,history,source,session_id,**turn_kwargs", True),
         ("gateway.run_turn", "GatewayTurnMixin", "_run_agent_queued_followup", "self,turn_ctx,adapter,pending,pending_event,response,result,stream_task", True),
         ("gateway.run_adapters", "GatewayAdapterLifecycleMixin", "_install_reconnected_adapter", "self,platform,adapter", True),
+        ("gateway.run_adapters", "GatewayAdapterLifecycleMixin", "_create_adapter", "self,platform,config", False),
         ("gateway.run_turn_runner", "TurnRunner", "_clarify_callback_sync", "self,questions", False),
-        ("plugins.platforms.telegram.adapter", "TelegramAdapter", "_build_message_event", "self,message,msg_type,update_id=", False),
-        ("plugins.platforms.telegram.adapter", "TelegramAdapter", "_register_handlers", "self,app", False),
-        ("plugins.platforms.telegram.adapter", "TelegramAdapter", "_accept_update", "self", False),
-        ("plugins.platforms.telegram.adapter", "TelegramAdapter", "_text_batch_key", "self,event", False),
-        ("plugins.platforms.telegram.adapter", "TelegramAdapter", "_photo_batch_key", "self,event,msg", False),
-        ("plugins.platforms.telegram.adapter", "TelegramAdapter", "_queue_media_group_event", "self,media_group_id,event", True),
+        ("gateway.slash_commands", "GatewaySlashCommandsMixin", "_handle_help_command", "self,event", True),
+        ("gateway.slash_commands", "GatewaySlashCommandsMixin", "_handle_commands_command", "self,event", True),
+        ("hermes_cli.commands", "", "gateway_help_lines", "allowed=", False),
         ("gateway.platforms.base", "BasePlatformAdapter", "_can_merge_text_debounce_events", "self,existing,event", False),
         ("gateway.run_startup", "GatewayStartupMixin", "_start_finish_wiring", "self,connected_count", True),
         ("gateway.run_startup", "GatewayStartupMixin", "_start_post_connect_services", "self,connected_count", True),
@@ -99,3 +98,22 @@ def check_native_contract() -> None:
         target = getattr(importlib.import_module(module_name), class_name)
         if not isinstance(getattr(target, name, None), kind):
             raise RuntimeError(f"Pinned Hermes compatibility attribute changed: {name}; no Aqla patches installed")
+
+
+def check_telegram_contract(adapter) -> None:
+    """Validate the discovered factory product, never a separately imported lookalike."""
+    specifications = (
+        ("_build_message_event", "self,message,msg_type,update_id=", False),
+        ("_register_handlers", "self,app", False),
+        ("_accept_update", "self", False),
+        ("_text_batch_key", "self,event", False),
+        ("_photo_batch_key", "self,event,msg", False),
+        ("_queue_media_group_event", "self,media_group_id,event", True),
+        ("_register_command_menu", "self", True),
+        ("_bot_commands", "menu_commands", False),
+        ("send", "self,chat_id,content,reply_to=,metadata=", True),
+    )
+    validate_hooks([HookContract(type(adapter), name, parameters, asynchronous) for name, parameters, asynchronous in specifications])
+    actual = SimpleNamespace(**{name: getattr(getattr(adapter, name, None), "__func__", getattr(adapter, name, None))
+                               for name, _, _ in specifications})
+    validate_hooks([HookContract(actual, name, parameters, asynchronous) for name, parameters, asynchronous in specifications])

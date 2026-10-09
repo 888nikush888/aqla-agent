@@ -73,6 +73,8 @@ class HermesExtension:
         self.last_presentation_sync = 0.0
         self.gateway_identity = secrets.token_hex(32)
         self.setup = NativeSetup(self.owner, load_verifier(self.settings.setup_password_hash_file), self.setup_request, self.setup_binding)
+        from .native_commands import NativeCommands
+        self.commands = NativeCommands(self)
         self.reader_error = None
         self.reported_reader_error = None
         self.reader_retry = ReaderRetry()
@@ -182,6 +184,7 @@ class HermesExtension:
         return SetupBinding(self.owner, self.owner, self.gateway_identity, entry.session_id)
 
     def revoke_setup(self):
+        self.commands.cancel()
         self.setup.lease = None
         self.setup.challenge = None
         self.setup.revision += 1
@@ -565,6 +568,9 @@ def register(ctx):
     ctx.register_hook("pre_gateway_dispatch", extension.inbound)
     ctx.register_hook("pre_tool_call", extension.before_tool)
     ctx.register_hook("on_session_end", extension.ended)
+    from .native_commands import register_commands
+    register_commands(ctx)
+    ctx.on_unload(extension.unbind_adapter)
     ctx.on_unload(lambda: EXTENSIONS.discard(extension))
     return extension
 
@@ -619,8 +625,44 @@ async def intercept_native_setup(adapter, update, context):
     """Called by a native PTB handler before any Hermes admission work."""
     for extension in tuple(EXTENSIONS):
         if extension.binding and extension.binding[0] is adapter:
-            return await extension.setup.intercept(update, context.bot)
-    return False
+            message = getattr(update, "effective_message", None)
+            text = getattr(message, "text", None) or ""
+            from .native_setup import addressed_to_bot
+            if text and text.split(maxsplit=1)[0].split("@", 1)[0].lower() == "/setup":
+                if (extension.setup.private_owner(message) and addressed_to_bot(text.split(maxsplit=1)[0], context.bot)
+                        and not any(getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))):
+                    extension.commands.cancel()
+            # Password admission always runs first; neither commands nor Hermes
+            # receives a candidate, including slash/forwarded/edited candidates.
+            if await extension.setup.intercept(update, context.bot):
+                return True
+            return await extension.commands.intercept(update, context.bot)
+    # Polling can begin before finish_wiring, or after plugin unload. Explain
+    # unavailable system commands and still delete replies to known prompts.
+    from .native_commands import COMMANDS
+    from .native_setup import SETUP_PROMPT, addressed_to_bot
+    message = getattr(update, "effective_message", None)
+    user, chat = getattr(message, "from_user", None), getattr(message, "chat", None)
+    owners = {*getattr(adapter, "_aqla_owners", ()), *(extension.owner for extension in EXTENSIONS)}
+    if (user and chat and not user.is_bot and str(user.id) in owners
+            and str(chat.id) == str(user.id) and chat.type == "private"):
+        prompt = getattr(message, "reply_to_message", None)
+        author = getattr(prompt, "from_user", None)
+        try:
+            late = bool(author and author.is_bot and author.id == context.bot.id and prompt.text == SETUP_PROMPT
+                        and str(prompt.chat.id) == str(user.id) and prompt.chat.type == "private")
+        except (AttributeError, RuntimeError):
+            late = False
+        if late:
+            try:
+                await asyncio.wait_for(context.bot.delete_message(chat_id=str(user.id), message_id=message.message_id), 10)
+            except Exception:
+                pass
+        text = getattr(message, "text", None) or ""
+        head = text.split(maxsplit=1)[0] if text else ""
+        if late or head.startswith("/") and addressed_to_bot(head, context.bot) and head.split("@", 1)[0][1:].lower() in COMMANDS:
+            await asyncio.wait_for(context.bot.send_message(chat_id=str(user.id), text="Native aqla-Steuerung ist noch nicht bereit. Starte den Befehl nach dem Gateway-Start neu."), 10)
+    return True
 
 
 def ingress_identity(event):
