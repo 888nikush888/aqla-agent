@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import yaml
 
 SYNTHETIC_PASSWORD = "/native-fixture-marker-never-a-user-credential"
+WRONG_SYNTHETIC_PASSWORD = "/native-wrong-fixture-marker-never-a-user-credential"
 
 
 async def grant_fixture(extension):
@@ -81,6 +82,12 @@ def main():
     assert not any(name.endswith(("sync_presentation_internal", "presentation_selection_internal", "integration")) for name in names)
     extension = next(iter(EXTENSIONS))
     admitted, sent, deleted, menus = [], [], [], []
+    delete_ack, tool_arguments = [True], []
+    native_mcp_call = extension.mcp_call
+    async def record_mcp_call(server, tool, arguments):
+        tool_arguments.append(arguments)
+        return await native_mcp_call(server, tool, arguments)
+    extension.mcp_call = record_mcp_call
     class Request(BaseRequest):
         read_timeout = 1
         async def initialize(self):
@@ -98,7 +105,7 @@ def main():
                 result = {"message_id": 1001 + len(sent), "date": 1791490000, "chat": {"id": 12345, "type": "private"}, "text": request_data.parameters["text"]}
             elif endpoint == "deleteMessage":
                 deleted.append(request_data.parameters)
-                result = True
+                result = delete_ack[0]
             elif endpoint == "setMyCommands":
                 menus.append(request_data.parameters)
                 result = True
@@ -188,6 +195,32 @@ def main():
                 COMMAND_REGISTRY.remove(fixture_system)
             await app.process_update(Update.de_json(payload("/setup@other_bot", 12), app.bot))
             assert extension.setup.challenge is None and admitted == []
+            # Authentic private candidates must also fail closed on either a
+            # wrong password or a missing positive native Telegram DeleteACK.
+            # Both pass through the real registry adapter and PTB dispatcher.
+            for identity, candidate, ack in ((30, WRONG_SYNTHETIC_PASSWORD, True), (32, SYNTHETIC_PASSWORD, False)):
+                await app.process_update(Update.de_json(payload("/setup", identity), app.bot))
+                assert extension.setup.challenge is not None
+                delete_ack[0] = ack
+                await app.process_update(Update.de_json(payload(candidate, identity + 1), app.bot))
+                assert extension.setup.claims() is None and admitted == []
+                assert deleted[-1]["message_id"] == identity + 1
+                assert "Setup nicht freigegeben" in sent[-1]["text"]
+                ordinary = extension.authority.sign("operator", "synthetic-rejected-setup-check")
+                try:
+                    await extension.mcp_call("aqla", "control", {"action": "resume", "context_auth": ordinary})
+                except AqlaError:
+                    pass
+                else:
+                    raise AssertionError("Rejected native candidate acquired MCP Setup authority")
+                entry = store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345"))
+                for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD):
+                    assert marker not in captured.getvalue()
+                    assert marker not in json.dumps(tool_arguments)
+                    assert marker not in json.dumps(store.load_transcript(entry.session_id))
+                    assert marker not in json.dumps(read_snapshot(home / "data/state.sqlite3"))
+            delete_ack[0] = True
+            deleted.clear()
             await app.process_update(Update.de_json(payload("/setup", 1), app.bot))
             updates = await app.bot.get_updates()
             await app.process_update(updates[0])
@@ -275,12 +308,12 @@ def main():
             fresh.boot(gateway, adapter=replacement)
             assert fresh.binding[0] is replacement and fresh.setup.claims() is None
             assert "module=hermes_plugins.platforms__telegram.adapter hooks=true setup_handler=True system_handler=True catalog_count=11" in captured.getvalue()
-            assert SYNTHETIC_PASSWORD not in captured.getvalue()
+            assert all(marker not in captured.getvalue() for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD))
             assert extension.authority.key.decode() not in captured.getvalue()
-            assert SYNTHETIC_PASSWORD not in json.dumps(read_snapshot(home / "data/state.sqlite3"))
+            assert all(marker not in json.dumps(read_snapshot(home / "data/state.sqlite3")) for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD))
             for path in home.rglob("*"):
                 if path.is_file() and path.suffix in (".json", ".jsonl", ".yaml", ".log"):
-                    assert SYNTHETIC_PASSWORD not in path.read_text(encoding="utf-8")
+                    assert all(marker not in path.read_text(encoding="utf-8") for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD))
         finally:
             tasks = [task for task in asyncio.all_tasks() if task.get_name().startswith("aqla-")]
             for task in tasks:
@@ -293,6 +326,8 @@ def main():
                           "actual_factory": True, "native_registry": True, "owner_menu_complete": True,
                           "native_direct_guided_controls": True, "callback_once": True, "factory_reload_rebuild": True,
                           "early_not_ready_failclosed": True, "native_catalog_pages_acl": True, "native_long_status_chunks": True,
+                          "authentic_wrong_password_rejected": True, "authentic_delete_ack_false_rejected": True,
+                          "rejected_passwords_absent_from_tools_history_logs": True,
                           "candidate_deletions": len(deleted), "model_admissions": len(admitted)}))
     try:
         asyncio.run(run())
