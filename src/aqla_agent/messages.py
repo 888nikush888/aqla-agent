@@ -233,8 +233,16 @@ def trade_block(data, trade, notices):
             lines.append("**Ergebnis:** PnL nicht vollständig bestätigt")
     if trade.get("unsent_reason"):
         lines.append("**Grund:** " + literal(ERRORS.get(trade["unsent_reason"], trade["unsent_reason"])))
-    if trade.get("maker_target_rejection"):
-        lines.append("**TP abgelehnt:** Maker-Ziel bleibt unausgeführt; vorhandener SL bleibt aktiv.")
+    remaining = decimal(trade.get("remaining_quantity")) or Decimal(0)
+    if trade.get("maker_target_rejection") and stage in ("open", "protecting", "unknown", "conflicted") and remaining > 0:
+        stop_confirmed = stage in ("open", "protecting") and not trade.get("execution_incident") and any(
+            order.get("kind") == "sl" and not order.get("retired")
+            and trade.get("order_observations", {}).get(order["cloid"], {}).get("status") == "open"
+            and (decimal(order.get("quantity")) or Decimal(0)) >= remaining
+            and decimal(order.get("price")) == decimal(trade.get("stop_price"))
+            for order in trade.get("orders", []))
+        lines.append("**TP abgelehnt:** Maker-Ziel bleibt unausgeführt; "
+                     + ("vorhandener SL bleibt aktiv." if stop_confirmed else "SL-Schutz wird abgeglichen."))
     if trade.get("external_conflict"):
         lines.append("**Verwaltung angehalten:** " + literal(trade['external_conflict']))
     stop_requests = [notice["stop_update"] for notice in notices if notice.get("stop_update")]

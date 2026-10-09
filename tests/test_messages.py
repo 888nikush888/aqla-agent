@@ -125,6 +125,35 @@ def test_maker_target_rejection_remains_visible_with_live_stop(opened):
     assert '**TP abgelehnt:**' in rendered and 'vorhandener SL bleibt aktiv' in rendered
 
 
+@pytest.mark.parametrize('stage', ['closed', 'closing', 'cleanup', 'cancelled', 'rejected'])
+def test_historical_maker_rejection_never_claims_live_stop_during_exit(opened, stage):
+    trade = next(iter(opened['trades'].values()))
+    trade.update(status=stage, maker_target_rejection='Native maker TP rejected', execution_incident='Emergency protection close')
+    rendered = text(telegram_view(opened, READY))
+    assert '**TP abgelehnt:**' not in rendered and 'vorhandener SL bleibt aktiv' not in rendered
+
+
+@pytest.mark.parametrize('missing', ['order_observation', 'coverage', 'price', 'remaining', 'emergency'])
+def test_maker_rejection_does_not_invent_live_stop_protection(opened, missing):
+    trade = next(iter(opened['trades'].values()))
+    trade.update(status='protecting', maker_target_rejection='Native maker TP rejected')
+    if missing == 'order_observation':
+        trade['order_observations'] = {}
+    elif missing == 'remaining':
+        trade['remaining_quantity'] = '0'
+    elif missing == 'emergency':
+        trade['execution_incident'] = 'Protection could not be confirmed; closing own exposure'
+    else:
+        for order in trade['orders']:
+            if order['kind'] == 'sl':
+                order['quantity' if missing == 'coverage' else 'price'] = '0'
+    rendered = text(telegram_view(opened, READY))
+    assert 'vorhandener SL bleibt aktiv' not in rendered
+    assert ('**TP abgelehnt:**' in rendered) is (missing != 'remaining')
+    if missing != 'remaining':
+        assert 'SL-Schutz wird abgeglichen' in rendered
+
+
 def test_lifecycle_displays_role_enrichment_without_rewriting_frozen_facts(opened):
     from aqla_agent.messages import lifecycle_block
 

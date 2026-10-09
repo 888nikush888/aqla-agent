@@ -8,13 +8,16 @@ import pytest
 from conftest import FakeExchange
 from test_adaptive_tps import setup_signal
 from test_deferred_entries import delayed_source
+from test_updates import update
 
 from aqla_agent.entry import PriceSnapshot, passive_entry_price, validate_entry_prices
 from aqla_agent.execution_roles import native_role
+from aqla_agent.messages import trade_block
 from aqla_agent.trading import Trading
 from aqla_hyperliquid_mcp.models import (
     AccountSnapshot,
     AqlaError,
+    Evidence,
     Interpretation,
     Market,
     Policy,
@@ -194,6 +197,109 @@ async def test_maker_target_reject_keeps_stop_and_unfilled_budget(setup, signal,
     sends = len(fake.actions)
     await trading.recover()
     assert len(fake.actions) == sends
+    rejection = copy.deepcopy(state.snapshot()["operations"][targets["operation_id"]])
+    await trading.close_position(trade["trade_id"], Decimal(100), "emergency:" + trade["trade_id"])
+    closed = await trading.refresh_trade(trade["trade_id"])
+    assert closed["status"] == "closed" and closed["remaining_quantity"] == "0"
+    rendered = trade_block(state.snapshot(), closed, [{"change": {"status": "closed"}}])
+    assert "**TP abgelehnt:**" not in rendered and "vorhandener SL bleibt aktiv" not in rendered
+    emergency = state.snapshot()["operations"]["emergency:" + trade["trade_id"]]
+    assert emergency["wire_action"]["orders"][0]["t"] == {"limit": {"tif": "Ioc"}}
+    assert state.snapshot()["operations"][targets["operation_id"]] == rejection
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unconfirmed", ["unknown", "foreign_cloid", "foreign_market", "wrong_side", "wrong_size", "missing_size", "not_reduce_only"])
+async def test_source_maker_replacement_resolves_only_after_own_confirmation_and_stays_resolved(setup, signal, monkeypatch, unconfirmed):
+    state, fake, exchange, trading, _, trade = await open_maker(setup, signal, monkeypatch)
+    identity = trade["trade_id"]
+    fake.fill(trade["entry_cloid"], trade["plan"]["quantity"], trade["plan"]["entry_price"])
+    fake.bid, fake.ask, fake.mid = "111", "111.2", "111.1"
+    rejected = await trading.refresh_trade(identity)
+    initial_operation = rejected["initial_targets"]["operation_id"]
+    initial = copy.deepcopy(state.snapshot()["operations"][initial_operation])
+    financial = {key: copy.deepcopy(rejected.get(key)) for key in
+                 ("fill_events", "entry_accounting", "entry_validated_fingerprint", "initial_sl_risk", "lifecycle_events", "fill_execution_roles")}
+
+    async def source_targets(message_id, prices):
+        source, interpretation = update(trading, message_id, "replace_targets", "Neue Ziele " + " und ".join(prices), take_profits=prices)
+        interpretation.evidence = [Evidence(field="take_profits." + str(index), source_id=source.source_id, quote=price)
+                                   for index, price in enumerate(prices)]
+        result = await trading.update_trade(source.event_id, interpretation)
+        assert state.snapshot()["bindings"]["update:" + source.event_id]["trade_id"] == identity
+        return source, result
+
+    # A source-authorized replacement may itself cross and reject. Both rejected
+    # generations remain immutable history after a second authorized replacement.
+    fake.bid, fake.ask, fake.mid = "116", "116.2", "116.1"
+    first_source, first_result = await source_targets(2, ["115", "125"])
+    assert first_result["result"]["legs"][0]["disposition"] == "rejected"
+    first_operation = "update:" + first_source.event_id
+    first = copy.deepcopy(state.snapshot()["operations"][first_operation])
+    await trading.refresh_trade(identity)
+    incident = copy.deepcopy(state.snapshot()["trades"][identity]["maker_target_rejection"])
+    assert incident["operation_id"] == first_operation
+    second_source, second_result = await source_targets(3, ["120", "130"])
+    assert second_result["result"]["phase"] == "acknowledged"
+    current = state.snapshot()["trades"][identity]
+    assert current["maker_target_rejection"] == incident  # ACK alone is insufficient.
+    replacement_cloids = {order["cloid"] for order in current["orders"] if order["kind"] == "tp" and not order.get("retired")}
+    assert replacement_cloids.isdisjoint(incident["target_cloids"])
+    original_handle = fake.handle
+    visible = False
+
+    def delayed_confirmation(request):
+        payload = json.loads(request.content)
+        response = original_handle(request)
+        if visible or request.url.path != "/info" or payload.get("type") != "orderStatus" or payload.get("oid") not in replacement_cloids:
+            return response
+        if unconfirmed == "unknown":
+            return httpx.Response(200, json={"status": "unknownOid"})
+        row = response.json()
+        field, value = {"foreign_cloid": ("cloid", "another-order"), "foreign_market": ("coin", "ETH"),
+                        "wrong_side": ("side", "B"), "wrong_size": ("origSz", "999"), "missing_size": ("origSz", None),
+                        "not_reduce_only": ("reduceOnly", False)}[unconfirmed]
+        row["order"]["order"][field] = value
+        return httpx.Response(200, json=row)
+
+    monkeypatch.setattr(exchange.client, "_transport", httpx.MockTransport(delayed_confirmation))
+    await trading.refresh_trade(identity)
+    assert state.snapshot()["trades"][identity]["maker_target_rejection"] == incident
+    assert state.snapshot()["trades"][identity]["status"] == "protecting"
+    visible = True
+    resolved = await trading.refresh_trade(identity)
+    assert resolved["status"] == "open" and not resolved.get("maker_target_rejection")
+    assert "**TP abgelehnt:**" not in trade_block(state.snapshot(), resolved, [{"change": {"status": "open"}}])
+    stable = state.snapshot()
+    sends = len(fake.actions)
+    incident_writes = []
+    original_update = state.update
+
+    def track_incident_writes(mutator, *args, **kwargs):
+        before = state.snapshot()["trades"][identity].get("maker_target_rejection")
+        result = original_update(mutator, *args, **kwargs)
+        after = state.snapshot()["trades"][identity].get("maker_target_rejection")
+        if before != after:
+            incident_writes.append((before, after))
+        return result
+
+    monkeypatch.setattr(state, "update", track_incident_writes)
+    for _ in range(2):
+        await Trading(exchange, state).recover()
+        after = state.snapshot()
+        assert after["trades"][identity]["maker_target_rejection"] is None
+        assert after["notifications"] == stable["notifications"]
+        assert after["operations"][initial_operation] == initial
+        assert after["operations"][first_operation] == first
+        assert {key: after["trades"][identity].get(key) for key in financial} == financial
+        assert after["trades"][identity]["target_updates"] == stable["trades"][identity]["target_updates"]
+        assert len(fake.actions) == sends
+    assert incident_writes == []
+    second_operation = state.snapshot()["operations"]["update:" + second_source.event_id]
+    assert all(order["r"] and order["t"] == {"limit": {"tif": "Alo"}} for order in second_operation["wire_action"]["orders"])
+    rejection_notices = [row["change"]["maker_target_rejection"] for row in stable["notifications"].values()
+                         if row.get("change", {}).get("maker_target_rejection")]
+    assert {row["operation_id"] for row in rejection_notices} == {initial_operation, first_operation}
 
 
 @pytest.mark.asyncio

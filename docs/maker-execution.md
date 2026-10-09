@@ -26,6 +26,13 @@ Maker targets retain the calculated target price and native reduce-only flag.
 Rejected targets remain unfilled, are visible in status/Telegram messages, and
 retain the confirmed stop. A new source-authorized target update remains possible
 through the existing management path; there is no implicit resubmission.
+The active rejection identifies the current TP operation and its own target
+identities. Retired generations cannot reassert it during recovery. A replacement
+ACK alone does not clear it: every current TP needs a positive own order/market
+observation with an accepted status. Rejected operation records and historical
+notifications remain intact. Closed/closing cards do not present a TP rejection
+as current or claim a live stop; active cards claim retained stop protection only
+when the latest own stop observation covers the remaining quantity and price.
 
 Actual fill role is native evidence: strict Hyperliquid `crossed`, Aster `maker`,
 or Lighter `is_maker_ask` combined with the owning account side. Planned mode and

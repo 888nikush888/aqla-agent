@@ -881,20 +881,43 @@ class Trading:
                 self.record_maker_target_rejection(trade_id, plan, result)
                 self._patch(trade_id, status="protecting")
                 return
-        if staged:
-            self.record_maker_target_rejection(trade_id, plan, self.state.snapshot()["operations"].get(staged["operation_id"], {}))
-        for operation in self.state.snapshot()["trades"][trade_id].get("target_updates", {}):
-            self.record_maker_target_rejection(trade_id, plan, self.state.snapshot()["operations"].get(operation, {}))
-        active_targets = [order for order in self.state.snapshot()["trades"][trade_id]["orders"] if order["kind"] == "tp" and not order.get("retired")]
+        snapshot = self.state.snapshot()
+        trade = snapshot["trades"][trade_id]
+        active_targets = [order for order in trade["orders"] if order["kind"] == "tp" and not order.get("retired")]
+        active_cloids = {order["cloid"] for order in active_targets}
+        generations = {**({staged["operation_id"]: staged} if staged else {}), **trade.get("target_updates", {})}
+        current_operations = [snapshot["operations"].get(operation, {}) for operation, generation in generations.items()
+                              if any(order["c"] in active_cloids for order in (generation.get("action") or {}).get("orders", []))]
+        for operation in current_operations:
+            self.record_maker_target_rejection(trade_id, plan, operation)
         if active_targets:
             observations = [await self.exchange.order_status(order["cloid"]) for order in active_targets]
             if "take_profits" in plan.backup_fields and plan.take_profit_execution != "maker_only" and any(row.get("order", {}).get("status") == "rejected" for row in observations):
                 raise AqlaError("Backup TP could not be installed")
             if any(row.get("order", {}).get("status") not in {"open", "filled", "triggered"} for row in observations):
-                if plan.take_profit_execution == "maker_only" and any(row.get("order", {}).get("status") == "rejected" for row in observations):
-                    self._patch(trade_id, maker_target_rejection="Native maker TP was rejected; target remains unfilled and stop protection is retained")
+                rejected = {order["cloid"] for order, row in zip(active_targets, observations, strict=True)
+                            if row.get("order", {}).get("status") == "rejected"}
+                for operation in current_operations:
+                    self.record_maker_target_rejection(trade_id, plan, operation, rejected_cloids=rejected)
                 self._patch(trade_id, status="protecting")
                 return
+            # An ACK does not resolve a rejection. Only positive observations of
+            # every current own TP identity can resolve the active incident.
+            if plan.take_profit_execution == "maker_only":
+                confirmed = all(row.get("status") == "order"
+                                and row.get("order", {}).get("order", {}).get("cloid") == order["cloid"]
+                                and row["order"]["order"].get("coin") == plan.market.symbol
+                                and row["order"]["order"].get("side") == ("A" if plan.side == "long" else "B")
+                                and row["order"]["order"].get("reduceOnly") is (plan.market.product == "perp")
+                                and row["order"]["order"].get("isTrigger") is False
+                                and Decimal(row["order"]["order"].get("origSz") or "0") == Decimal(order["quantity"])
+                                for order, row in zip(active_targets, observations, strict=True))
+                if not confirmed:
+                    self._patch(trade_id, status="protecting")
+                    return
+                incident = self.state.snapshot()["trades"][trade_id].get("maker_target_rejection")
+                if not isinstance(incident, dict) or not active_cloids.intersection(incident["target_cloids"]):
+                    self._patch(trade_id, maker_target_rejection=None)
         self._patch(trade_id, status="open")
         pending = self.state.snapshot()["trades"][trade_id].get("pending_stop_update")
         if pending and pending["phase"] in STOP_UPDATE_ACTIVE:
@@ -1720,9 +1743,19 @@ class Trading:
         self._patch(trade_id, management_revision=trade["management_revision"] + 1)
         return result
 
-    def record_maker_target_rejection(self, trade_id, plan, result):
-        if plan.take_profit_execution == "maker_only" and (result.get("phase") == "rejected" or any(leg.get("disposition") == "rejected" for leg in result.get("legs", []))):
-            self._patch(trade_id, maker_target_rejection="Native maker TP was rejected; target remains unfilled and stop protection is retained")
+    def record_maker_target_rejection(self, trade_id, plan, result, *, rejected_cloids=()):
+        if plan.take_profit_execution != "maker_only":
+            return
+        trade = self.state.snapshot()["trades"][trade_id]
+        active = {order["cloid"] for order in trade["orders"] if order["kind"] == "tp" and not order.get("retired")}
+        orders = result.get("wire_action", {}).get("orders", [])
+        current = {order["c"] for order in orders if order.get("c") in active}
+        rejected = (result.get("phase") == "rejected" or current.intersection(rejected_cloids)
+                    or any(leg.get("disposition") == "rejected" and 0 <= leg.get("index", -1) < len(orders)
+                           and orders[leg["index"]].get("c") in current for leg in result.get("legs", [])))
+        if current and rejected:
+            self._patch(trade_id, maker_target_rejection={"operation_id": result["operation_id"], "target_cloids": sorted(current),
+                        "reason": "Native maker TP was rejected; target remains unfilled"})
 
     async def recover(self):
         with order_observations(self.exchange):
