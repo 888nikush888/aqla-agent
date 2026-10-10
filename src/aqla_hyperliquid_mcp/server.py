@@ -31,6 +31,8 @@ from aqla_agent.ranking import RankingPolicy, Tier, set_manual_rank, status_view
 from aqla_agent.reporting import Reporting
 from aqla_agent.router import Router, recovery_diagnostics
 from aqla_agent.setup import SetupBinding, SetupGate
+from aqla_agent.tool_queries import compact_view, source_attribution
+from aqla_agent.tool_queries import source_lookup as lookup_sources
 
 from . import __version__
 from .actions import NATIVE_MODELS, NativeRequest
@@ -132,7 +134,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "exchange_atomicity_guaranteed": False, "live_exchange_verified": False}
 
     @server.tool(annotations=read)
-    async def status(context_auth: str = "") -> dict:
+    async def status(context_auth: str = "", view: Literal["full", "compact"] = "full", offset: int = 0, limit: int = 20,
+                     view_version: str | None = None) -> dict:
         """Read effective user rules, sources, pending work, owned trades and unresolved operations."""
         snapshot = state.snapshot()
         ready = trading.ready()
@@ -140,7 +143,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         page = notification_page(snapshot, authority.key if authority else None, ready, require_key=False)
         claims = authorize(context_auth, operator=True) if context_auth else None
         lease_id, binding = setup_context(claims)
-        return {"network": settings.network, "account": exchange.account, "paused": snapshot["paused"], "setup": setup_gate.status(binding, lease_id, owner_id=settings.telegram_owner_id),
+        result = {"network": settings.network, "account": exchange.account, "paused": snapshot["paused"], "setup": setup_gate.status(binding, lease_id, owner_id=settings.telegram_owner_id),
                 "policy": snapshot["policy"], "policy_revision": snapshot["policy_revision"], "sources": snapshot["sources"],
                 "source_names": snapshot.get("source_names", {}), "source_names_revision": snapshot.get("source_names_revision", 0),
                 "pending": [row["event_id"] for row in snapshot["events"].values() if row["status"] in UNFINISHED],
@@ -157,6 +160,16 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "telegram_view": {**page["telegram_view"], "status": telegram_view({**snapshot, "notifications": {}}, trading.accounts_ready() if snapshot["ranking_policy"]["enabled"] else ready,
                                                                                  sheets_enabled=settings.google_sheets.enabled, inventory=inventory)["status"]},
                 "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})), "last_synced_at": snapshot.get("journal_synced_at")}}
+        return compact_view(result, "status", {}, offset, limit, view_version) if view == "compact" else result
+
+    @server.tool(annotations=read)
+    async def source_lookup(start: str, end: str, source: str | None = None, symbol: str | None = None,
+                            status: str | None = None, account: str | None = None, network: Literal["mainnet", "testnet"] | None = None,
+                            offset: int = 0, limit: int = 20, cursor: str | None = None,
+                            time_field: Literal["sent_at", "received_at"] = "sent_at") -> dict:
+        """LOCAL retained-source search over an aware interval [start,end), stable pages and explicit Berlin offsets. Status matches event status OR a bound trade's status. Undated saved bindings have unknown interval membership. Never reads an exchange or changes state; absence never proves never received."""
+        return await asyncio.to_thread(lambda: lookup_sources(state.snapshot(), start, end, source=source, symbol=symbol, status=status,
+                              account=account, network=network, offset=offset, limit=limit, cursor=cursor, time_field=time_field))
 
     @server.tool(annotations=read)
     async def setup_status(context_auth: str = "") -> dict:
@@ -201,9 +214,12 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "page": {"offset": offset, "limit": limit, "totals": totals}, "publication_job": diagnostic}
 
     @server.tool(annotations=read)
-    async def trade_diagnostics(trade_id: str | None = None, symbol: str | None = None) -> dict:
+    async def trade_diagnostics(trade_id: str | None = None, symbol: str | None = None, offset: int = 0, limit: int = 20,
+                                view: Literal["full", "compact"] = "full", view_version: str | None = None) -> dict:
         """Read source, exact sent order type, own fills, price checks and proved closure reason, including closed trades."""
         from aqla_agent.lifecycle import close_reason
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+            raise AqlaError("Diagnostic page requires offset >= 0 and limit 1–100")
         snapshot = state.snapshot()
         if trade_id is None:
             if not symbol:
@@ -211,15 +227,16 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             candidates = [row for row in snapshot["trades"].values() if row["plan"]["market"]["symbol"].casefold() == symbol.casefold()]
             candidates.sort(key=lambda row: (row.get("closed_at", row["plan"]["created_at"]), row["trade_id"]), reverse=True)
             if len(candidates) != 1:
-                return {"candidates": [{"trade_id": row["trade_id"], "market": row["plan"]["market"]["symbol"], "status": row["status"], "created_at": row["plan"]["created_at"], "closed_at": row.get("closed_at")} for row in candidates[:20]],
-                        "selection_required": True}
+                return {"candidates": [{"trade_id": row["trade_id"], "market": row["plan"]["market"]["symbol"], "status": row["status"], "created_at": row["plan"]["created_at"], "closed_at": row.get("closed_at")} for row in candidates[offset:offset + limit]],
+                        "selection_required": True, "total": len(candidates), "offset": offset,
+                        "next_offset": offset + limit if offset + limit < len(candidates) else None}
             trade_id = candidates[0]["trade_id"]
         trade = snapshot["trades"].get(trade_id)
         if trade is None:
             raise AqlaError("Unknown Aqla trade ID")
         operations = [trading.public_operation(row) for row in snapshot["operations"].values()
                       if trade_id in row["operation_id"]]
-        return {"trade_id": trade_id, "status": trade["status"], "plan": trade["plan"],
+        result = {"trade_id": trade_id, "status": trade["status"], "plan": trade["plan"],
                 "sources": [row["source"] for row in snapshot["events"].values() if row["source_id"] in trade["plan"]["source_refs"]],
                 "source_names": snapshot.get("source_names", {}), "orders": trade["orders"], "exit_orders": trade.get("exit_orders", []),
                 "order_observations": trade.get("order_observations", {}), "fill_events": trade.get("fill_events", {}),
@@ -229,12 +246,16 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "price_checks": trade.get("price_checks", []), "waiting_snapshot": trade.get("waiting_snapshot"),
                 "waiting_error": trade.get("waiting_error"), "unsent_reason": trade.get("unsent_reason"),
                 "close_reason": trade.get("close_reason", close_reason(trade)), "lifecycle_events": trade.get("lifecycle_events", {}),
-                "operations": operations, "historical_missing_quotes_are_not_inferred": True}
+                "operations": operations, "historical_missing_quotes_are_not_inferred": True,
+                **source_attribution(snapshot, trade["plan"])}
+        return compact_view(result, "trade_diagnostics", {"trade_id": trade_id}, offset, limit, view_version) if view == "compact" else result
 
     @server.tool(annotations=read)
-    async def source_context(event_id: str) -> dict:
+    async def source_context(event_id: str, view: Literal["full", "compact"] = "full", offset: int = 0, limit: int = 20,
+                             view_version: str | None = None) -> dict:
         """Read source message, bounded same-channel/reply context and open trade bindings."""
-        return trading.context(event_id)
+        result = trading.context(event_id)
+        return compact_view(result, "source_context", {"event_id": event_id}, offset, limit, view_version) if view == "compact" else result
 
     @server.tool(annotations=write)
     async def interpret_source(event_id: str, interpretation: Interpretation, context_auth: str = "") -> dict:

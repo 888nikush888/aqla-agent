@@ -71,6 +71,17 @@ def check_native_contract() -> None:
         ("agent.background_review", "", "spawn_background_review_thread", "agent,messages_snapshot,review_memory=,review_skills=,focus=,task_cfg=,review_run=,explicit=", False),
         ("agent.background_review", "", "_action_lines", "data,detail,verbose", False),
         ("agent.background_review", "", "_publish_review_summary", "agent,actions", False),
+        ("agent.tool_executor", "", "_unwrap_tool_search_call", "agent,function_name,function_args,@flatten_probe=", False),
+        ("agent.tool_executor", "", "_commit_tool_result", "agent,messages,ref,function_result,@budget,@tool_duration,@is_error,@blocked,@effect_disposition,@observed=,@error_preview=,@success_log_chars=,@verbose_text=", False),
+        ("agent.tool_executor", "", "_finalize_tool_batch", "agent,messages,effective_task_id,num_tools,budget", False),
+        ("agent.tool_executor", "", "maybe_persist_tool_result", "content,tool_name,tool_use_id,env=,config=,threshold=", False),
+        ("tools.tool_result_storage", "", "maybe_persist_tool_result", "content,tool_name,tool_use_id,env=,config=,threshold=", False),
+        ("tools.tool_search_validation", "", "_schema_for_local_validation", "node", False),
+        ("tools.tool_search_validation", "", "_schema_has_external_ref", "node", False),
+        ("model_tools", "", "_dispatch_bridge_tool", "function_name,function_args,enabled_toolsets,disabled_toolsets", False),
+        ("agent.tool_guardrails", "ToolCallGuardrailController", "_build_result_reference_stub", "self,tool_name,args", False),
+        ("gateway.run_plugin_rewire", "GatewayPluginRewireMixin", "_rewire_plugin_handlers", "self,profile_name=,profile_home=", False),
+        ("agent.tool_dispatch_helpers", "", "_is_untrusted_tool", "name", False),
     ]
     contracts = []
     for module_name, class_name, name, parameters, asynchronous in specifications:

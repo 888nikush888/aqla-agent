@@ -68,6 +68,9 @@ def install_strict_profile():
     reconnect = GatewayAdapterLifecycleMixin._install_reconnected_adapter
 
     async def run_agent(self, message, context_prompt, history, source, session_id, **kwargs):
+        from .tool_runtime import GUIDANCE, owned_profile
+        if owned_profile():
+            context_prompt = (context_prompt or "") + "\n\n" + GUIDANCE
         return await run_native_turn(self, source, lambda: native_turn(self, message, context_prompt, history, source, session_id, **kwargs))
 
     async def queued_followup(self, turn_ctx, adapter, pending, pending_event, response, result, stream_task):
@@ -218,6 +221,8 @@ def install_strict_profile():
     install_skill_review(replace)
     from .native_commands import install_catalog
     install_catalog(replace)
+    from .tool_runtime import install as install_tool_runtime
+    install_tool_runtime(replace)
 
     def undo():
         global _ACTIVE_UNDO

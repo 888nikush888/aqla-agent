@@ -369,7 +369,7 @@ class SheetsClient:
             headers = HEADERS[table]
             filters = dict(filters or {})
             if any(key not in headers for key in filters):
-                raise AqlaError("Unknown journal filter column")
+                raise AqlaError("Unknown journal filter column. Valid named columns: " + ", ".join(headers))
             cursor = None
             if scan_cursor is not None:
                 if offset != 0 or not filters:

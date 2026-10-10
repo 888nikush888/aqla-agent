@@ -61,6 +61,8 @@ class HermesExtension:
         self.authority = Authority.from_file(self.settings.integration_key_file)
         self.server = ctx.get_config("mcp_server", "aqla")
         self.turn_claim = ContextVar("aqla_turn_claim", default=None)
+        self._live_claims = weakref.WeakValueDictionary()
+        self._claim_lock = threading.RLock()
         self.turn_event = ContextVar("aqla_turn_event", default=None)
         self.gateway = None
         self.binding = None
@@ -94,19 +96,27 @@ class HermesExtension:
         claim = self.turn_claim.get()
         if claim:
             claim.revoke()
-        self.turn_claim.set(TurnClaim(origin) if origin else None)
+        fresh = TurnClaim(origin) if origin else None
+        if fresh:
+            with self._claim_lock:
+                self._live_claims[id(fresh)] = fresh
+        self.turn_claim.set(fresh)
 
     @contextmanager
     def claim_scope(self, origin):
         # Native Hermes copies ContextVars into its executor. The shared receipt
         # can also be revoked by its real finalizer or a cancelled async caller.
         claim = TurnClaim(origin)
+        with self._claim_lock:
+            self._live_claims[id(claim)] = claim
         token = self.turn_claim.set(claim)
         try:
             yield
         finally:
             claim.revoke()
             self.turn_claim.reset(token)
+            with self._claim_lock:
+                self._live_claims.pop(id(claim), None)
 
     async def with_event(self, incoming, gateway, callback):
         if self.setup.lease and self.setup.lease[1] != self.setup_binding():
@@ -453,6 +463,9 @@ class HermesExtension:
             self.started = True
 
     def unbind_adapter(self):
+        with self._claim_lock:
+            for claim in tuple(self._live_claims.values()):
+                claim.revoke()
         self.revoke_setup()
         if self.binding:
             adapter, original, wrapper = self.binding
@@ -503,10 +516,17 @@ class HermesExtension:
         short = tool_name.removeprefix("mcp__aqla__").removeprefix("mcp_aqla_")
         origin = self.active_context
         claim = self.turn_claim.get()
+        diagnostic = None
+        if short == "monthly_report":
+            from .tool_schema import diagnostic_bool
+            try:
+                diagnostic = diagnostic_bool(args)
+            except ValueError as error:
+                return {"action": "block", "message": str(error)}
         if short in ("status", "setup_status"):
             setup = self.setup.claims() if origin and origin[0] == "operator" else None
             return {"action": "modify", "args": {"context_auth": self.authority.sign(*origin, setup=setup) if origin and origin[0] == "operator" else ""}}
-        if short == "monthly_report" and origin and origin[0] == "operator" and claim.can_change() and not args.get("diagnostics_only", False):
+        if short == "monthly_report" and origin and origin[0] == "operator" and claim.can_change() and not diagnostic:
             # The read tool stays read-only. The native owner-request hook asks the
             # internal publisher for an analysis tab, separately from model tools.
             from .monthly import month_bounds
@@ -545,6 +565,8 @@ class HermesExtension:
                 master_content(args, self.master_path)
             except (ValueError, OSError) as error:
                 return {"action": "block", "message": str(error)}
+        if short == "monthly_report" and isinstance(args.get("diagnostics_only"), str):
+            return {"action": "modify", "args": {"diagnostics_only": diagnostic}}
         return None
 
     def ended(self, **_):
@@ -570,14 +592,19 @@ def register(ctx):
     ctx.register_hook("on_session_end", extension.ended)
     from .native_commands import register_commands
     register_commands(ctx)
+    from .tool_outputs import register_reader
+    register_reader(ctx)
     ctx.on_unload(extension.unbind_adapter)
     ctx.on_unload(lambda: EXTENSIONS.discard(extension))
     return extension
 
 
-def gateway_ready(gateway):
+def gateway_ready(gateway, *, adapter=None):
+    from hermes_constants import hermes_home_key
     for extension in tuple(EXTENSIONS):
-        extension.boot(gateway)
+        manager = getattr(extension.ctx, "_manager", None)
+        if manager is None or manager.scope_key == hermes_home_key():
+            extension.boot(gateway, adapter=adapter)
 
 
 def rebind_native_adapter(gateway, platform, adapter):

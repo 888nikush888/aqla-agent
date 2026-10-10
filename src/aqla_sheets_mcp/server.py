@@ -6,6 +6,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from aqla_agent.presentation import PresentationSnapshot
+from aqla_agent.tool_queries import compact_view
 from aqla_hyperliquid_mcp import __version__
 from aqla_hyperliquid_mcp.auth import Authority
 from aqla_hyperliquid_mcp.models import AqlaError, digest
@@ -89,13 +90,17 @@ def create_server(settings, *, client=None):
     @server.tool(annotations=read)
     async def journal_read(table: Table, offset: Annotated[int, Field(ge=0)] = 0,
                            limit: Annotated[int, Field(ge=1, le=500)] = 100, filters: dict[str, str] | None = None, account_key: str | None = None,
-                           scan_cursor: Annotated[str | None, Field(max_length=2048)] = None) -> dict:
+                           scan_cursor: Annotated[str | None, Field(max_length=2048)] = None,
+                           view: Literal["full", "compact"] = "full", view_offset: int = 0, view_limit: int = 20,
+                           view_version: str | None = None) -> dict:
         """Read a bounded journal page, optionally filtering exact named columns such as Quelle or Symbol."""
         configured()
         selected = scoped_client(account_key) if account_key else client
         if table not in selected.allowed_tables:
             raise AqlaError("This table belongs to the shared analysis/configuration view")
-        return await asyncio.to_thread(selected.read, table, offset, limit, filters, scan_cursor=scan_cursor)
+        result = await asyncio.to_thread(selected.read, table, offset, limit, filters, scan_cursor=scan_cursor)
+        return compact_view(result, "journal_read", {"table": table, "offset": offset, "limit": limit, "filters": filters,
+                            "account_key": account_key, "scan_cursor": scan_cursor}, view_offset, view_limit, view_version) if view == "compact" else result
 
     @server.tool(annotations=read)
     async def journal_statistics(group_by: Literal["gesamt", "Quelle", "Symbol", "Richtung", "Börse", "Pipeline", "Profil", "Währung"] = "gesamt", account_key: str | None = None) -> dict:
