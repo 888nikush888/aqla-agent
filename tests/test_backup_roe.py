@@ -1,7 +1,9 @@
 """Backup ROE is measured against original deployed margin, before costs."""
 import copy
+import json
 from dataclasses import asdict
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from oracles.rules_9ce4972 import make_plan as legacy_plan
@@ -18,6 +20,7 @@ from aqla_hyperliquid_mcp.models import (
     AqlaError,
     BackupValues,
     Evidence,
+    Interpretation,
     Market,
     Policy,
     TradePlan,
@@ -113,6 +116,43 @@ def test_legacy_backup_bytes_and_plan_oracle_remain_identical(signal):
     old = actual.model_dump(mode="json")
     old.pop("effective_leverage")
     assert TradePlan.model_validate(old).effective_leverage == 2
+
+
+@pytest.mark.parametrize("explicit_defaults", [False, True])
+def test_pre_roe_backup_identity_matches_frozen_release_models(explicit_defaults):
+    # Produced with models AND rules from the recorded pre-ROE Git revision.
+    # Importing old rules with current model classes cannot detect repr drift.
+    case = json.loads((Path(__file__).parent / "oracles" / "backup_legacy_0a36219.json").read_text())
+    units = {"fallback_stop_loss_unit": "course_percent", "fallback_take_profit_unit": "course_percent"} if explicit_defaults else {}
+    policy = Policy.model_validate({**case["policy"], **units})
+    configured = BackupValues.model_validate({**case["backup"], **units})
+    plan = make_plan(Interpretation.model_validate(case["signal"]), Market.model_validate(case["market"]),
+        AccountSnapshot.model_validate(case["account"]), policy, 7, 1000, ("testnet", "owner"),
+        stamp=1000, backup=configured, backup_revision=3)
+    assert plan.model_dump(mode="json") == case["plan"]
+    assert plan.plan_id == "e825dceb4ce3f43b99b5478a1118780bb1ef661a91e71048f38f46f56078849d"
+    assert plan.trade_id == "f2de51483cb6852947a6f0e24fcdc841"
+    assert "fallback_stop_loss_unit" not in str(policy) and "fallback_take_profit_unit" not in str(configured)
+
+
+@pytest.mark.parametrize("roe_model", ["policy", "backup"])
+def test_roe_unit_changes_identity_even_with_identical_one_x_prices(roe_model):
+    stamp = 1000
+    value = Interpretation(kind="new_signal", source_refs=["channel:1"], symbol="BTC", side="long")
+    market = Market(symbol="BTC", asset_id=0, product="perp", size_decimals=2, mid="100", max_leverage=1)
+    account = AccountSnapshot(equity="10000", available_margin="10000", observed_at=stamp)
+    policy = Policy(leverage_mode="signal")
+    configured = BackupValues(leverage=1, fallback_stop_loss_percent="1", fallback_take_profit_percentages=["1", "2"])
+    course = make_plan(value, market, account, policy, 7, stamp, ("testnet", "owner"), stamp=stamp, backup=configured)
+    units = {"fallback_stop_loss_unit": "roe_percent", "fallback_take_profit_unit": "roe_percent"}
+    if roe_model == "policy":
+        policy = Policy.model_validate({**policy.model_dump(), **units})
+    else:
+        configured = BackupValues.model_validate({**configured.model_dump(), **units})
+    roe = make_plan(value, market, account, policy, 7, stamp, ("testnet", "owner"), stamp=stamp, backup=configured)
+    assert (roe.stop_loss, roe.take_profits, roe.quantity, roe.risk_usdc) == (course.stop_loss, course.take_profits, course.quantity, course.risk_usdc)
+    assert roe.trade_id == course.trade_id and roe.plan_id != course.plan_id
+    assert "roe_percent" in str(policy if roe_model == "policy" else configured)
 
 
 @pytest.mark.parametrize("unit,values,expected", [

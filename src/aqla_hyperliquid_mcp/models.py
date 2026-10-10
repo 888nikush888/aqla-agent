@@ -70,6 +70,13 @@ class Policy(Model):
     allow_stop_widening: bool = False
     cost_reserve_bps: Nonnegative = Field(default=Decimal("10"), le=1000)
 
+    def __repr_args__(self):
+        # Historical plan hashes use default=str. Keep the legacy text exactly,
+        # while explicit ROE remains part of the immutable plan identity.
+        for name, value in super().__repr_args__():
+            if name not in ("fallback_stop_loss_unit", "fallback_take_profit_unit") or value != "course_percent":
+                yield name, value
+
     @model_serializer(mode="wrap")
     def compatible_execution_fields(self, handler):
         result = handler(self)
@@ -340,6 +347,11 @@ class BackupValues(Model):
     fallback_take_profit_percentages: list[Annotated[Decimal, Field(gt=0, lt=100)]] = Field(default_factory=list, max_length=20)
     fallback_take_profit_unit: Literal["course_percent", "roe_percent"] = Field(default="course_percent",
         description="Frozen backup TP unit: price movement or nominal ROE on original position margin at effective leverage, before fees/funding")
+
+    def __repr_args__(self):
+        for name, value in super().__repr_args__():
+            if name not in ("fallback_stop_loss_unit", "fallback_take_profit_unit") or value != "course_percent":
+                yield name, value
 
     @model_serializer(mode="wrap")
     def compatible_units(self, handler):

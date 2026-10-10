@@ -1,0 +1,198 @@
+{
+  "frozen_at": "0a36219dcc65907ac057e67d06cc39ccf4e6bd37",
+  "signal": {
+    "kind": "new_signal",
+    "source_refs": [
+      "channel:1"
+    ],
+    "symbol": "BTC",
+    "side": "long",
+    "leverage": null,
+    "entry": "unspecified",
+    "entry_prices": [],
+    "stop_loss": null,
+    "take_profits": [],
+    "update_action": null,
+    "reduce_percent": null,
+    "bound_trade_id": null,
+    "evidence": [],
+    "reason": ""
+  },
+  "market": {
+    "symbol": "BTC",
+    "asset_id": 0,
+    "product": "perp",
+    "size_decimals": 2,
+    "mid": "100",
+    "max_leverage": 20,
+    "dex": "",
+    "min_notional": "10",
+    "base_token": null,
+    "quote_token": "USDC",
+    "collateral_token": null,
+    "native_symbol": null,
+    "price_tick": null,
+    "quantity_step": null,
+    "min_quantity": "0",
+    "max_quantity": null,
+    "margin_leverage_scale": null,
+    "leverage_tiers": []
+  },
+  "account": {
+    "equity": "10000",
+    "available_margin": "10000",
+    "position_size": null,
+    "observed_at": 1000,
+    "account_mode": "disabled",
+    "positions": null,
+    "entry_orders": []
+  },
+  "policy": {
+    "product": "perp",
+    "sizing_mode": "risk_percent",
+    "risk_percent": "0.5",
+    "fixed_notional_usdc": null,
+    "max_notional_usdc": "500",
+    "leverage_mode": "signal",
+    "leverage": 2,
+    "fallback_stop_loss_percent": null,
+    "fallback_take_profit_percentages": [],
+    "margin_mode": "isolated",
+    "max_open_trades": 3,
+    "max_total_risk_percent": "1.5",
+    "entry_mode": "source",
+    "entry_range_choice": "midpoint",
+    "max_slippage_percent": "0.3",
+    "max_signal_age_seconds": 300,
+    "take_profit_allocation": "equal",
+    "take_profit_weights": [],
+    "break_even_after_tp": null,
+    "stop_management": "break_even",
+    "allowed_updates": [
+      "move_stop",
+      "break_even",
+      "replace_targets",
+      "reduce",
+      "close",
+      "cancel_entry"
+    ],
+    "allow_stop_widening": false,
+    "cost_reserve_bps": "10"
+  },
+  "backup": {
+    "leverage": 2,
+    "entry_mode": "source_or_market",
+    "fallback_stop_loss_percent": "1",
+    "fallback_take_profit_percentages": [
+      "1",
+      "2"
+    ]
+  },
+  "plan": {
+    "plan_id": "e825dceb4ce3f43b99b5478a1118780bb1ef661a91e71048f38f46f56078849d",
+    "trade_id": "f2de51483cb6852947a6f0e24fcdc841",
+    "source_refs": [
+      "channel:1"
+    ],
+    "source_revisions": {},
+    "policy_revision": 7,
+    "policy": {
+      "product": "perp",
+      "sizing_mode": "risk_percent",
+      "risk_percent": "0.5",
+      "fixed_notional_usdc": null,
+      "max_notional_usdc": "500",
+      "leverage_mode": "signal",
+      "leverage": 2,
+      "fallback_stop_loss_percent": null,
+      "fallback_take_profit_percentages": [],
+      "margin_mode": "isolated",
+      "max_open_trades": 3,
+      "max_total_risk_percent": "1.5",
+      "entry_mode": "source",
+      "entry_range_choice": "midpoint",
+      "max_slippage_percent": "0.3",
+      "max_signal_age_seconds": 300,
+      "take_profit_allocation": "equal",
+      "take_profit_weights": [],
+      "break_even_after_tp": null,
+      "stop_management": "break_even",
+      "allowed_updates": [
+        "move_stop",
+        "break_even",
+        "replace_targets",
+        "reduce",
+        "close",
+        "cancel_entry"
+      ],
+      "allow_stop_widening": false,
+      "cost_reserve_bps": "10"
+    },
+    "signal_leverage": null,
+    "signal_leverage_original": null,
+    "effective_leverage": 2,
+    "source_symbol": "BTC",
+    "backup_fields": [
+      "stop_loss",
+      "take_profits",
+      "leverage",
+      "entry"
+    ],
+    "backup_values": {
+      "leverage": 2,
+      "entry_mode": "source_or_market",
+      "fallback_stop_loss_percent": "1",
+      "fallback_take_profit_percentages": [
+        "1",
+        "2"
+      ]
+    },
+    "backup_profile_revision": 3,
+    "network": "testnet",
+    "account": "owner",
+    "principal": null,
+    "market": {
+      "symbol": "BTC",
+      "asset_id": 0,
+      "product": "perp",
+      "size_decimals": 2,
+      "mid": "100",
+      "max_leverage": 20,
+      "dex": "",
+      "min_notional": "10",
+      "base_token": null,
+      "quote_token": "USDC",
+      "collateral_token": null,
+      "native_symbol": null,
+      "price_tick": null,
+      "quantity_step": null,
+      "min_quantity": "0",
+      "max_quantity": null,
+      "margin_leverage_scale": null,
+      "leverage_tiers": []
+    },
+    "side": "long",
+    "entry_kind": "market",
+    "entry_price": "100",
+    "entry_limit": "100.30",
+    "stop_loss": "99.000",
+    "take_profits": [
+      "101.00",
+      "102.00"
+    ],
+    "source_take_profit_count": 0,
+    "quantity": "4.98",
+    "tp_quantities": [
+      "2.49",
+      "2.49"
+    ],
+    "risk_usdc": "6.973494",
+    "deadline_at": 301000,
+    "created_at": 1000,
+    "exchange": "hyperliquid",
+    "pipeline_id": null,
+    "profile_id": null,
+    "profile_revision": null,
+    "pipeline_revision": null
+  }
+}
