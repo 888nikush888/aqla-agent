@@ -237,6 +237,16 @@ def test_leverage_and_backup_provenance(opened):
     assert 'Backup verwendet:** SL' in result and 'vorläufig' in result
 
 
+def test_backup_roe_intent_uses_original_margin_and_saved_values(opened):
+    trade=next(iter(opened['trades'].values()))
+    trade['plan'].update(backup_fields=['stop_loss','take_profits'],backup_values={
+        'fallback_stop_loss_percent':'40','fallback_stop_loss_unit':'roe_percent',
+        'fallback_take_profit_percentages':['25','50'],'fallback_take_profit_unit':'roe_percent'})
+    result=text(telegram_view(opened,READY))
+    assert 'SL: 40 % Marginverlust' in result and 'TPs: 25, 50 % ROE' in result
+    assert 'ursprüngliche Positionsmargin vor Gebühren und Funding' in result
+
+
 def test_unsafe_names_are_literal_not_links_or_instructions():
     assert literal('[VIP](https://invalid)')=='`[VIP](https://invalid)`'
     assert '\n' not in literal('VIP\n**test**')

@@ -94,6 +94,8 @@ def button(bot, label):
     ('/aqla_parameter Standard risk_percent 0,75', "risk_percent", "0.75"),
     ('/aqla_parameter standard allowed_updates ["move_stop", "close"]', "allowed_updates", ["move_stop", "close"]),
     ('/aqla_parameter standard fallback_take_profit_percentages [1, 2]', "fallback_take_profit_percentages", ["1", "2"]),
+    ('/aqla_parameter standard fallback_stop_loss_unit roe_percent', "fallback_stop_loss_unit", "roe_percent"),
+    ('/aqla_parameter standard fallback_take_profit_unit roe_percent', "fallback_take_profit_unit", "roe_percent"),
     ('/aqla_parameter standard fallback_take_profit_percentages ["1,5", "2,5"]', "fallback_take_profit_percentages", ["1.5", "2.5"]),
     ('/aqla_parameter standard allow_stop_widening true', "allow_stop_widening", True),
     ('/aqla_parameter standard margin_mode cross', "margin_mode", "cross"),
@@ -109,6 +111,21 @@ async def test_direct_parameter_complete_schema_preserves_other_values(controls,
     assert {name: val for name, val in after.items() if name != key} == {name: val for name, val in before.items() if name != key}
     assert "Gespeichert:" in bot.sent[-1]["text"] and "→" in bot.sent[-1]["text"]
     assert commands.dialog is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,label", [("fallback_stop_loss_percent", "% Marginverlust"),
+                                         ("fallback_take_profit_percentages", "% ROE (JSON-Liste)")])
+async def test_guided_backup_units_and_original_margin_labels(controls, field, label):
+    commands, bot, data, mutations, *_ = controls
+    await commands.intercept(update("/aqla_parameter standard " + field.replace("percentages", "unit").replace("percent", "unit")), bot)
+    token = button(bot, "% ROE (ursprüngliche Margin)")
+    await commands.intercept(callback(token), bot)
+    assert len(mutations) == 1
+    await commands.intercept(update("/aqla_parameter standard " + field), bot)
+    assert "Einheit: " + label in bot.sent[-1]["text"]
+    assert "ursprüngliche Positionsmargin vor Gebühren und Funding" in bot.sent[-1]["text"]
+    assert data["profiles"]["standard"]["parameters"][field.replace("percentages", "unit").replace("percent", "unit")] == "roe_percent"
 
 
 @pytest.mark.asyncio

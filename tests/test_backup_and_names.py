@@ -13,10 +13,11 @@ from aqla_hyperliquid_mcp.rules import make_plan, verify_evidence
 from aqla_sheets_mcp.journal import HEADERS, project
 
 
-def configure(state, *, stop=None, targets=(), leverage=2):
+def configure(state, *, stop=None, targets=(), leverage=2, unit="course_percent"):
     snapshot = state.snapshot()
     values = {**snapshot['profiles']['backup']['parameters'], 'leverage': leverage,
-              'fallback_stop_loss_percent': stop, 'fallback_take_profit_percentages': list(targets)}
+              'fallback_stop_loss_percent': stop, 'fallback_take_profit_percentages': list(targets),
+              'fallback_stop_loss_unit': unit, 'fallback_take_profit_unit': unit}
     profile = TradingProfile(id='backup', name='Backup', parameters=Parameters(**values))
     state.update(lambda data: route_control(data, 'set_profile', expected_revision=data['configuration_revision'], profile=profile))
 
@@ -183,10 +184,11 @@ async def test_final_percent_prices_follow_real_fill_and_restart(setup,signal,si
 
 
 @pytest.mark.asyncio
-async def test_rejected_backup_tp_closes_with_sl_retained_until_exit(setup,signal):
+@pytest.mark.parametrize('unit',['course_percent','roe_percent'])
+async def test_rejected_backup_tp_closes_with_sl_retained_until_exit(setup,signal,unit):
     _,state,fake,exchange,trading=setup
     source,value=signal
-    configure(state,targets=['1','2'])
+    configure(state,targets=['25','50'] if unit=='roe_percent' else ['1','2'],unit=unit)
     plan=await trading.preview(source.event_id,missing(value,'take_profits'))
     original=fake.handle
     seen=[]
@@ -209,10 +211,11 @@ async def test_rejected_backup_tp_closes_with_sl_retained_until_exit(setup,signa
 
 
 @pytest.mark.asyncio
-async def test_lost_backup_sl_reply_reconciles_exact_identity(setup,signal,monkeypatch):
+@pytest.mark.parametrize('unit',['course_percent','roe_percent'])
+async def test_lost_backup_sl_reply_reconciles_exact_identity(setup,signal,monkeypatch,unit):
     _,state,fake,exchange,trading=setup
     source,value=signal
-    configure(state,stop='1')
+    configure(state,stop='40' if unit=='roe_percent' else '1',unit=unit)
     plan=await trading.preview(source.event_id,missing(value,'stop_loss'))
     original=exchange.mutate
     async def lose(operation,*args,**kwargs):

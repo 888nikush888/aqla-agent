@@ -46,8 +46,17 @@ UNITS = {
     "take_profit_weights": "Gewichte (JSON-Liste)", "allowed_updates": "JSON-Liste",
     "break_even_after_tp": "TP-Nummer",
 }
+BACKUP_UNIT_LABELS = {"course_percent": "% Kursbewegung", "roe_percent": "% ROE (ursprüngliche Margin)"}
 LIMIT_FIELDS = {"offene_trades": "max_open_trades", "offene trades": "max_open_trades",
                 "gesamtrisiko": "max_total_risk_percent"}
+
+
+def parameter_unit(field, parameters):
+    if field == "fallback_stop_loss_percent":
+        return "% Marginverlust" if parameters.get("fallback_stop_loss_unit", "course_percent") == "roe_percent" else "% Kursbewegung"
+    if field == "fallback_take_profit_percentages":
+        return ("% ROE" if parameters.get("fallback_take_profit_unit", "course_percent") == "roe_percent" else "% Kursbewegung") + " (JSON-Liste)"
+    return UNITS.get(field, "Wert")
 
 
 def register_commands(ctx):
@@ -338,9 +347,13 @@ class NativeCommands:
         if selected.get("type") == "boolean":
             options = [True, False]
         current = self.current()
-        text = prefix + f"{dialog.target} · {dialog.field}\nAktuell: {current}\nEinheit: {UNITS.get(dialog.field, 'Wert')}"
+        parameters = dialog.snapshot["profiles"][dialog.target]["parameters"] if dialog.command == "aqla_parameter" else {}
+        unit = parameter_unit(dialog.field, parameters)
+        text = prefix + f"{dialog.target} · {dialog.field}\nAktuell: {current}\nEinheit: {unit}"
+        if dialog.command == "aqla_parameter" and dialog.field.startswith("fallback_") and "roe_percent" in parameters.values():
+            text += "\nROE-Basis: ursprüngliche Positionsmargin vor Gebühren und Funding."
         if options is not None:
-            buttons = self.choices([(str(value), value) for value in options], "value")
+            buttons = self.choices([(BACKUP_UNIT_LABELS.get(value, str(value)) if dialog.field in ("fallback_stop_loss_unit", "fallback_take_profit_unit") else str(value), value) for value in options], "value")
         else:
             example = '["move_stop", "close"]' if dialog.field == "allowed_updates" else "[1, 2]" if selected.get("type") == "array" else "5" if selected.get("type") == "integer" else "0,5"
             text += "\nSende den neuen Wert. Beispiel: " + example
@@ -400,7 +413,8 @@ class NativeCommands:
         # No additional confirmation: a valid final value is the authorization.
         await self.control(**arguments)
         self.cancel()
-        await self.reply(bot, f"Gespeichert: {dialog.target} · {dialog.field}: {old} → {value}")
+        suffix = " · " + parameter_unit(dialog.field, values) if dialog.command == "aqla_parameter" and dialog.field in ("fallback_stop_loss_percent", "fallback_take_profit_percentages") else ""
+        await self.reply(bot, f"Gespeichert: {dialog.target} · {dialog.field}: {old} → {value}" + suffix)
 
     async def start(self, bot, command, raw):
         self.cancel()
@@ -454,7 +468,7 @@ class NativeCommands:
             lines = [f"{row.get('name', identity)} · {identity}: {row['tier']} · Nachweise {row.get('proof_total', 0)} · ausgeschlossen {row.get('excluded_count', 0)}\nMetriken: {json.dumps(row.get('metrics', {}), ensure_ascii=False)}\nNachweise: {json.dumps(row.get('evidence', []), ensure_ascii=False)}\nAusschlüsse: {json.dumps(row.get('exclusions', []), ensure_ascii=False)}" for identity, row in ranking["sources"].items()]
             await self.reply(bot, "\n\n".join(lines) or "Keine Kanäle konfiguriert.")
         elif command == "aqla_profile":
-            lines = [f"{row['name']} · {identity}\n" + "\n".join(f"{name}: {getattr(Parameters.model_validate(row['parameters']), name)}" for name in Parameters.model_fields)
+            lines = [f"{row['name']} · {identity}\n" + "\n".join(f"{name}: {getattr(Parameters.model_validate(row['parameters']), name)}" + (" · " + parameter_unit(name, row['parameters']) if name in ("fallback_stop_loss_percent", "fallback_take_profit_percentages") else "") for name in Parameters.model_fields)
                      for identity, row in snapshot["profiles"].items() if row.get("parameters")]
             await self.reply(bot, "\n\n".join(lines) or "Keine Profile konfiguriert.")
         else:

@@ -48,7 +48,11 @@ class Policy(Model):
     leverage: int = Field(default=2, ge=1, le=100,
         description="Used only in fixed mode; never a fallback for missing signal leverage")
     fallback_stop_loss_percent: Positive | None = Field(default=None, lt=100)
+    fallback_stop_loss_unit: Literal["course_percent", "roe_percent"] = Field(default="course_percent",
+        description="Backup SL magnitude: course_percent is price loss; roe_percent is loss of original position margin, before fees/funding, using the plan's effective leverage")
     fallback_take_profit_percentages: list[Positive] = Field(default_factory=list, max_length=20)
+    fallback_take_profit_unit: Literal["course_percent", "roe_percent"] = Field(default="course_percent",
+        description="Backup TP percentages: course_percent is price movement; roe_percent is nominal profit on original position margin, before fees/funding, using the plan's effective leverage")
     margin_mode: Literal["cross", "isolated"] = "isolated"
     max_open_trades: int = Field(default=3, ge=1, le=100)
     max_total_risk_percent: Positive = Field(default=Decimal("1.5"), le=100)
@@ -71,6 +75,9 @@ class Policy(Model):
         result = handler(self)
         for key in ("entry_execution", "take_profit_execution"):
             if getattr(self, key) == "standard":
+                result.pop(key, None)
+        for key in ("fallback_stop_loss_unit", "fallback_take_profit_unit"):
+            if getattr(self, key) == "course_percent":
                 result.pop(key, None)
         return result
 
@@ -328,7 +335,23 @@ class BackupValues(Model):
     leverage: int = Field(ge=1, le=100)
     entry_mode: Literal["source", "source_or_market"] = "source_or_market"
     fallback_stop_loss_percent: Positive | None = Field(default=None, lt=100)
+    fallback_stop_loss_unit: Literal["course_percent", "roe_percent"] = Field(default="course_percent",
+        description="Frozen backup SL unit: price loss or nominal loss on original position margin at effective leverage, before fees/funding")
     fallback_take_profit_percentages: list[Annotated[Decimal, Field(gt=0, lt=100)]] = Field(default_factory=list, max_length=20)
+    fallback_take_profit_unit: Literal["course_percent", "roe_percent"] = Field(default="course_percent",
+        description="Frozen backup TP unit: price movement or nominal ROE on original position margin at effective leverage, before fees/funding")
+
+    @model_serializer(mode="wrap")
+    def compatible_units(self, handler):
+        result = handler(self)
+        for key in ("fallback_stop_loss_unit", "fallback_take_profit_unit"):
+            if getattr(self, key) == "course_percent":
+                result.pop(key, None)
+        return result
+
+    def uses_roe(self, fields):
+        return ("stop_loss" in fields and self.fallback_stop_loss_unit == "roe_percent"
+                or "take_profits" in fields and self.fallback_take_profit_unit == "roe_percent")
 
     @model_validator(mode="after")
     def ordered(self):
@@ -423,6 +446,9 @@ class TradePlan(Model):
 
     @model_validator(mode="after")
     def leverage_consistent(self):
+        if self.backup_values is not None and self.backup_values.uses_roe(self.backup_fields):
+            if self.market.product != "perp" or self.effective_leverage is None:
+                raise ValueError("Backup ROE requires a perpetual plan with explicit effective leverage")
         if self.signal_leverage_original is not None and self.signal_leverage != int(self.signal_leverage_original.to_integral_value(rounding=ROUND_FLOOR)):
             raise ValueError("Signal leverage differs from the original value rounded down")
         if self.policy.leverage_mode == "signal":

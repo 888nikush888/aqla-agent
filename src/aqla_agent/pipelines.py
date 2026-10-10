@@ -29,7 +29,11 @@ class Parameters(Model):
     leverage_mode: Literal["fixed", "signal"] = "fixed"
     leverage: int = Field(default=2, ge=1, le=100)
     fallback_stop_loss_percent: Positive | None = Field(default=None, lt=100)
+    fallback_stop_loss_unit: Literal["course_percent", "roe_percent"] = Field(default="course_percent",
+        description="course_percent: price loss; roe_percent: loss on original position margin at the plan's effective leverage, before fees/funding")
     fallback_take_profit_percentages: list[Positive] = Field(default_factory=list, max_length=20)
+    fallback_take_profit_unit: Literal["course_percent", "roe_percent"] = Field(default="course_percent",
+        description="course_percent: price movement; roe_percent: nominal profit on original position margin at the plan's effective leverage, before fees/funding")
     margin_mode: Literal["cross", "isolated"] = "isolated"
     entry_mode: Literal["source", "source_or_market"] = "source_or_market"
     entry_range_choice: Literal["near", "far", "midpoint"] = "midpoint"
@@ -50,6 +54,9 @@ class Parameters(Model):
         values = handler(self)
         for key in ("entry_execution", "take_profit_execution"):
             if values.get(key) == "standard":
+                values.pop(key)
+        for key in ("fallback_stop_loss_unit", "fallback_take_profit_unit"):
+            if values.get(key) == "course_percent":
                 values.pop(key)
         return values
 

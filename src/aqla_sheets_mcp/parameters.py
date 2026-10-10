@@ -7,8 +7,10 @@ from aqla_hyperliquid_mcp.models import Policy
 PARAMETERS = {
     "entry_execution": ("Ausführung", "Entry-Ausführung", "", "standard / maker_only", "Maker-only platziert ausschließlich Post-only-Limits; kein Taker-Fallback."),
     "take_profit_execution": ("Ausführung", "TP-Ausführung", "", "standard / maker_only", "Maker-only nutzt Post-only-Limits für Take Profits. Schutz-Stops bleiben unverändert."),
-    "fallback_stop_loss_percent": ("Backup", "SL bei fehlender Angabe", "% Kursbewegung", "> 0 bis < 100 oder nicht gesetzt", "Nur das globale Backup ergänzt fehlende SLs; Referenz ist der tatsächliche Entry-VWAP, unabhängig vom Hebel."),
-    "fallback_take_profit_percentages": ("Backup", "TPs bei fehlender Angabe", "% Kursbewegung", "1–20 eindeutige aufsteigende Werte zwischen 0 und 100", "Nur das globale Backup ergänzt eine vollständig fehlende TP-Liste. Vorhandene Signalziele bleiben erhalten."),
+    "fallback_stop_loss_percent": ("Backup", "SL bei fehlender Angabe", "% Kursbewegung", "> 0 bis < 100 oder nicht gesetzt", "Nur fehlende SLs; Einheit laut SL-Einstellung. ROE: Verlust der ursprünglichen Positionsmargin vor Gebühren/Funding; wirksamer Tradehebel, tatsächlicher Entry-VWAP."),
+    "fallback_stop_loss_unit": ("Backup", "Einheit des Backup-SL", "", "course_percent / roe_percent", "Kursverlust oder Verlust der ursprünglichen Positionsmargin vor Gebühren/Funding. Standard: Kursprozent."),
+    "fallback_take_profit_percentages": ("Backup", "TPs bei fehlender Angabe", "% Kursbewegung", "1–20 eindeutige aufsteigende Werte zwischen 0 und 100", "Nur vollständig fehlende TP-Liste; Einheit laut TP-Einstellung. ROE: nominaler Gewinn auf ursprüngliche Positionsmargin vor Gebühren/Funding mit wirksamem Tradehebel. Signalziele bleiben erhalten."),
+    "fallback_take_profit_unit": ("Backup", "Einheit der Backup-TPs", "", "course_percent / roe_percent", "Kursbewegung oder nominale ROE auf ursprüngliche Positionsmargin vor Gebühren/Funding. Standard: Kursprozent."),
     "product": ("Markt", "Handelsprodukt", "", "USDC-Perpetuals", "Die automatische Signalstrecke handelt USDC-Perpetuals; Spot wird dort nicht ausgeführt."),
     "sizing_mode": ("Positionsgröße", "Größenberechnung", "", "Nach Risiko / Fester Positionswert", "Bestimmt die Positionsgröße. Risiko-, Margin- und Positionswertgrenzen gelten in beiden Modi."),
     "risk_percent": ("Risiko", "Risiko je Trade", "% Kontoequity", "> 0 bis 100", "Obergrenze für das berechnete SL-Risiko einschließlich Kostenreserve; auch bei festem Positionswert."),
@@ -33,6 +35,7 @@ PARAMETERS = {
 }
 
 VALUE_LABELS = {
+    "course_percent": "Kursprozent", "roe_percent": "ROE auf ursprüngliche Margin",
     "standard": "Standard", "maker_only": "Nur Maker (Post-only)",
     "fixed": "Fest", "signal": "Aus Signal, am Börsenmaximum gedeckelt",
     "perp": "Perpetuals", "spot": "Spot (automatisch nicht unterstützt)",
@@ -46,6 +49,14 @@ VALUE_LABELS = {
 }
 
 OPERATING_PARAMETERS = 6
+
+
+def backup_unit(field, values, unit):
+    if field == "fallback_stop_loss_percent" and values.get("fallback_stop_loss_unit") == "roe_percent":
+        return "% Marginverlust"
+    if field == "fallback_take_profit_percentages" and values.get("fallback_take_profit_unit") == "roe_percent":
+        return "% ROE"
+    return unit
 
 
 def display(value, field=""):
@@ -74,20 +85,23 @@ def parameter_values(data):
     yield "policy_revision", "Betrieb", "Regelstand", data["policy_revision"], "Revision", "Automatisch", "0", "Version der aktiven Handelsregeln; wird beim Ändern der Regeln erhöht."
     defaults = Policy().model_dump()
     for field, (category, label, unit, allowed, description) in PARAMETERS.items():
-        value = display(current.get(field, "standard"), field) if current is not None else "Nicht festgelegt"
+        default = "course_percent" if field in ("fallback_stop_loss_unit", "fallback_take_profit_unit") else "standard"
+        value = display(current.get(field, default), field) if current is not None else "Nicht festgelegt"
+        unit = backup_unit(field, current or {}, unit)
         if field == "leverage" and current is not None and current["leverage_mode"] == "signal":
             value = "Nicht verwendet (Signalmodus)"
         if field == "break_even_after_tp" and current is not None and current["stop_management"] == "tp_ladder":
             value = "Nicht verwendet (TP-Leiter)"
         if field == "take_profit_weights" and current is not None and current["take_profit_allocation"] != "custom":
             value = "Nicht verwendet"
-        yield field, category, label, value, unit, allowed, display(defaults.get(field, "standard"), field), description, "standard", "hyperliquid", "USDC", data.get("profiles", {}).get("standard", {}).get("revision", data["policy_revision"])
+        yield field, category, label, value, unit, allowed, display(defaults.get(field, default), field), description, "standard", "hyperliquid", "USDC", data.get("profiles", {}).get("standard", {}).get("revision", data["policy_revision"])
     for identity, profile in data.get("profiles", {}).items():
         if identity == "standard" or profile.get("parameters") is None:
             continue
         for field, value in profile["parameters"].items():
             legacy = {"fixed_notional_quote": "fixed_notional_usdc", "max_notional_quote": "max_notional_usdc"}.get(field, field)
             category, label, unit, allowed, description = PARAMETERS[legacy]
+            unit = backup_unit(field, profile["parameters"], unit)
             yield "profile:" + identity + ":" + field, category, label, display(value, legacy), "Abrechnungswährung" if field.endswith("_quote") else unit, allowed, "", description, identity, "", "Je Börsenziel", profile["revision"]
     for venue, limits in data.get("venue_limits", {}).items():
         for field in ("max_open_trades", "max_total_risk_percent"):

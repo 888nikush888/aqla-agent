@@ -46,8 +46,8 @@ Quellenverwaltung: Name/ID, Handelsmeldungen: Name. Pipelines: IDs; Namen eindeu
 Nur IDs/belegte Usernames abonnieren, kein Format raten. sources_unavailable melden,
 ID bewahren; andere Arbeit läuft. backup ergänzt nur fehlenden Hebel/Entry/SL/ganze
 TPs, nie ungültige Werte. Risiko/Verteilung/Limits: Hauptprofil. set_profile:
-leverage_mode=fixed; fallback_stop_loss_percent/fallback_take_profit_percentages:
-Kursprozente ab Entry-VWAP, leer=kein Ersatz. backup_fields/vorläufige/finale Preise trennen.
+leverage_mode=fixed; fallback_*_unit: Kurs% oder ROE(Anfangsmargin vor Kosten).
+ROE/wirksamer Hebel ab Entry-VWAP; leer=kein Ersatz. backup_fields/vorläufig/final trennen.
 
 Pending: source_context lesen. Keine Kanalmuster:
 new_signal/trade_update/report/unrelated/incomplete/ambiguous. Nur belegte

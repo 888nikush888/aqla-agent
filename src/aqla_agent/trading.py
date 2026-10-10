@@ -230,7 +230,8 @@ class Trading:
         refs = [item["source"]["sent_at"] for item in latest_sources(snapshot["events"], interpretation.source_refs).values()]
         risk = sum(Decimal(trade["reserved_risk"]) for trade in active)
         backup_profile = snapshot.get("profiles", {}).get("backup")
-        backup = BackupValues.model_validate({key: backup_profile["parameters"][key] for key in BackupValues.model_fields}) if backup_profile else None
+        backup = BackupValues.model_validate({key: backup_profile["parameters"][key] for key in BackupValues.model_fields
+                                             if key in backup_profile["parameters"]}) if backup_profile else None
         maker_quote = None
         maker_price = None
         if policy.entry_execution == "maker_only" and interpretation.entry not in ("limit", "range"):
@@ -988,7 +989,9 @@ class Trading:
                 return False
             stop, targets = backup_prices(reference, plan.side, plan.market,
                 plan.backup_values.fallback_stop_loss_percent if "stop_loss" in plan.backup_fields else None,
-                selected_targets(plan.backup_values.fallback_take_profit_percentages, plan.policy) if "take_profits" in plan.backup_fields else ())
+                selected_targets(plan.backup_values.fallback_take_profit_percentages, plan.policy) if "take_profits" in plan.backup_fields else (),
+                stop_unit=plan.backup_values.fallback_stop_loss_unit,
+                take_profit_unit=plan.backup_values.fallback_take_profit_unit, leverage=plan.effective_leverage)
             stop = stop if stop is not None else Decimal(trade["stop_price"])
             targets = targets if "take_profits" in plan.backup_fields else [Decimal(value) for value in trade["targets"]]
             if not (stop < reference < min(targets) if plan.side == "long" else stop > reference > max(targets)):

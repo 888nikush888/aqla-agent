@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from decimal import ROUND_DOWN, ROUND_FLOOR, ROUND_UP, Decimal, localcontext
+from decimal import ROUND_DOWN, ROUND_FLOOR, ROUND_UP, Decimal, InvalidOperation, localcontext
 from typing import Literal
 
 from .models import (
@@ -108,8 +108,21 @@ def effective_leverage(signal: Interpretation, market: Market, policy: Policy, b
     return policy.leverage
 
 
-def backup_prices(reference, side, market, stop_percent=None, percentages=()):
-    """Price movement, never leveraged ROI; grid prices away from the entry."""
+def backup_prices(reference, side, market, stop_percent=None, percentages=(), *,
+                  stop_unit="course_percent", take_profit_unit="course_percent", leverage=None):
+    """Nominal ROE uses the original position margin; grid away from entry."""
+    uses_roe = stop_percent is not None and stop_unit == "roe_percent" or percentages and take_profit_unit == "roe_percent"
+    if uses_roe:
+        try:
+            effective = Decimal(leverage) if leverage is not None and not isinstance(leverage, bool) else Decimal(0)
+        except (InvalidOperation, ValueError, TypeError):
+            effective = Decimal(0)
+        if market.product != "perp" or not effective.is_finite() or effective < 1 or effective != effective.to_integral_value():
+            raise AqlaError("Backup ROE requires valid effective perpetual leverage")
+        if stop_percent is not None and stop_unit == "roe_percent":
+            stop_percent /= effective
+        if take_profit_unit == "roe_percent":
+            percentages = [value / effective for value in percentages]
     long = side == "long"
     stop = price_grid(reference * (1 + (-1 if long else 1) * stop_percent / 100), market, up=not long) if stop_percent is not None else None
     targets = [price_grid(reference * (1 + (1 if long else -1) * value / 100), market, up=long) for value in percentages]
@@ -267,7 +280,9 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         kind, entry, limit = selected_entry.kind, selected_entry.price, selected_entry.limit
         derived_stop, derived_targets = backup_prices(entry, signal.side, market,
             backup.fallback_stop_loss_percent if "stop_loss" in fields else None,
-            selected_targets(backup.fallback_take_profit_percentages, policy) if "take_profits" in fields else ())
+            selected_targets(backup.fallback_take_profit_percentages, policy) if "take_profits" in fields else (),
+            stop_unit=backup.fallback_stop_loss_unit if backup else "course_percent",
+            take_profit_unit=backup.fallback_take_profit_unit if backup else "course_percent", leverage=leverage)
         stop = derived_stop if "stop_loss" in fields else price_grid(signal.stop_loss, market, up=not long)
         source_tp = None
         from aqla_agent.percent_targets import reference_entry
@@ -300,12 +315,41 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
             maximum = min(maximum, policy.fixed_notional_usdc / position_price)
         quantity = quantity_grid(min(maximum, market.max_quantity) if market.max_quantity else maximum, market)
         if market.leverage_tiers:
-            tier = next((tier for tier in market.leverage_tiers if tier.notional_floor <= quantity * limit < tier.notional_cap), None)
-            if tier is None:
-                raise AqlaError("Planned notional is outside the supported leverage brackets")
-            market = market.model_copy(update={"max_leverage": min(market.max_leverage, tier.max_leverage)})
-            leverage = effective_leverage(signal, market, policy, backup)
-            quantity = quantity_grid(min(quantity, account.available_margin * margin_leverage(leverage, market) / limit), market)
+            if backup is not None and backup.uses_roe(fields):
+                # Lower-only convergence: a wider ROE stop can reduce notional into
+                # another bracket. Never raise leverage or quantity to chase a tier.
+                for _ in range(len(market.leverage_tiers) + 1):
+                    tier = next((tier for tier in market.leverage_tiers if tier.notional_floor <= quantity * limit < tier.notional_cap), None)
+                    if tier is None:
+                        raise AqlaError("Planned notional is outside the supported leverage brackets")
+                    market = market.model_copy(update={"max_leverage": min(market.max_leverage, tier.max_leverage)})
+                    leverage = effective_leverage(signal, market, policy, backup)
+                    derived_stop, derived_targets = backup_prices(entry, signal.side, market,
+                        backup.fallback_stop_loss_percent if "stop_loss" in fields else None,
+                        selected_targets(backup.fallback_take_profit_percentages, policy) if "take_profits" in fields else (),
+                        stop_unit=backup.fallback_stop_loss_unit, take_profit_unit=backup.fallback_take_profit_unit,
+                        leverage=leverage)
+                    if "stop_loss" in fields:
+                        stop = derived_stop
+                    if "take_profits" in fields:
+                        targets = derived_targets
+                    if not (stop < min(entry, limit) and all(t > max(entry, limit) for t in targets) if long else stop > max(entry, limit) and all(t < min(entry, limit) for t in targets)):
+                        raise AqlaError("SL, entry and TPs have invalid direction/ordering after rounding")
+                    distance = abs(limit - stop) + cost
+                    reduced = quantity_grid(min(quantity, budget / distance,
+                                                account.available_margin * margin_leverage(leverage, market) / limit), market)
+                    if reduced == quantity:
+                        break
+                    quantity = reduced
+                else:
+                    raise AqlaError("Backup ROE leverage brackets did not converge")
+            else:
+                tier = next((tier for tier in market.leverage_tiers if tier.notional_floor <= quantity * limit < tier.notional_cap), None)
+                if tier is None:
+                    raise AqlaError("Planned notional is outside the supported leverage brackets")
+                market = market.model_copy(update={"max_leverage": min(market.max_leverage, tier.max_leverage)})
+                leverage = effective_leverage(signal, market, policy, backup)
+                quantity = quantity_grid(min(quantity, account.available_margin * margin_leverage(leverage, market) / limit), market)
         if quantity <= 0 or quantity < market.min_quantity or quantity * limit < market.min_notional:
             raise AqlaError("Insufficient risk/margin budget or exchange minimum notional")
         tp_sizes = split_targets(quantity, len(targets), policy, market)
@@ -315,7 +359,7 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         values = dict(trade_id=trade_id, source_refs=signal.source_refs, policy_revision=revision, policy=policy,
                       signal_leverage=int(Decimal(signal.leverage).to_integral_value(rounding=ROUND_FLOOR)) if signal.leverage is not None else None,
                       signal_leverage_original=signal.leverage, effective_leverage=leverage, source_symbol=signal.symbol,
-                      backup_fields=fields, backup_values=backup if fields else None, backup_profile_revision=backup_revision if fields else None,
+                      backup_fields=fields, backup_values=backup.model_copy(deep=True) if fields else None, backup_profile_revision=backup_revision if fields else None,
                       network=binding[0], account=binding[1], principal=principal, market=market, side=signal.side, entry_kind=kind,
                       entry_price=entry, entry_limit=limit, stop_loss=stop, take_profits=targets, quantity=quantity,
                       source_take_profit_count=len(signal.take_profits),

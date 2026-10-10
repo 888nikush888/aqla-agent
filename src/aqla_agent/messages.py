@@ -207,6 +207,14 @@ def trade_block(data, trade, notices):
             lines.append("**Backup verwendet:** " + ", ".join(labels.get(field, literal(field)) for field in plan["backup_fields"]))
             if set(plan["backup_fields"]) & {"stop_loss", "take_profits"}:
                 lines.append("**Backup-Preise:** " + ("endgültig ab realem Entry" if trade.get("backup_finalization", {}).get("phase") == "applied" else "vorläufig"))
+                backup = plan.get("backup_values") or {}
+                roe = []
+                if "stop_loss" in plan["backup_fields"] and backup.get("fallback_stop_loss_unit") == "roe_percent":
+                    roe.append("SL: " + number(backup.get("fallback_stop_loss_percent")) + " % Marginverlust")
+                if "take_profits" in plan["backup_fields"] and backup.get("fallback_take_profit_unit") == "roe_percent":
+                    roe.append("TPs: " + ", ".join(number(value) for value in backup.get("fallback_take_profit_percentages", [])) + " % ROE")
+                if roe:
+                    lines.append("**Backup-Ziele:** " + " · ".join(roe) + "\nBasis: ursprüngliche Positionsmargin vor Gebühren und Funding.")
     else:
         if "stop_price" in changes:
             old = previous.get("stop_price")
