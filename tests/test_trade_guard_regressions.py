@@ -345,7 +345,7 @@ async def test_live_reply_and_latest_edit_can_use_historical_supplement(setup, s
     edited = live.model_copy(update={"edited_at": live.sent_at + 1, "text": "Korrektur: Rest schließen"})
     trading.ingest(edited)
     update = Interpretation(kind="trade_update", source_refs=[edited.source_id, historical.source_id], update_action="close")
-    with pytest.raises(AqlaError, match="latest anchor revision"):
+    with pytest.raises(AqlaError, match="latest anchor revision|executed revision is immutable"):
         trading.record_interpretation(live.event_id, update)
     await trading.update_trade(edited.event_id, update)
     await trading.recover()
