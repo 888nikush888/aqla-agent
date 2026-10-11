@@ -23,6 +23,8 @@ def test_deployment_is_separate_and_has_native_hermes_transport(tmp_path):
     assert config['agent']['clarify_timeout'] == 60
     assert {'clarify','todo','session_search'} <= set(config['platform_toolsets']['telegram'])
     assert config["skills"]["write_approval"] is True
+    assert config["skills"]["auto_load"] == ["caveman", "aqla-master"]
+    assert (target / "hermes-home" / "skills" / "caveman" / "SKILL.md").read_bytes() == (project / "skills" / "caveman" / "SKILL.md").read_bytes()
     assert config["skills"]["creation_nudge_interval"] == 0
     assert config["auxiliary"]["background_review"]["enabled"] is False
     assert config["plugins"]["entries"]["aqla-events"]["settings"]["owner_id"] == "12345"

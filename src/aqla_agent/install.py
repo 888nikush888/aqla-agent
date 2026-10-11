@@ -66,11 +66,17 @@ def prepare(project: Path, destination: Path, owner: str,
     home = destination / "hermes-home"
     home.mkdir(mode=0o700)
     shutil.copytree(project / "skills" / "aqla-master", home / "skills" / "aqla-master")
+    auto_load = ["aqla-master"]
+    if (project / "skills" / "caveman" / "SKILL.md").is_file():
+        shutil.copytree(project / "skills" / "caveman", home / "skills" / "caveman")
+        # Load voice before the unchanged trading master: exact financial
+        # messages, evidence, numbers and authorization rules take precedence.
+        auto_load.insert(0, "caveman")
     shutil.copytree(project / "hermes_plugin" / "aqla-events", home / "plugins" / "aqla-events")
     python = str(destination / ".venv" / "bin" / "python")
     hermes_config = {
         "model": {"default": model, "provider": "custom", "base_url": model_url, "api_key": "${HERMES_MODEL_API_KEY}"},
-        "skills": {"auto_load": ["aqla-master"], "write_approval": True, "creation_nudge_interval": 0},
+        "skills": {"auto_load": auto_load, "write_approval": True, "creation_nudge_interval": 0},
         "auxiliary": {"background_review": {"enabled": False}},
         "compression": {"enabled": True, "threshold_tokens": 64000, "tail_mode": "lean", "protect_last_n": 20,
                         "proactive_prune_tokens": 48000, "proactive_prune_min_result_chars": 8000,
