@@ -76,9 +76,9 @@ def prepare(project: Path, destination: Path, owner: str,
     python = str(destination / ".venv" / "bin" / "python")
     hermes_config = {
         "model": {"default": model, "provider": "custom", "base_url": model_url, "api_key": "${HERMES_MODEL_API_KEY}"},
-        "skills": {"auto_load": auto_load, "write_approval": True, "creation_nudge_interval": 0},
-        "auxiliary": {"background_review": {"enabled": False}},
-        "compression": {"enabled": True, "threshold_tokens": 64000, "tail_mode": "lean", "protect_last_n": 20,
+        "skills": {"auto_load": auto_load, "write_approval": True, "creation_nudge_interval": 100},
+        "auxiliary": {"background_review": {"enabled": True, "min_interval_seconds": 21600, "max_input_tokens": 256000}},
+        "compression": {"enabled": True, "threshold_tokens": 128000, "tail_mode": "lean", "protect_last_n": 20,
                         "proactive_prune_tokens": 48000, "proactive_prune_min_result_chars": 8000,
                         "proactive_prune_min_reclaim_tokens": 4096, "micro_compact": False},
         "tools": {"tool_search": {"enabled": "auto", "listing": "off"}},

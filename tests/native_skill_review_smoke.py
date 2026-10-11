@@ -120,8 +120,9 @@ def main():
     review.build_cache_parity_fork = counted_fork
     reviewer = SimpleNamespace(client=SimpleNamespace(SUPPORTS_HERMES_TOOL_CALLS=True), provider="custom", model="synthetic",
                                _safe_print=lambda _: None, _emit_auxiliary_failure=lambda *_: None, background_review_callback=None)
-    def automatic_review(*, explicit=False):
-        target, _ = review.spawn_background_review_thread(reviewer, [], review_skills=True, task_cfg={}, explicit=explicit)
+    def automatic_review(*, explicit=False, interval=0):
+        target, _ = review.spawn_background_review_thread(
+            reviewer, [], review_skills=True, task_cfg={"min_interval_seconds": interval}, explicit=explicit)
         target()
     operation = {"action": "patch", "name": "aqla-master", "old_string": "Du bist aqla Agent.",
                  "new_string": "Du bist aqla Agent. Prüfe Replies besonders sorgfältig."}
@@ -209,6 +210,23 @@ def main():
         assert not approval.list_pending(approval.SKILLS)
         automatic_review()
         assert len(fork_starts) == 3
+        # Two queued native targets must recheck the persistent gate at actual start.
+        target_one, _ = review.spawn_background_review_thread(
+            reviewer, [], review_skills=True, task_cfg={"min_interval_seconds": 21600})
+        target_two, _ = review.spawn_background_review_thread(
+            reviewer, [], review_skills=True, task_cfg={"min_interval_seconds": 21600})
+        target_one()
+        target_two()
+        automatic_review(interval=21600)
+        assert len(fork_starts) == 4
+        reserved_run = review.prepare_background_review_run(reviewer)
+        assert reserved_run is not None
+        skipped, _ = review.spawn_background_review_thread(
+            reviewer, [], review_skills=True, task_cfg={"min_interval_seconds": 21600}, review_run=reserved_run)
+        skipped()
+        assert reviewer._background_review_run is None
+        automatic_review(explicit=True, interval=21600)
+        assert len(fork_starts) == 5
         assert hashlib.sha256(master.read_bytes()).digest() != hashlib.sha256(original).digest()
         # Native Hermes may open its session DB; no trading state is created by
         # drafting, approving or rejecting a skill.
@@ -217,6 +235,8 @@ def main():
                           "stale_proposal_blocked": True, "source_approval_blocked": True, "always_ask": True,
                           "native_approval_question": True, "pending_blocks_native_fork": True, "explicit_review_available": True,
                           "review_resumes_after_reject_and_approve": True, "compatibility_failure_has_no_partial_patch": True,
+                          "queued_reviews_recheck_cooldown": True, "explicit_review_bypasses_cooldown": True,
+                          "skipped_review_releases_native_run": True,
                           "double_install_undo": True, "counted_native_fork_starts": len(fork_starts), "exchange_actions": 0, "model_calls": 0}))
     finally:
         EXTENSIONS.discard(extension)

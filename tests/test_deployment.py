@@ -25,8 +25,12 @@ def test_deployment_is_separate_and_has_native_hermes_transport(tmp_path):
     assert config["skills"]["write_approval"] is True
     assert config["skills"]["auto_load"] == ["caveman", "aqla-master"]
     assert (target / "hermes-home" / "skills" / "caveman" / "SKILL.md").read_bytes() == (project / "skills" / "caveman" / "SKILL.md").read_bytes()
-    assert config["skills"]["creation_nudge_interval"] == 0
-    assert config["auxiliary"]["background_review"]["enabled"] is False
+    assert config["skills"]["creation_nudge_interval"] == 100
+    assert config["auxiliary"]["background_review"] == {
+        "enabled": True, "min_interval_seconds": 21600, "max_input_tokens": 256000}
+    assert config["compression"]["threshold_tokens"] == 128000
+    assert config["compression"]["protect_last_n"] == 20
+    assert config["compression"]["proactive_prune_tokens"] == 48000
     assert config["plugins"]["entries"]["aqla-events"]["settings"]["owner_id"] == "12345"
     assert config["mcp_servers"]["aqla"]["command"].startswith(str(target))
     assert config["mcp_servers"]["sheets"]["args"][1] == "aqla_sheets_mcp"

@@ -45,7 +45,7 @@ def main():
     db.append_messages_batch("compression-fixture", messages)
     live = db.get_messages_as_conversation("compression-fixture")
     compressor = ContextCompressor(model="deepseek/deepseek-v4.1-flash", config_context_length=1048576,
-                                   threshold_tokens_cap=64000, proactive_prune_tokens=48000,
+                                   threshold_tokens_cap=128000, proactive_prune_tokens=48000,
                                    protect_last_n=20, proactive_prune_min_result_chars=8000,
                                    proactive_prune_min_reclaim_tokens=4096, quiet_mode=True)
     compressor._session_db, compressor._session_id = db, "compression-fixture"
@@ -54,7 +54,9 @@ def main():
             pruned, count = compressor.prune_tool_results_only(live, current_tokens=80000)
         assert count > 0 and len(json.dumps(pruned)) < len(json.dumps(live))
         assert [row["content"] for row in pruned[-20:]] == [row["content"] for row in live[-20:]]
-        assert compressor.threshold_tokens == 64000
+        assert compressor.threshold_tokens == 128000
+        # The reported production context must no longer hit the soft trigger.
+        assert compressor.should_compress_info(74537) == (False, None)
         recovered = 0
         for row in pruned:
             if row.get("role") != "tool":

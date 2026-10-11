@@ -74,6 +74,7 @@ def check_native_contract() -> None:
         ("tools.skill_usage", "", "adopt_skill", "skill_name", False),
         ("tools.fuzzy_match", "", "fuzzy_find_and_replace", "content,old_string,new_string,replace_all=", False),
         ("agent.background_review", "", "spawn_background_review_thread", "agent,messages_snapshot,review_memory=,review_skills=,focus=,task_cfg=,review_run=,explicit=", False),
+        ("agent.background_review", "", "finish_background_review_run", "agent,run", False),
         ("agent.background_review", "", "_action_lines", "data,detail,verbose", False),
         ("agent.background_review", "", "_publish_review_summary", "agent,actions", False),
         ("agent.tool_executor", "", "_unwrap_tool_search_call", "agent,function_name,function_args,@flatten_probe=", False),
