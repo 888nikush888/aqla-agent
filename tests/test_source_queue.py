@@ -27,6 +27,23 @@ def test_representational_duplicates_are_not_financial_conflicts(change):
     assert latest_sources(events)[source.source_id]["source"]["text"] == source.text
 
 
+def test_pure_evidence_revision_rows_need_no_processing_metadata(signal):
+    from aqla_hyperliquid_mcp.rules import verify_evidence
+    source, interpretation = signal
+    alias = source.model_copy(update={"edited_at": source.sent_at, "media": "caption"})
+    events = {item.event_id: {"event_id": item.event_id, "source_id": item.source_id,
+        "source": item.model_dump(mode="json")} for item in (source, alias)}
+    before = copy.deepcopy(events)
+    assert latest_sources(events)[source.source_id]["source"]["text"] == source.text
+    verify_evidence(interpretation, events)
+    assert events == before
+    conflict = source.model_copy(update={"text": source.text + " conflicting"})
+    events[conflict.event_id] = {"event_id": conflict.event_id, "source_id": conflict.source_id,
+        "source": conflict.model_dump(mode="json")}
+    with pytest.raises(AqlaError, match="conflicting content"):
+        latest_sources(events)
+
+
 def test_true_current_conflict_blocks_but_unique_newer_edit_is_processable():
     source = SourceEvent(chat_id="channel", message_id=1, sent_at=1000, text="BTC SL 90")
     conflict = source.model_copy(update={"text": "BTC SL 95"})

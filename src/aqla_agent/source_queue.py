@@ -31,7 +31,7 @@ def current_rows(rows):
 
 def anchor_row(rows):
     return min(rows, key=lambda row: (not row.get("queue_anchor", False),
-               row["status"] not in ("interpreted", "executed", "updated"),
+               row.get("status") not in ("interpreted", "executed", "updated"),
                row["source"].get("received_at", 0), row["event_id"]))
 
 
