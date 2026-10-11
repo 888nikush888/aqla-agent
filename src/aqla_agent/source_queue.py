@@ -1,7 +1,22 @@
 """Pure source revision selection and conservative queue maintenance."""
-from aqla_hyperliquid_mcp.models import AqlaError, digest
+from aqla_hyperliquid_mcp.models import AqlaError, SourceEvent, digest
 
 UNFINISHED = {"pending", "interpreted", "needs_reconciliation"}
+
+
+def is_source_row(row):
+    """Opaque legacy history is retained, never admitted as a current source."""
+    if not isinstance(row, dict) or not isinstance(row.get("event_id"), str) or not isinstance(row.get("source_id"), str):
+        return False
+    try:
+        SourceEvent.model_validate(row.get("source"))
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def binding_trade_id(binding):
+    return binding.get("trade_id") if isinstance(binding, dict) else binding if isinstance(binding, str) else None
 
 
 def version(row):
@@ -19,7 +34,7 @@ def content(row):
 def groups(events, refs=None):
     result = {}
     for row in events.values():
-        if refs is None or row["source_id"] in refs:
+        if is_source_row(row) and (refs is None or row["source_id"] in refs):
             result.setdefault(row["source_id"], []).append(row)
     return result
 
@@ -47,7 +62,8 @@ def canonical_sources(events, refs=None):
 
 
 def recovery_ids(snapshot, event_rows=None):
-    identities = {row["event_id"] for row in (event_rows if event_rows is not None else snapshot["events"].values()) if row["status"] == "needs_reconciliation"}
+    identities = {row["event_id"] for row in (event_rows if event_rows is not None else snapshot["events"].values())
+                  if is_source_row(row) and row.get("status") == "needs_reconciliation"}
     for trade in snapshot.get("trades", {}).values():
         if trade.get("status") not in ("closed", "cancelled", "rejected"):
             identities.update(trade.get("plan", {}).get("source_revisions", {}).values())
@@ -66,7 +82,7 @@ def recovery_ids(snapshot, event_rows=None):
             trade = snapshot.get("trades", {}).get(operation.get("trade_id"), {})
             identities.update(trade.get("plan", {}).get("source_revisions", {}).values())
             binding = snapshot.get("bindings", {}).get(operation_id, {})
-            identities.update(snapshot.get("trades", {}).get(binding.get("trade_id"), {}).get("plan", {}).get("source_revisions", {}).values())
+            identities.update(snapshot.get("trades", {}).get(binding_trade_id(binding), {}).get("plan", {}).get("source_revisions", {}).values())
             if operation_id.startswith("update:") and operation_id[7:] in snapshot["events"]:
                 identities.add(operation_id[7:])
             for saved in snapshot.get("plans", {}).values():
@@ -78,7 +94,7 @@ def recovery_ids(snapshot, event_rows=None):
     binding_roots.extend(snapshot.get("venue_bindings", {}).values())
     for bindings in binding_roots:
         for identity, binding in bindings.items():
-            trade = snapshot.get("trades", {}).get(binding.get("trade_id"), {})
+            trade = snapshot.get("trades", {}).get(binding_trade_id(binding), {})
             if trade and trade.get("status") not in ("closed", "cancelled", "rejected"):
                 if identity in snapshot["events"]:
                     identities.add(identity)
@@ -104,7 +120,7 @@ def repair_queue(snapshot):
         anchor = anchor_row(current)
         signature = digest(sorted(row["event_id"] for row in current)) if conflict else None
         for row in rows:
-            if row["event_id"] in protected or row["status"] not in ("pending", "interpreted"):
+            if row["event_id"] in protected or row.get("status") not in ("pending", "interpreted"):
                 continue
             if row not in current or not conflict and row is not anchor:
                 row.update(status="superseded",
@@ -124,13 +140,13 @@ def repair_queue(snapshot):
 
 def queue_overview(snapshot, limit=50, *, event_rows=None):
     events = snapshot["events"]
-    event_rows = list(events.values()) if event_rows is None else event_rows
+    event_rows = [row for row in (events.values() if event_rows is None else event_rows) if is_source_row(row)]
     recovery = recovery_ids(snapshot, event_rows)
     grouped = {}
     for row in event_rows:
         grouped.setdefault(row["source_id"], []).append(row)
     ready, blocked, signatures = [], [], []
-    recovery_work = {identity for identity in recovery if identity in events and events[identity]["status"] in UNFINISHED}
+    recovery_work = {identity for identity in recovery if identity in events and is_source_row(events[identity]) and events[identity].get("status") in UNFINISHED}
     historical_conflicts = []
     for ref, rows in grouped.items():
         current = current_rows(rows)
@@ -143,16 +159,16 @@ def queue_overview(snapshot, limit=50, *, event_rows=None):
                 if len(previous) > 1 and len({digest(content(row)) for row in previous}) > 1:
                     historical_conflicts.append({"source_id": ref, "version": stamp, "signature": digest(sorted(row["event_id"] for row in previous))})
         if len(current) > 1 and len({digest(content(row)) for row in current}) > 1:
-            unfinished = [row["event_id"] for row in current if row["status"] in UNFINISHED]
+            unfinished = [row["event_id"] for row in current if row.get("status") in UNFINISHED]
             if unfinished:
                 blocked.extend(unfinished)
                 signatures.append(digest(sorted(row["event_id"] for row in current)))
-        elif anchor_row(current)["status"] in ("pending", "interpreted") and anchor_row(current)["event_id"] not in recovery:
+        elif anchor_row(current).get("status") in ("pending", "interpreted") and anchor_row(current)["event_id"] not in recovery:
             ready.append(anchor_row(current)["event_id"])
     operations = [identity for identity, operation in snapshot.get("operations", {}).items() if operation.get("phase") in ("prepared", "sending", "unknown")]
     return {"ready_total": len(ready), "ready": ready[:limit],
-            "raw_unfinished_total": sum(row["status"] in UNFINISHED for row in event_rows),
-            "superseded_total": sum(row["status"] == "superseded" for row in event_rows),
+            "raw_unfinished_total": sum(row.get("status") in UNFINISHED for row in event_rows),
+            "superseded_total": sum(row.get("status") == "superseded" for row in event_rows),
             "blocked_total": len(signatures), "blocked_revision_total": len(blocked), "blocked": blocked[:limit],
             "blocked_signature": digest(sorted(signatures)) if signatures else None,
             "recovery_total": len(recovery_work) + len(operations), "recovery_source_total": len(recovery_work), "recovery": sorted(recovery_work)[:limit],

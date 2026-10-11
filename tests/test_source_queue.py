@@ -44,6 +44,32 @@ def test_pure_evidence_revision_rows_need_no_processing_metadata(signal):
         latest_sources(events)
 
 
+def test_opaque_legacy_history_is_preserved_and_never_ready_during_startup_or_reads(setup, tmp_path):
+    import json
+
+    from aqla_hyperliquid_mcp.state import State
+    settings, state, *_ = setup
+    data = state.snapshot()
+    data.update(sequence=88, events={
+        "existing-message": {"event_id": "existing-message", "classification": "report"},
+        "opaque-pending": {"event_id": "opaque-pending", "status": "pending"},
+        "partial-source": {"event_id": "partial-source", "source_id": "old", "source": {"text": "old"}, "status": "pending"}},
+        bindings={"source:old": "trade:existing"})
+    before = copy.deepcopy(data)
+    repair_queue(data)
+    assert data == before and latest_sources(data["events"]) == {}
+    assert queue_overview(data)["ready_total"] == queue_overview(data)["raw_unfinished_total"] == 0
+    assert reader_overview(data, 20)["pending"] == [] and reader_overview(data, 20)["tracked_ids"] == {}
+    path = tmp_path / "opaque-legacy.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    original_bytes = path.read_bytes()
+    with State(settings.model_copy(update={"state_path": path})) as imported:
+        assert imported.snapshot() == before
+        assert imported.reader_snapshot(20)["pending"] == []
+        assert imported.snapshot()["sequence"] == 88
+    assert path.read_bytes() == original_bytes
+
+
 def test_true_current_conflict_blocks_but_unique_newer_edit_is_processable():
     source = SourceEvent(chat_id="channel", message_id=1, sent_at=1000, text="BTC SL 90")
     conflict = source.model_copy(update={"text": "BTC SL 95"})

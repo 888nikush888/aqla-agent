@@ -206,7 +206,11 @@ def test_reader_projection_matches_full_snapshot_contract_and_detaches_returned_
                                    received_at=1_800_000_000_000 + index, text="reader context", historical=True))
     before = state.snapshot()
     expected = {"sources": before["sources"], "cursors": before["cursors"], "context_cutoffs": {}, "context_ids": {},
-                "source_aliases": before["source_aliases"], "tracked_ids": {"channel": [3, 4]}, "pending": [], "notification_pending": 0}
+                "source_aliases": before["source_aliases"], "tracked_ids": {"channel": [3, 4]}, "pending": [], "notification_pending": 0,
+                "source_queue": {"ready_total": 0, "ready": [], "raw_unfinished_total": 0, "superseded_total": 0,
+                    "blocked_total": 0, "blocked_revision_total": 0, "blocked": [], "blocked_signature": None,
+                    "recovery_total": 0, "recovery_source_total": 0, "recovery": [], "recovery_operation_total": 0,
+                    "recovery_operations": [], "historical_conflict_total": 0, "historical_conflicts": []}}
     result = state.reader_snapshot(2)
     assert result == expected
     result["tracked_ids"]["channel"].append(999)
@@ -228,7 +232,7 @@ def test_reader_projection_uses_linear_grouper_without_copying_unselected_roots(
         def __deepcopy__(self, _):
             pytest.fail("The reader must not copy an unrelated full-state body")
     events = {str(index): {"event_id": str(index), "source_id": "ref-" + str(index), "status": "pending" if index % 3 == 0 else "report",
-        "source": {"chat_id": str(index % 10), "message_id": index + 1}} for index in range(1000)}
+        "source": {"chat_id": str(index % 10), "message_id": index + 1, "sent_at": index, "text": "reader context"}} for index in range(1000)}
     state.data["events"] = events
     expected = reader_overview(state.data, 5)
     counted = CountedEvents(events)

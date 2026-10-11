@@ -1,7 +1,7 @@
 """Pure bounded reader projection shared by the selective state view and its oracles."""
 from typing import TypedDict
 
-from aqla_agent.source_queue import queue_overview
+from aqla_agent.source_queue import is_source_row, queue_overview
 from aqla_agent.trading import OPEN
 
 
@@ -23,6 +23,8 @@ def reader_overview(snapshot, context_limit: int) -> ReaderOverview:
     grouped, active, pending = {}, {}, []
     event_rows = []
     for row in snapshot["events"].values():
+        if not is_source_row(row):
+            continue
         event_rows.append(row)
         chat, identity = row["source"]["chat_id"], row["source"]["message_id"]
         grouped.setdefault(chat, set()).add(identity)
