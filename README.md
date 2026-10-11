@@ -10,7 +10,7 @@ Gold/XAU wird auf Hyperliquid als `xyz:GOLD` erkannt; Dezimalhebel werden abgeru
 
 Eigenständiges Python-Projekt. Ein kontrollierter Handels-MCP, ein kurzer bearbeitbarer Master-Skill und ein read-only Telegram-Quellenleser für abonnierte Kanäle. SQLite speichert Handelszustand und Hermes-Gespräche. Keine eigene Bot-Anbindung, MiniApp oder autonome Strategieoptimierung. Manuell an den Hermes-Bot weitergeleitete Signale werden ebenfalls als Quellen erfasst.
 
-Kanalränge F–S gewichten das Profilrisiko und wählen Testnet oder Mainnet für neue Entries. Bei einem bestätigten fehlenden Hyperliquid-Markt können Pipelines auf Aster oder Lighter im selben Netzwerk ausweichen. Belegte ROI-/ROE-TPs werden mit dem ursprünglichen Signalhebel in Kursziele übersetzt. [Ranking, Konten, Börsenersatz und Prozentziele](docs/ranking-routing-roi.md).
+Kanalränge F–S gewichten das Profilrisiko und wählen Testnet oder Mainnet für neue Entries. Bei einem bestätigten fehlenden Hyperliquid-Markt können Pipelines auf Aster oder Lighter im selben Netzwerk ausweichen. Neue TP-Prozente sind verbindlich Margin-ROE: eigene Anfangsmargin vor Kosten, tatsächlich wirksamer Hebel und endgültiger eigener Entry-VWAP. Quellenwarteschlange und Benachrichtigungen sind getrennt; aktuelle Quellen benötigen belegte Entscheidungen. [Quellenverarbeitung](docs/source-processing.md). [Ranking, Konten, Börsenersatz und Prozentziele](docs/ranking-routing-roi.md).
 
 Betreiberänderungen an Rang, Handelsregeln, Quellen/Pipelines, Limits und Aktivierung sind durch den [privaten Setup-Modus](docs/setup-mode.md) geschützt: `/setup`, native Passwortprüfung und bestätigtes Löschen, dann 300 Sekunden Freigabe. Status, Pause/Disable und Schutz bleiben verfügbar.
 

@@ -217,7 +217,11 @@ class SourceEvent(Model):
 
     @property
     def event_id(self):
-        return digest([self.source_id, self.edited_at, self.text, self.media])[:32]
+        values = [self.source_id, self.edited_at, self.text, self.media]
+        contextual = [self.reply_to_id, self.thread_id, self.forward_from, self.album_id]
+        if any(value is not None for value in contextual):
+            values.append(contextual)
+        return digest(values)[:32]
 
 
 class Evidence(Model):
@@ -239,7 +243,7 @@ class Interpretation(Model):
     entry_prices: list[Positive] = Field(default_factory=list, max_length=2)
     stop_loss: Positive | None = None
     take_profits: list[Positive] = Field(default_factory=list, max_length=20)
-    take_profit_unit: Literal["price", "course_percent", "roi_percent"] = Field(default="price", description="Source TP values: absolute prices, unleveraged course percentages, or evidenced nominal gross ROI/ROE percentages for linear perps. Unlabelled/ambiguous percentages cannot be guessed.")
+    take_profit_unit: Literal["price", "course_percent", "roi_percent", "roe_percent"] = Field(default="price", description="New source TP percentages use roe_percent: nominal profit on own initial margin before fees/funding, effective executed leverage and final own fill VWAP. Rule source-roe-v1. Legacy course_percent/roi_percent remain readable only.")
     update_action: Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"] | None = None
     reduce_percent: Positive | None = Field(default=None, le=100)
     bound_trade_id: str | None = None

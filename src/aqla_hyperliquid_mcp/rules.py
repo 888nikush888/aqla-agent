@@ -134,21 +134,8 @@ def backup_prices(reference, side, market, stop_percent=None, percentages=(), *,
 
 
 def latest_sources(events: dict, refs=None):
-    latest = {}
-    revisions = {}
-    for row in events.values():
-        ref = row["source_id"]
-        if refs is not None and ref not in refs:
-            continue
-        previous = latest.get(ref)
-        version = row["source"].get("edited_at") or row["source"]["sent_at"]
-        identity = revisions.setdefault((ref, version), row["event_id"])
-        if identity != row["event_id"]:
-            raise AqlaError("Source revisions have conflicting content at the same timestamp")
-        prior_version = (previous["source"].get("edited_at") or previous["source"]["sent_at"]) if previous else -1
-        if version > prior_version:
-            latest[ref] = row
-    return latest
+    from aqla_agent.source_queue import canonical_sources
+    return canonical_sources(events, refs)
 
 
 def slippage_price(reference: Decimal, percent: Decimal, market: Market, buy: bool):
@@ -185,9 +172,9 @@ def verify_evidence(signal: Interpretation, events: dict):
         raise AqlaError("Deferred entry timing needs contextual source evidence")
     if signal.source_exchange is not None and not any(signal.source_exchange.casefold() in value.casefold() for value in fields.get("source_exchange", [])):
         raise AqlaError("Source exchange needs contextual source evidence")
-    if signal.take_profit_unit != "price" and signal.take_profits and not fields.get("take_profit_unit"):
+    if signal.take_profit_unit not in ("price", "roe_percent") and signal.take_profits and not fields.get("take_profit_unit"):
         raise AqlaError("Percentage TP unit needs contextual source evidence")
-    if signal.take_profit_unit != "price" and signal.take_profits:
+    if signal.take_profit_unit not in ("price", "roe_percent") and signal.take_profits:
         unit_proof = " ".join(fields["take_profit_unit"])
         roi = re.search(r"\b(?:ROI|ROE)\b|return on (?:equity|investment)|рентабельност", unit_proof, re.I)
         movement = re.search(r"price|kurs|course|цены|движени|unleveraged|без плеч|hebelunabhängig", unit_proof, re.I)
@@ -195,12 +182,26 @@ def verify_evidence(signal: Interpretation, events: dict):
             raise AqlaError("Ambiguous percentage TP definition; evidence must distinguish price movement from nominal ROI/ROE")
         if signal.take_profit_unit == "roi_percent" and re.search(r"annuali[sz]ed|net ROI|net ROE|netto|годов|после (?:комисс|издерж)", unit_proof, re.I):
             raise AqlaError("This ROI definition cannot be converted as nominal linear ROI before costs")
-    if signal.take_profit_unit == "price":
-        for index, _value in enumerate(signal.take_profits):
-            # A quoted percent is not an absolute price. Precise price-only excerpts
-            # remain possible when a channel supplies price and ROI together.
-            if fields.get(f"take_profits.{index}") and all("%" in quote for quote in fields[f"take_profits.{index}"]):
-                raise AqlaError("A TP percentage cannot be interpreted as an absolute price")
+    for field, value in numeric.items():
+        if value is None or not (field == "stop_loss" or field.startswith("take_profits.")):
+            continue
+        percentage = field.startswith("take_profits.") and signal.take_profit_unit != "price"
+        modes = []
+        for proof in signal.evidence:
+            if proof.field != field:
+                continue
+            original = texts[proof.source_id]
+            for occurrence in re.finditer(re.escape(proof.quote), original):
+                for number in re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])", proof.quote):
+                    if value not in set(quoted_numbers(number.group())):
+                        continue
+                    tail = original[occurrence.start() + number.end():]
+                    modes.append(bool(re.match(r"\s*%", tail)))
+        if not modes or any(mode != percentage for mode in modes):
+            raise AqlaError(f"Source percentage/price evidence needs a precise original span: {field}")
+    if signal.take_profit_unit == "roe_percent" and signal.take_profits:
+        if re.search(r"annuali[sz]ed|net ROI|net ROE|netto|годов|после (?:комисс|издерж)", " ".join(texts.values()), re.I):
+            raise AqlaError("Special percentage definition cannot be converted as nominal ROE before costs")
 
 
 @dataclass(frozen=True)
@@ -289,14 +290,16 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         source_reference = reference_entry(signal, policy)
         if signal.take_profit_unit != "price" and signal.take_profits:
             from aqla_agent.percent_targets import prices
-            reference = source_reference
+            reference = None if signal.take_profit_unit == "roe_percent" else source_reference
             selected = selected_targets(signal.take_profits, policy)
-            targets = prices(reference or entry, signal.side, market, signal.take_profit_unit, selected, signal.leverage)
+            targets = prices(reference or entry, signal.side, market, signal.take_profit_unit, selected, margin_leverage(leverage, market) if signal.take_profit_unit == "roe_percent" else signal.leverage)
             source_tp = {"unit": signal.take_profit_unit, "values": [str(value) for value in selected],
                          "reference_kind": "signal_entry" if reference is not None else "fill_vwap",
                          "reference_entry": str(reference) if reference is not None else None,
                          "signal_leverage": str(signal.leverage) if signal.leverage is not None else None,
                          "preview_reference": str(reference or entry), "preview_prices": [str(value) for value in targets], "nominal_before_costs": True}
+            if signal.take_profit_unit == "roe_percent":
+                source_tp.update(margin_leverage=str(margin_leverage(leverage, market)), rules_version="source-roe-v1")
         else:
             targets = derived_targets if "take_profits" in fields else [price_grid(value, market, up=not long) for value in selected_targets(signal.take_profits, policy)]
         ordered = sorted(set(targets), reverse=not long)

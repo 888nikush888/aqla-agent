@@ -40,7 +40,9 @@ def test_conflicting_same_timestamp_revisions_are_rejected_independently_of_arri
     trading.ingest(newer)
     events = list(state.snapshot()["events"].items())
     events = OrderedDict(reversed(events) if reverse else events)
+    assert latest_sources(events, interpretation.source_refs)[source.source_id]["event_id"] == newer.event_id
+    verify_evidence(interpretation, events)
+    current_conflict = newer.model_copy(update={"text": newer.text + " conflicting current edit"})
+    trading.ingest(current_conflict)
     with pytest.raises(AqlaError, match="conflicting content"):
-        latest_sources(events, interpretation.source_refs)
-    with pytest.raises(AqlaError, match="conflicting content"):
-        verify_evidence(interpretation, events)
+        latest_sources(state.snapshot()["events"], interpretation.source_refs)

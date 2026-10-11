@@ -558,7 +558,7 @@ def percentage_signal(trading, *, entry=True):
     if entry:
         proofs.append(("entry_prices.0", "Entry 100"))
     signal = Interpretation(kind="new_signal", source_refs=[source.source_id], symbol="BTC", side="long", entry="limit" if entry else "market",
-                            entry_prices=[100] if entry else [], stop_loss=90, take_profits=[20, 40], take_profit_unit="roi_percent", leverage=10,
+                            entry_prices=[100] if entry else [], stop_loss=90, take_profits=[20, 40], take_profit_unit="roe_percent", leverage=10,
                             evidence=[Evidence(field=field, quote=quote, source_id=source.source_id) for field, quote in proofs])
     return source, signal
 
@@ -569,8 +569,8 @@ async def test_percent_preview_execution_and_frozen_reference(setup, source_entr
     _, state, _, _, trading = setup
     source, value = percentage_signal(trading, entry=source_entry)
     plan = await trading.preview(source.event_id, value)
-    assert [Decimal(value) for value in plan["take_profits"]] == [102, 104]
-    assert plan["source_tp"]["reference_kind"] == ("signal_entry" if source_entry else "fill_vwap")
+    assert [Decimal(value) for value in plan["take_profits"]] == [110, 120]
+    assert plan["source_tp"]["reference_kind"] == "fill_vwap"
     if source_entry:
         # Fake exchange only auto-fills IOC, so use source market input for the execution case below.
         return
@@ -596,18 +596,18 @@ async def test_roi_update_freezes_original_base_preserves_evidence_and_survives_
     message = SourceEvent(chat_id="channel", message_id=2, reply_to_id=1, sent_at=now_ms(), text="BTC long TP ROI 30% and ROI 60%")
     trading.ingest(message)
     update = Interpretation(kind="trade_update", source_refs=[message.source_id], symbol="BTC", side="long",
-                            update_action="replace_targets", take_profits=[30, 60], take_profit_unit="roi_percent",
+                            update_action="replace_targets", take_profits=[30, 60], take_profit_unit="roe_percent",
                             evidence=[Evidence(field=field, quote=quote, source_id=message.source_id) for field, quote in (
                                 ("take_profit_unit", "TP ROI 30%"), ("take_profits.0", "ROI 30%"), ("take_profits.1", "ROI 60%"))])
     await trading.update_trade(message.event_id, update)
     saved = state.snapshot()["trades"][trade["trade_id"]]
-    assert list(map(Decimal, saved["targets"])) == [103, 106]
+    assert list(map(Decimal, saved["targets"])) == [115, 130]
     assert saved["source_tp_override"]["values"] == ["30", "60"]
     assert state.snapshot()["events"][message.event_id]["interpretation"]["take_profits"] == ["30", "60"]
     if waiting:
         fake.mid = "100"
         await trading.recover()
-        assert state.snapshot()["trades"][trade["trade_id"]]["targets"] == ["103.00", "106.00"]
+        assert state.snapshot()["trades"][trade["trade_id"]]["targets"] == ["115.00", "130.00"]
     else:
         sends = len(fake.actions)
         await trading.update_trade(message.event_id, update)

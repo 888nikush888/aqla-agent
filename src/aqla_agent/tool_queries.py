@@ -77,14 +77,17 @@ def page(rows, offset, limit, metadata, *, max_bytes=BYTE_CAP):
 
 
 def compact_view(value, tool, arguments, offset=0, limit=20, view_version=None):
-    version = digest(value)
+    version = digest({key: item for key, item in value.items() if key != "source_read_receipt"})
     if view_version is not None and view_version != version or offset and view_version is None:
         raise AqlaError("This live compact view requires the same view_version for continued pages. If it changed, restart at offset 0 or request the full view and page its immutable native output_id.")
     rows = []
     for name, item in value.items():
+        if name == "source_read_receipt":
+            continue
         entries = list(enumerate(item)) if isinstance(item, list) else list(item.items()) if isinstance(item, dict) else [(None, item)]
         rows.extend({"section": name, "key": key, "value": shrink(row)} for key, row in entries)
-    result = page(rows, offset, limit, {"view": "compact", "view_version": version, "paging_basis": "live_snapshot",
+    receipt_metadata = {"source_read_receipt": value["source_read_receipt"]} if "source_read_receipt" in value else {}
+    result = page(rows, offset, limit, {**receipt_metadata, "view": "compact", "view_version": version, "paging_basis": "live_snapshot",
         "continuation_requires_same_view_version": True, "full_details": {"tool": tool, "arguments": {**arguments, "view": "full"}},
         "full_body_available": True})
     while True:

@@ -128,7 +128,7 @@ def risk_block(trade):
 def target_label(plan, index):
     spec = plan.get("source_tp")
     if spec and spec.get("unit") != "price" and index < len(spec["values"]):
-        return " · " + number(spec["values"][index]) + (" % ROI vor Kosten" if spec["unit"] == "roi_percent" else " % Kursbewegung")
+        return " · " + number(spec["values"][index]) + (" % ROE eigene Margin vor Kosten" if spec["unit"] == "roe_percent" else " % ROI vor Kosten" if spec["unit"] == "roi_percent" else " % Kursbewegung")
     return ""
 
 
@@ -318,7 +318,9 @@ def lifecycle_block(data, event):
 
 def status_text(data, exchanges, sheets_enabled, inventory):
     active = [row for row in data["trades"].values() if row["status"] in OPEN]
-    pending = sum(row["status"] in ("pending", "interpreted", "needs_reconciliation") for row in data["events"].values())
+    from .source_queue import queue_overview
+    source_queue = queue_overview(data)
+    pending = source_queue["ready_total"]
     unknown = sum(row["phase"] in ("prepared", "sending", "unknown") for row in data["operations"].values())
     enabled = any(row.get("enabled") and row.get("configured") for row in exchanges.values())
     lines = ["📊 **Aqla · Systemstatus**", "**Entries:** " + ("pausiert" if data["paused"] else "nach Profilregeln freigegeben" if enabled else "keine Börse freigegeben")]
@@ -326,7 +328,7 @@ def status_text(data, exchanges, sheets_enabled, inventory):
     if data.get("ranking_policy", {}).get("enabled"):
         ranks = data.get("source_ranks", {})
         lines.append("**Kanalränge:** " + " · ".join(f"{source_name(data, source)}: {literal(row['tier'])}" + (" (Startfreigabe)" if row.get("bootstrap") and row.get("metrics", {}).get("score") is None else "") for source, row in ranks.items()))
-    lines.append(f"**Offene Trades:** {len(active)} · **Ausstehende Quellen:** {pending}\n**Ungeklärte Vorgänge:** {unknown}")
+    lines.append(f"**Offene Trades:** {len(active)} · **Ausstehende Quellen:** {pending} · **Blockierte Quellen:** {source_queue["blocked_total"]}\n**Quellen-Recovery:** {source_queue["recovery_source_total"]} · **Ungeklärte Vorgänge:** {unknown}")
     queue = len(data.get("journal_pending", {}))
     lines.append("**Sheets:** " + ("deaktiviert" if not sheets_enabled else f"{queue} Übertragungen ausstehend" if queue else "Journal synchronisiert"))
     for venue, row in inventory.items():

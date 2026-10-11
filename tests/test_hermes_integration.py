@@ -670,3 +670,37 @@ async def test_missing_reader_session_reports_status_and_preserves_pending_wake(
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["ready", "blocked", "recovery"])
+async def test_wake_observed_source_work_independent_of_zero_notifications(extension, monkeypatch, mode):
+    ext, ctx = extension
+    queue = {"ready_total": 0, "blocked_total": 0, "recovery_total": 0}
+    queue[mode + "_total"] = 12 if mode == "ready" else 1
+    if mode == "blocked":
+        queue.update(blocked=["blocked-revision"], blocked_signature="signature")
+    elif mode == "recovery":
+        queue.update(recovery_operations=["entry:owned-trade"])
+    pending = [f"ready-{i}" for i in range(12)] if mode == "ready" else []
+    calls, wakes = [], []
+    async def snapshot(*args, **kwargs):
+        calls.append(1)
+        if len(calls) > 2:
+            raise asyncio.CancelledError
+        return {"pending": pending, "notification_pending": 0, "source_queue": queue}
+    async def instant_sleep(*args):
+        pass
+    monkeypatch.setattr("aqla_agent.events.asyncio.sleep", instant_sleep)
+    monkeypatch.setattr("aqla_agent.events.time.monotonic", lambda: 100)
+    ext.call = snapshot
+    ctx.inject_message = lambda text, **kwargs: wakes.append(text) or True
+    with pytest.raises(asyncio.CancelledError):
+        await ext.worker()
+    assert len(wakes) == 1 and '"notification_pending": 0' in wakes[0]
+    assert f'"{mode}_total": {queue[mode + "_total"]}' in wakes[0]
+    assert "reader_recovered" not in wakes[0]
+    if mode == "ready":
+        assert "ready-7" in wakes[0] and "ready-8" not in wakes[0]
+    elif mode == "recovery":
+        assert "entry:owned-trade" in wakes[0]

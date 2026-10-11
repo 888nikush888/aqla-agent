@@ -20,7 +20,7 @@ def test_reader_overview_single_scan_matches_complete_original_output(chats, cou
                 self.scans += 1
                 yield value
     events = CountedEvents({str(index): {"event_id": str(index), "source_id": f"source-{index}",
-                                       "source": {"chat_id": str(index % chats), "message_id": index + 1},
+                                       "source": {"chat_id": str(index % chats), "message_id": index + 1, "sent_at": index, "text": "body"},
                                        "status": "pending" if index % 13 == 0 else "report"} for index in range(count)})
     snapshot = {"events": events, "trades": {"active": {"status": "open", "plan": {"source_refs": [f"source-{index}" for index in range(0, count, 997)]}}},
                 "sources": [str(index) for index in range(chats)], "cursors": {"0": 7}, "context_cutoffs": {"0": 4},
@@ -45,6 +45,10 @@ def test_reader_overview_single_scan_matches_complete_original_output(chats, cou
                 "pending": [row["event_id"] for row in events.values() if row["status"] in UNFINISHED][:50], "notification_pending": 1}
     old_elapsed = time.perf_counter() - started
     assert events.scans == count * (chats + 2)
+    assert actual["source_queue"]["ready_total"] == sum(index % 13 == 0 for index in range(count))
+    assert actual["source_queue"]["raw_unfinished_total"] == actual["source_queue"]["ready_total"]
+    assert actual["source_queue"]["blocked_total"] == 0
+    expected["source_queue"] = actual["source_queue"]
     assert actual == expected and snapshot == before
     print(f"reader overview events={count} chats={chats} old_scans={events.scans} new_scans={count} old_seconds={old_elapsed:.6f} new_seconds={elapsed:.6f}")
 

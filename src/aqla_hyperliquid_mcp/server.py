@@ -31,6 +31,7 @@ from aqla_agent.ranking import RankingPolicy, Tier, set_manual_rank, status_view
 from aqla_agent.reporting import Reporting
 from aqla_agent.router import Router, recovery_diagnostics
 from aqla_agent.setup import SetupBinding, SetupGate
+from aqla_agent.source_queue import queue_overview
 from aqla_agent.tool_queries import compact_view, source_attribution
 from aqla_agent.tool_queries import source_lookup as lookup_sources
 
@@ -46,7 +47,7 @@ from .projections import ReaderOverview as ReaderOverview
 from .projections import reader_overview as reader_overview
 from .state import State
 from .streams import SUBSCRIPTION_MODELS, Streams, Subscription
-from .trades import OPEN, UNFINISHED
+from .trades import OPEN
 
 
 def create_server(settings: Settings, *, profile="agent", exchange=None, state=None):
@@ -56,6 +57,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     reporting = Reporting(state, trading)
     streams = Streams(settings.base_url, timeout=settings.timeout_seconds)
     authority = Authority.from_file(settings.integration_key_file) if settings.integration_key_file else None
+    trading.source.disposition_key = authority.key if authority else None
     setup_gate = SetupGate(authority is not None and bool(settings.telegram_owner_id) and load_verifier(settings.setup_password_hash_file) is not None)
 
     def setup_context(claims):
@@ -138,6 +140,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                      view_version: str | None = None) -> dict:
         """Read effective user rules, sources, pending work, owned trades and unresolved operations."""
         snapshot = state.snapshot()
+        queue = queue_overview(snapshot)
         ready = trading.ready()
         inventory = await trading.inventory_status()
         page = notification_page(snapshot, authority.key if authority else None, ready, require_key=False)
@@ -146,7 +149,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         result = {"network": settings.network, "account": exchange.account, "paused": snapshot["paused"], "setup": setup_gate.status(binding, lease_id, owner_id=settings.telegram_owner_id),
                 "policy": snapshot["policy"], "policy_revision": snapshot["policy_revision"], "sources": snapshot["sources"],
                 "source_names": snapshot.get("source_names", {}), "source_names_revision": snapshot.get("source_names_revision", 0),
-                "pending": [row["event_id"] for row in snapshot["events"].values() if row["status"] in UNFINISHED],
+                "pending": queue["ready"], "source_queue": queue,
                 "trades": [row for row in snapshot["trades"].values() if row["status"] in OPEN],
                 "unresolved_operations": [trading.public_operation(row) for row in snapshot["operations"].values() if row["phase"] in ("prepared", "sending", "unknown")],
                 "notifications": page["notifications"], "notification_versions": page["notification_versions"],
@@ -255,18 +258,24 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                              view_version: str | None = None) -> dict:
         """Read source message, bounded same-channel/reply context and open trade bindings."""
         result = trading.context(event_id)
+        receipt = result.get("source_read_receipt")
+        result = {"source_read_receipt": receipt, "percentage_rule": "source-roe-v1: new TP percentages use roe_percent on own initial margin before fees/funding, effective margin leverage and final own entry VWAP", **result}
         return compact_view(result, "source_context", {"event_id": event_id}, offset, limit, view_version) if view == "compact" else result
 
     @server.tool(annotations=write)
-    async def interpret_source(event_id: str, interpretation: Interpretation, context_auth: str = "") -> dict:
+    async def interpret_source(event_id: str, interpretation: Interpretation, context_auth: str = "", source_read_receipt: str = "") -> dict:
         """Save contextual classification/evidence for an actual received source; does not trade."""
         authorize(context_auth)
+        if interpretation.kind not in ("new_signal", "trade_update"):
+            return trading.source.record_interpretation(event_id, interpretation, read_receipt=source_read_receipt)
         return trading.record_interpretation(event_id, interpretation)
 
     @server.tool(annotations=write)
-    async def trade_preview(event_id: str, interpretation: Interpretation, context_auth: str = "") -> dict:
+    async def trade_preview(event_id: str, interpretation: Interpretation, context_auth: str = "", source_read_receipt: str = "") -> dict:
         """Calculate and durably save an immutable source-bound plan under current user rules."""
         authorize(context_auth)
+        if interpretation.kind not in ("new_signal", "trade_update"):
+            return trading.source.record_interpretation(event_id, interpretation, read_receipt=source_read_receipt)
         try:
             result = await trading.preview(event_id, interpretation)
             if state.snapshot()["events"][event_id].get("last_error"):

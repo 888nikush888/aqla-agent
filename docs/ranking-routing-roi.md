@@ -53,14 +53,14 @@ Der Plan speichert ursprüngliche Setup-ID, Quelle, Pipeline, Routing-Leg, angef
 
 ## Prozentziele
 
-`take_profit_unit` unterscheidet `price`, `course_percent` und `roi_percent`. Die Definition und die Werte brauchen Originalbelege. Bloße unklare TP-Prozente werden nicht geraten; nicht nominale/netto/annualisierte ROI-Definitionen werden abgelehnt.
+Neue `take_profit_unit=roe_percent`-Ziele folgen der festen Betreiberregel `source-roe-v1`: nominaler Gewinn auf die eigene eingesetzte Anfangsmargin, vor Gebühren/Funding. Zahlen und Prozentzeichen müssen im Original belegt sein, auch ohne ROI-/ROE-Beschriftung. Netto/annualisierte Sonderdefinitionen werden abgelehnt. Absolute Preise bleiben `price`; gekürzte Zahlen aus Prozentangaben sind keine Preisbelege.
 
-```text
-Long-TP  = Bezug × (1 + ROI / (100 × originaler Signalhebel))
-Short-TP = Bezug × (1 - ROI / (100 × originaler Signalhebel))
+```
+Long-TP  = eigener finaler Entry-VWAP × (1 + ROE / (100 × eigene Margin-Leverage))
+Short-TP = eigener finaler Entry-VWAP × (1 - ROE / (100 × eigene Margin-Leverage))
 ```
 
-Der originale Dezimalhebel gilt auch nach Abrundung/Deckelung. Kein Profil-/Backup-Ersatz für fehlenden ROI-Hebel. Bezug ist der ursprüngliche belegte Signal-Entry oder die profilgemäß ausgewählte Range, sonst der endgültige Fill-VWAP. Kursprozente benötigen keinen Hebel. Tick-Rundung erfolgt in Gewinnrichtung; Zielordnung, Mindestgrößen, adaptive Verteilung und Stop-Leiter bleiben verbindlich. Werte, Bezug und abgeleitete Ziele werden vor TP-Versand gespeichert. Updates verwenden diese gespeicherte Basis; Wiederanlauf verwendet vorhandene Orders/Operationsidentitäten.
+Der Originalsignalhebel bleibt Evidenz. Ausführungshebel wird abgerundet und gedeckelt oder vom Fixed-/Backup-Profil bestimmt. Die eigene Margin-Leverage folgt dieser tatsächlichen Basis. Previewpreise sind vorläufig; nach bestätigten vollständigen eigenen Entry-Fills einschließlich Teilfill-/Cancel-Reconciliation wird die VWAP-Basis dauerhaft eingefroren. Updates behalten diese eigene Marginbasis. Tick-Rundung, Mindestgrößen, adaptive Verteilung und Stop-Leiter gelten weiter. Gespeicherte Legacy-`roi_percent`-/`course_percent`-Pläne behalten ihre Originalhebel-/Signalentry-Semantik und Operationsidentitäten.
 
 ## Analyse und Einführung
 

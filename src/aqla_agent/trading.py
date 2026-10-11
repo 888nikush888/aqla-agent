@@ -92,18 +92,25 @@ class Trading:
             raise AqlaError("Source is not subscribed")
         if source.event_id in snapshot["events"]:
             return snapshot["events"][source.event_id]
+        legacy_event_id = digest([source.source_id, source.edited_at, source.text, source.media])[:32]
+        if legacy_event_id != source.event_id and legacy_event_id in snapshot.get("event_tombstones", {}):
+            return {"event_id": legacy_event_id, "source_id": source.source_id, "status": "already_processed", "reason": "legacy contextual revision retained as processed"}
         if source.event_id in snapshot.get("event_tombstones", {}):
             return {"event_id": source.event_id, "source_id": source.source_id, "status": "already_processed"}
 
         def insert(state):
             if source.event_id in state["events"]:
                 return state["events"][source.event_id]
+            if legacy_event_id != source.event_id and legacy_event_id in state.get("event_tombstones", {}):
+                return {"event_id": legacy_event_id, "source_id": source.source_id, "status": "already_processed", "reason": "legacy contextual revision retained as processed"}
             if source.event_id in state.get("event_tombstones", {}):
                 return {"event_id": source.event_id, "source_id": source.source_id, "status": "already_processed"}
             row = {"event_id": source.event_id, "source_id": source.source_id, "source": source.model_dump(mode="json"),
                    "status": "context" if source.historical else "pending", "interpretation": None, "native_forward": bool(trusted_forward)}
             state["events"][source.event_id] = row
             state["cursors"][source.chat_id] = max(source.message_id, state["cursors"].get(source.chat_id, 0))
+            from .source_queue import repair_queue
+            repair_queue(state)
             self.prune_events(state, inserted_event=source.event_id)
             return row
 
@@ -147,6 +154,8 @@ class Trading:
         messages = [item for item in snapshot["events"].values() if item["source"]["chat_id"] == source["chat_id"]]
         messages.sort(key=lambda item: (item["source"]["sent_at"], item["source"].get("edited_at") or 0))
         included = messages[-self.exchange.settings.max_context_messages:]
+        if row not in included:
+            included.insert(0, row)
         reply = source.get("reply_to_id")
         seen = set()
         while reply and reply not in seen:
@@ -158,38 +167,61 @@ class Trading:
                 included.insert(0, parent)
             reply = parent["source"].get("reply_to_id")
         trades = [trade for trade in snapshot["trades"].values() if trade["status"] in OPEN and trade["chat_id"] == source["chat_id"]]
-        return {"event": row, "messages": included, "trades": trades, "policy": snapshot["policy"],
+        result = {"event": row, "messages": included, "trades": trades, "policy": snapshot["policy"],
+                "classification_constraints": {"missing_text": not source.get("text", "").strip(),
+                    "media": source.get("media", "text"), "empty_body_only_kind": "incomplete"},
                 "source_names": snapshot.get("source_names", {}), "source_name": snapshot.get("source_names", {}).get(source["chat_id"]),
                 "backup_profile": snapshot.get("profiles", {}).get("backup"),
                 "policy_revision": snapshot["policy_revision"], "context_truncated": len(included) < len(messages)}
+        if getattr(self, "disposition_key", None):
+            from .source_disposition import issue_receipt
+            try:
+                result["source_read_receipt"] = issue_receipt(snapshot["events"], event_id, self.disposition_key, context_rows=included)
+            except AqlaError as error:
+                result["source_read_receipt"] = None
+                result["source_read_error"] = str(error)
+        return result
 
-    def record_interpretation(self, event_id, interpretation: Interpretation):
-        snapshot = self.state.snapshot()
-        row = snapshot["events"].get(event_id)
-        if row is None:
-            raise AqlaError("Unknown source event")
-        refs = [item for item in snapshot["events"].values() if item["source_id"] in interpretation.source_refs]
-        if not refs or any(item["source"]["chat_id"] != row["source"]["chat_id"] for item in refs):
-            raise AqlaError("A setup may only combine messages from the same source")
-        if interpretation.kind in ("new_signal", "trade_update"):
-            if row["source"].get("historical"):
-                raise AqlaError("Historical context cannot authorize an exchange action")
-            if row["source_id"] not in interpretation.source_refs:
-                raise AqlaError("An actionable interpretation must reference its live anchor event")
-            if latest_sources(snapshot["events"], [row["source_id"]])[row["source_id"]]["event_id"] != event_id:
-                raise AqlaError("An actionable interpretation must use the latest anchor revision")
-        verify_evidence(interpretation, snapshot["events"])
-        previous = row.get("interpretation")
-        if row["status"] in ("executed", "updated"):
-            if previous is not None:
-                previous = Interpretation.model_validate(previous).model_dump(mode="json")
-            if previous != interpretation.model_dump(mode="json"):
-                raise AqlaError("An executed revision is immutable; interpret the edit as a new update revision")
+    def record_interpretation(self, event_id, interpretation: Interpretation, *, read_receipt=""):
+        def commit(snapshot):
+
+            row = snapshot["events"].get(event_id)
+            if row is None:
+                raise AqlaError("Unknown source event")
+            previous = row.get("interpretation")
+            if row["status"] in ("executed", "updated"):
+                previous = Interpretation.model_validate(previous).model_dump(mode="json") if previous is not None else None
+                if previous != interpretation.model_dump(mode="json"):
+                    raise AqlaError("An executed revision is immutable; interpret the edit as a new update revision")
+                return row
+            from .source_queue import recovery_ids
+            if event_id in recovery_ids(snapshot):
+                prior = Interpretation.model_validate(previous).model_dump(mode="json") if previous is not None else None
+                if prior == interpretation.model_dump(mode="json"):
+                    return row
+                raise AqlaError("Financial recovery revision is immutable; reconcile its existing operations")
+            if interpretation.kind not in ("new_signal", "trade_update") and getattr(self, "disposition_key", None):
+                from .source_disposition import verify_disposition
+                verify_disposition(snapshot, event_id, interpretation, read_receipt, self.disposition_key)
+            refs = [item for item in snapshot["events"].values() if item["source_id"] in interpretation.source_refs]
+            if not refs or any(item["source"]["chat_id"] != row["source"]["chat_id"] for item in refs):
+                raise AqlaError("A setup may only combine messages from the same source")
+            if interpretation.kind in ("new_signal", "trade_update"):
+                if not row["source"].get("text", "").strip():
+                    raise AqlaError("Live anchor has no textual source intent; read source_context and classify incomplete")
+                if row["source"].get("historical"):
+                    raise AqlaError("Historical context cannot authorize an exchange action")
+                if row["source_id"] not in interpretation.source_refs:
+                    raise AqlaError("An actionable interpretation must reference its live anchor event")
+                if latest_sources(snapshot["events"], [row["source_id"]])[row["source_id"]]["event_id"] != event_id:
+                    raise AqlaError("An actionable interpretation must use the latest anchor revision")
+            verify_evidence(interpretation, snapshot["events"])
+            if interpretation.take_profit_unit in ("course_percent", "roi_percent") and interpretation.take_profits:
+                raise AqlaError("New source TP percentages must use roe_percent under source-roe-v1")
+            row.update(interpretation=interpretation.model_dump(mode="json"),
+                       status=interpretation.kind if interpretation.kind not in ("new_signal", "trade_update") else "interpreted")
             return row
-        self.state.update(lambda state: state["events"][event_id].update(
-            interpretation=interpretation.model_dump(mode="json"),
-            status=interpretation.kind if interpretation.kind not in ("new_signal", "trade_update") else "interpreted"))
-        return self.state.snapshot()["events"][event_id]
+        return (self.state.update_if_changed if hasattr(self.state, "update_if_changed") else self.state.update)(commit)
 
     async def preview(self, event_id, interpretation: Interpretation):
         row = self.record_interpretation(event_id, interpretation)
@@ -955,7 +987,7 @@ class Trading:
             raise AqlaError("Source percentage targets require confirmed final entry fills")
         from .percent_targets import prices
         reference = specification["reference_entry"] or trade["entry_vwap"]
-        targets = prices(reference, plan.side, plan.market, specification["unit"], specification["values"], specification["signal_leverage"])
+        targets = prices(reference, plan.side, plan.market, specification["unit"], specification["values"], specification.get("margin_leverage") if specification["unit"] == "roe_percent" else specification["signal_leverage"])
         entry = Decimal(trade["entry_vwap"])
         if any(value <= entry if plan.side == "long" else value >= entry for value in targets):
             raise AqlaError("Source percentage targets are no longer profitable relative to the executed entry")
@@ -1593,18 +1625,22 @@ class Trading:
             if signal.update_action == "replace_targets":
                 if signal.take_profit_unit != "price":
                     from .percent_targets import prices
+                    if signal.take_profit_unit == "roe_percent" and plan.effective_leverage is None:
+                        raise AqlaError("Cannot establish own initial margin leverage for this legacy trade; reconcile instead of guessing")
                     specification = trade.get("percent_finalization") or plan.source_tp
                     if not specification:
                         specification = {"reference_entry": str(plan.source_entry_reference) if plan.source_entry_reference is not None else trade.get("entry_vwap"),
                                          "signal_leverage": plan.signal_leverage_original or plan.signal_leverage}
-                    reference = specification.get("reference_entry") or trade["entry_vwap"]
+                    reference = (trade.get("entry_vwap") or str(plan.entry_price)) if signal.take_profit_unit == "roe_percent" else specification.get("reference_entry") or trade["entry_vwap"]
                     if reference is None:
                         raise AqlaError("Percentage TP update requires this trade's stored source reference")
-                    converted = prices(reference, plan.side, plan.market, signal.take_profit_unit, selected_targets(signal.take_profits, plan.policy), specification.get("signal_leverage"))
+                    converted = prices(reference, plan.side, plan.market, signal.take_profit_unit, selected_targets(signal.take_profits, plan.policy), margin_leverage(plan.effective_leverage, plan.market) if signal.take_profit_unit == "roe_percent" else specification.get("signal_leverage"))
                     original = signal.model_dump(mode="json")
                     update_targets = converted
                     update_spec = {"unit": signal.take_profit_unit, "values": [str(value) for value in selected_targets(signal.take_profits, plan.policy)],
                                    "reference_entry": str(reference), "signal_leverage": specification.get("signal_leverage")}
+                    if signal.take_profit_unit == "roe_percent":
+                        update_spec.update(margin_leverage=str(margin_leverage(plan.effective_leverage, plan.market)), reference_kind="fill_vwap", reference_entry=trade.get("entry_vwap"), rules_version="source-roe-v1")
                     # Validate the quoted update before converting; computed prices
                     # have no invented price quotations.
                     self.state.update(lambda data: data["trades"][trade["trade_id"]].setdefault("percent_updates", {}).__setitem__(event_id,

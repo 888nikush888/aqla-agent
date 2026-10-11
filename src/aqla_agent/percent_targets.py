@@ -1,4 +1,4 @@
-"""Evidenced source percentages; source leverage is never the exchange-capped leverage."""
+"""Source percentages: new own-margin ROE and preserved legacy source semantics."""
 from decimal import Decimal
 
 from aqla_hyperliquid_mcp.models import AqlaError
@@ -17,11 +17,13 @@ def reference_entry(signal, policy):
 def prices(reference, side, market, unit, values, leverage=None):
     from aqla_hyperliquid_mcp.rules import price_grid
     reference = Decimal(str(reference))
-    if unit not in ("course_percent", "roi_percent"):
+    if unit not in ("course_percent", "roi_percent", "roe_percent"):
         raise AqlaError("Unknown source percentage interpretation")
-    if unit == "roi_percent" and (leverage is None or Decimal(str(leverage)) < 1):
+    if unit in ("roi_percent", "roe_percent") and (leverage is None or Decimal(str(leverage)) < 1):
+        if unit == "roe_percent":
+            raise AqlaError("ROE targets need the actual effective own initial margin leverage")
         raise AqlaError("ROI targets need the evidenced original signal leverage; profile/Backup leverage cannot replace it")
-    percentages = [Decimal(str(value)) / (Decimal(str(leverage)) if unit == "roi_percent" else 1) for value in values]
+    percentages = [Decimal(str(value)) / (Decimal(str(leverage)) if unit in ("roi_percent", "roe_percent") else 1) for value in values]
     if percentages != sorted(set(percentages)) or any(value <= 0 or not value.is_finite() for value in percentages):
         raise AqlaError("Source percentage targets must be finite, positive, unique and ascending")
     long = side == "long"

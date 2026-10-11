@@ -85,6 +85,8 @@ class State:
             if not existing or migrated or legacy or self.journal_enabled:
                 self._write(self.data)
             self._store.seal()
+            from aqla_agent.source_queue import repair_queue
+            self.update_if_changed(repair_queue)
         except BaseException:
             if self._store is not None:
                 self._store.close()

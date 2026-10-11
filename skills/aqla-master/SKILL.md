@@ -49,9 +49,12 @@ TPs, nie ungültige Werte. Risiko/Verteilung/Limits: Hauptprofil. set_profile:
 leverage_mode=fixed; fallback_*_unit: Kurs% oder ROE(Anfangsmargin vor Kosten).
 ROE/wirksamer Hebel ab Entry-VWAP; leer=kein Ersatz. backup_fields/vorläufig/final trennen.
 
-Pending: source_context lesen. Keine Kanalmuster:
-new_signal/trade_update/report/unrelated/incomplete/ambiguous. Nur belegte
-zusammengehörige Nachrichten, unabhängige Setups nicht mischen.
+Automatisch: je ID source_context. Nichtaktional: source_read_receipt,
+evidence classification-Zitat/source_id+reason; leer→incomplete. Fehler→Reread.
+new_signal/trade_update/report/unrelated/incomplete/ambiguous; belegte Setups nicht mischen.
+source_queue≠notifications; Stau leer nur ready=blocked=0. Blockanzahl einmal/Signatur;
+recovery→reconcile.
+
 notifications_read(cursor=null)→next_cursor; telegram_view-Texte.
 details_available: notifications_details(ID,version,cursor), keine Versionsmischung.
 Verarbeitete IDs+notification_versions→notifications_ack; ACK/stale→cursor=null.
@@ -67,11 +70,11 @@ lokal reserviert, keine Börsenorder. Python wartet/prüft Preise/SL/Risiko. Zuk
 SL jenseits aktuellen Kurses beendet Warten nicht; keine Nachholung.
 leverage originalgetreu belegen; Python rundet ab/deckelt.
 Nur fehlend=null, mehrdeutig=ambiguous; fixed: Profilhebel.
-take_profit_unit=price/course_percent/roi_percent + Einheitenbeleg; mehrdeutige
-TP-Prozente→ambiguous. ROI/ROE=nominal/linear/vor Kosten; andere/unbelegte Definition
-ablehnen. ROI: Originalsignalhebel zwingend, nie Profil-/Backup-Hebel; Originalprozente
-übergeben. Pythonbasis: Signal-Entry/Range, sonst finaler VWAP. Hebelrundung/-deckel:
-keine Zielverschiebung. Nie TP-Preise selbst rechnen; ROI-Updates: gespeicherte Basis.
+TP: price absolut; neue % immer roe_percent, source-roe-v1. Zahl+% original belegen.
+ROE=Gewinn/eigene Anfangsmargin vor Kosten; netto/annualisiert ablehnen. Eigener
+wirksamer Hebel, finaler Entry-VWAP; Originalhebel belegen. Python: Ziele.
+Altpläne gleich.
+
 adaptive: maximal fünf Ziele, 50/25/12,5/7,5/5 % Position;
 bei weniger letztes mit Rest. first_target: 100 % TP1. Alle Quellziele erhalten;
 Python wählt. tp_ladder nach eigenen vollständigen Fills: TP1→VWAP, TP3→TP1, TP4→TP2;
