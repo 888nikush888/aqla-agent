@@ -186,11 +186,11 @@ class State:
         with self._thread_lock:
             return copy.deepcopy(batch(self.data, limit))
 
-    def notification_page(self, key, *, cursor=None, limit=100):
+    def notification_page(self, key, *, cursor=None, limit=100, view="full"):
         from aqla_agent.notifications import notification_page
 
         with self._thread_lock:
-            return copy.deepcopy(notification_page(self.data, key, {}, cursor=cursor, limit=limit))
+            return copy.deepcopy(notification_page(self.data, key, {}, cursor=cursor, limit=limit, view=view))
 
     def notification_details(self, key, identity, version, *, cursor=None, limit=16384):
         from aqla_agent.notifications import notification_details

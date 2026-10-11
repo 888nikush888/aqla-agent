@@ -46,6 +46,11 @@ def validate_hooks(contracts: list[HookContract]) -> None:
 
 def check_native_contract() -> None:
     specifications = [
+        ("gateway.run_turn", "GatewayTurnMixin", "_resolve_turn_toolsets", "self,user_config,source,platform_key", False),
+        ("agent.turn_usage", "", "record_response_usage", "agent,response,@messages,@api_call_count,@api_duration,@compression_attempts,@max_compression_attempts", False),
+        ("agent.turn_response_check", "", "record_response_usage", "agent,response,@messages,@api_call_count,@api_duration,@compression_attempts,@max_compression_attempts", False),
+        ("agent.context_compressor", "", "call_llm", "task=,@provider=,@model=,@base_url=,@api_key=,@main_runtime=,@messages,@temperature=,@max_tokens=,@tools=,@timeout=,@extra_body=,@reasoning_config=,@extra_headers=,@api_mode=,@stream=,@stream_options=,@route_info=,@latency_info=", False),
+        ("agent.context_compressor", "", "_summarize_tool_result", "tool_name,tool_args,tool_content", False),
         ("gateway.run", "", "_start_gateway_start_cron_and_housekeeping", "runner", False),
         ("gateway.run_turn", "GatewayTurnMixin", "_run_agent", "self,message,context_prompt,history,source,session_id,**turn_kwargs", True),
         ("gateway.run_turn", "GatewayTurnMixin", "_run_agent_queued_followup", "self,turn_ctx,adapter,pending,pending_event,response,result,stream_task", True),

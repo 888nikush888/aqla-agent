@@ -227,7 +227,19 @@ class SourceEvent(Model):
 class Evidence(Model):
     field: str = Field(min_length=1, max_length=100)
     source_id: str
-    quote: str = Field(min_length=1, max_length=1500)
+    quote: str = Field(min_length=1, max_length=1500,
+                       description="Exact original substring. Each numeric price/percentage field needs its own number (and % when present), without other numbers. Never quote a whole multi-price message for one numeric field.")
+
+
+class SourceClassification(Model):
+    """A non-actionable batch item cannot carry any trade instruction."""
+    event_id: str = Field(min_length=1, max_length=256)
+    kind: Literal["report", "unrelated", "incomplete", "ambiguous"]
+    source_refs: list[str] = Field(min_length=1, max_length=20)
+    evidence: list[Evidence] = Field(default_factory=list, max_length=60,
+        description="Include field=classification, current anchor source_id and an exact original quote; every item needs its own proof. Empty-text incomplete is the only quote exception.")
+    reason: str = Field(min_length=1, max_length=2000)
+    source_read_receipt: str = Field(min_length=1, max_length=32768)
 
 
 class Interpretation(Model):
@@ -243,8 +255,9 @@ class Interpretation(Model):
     entry_prices: list[Positive] = Field(default_factory=list, max_length=2)
     stop_loss: Positive | None = None
     take_profits: list[Positive] = Field(default_factory=list, max_length=20)
-    take_profit_unit: Literal["price", "course_percent", "roi_percent", "roe_percent"] = Field(default="price", description="New source TP percentages use roe_percent: nominal profit on own initial margin before fees/funding, effective executed leverage and final own fill VWAP. Rule source-roe-v1. Legacy course_percent/roi_percent remain readable only.")
-    update_action: Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"] | None = None
+    take_profit_unit: Literal["price", "course_percent", "roi_percent", "roe_percent"] = Field(default="price", description="Absolute targets without a source % marker use price. Explicit new source TP percentages use roe_percent: nominal profit on own initial margin before fees/funding, effective executed leverage and final own fill VWAP. Rule source-roe-v1. Legacy course_percent/roi_percent remain readable only.")
+    update_action: Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"] | None = Field(default=None,
+        description="For trade_update emit only changed action fields: move_stop needs stop_loss; replace_targets needs take_profits; reduce needs reduce_percent. Leave unrelated prices/targets null or empty; do not restate the whole original setup.")
     reduce_percent: Positive | None = Field(default=None, le=100)
     bound_trade_id: str | None = None
     evidence: list[Evidence] = Field(default_factory=list, max_length=60)

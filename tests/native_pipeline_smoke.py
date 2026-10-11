@@ -275,7 +275,28 @@ create_server(settings, state=state, exchange=exchange).run(transport="stdio")
                              source=source, message_type=MessageType.TEXT, message_id="42",
                              metadata={}, raw_message=None if args.mode == "owner" else {"forward_origin": True, "date": datetime.fromtimestamp(original.sent_at / 1000, UTC)})
         assert extension.inbound(event, gateway) is None
-        result = await adapter._message_handler(event)
+        from gateway.run_turn import GatewayTurnMixin
+        from model_tools import get_tool_definitions
+
+        gateway._resolve_enabled_toolsets_for_source = lambda *_: ["skills", "clarify", "todo", "session_search", "mcp-aqla", "mcp-sheets"]
+        with extension.claim_scope(("source", "schema-probe")):
+            enabled, disabled = GatewayTurnMixin._resolve_turn_toolsets(gateway, {}, source, "telegram")
+            assert enabled == ["aqla-source"]
+            selected_names = {row["function"]["name"] for row in get_tool_definitions(enabled, disabled, quiet_mode=True, skip_tool_search_assembly=True)}
+            assert {"mcp__aqla__source_context_batch", "mcp__aqla__interpret_source_batch", "aqla_read_tool_result"} <= selected_names
+            assert not {"mcp__aqla__control", "mcp__sheets__journal_read", "clarify", "skill_manage"} & selected_names
+        with extension.claim_scope(("operator", "schema-probe")):
+            enabled, _ = GatewayTurnMixin._resolve_turn_toolsets(gateway, {}, source, "telegram")
+            assert "skills" in enabled and "mcp-sheets" in enabled
+        from aqla_agent.usage_metrics import RUN, UsageRun
+        aggregate = UsageRun(args.mode)
+        metrics_token = RUN.set(aggregate)
+        try:
+            result = await adapter._message_handler(event)
+        finally:
+            RUN.reset(metrics_token)
+        assert len(aggregate.api) > 0 and aggregate.tools
+        assert all(row.get("output_tokens", 0) >= row.get("reasoning_tokens", 0) for row in aggregate.api)
         print("Tool result names:", [message.get("tool_name") for message in result["messages"] if message.get("role") == "tool"])
         if args.mode == "owner":
             print("Skill result:", [message.get("content") for message in result["messages"] if message.get("role") == "tool" and message.get("tool_name") in ("skill_manage", "tool_call")])

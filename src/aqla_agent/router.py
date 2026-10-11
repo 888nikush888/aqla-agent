@@ -164,13 +164,19 @@ class Router:
             self.state.update(lambda data: source_rank(data, source.chat_id))
         return result
 
-    def context(self, event_id):
-        result = self.source.context(event_id)
+    def context(self, event_id, *, decision=False):
+        result = self.source.context(event_id, compact_receipt=decision)
         data = self.state.snapshot()
         result.update(profiles=data["profiles"], pipelines=data["pipelines"], configuration_revision=data["configuration_revision"],
                       venue_limits=data["venue_limits"], execution_targets=data["events"][event_id].get("targets", {}))
         from .ranking import snapshot_rank
         result.update(source_rank=snapshot_rank(data, data["events"][event_id]["source"]["chat_id"]), execution_accounts=self.accounts_ready())
+        if decision:
+            selected = self.selected_targets(data["events"][event_id], data)
+            pipeline_ids = {target["pipeline_id"] for target in selected.values()}
+            result["pipelines"] = {key: row for key, row in data["pipelines"].items() if key in pipeline_ids}
+            profile_ids = {target["profile_id"] for target in selected.values()} | {"backup"}
+            result["profiles"] = {key: row for key, row in data["profiles"].items() if key in profile_ids}
         return result
 
     def record_interpretation(self, event_id, interpretation):

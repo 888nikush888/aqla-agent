@@ -6,7 +6,7 @@ import binascii
 import hashlib
 import hmac
 import json
-from typing import Literal
+from typing import Literal, NotRequired
 
 from pydantic_core import to_json
 from typing_extensions import TypedDict
@@ -32,11 +32,13 @@ class NotificationView(TypedDict):
 
 
 class NotificationReadResult(TypedDict):
-    notifications: dict[str, Notice]
+    notifications: NotRequired[dict[str, Notice]]
     notification_versions: dict[str, str]
-    telegram_view: NotificationView
+    telegram_view: NotRequired[NotificationView]
     pending: int
     next_cursor: str | None
+    view: NotRequired[str]
+    details_required: NotRequired[dict[str, str]]
 
 
 class NotificationPageMetadata(TypedDict):
@@ -137,10 +139,12 @@ def _summary(identity: str, notice) -> Notice:
 
 
 def notification_page(snapshot, key: bytes | None, exchanges, *, cursor: str | None = None,
-                      limit: int = 100, require_key: bool = True) -> NotificationReadResult:
+                      limit: int = 100, require_key: bool = True, view: str = "full") -> NotificationReadResult:
     from .messages import telegram_view
     if type(limit) is not int or not 1 <= limit <= 100:
         raise AqlaError("Notification page limit must be between 1 and 100")
+    if view not in ("full", "facts", "rendered"):
+        raise AqlaError("Notification view must be full, facts or rendered")
     if require_key or cursor is not None:
         _require_key(key)
     anchor = None
@@ -162,10 +166,18 @@ def notification_page(snapshot, key: bytes | None, exchanges, *, cursor: str | N
         notices = {identity: _summary(identity, source[identity]) if summary else source[identity] for _, identity in chosen}
         versions = {identity: all_versions[identity] for _, identity in chosen}
         more = count < len(ordered)
-        return {"notifications": dict(notices), "notification_versions": dict(versions),
+        result = {"notifications": dict(notices), "notification_versions": dict(versions),
                 "telegram_view": telegram_view({**snapshot, "notifications": notices}, exchanges,
                                                notification_versions=versions, include_status=False),
                 "pending": len(source), "next_cursor": _cursor(snapshot, key, "notifications_read", last=chosen[-1][0]) if chosen and more and key is not None else None}
+        if view == "facts":
+            result.pop("telegram_view")
+        elif view == "rendered":
+            result.pop("notifications")
+            result["details_required"] = versions if summary else {}
+        if view != "full":
+            result["view"] = view
+        return result
 
     count = len(selected)
     result = response(count)

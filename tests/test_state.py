@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from aqla_hyperliquid_mcp.models import AqlaError, Settings
+from aqla_hyperliquid_mcp.models import AqlaError, Settings, digest
 from aqla_hyperliquid_mcp.state import State
 from aqla_hyperliquid_mcp.storage import database_path, read_snapshot
 
@@ -212,6 +212,9 @@ def test_reader_projection_matches_full_snapshot_contract_and_detaches_returned_
                     "recovery_total": 0, "recovery_source_total": 0, "recovery": [], "recovery_operation_total": 0,
                     "recovery_operations": [], "historical_conflict_total": 0, "historical_conflicts": []}}
     result = state.reader_snapshot(2)
+    assert result.pop("notification_signature") == digest(before["notifications"])
+    assert result["source_queue"].pop("ready_signature") == digest([])
+    assert result["source_queue"].pop("recovery_signature") == digest([])
     assert result == expected
     result["tracked_ids"]["channel"].append(999)
     result["cursors"]["channel"] = 999

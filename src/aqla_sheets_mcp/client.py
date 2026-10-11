@@ -364,15 +364,30 @@ class SheetsClient:
                     "startIndex": 0, "endIndex": existing["Handelsparameter"][1]}}}]})
             return {"accepted": accepted, "synced": len(accepted)}
 
-    def read(self, table, offset=0, limit=100, filters=None, *, scan_cursor: str | None = None):
+    def read(self, table, offset=0, limit=100, filters=None, *, scan_cursor: str | None = None,
+             start: str | None = None, end: str | None = None, time_column: str | None = None):
         with self.lock:
             headers = HEADERS[table]
             filters = dict(filters or {})
             if any(key not in headers for key in filters):
                 raise AqlaError("Unknown journal filter column. Valid named columns: " + ", ".join(headers))
+            bounds = None
+            metadata = {}
+            if start is not None or end is not None or time_column is not None:
+                from aqla_agent.tool_queries import aware_time
+                if start is None or end is None:
+                    raise AqlaError("Journal time range requires aware start and end, with exclusive end")
+                time_column = time_column or next((name for name in headers if name.endswith("(UTC)")), None)
+                if time_column not in headers or not time_column.endswith("(UTC)"):
+                    raise AqlaError("Choose an existing journal UTC time column")
+                bounds = (aware_time(start), aware_time(end))
+                if bounds[0] >= bounds[1]:
+                    raise AqlaError("Journal time range requires start < end")
+                metadata = {"time_range": {"start": start, "end": end, "column": time_column}, "undated_rows_excluded": 0}
+            filtered = bool(filters) or bounds is not None
             cursor = None
             if scan_cursor is not None:
-                if offset != 0 or not filters:
+                if offset != 0 or not filtered:
                     raise AqlaError("A journal scan cursor requires offset 0 and nonempty filters")
                 if not 1 <= limit <= 500:
                     raise AqlaError("Journal page limit must be between 1 and 500")
@@ -387,11 +402,12 @@ class SheetsClient:
             items = list(found.items())
             start = 0
             binding = index_digest = None
-            if filters:
+            if filtered:
                 binding = _scan_digest({"spreadsheet": self.settings.spreadsheet_id, "scope": self.scope,
                                         "scope_key": self.scope_key, "prefix": self.prefix,
                                         "sheet_id": properties[self.prefix + table]["sheetId"], "table": table,
-                                        "headers": [*headers, *META_HEADERS], "filters": filters})
+                                        "headers": [*headers, *META_HEADERS], "filters": filters,
+                                        **({"time_range": metadata["time_range"]} if bounds else {})})
                 index_digest = _scan_digest([[identity, index, *meta] for identity, (index, meta) in items])
                 if cursor is not None:
                     if cursor["binding"] != binding or cursor["index"] != index_digest:
@@ -399,7 +415,7 @@ class SheetsClient:
                     start = cursor["next"]
                     if start >= len(items):
                         raise AqlaError("Invalid journal scan cursor position; restart at offset 0")
-            selected = items[start:] if filters else items[offset:offset + limit]
+            selected = items[start:] if filtered else items[offset:offset + limit]
             loaded = self.bodies(table, [item[1][0] for item in selected], [MAX_BODY_REQUESTS])
             if cursor is not None:
                 for identity, (index, meta) in selected:
@@ -421,8 +437,16 @@ class SheetsClient:
                 valid = fingerprint(cells[:len(headers)]) == cells[len(headers)]
                 if not valid:
                     invalid += 1
-                if all(str(row[key]) == value for key, value in filters.items()):
-                    if not filters or offset <= matched < offset + limit:
+                in_range = True
+                if bounds is not None:
+                    try:
+                        timestamp = aware_time(str(row[time_column]))
+                        in_range = bounds[0] <= timestamp < bounds[1]
+                    except AqlaError:
+                        metadata["undated_rows_excluded"] += 1
+                        in_range = False
+                if in_range and all(str(row[key]) == value for key, value in filters.items()):
+                    if not filtered or offset <= matched < offset + limit:
                         rows.append({**row, "_verified": valid})
                     matched += 1
                     if cursor is not None and len(rows) == limit:
@@ -433,16 +457,16 @@ class SheetsClient:
                         "unverified_rows": invalid, "unverified_rows_scope": "scan", "scanned_rows": scanned,
                         "matched_rows_scanned": matched, "complete": complete, "scan_complete": complete,
                         "scan_truncated": not complete, "next_offset": None,
-                        "next_scan_cursor": None if complete else _encode_scan_cursor(binding, index_digest, start + scanned)}
-            total = matched if filters and complete else None if filters else len(found)
-            next_offset = offset + len(rows) if (matched if filters else len(found)) > offset + len(rows) else None
-            if filters and not complete and offset > matched:
+                        "next_scan_cursor": None if complete else _encode_scan_cursor(binding, index_digest, start + scanned), **metadata}
+            total = matched if filtered and complete else None if filtered else len(found)
+            next_offset = offset + len(rows) if (matched if filtered else len(found)) > offset + len(rows) else None
+            if filtered and not complete and offset > matched:
                 raise AqlaError("Filtered offset exceeds the scanned prefix; start at offset 0, follow next_offset, then next_scan_cursor")
-            result = {"table": table, "rows": rows, "total": total, "total_complete": not filters or complete,
-                    "unverified_rows": invalid, "unverified_rows_scope": "scan" if filters else "page",
+            result = {"table": table, "rows": rows, "total": total, "total_complete": not filtered or complete,
+                    "unverified_rows": invalid, "unverified_rows_scope": "scan" if filtered else "page",
                     "scanned_rows": scanned, "matched_rows_scanned": matched, "complete": complete,
-                    "scan_truncated": not complete, "next_offset": next_offset}
-            if filters:
+                    "scan_truncated": not complete, "next_offset": next_offset, **metadata}
+            if filtered:
                 result.update(scan_complete=complete, next_scan_cursor=(
                     _encode_scan_cursor(binding, index_digest, scanned) if not complete and next_offset is None else None))
             return result

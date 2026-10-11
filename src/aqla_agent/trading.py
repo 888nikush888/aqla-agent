@@ -145,7 +145,7 @@ class Trading:
             state.setdefault("event_tombstones", {})[row["event_id"]] = row["source_id"]
             del state["events"][row["event_id"]]
 
-    def context(self, event_id):
+    def context(self, event_id, *, compact_receipt=False):
         snapshot = self.state.snapshot()
         row = snapshot["events"].get(event_id)
         if not row:
@@ -176,29 +176,34 @@ class Trading:
         if getattr(self, "disposition_key", None):
             from .source_disposition import issue_receipt
             try:
-                result["source_read_receipt"] = issue_receipt(snapshot["events"], event_id, self.disposition_key, context_rows=included)
+                result["source_read_receipt"] = issue_receipt(snapshot["events"], event_id, self.disposition_key, context_rows=included,
+                                                            compact=compact_receipt)
             except AqlaError as error:
                 result["source_read_receipt"] = None
                 result["source_read_error"] = str(error)
         return result
 
-    def record_interpretation(self, event_id, interpretation: Interpretation, *, read_receipt=""):
+    def record_interpretation(self, event_id, interpretation: Interpretation, *, read_receipt="", result_view="full"):
         def commit(snapshot):
 
             row = snapshot["events"].get(event_id)
             if row is None:
                 raise AqlaError("Unknown source event")
             previous = row.get("interpretation")
+            from .efficiency import classification_ack
+            def result():
+                changed = previous != row.get("interpretation")
+                return classification_ack(row, changed) if result_view == "ack" else row
             if row["status"] in ("executed", "updated"):
                 previous = Interpretation.model_validate(previous).model_dump(mode="json") if previous is not None else None
                 if previous != interpretation.model_dump(mode="json"):
                     raise AqlaError("An executed revision is immutable; interpret the edit as a new update revision")
-                return row
+                return result()
             from .source_queue import recovery_ids
             if event_id in recovery_ids(snapshot):
                 prior = Interpretation.model_validate(previous).model_dump(mode="json") if previous is not None else None
                 if prior == interpretation.model_dump(mode="json"):
-                    return row
+                    return result()
                 raise AqlaError("Financial recovery revision is immutable; reconcile its existing operations")
             if interpretation.kind not in ("new_signal", "trade_update") and getattr(self, "disposition_key", None):
                 from .source_disposition import verify_disposition
@@ -220,7 +225,7 @@ class Trading:
                 raise AqlaError("New source TP percentages must use roe_percent under source-roe-v1")
             row.update(interpretation=interpretation.model_dump(mode="json"),
                        status=interpretation.kind if interpretation.kind not in ("new_signal", "trade_update") else "interpreted")
-            return row
+            return result()
         return (self.state.update_if_changed if hasattr(self.state, "update_if_changed") else self.state.update)(commit)
 
     async def preview(self, event_id, interpretation: Interpretation):

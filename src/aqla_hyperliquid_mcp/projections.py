@@ -4,6 +4,8 @@ from typing import TypedDict
 from aqla_agent.source_queue import is_source_row, queue_overview
 from aqla_agent.trading import OPEN
 
+from .models import digest
+
 
 class ReaderOverview(TypedDict):
     sources: list[str]
@@ -14,6 +16,7 @@ class ReaderOverview(TypedDict):
     tracked_ids: dict[str, list[int]]
     pending: list[str]
     notification_pending: int
+    notification_signature: str
     source_queue: dict
 
 
@@ -36,4 +39,5 @@ def reader_overview(snapshot, context_limit: int) -> ReaderOverview:
     tracked = {chat: sorted(set(sorted(identities)[-context_limit:]) | active.get(chat, set())) for chat, identities in grouped.items()}
     return {"sources": snapshot["sources"], "cursors": snapshot["cursors"], "context_cutoffs": snapshot.get("context_cutoffs", {}),
             "context_ids": snapshot.get("context_ids", {}), "source_aliases": snapshot.get("source_aliases", {}), "tracked_ids": tracked,
-            "pending": pending, "source_queue": queue, "notification_pending": len(snapshot["notifications"])}
+            "pending": pending, "source_queue": queue, "notification_pending": len(snapshot["notifications"]),
+            "notification_signature": digest(snapshot["notifications"])}

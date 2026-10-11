@@ -167,10 +167,12 @@ def queue_overview(snapshot, limit=50, *, event_rows=None):
             ready.append(anchor_row(current)["event_id"])
     operations = [identity for identity, operation in snapshot.get("operations", {}).items() if operation.get("phase") in ("prepared", "sending", "unknown")]
     return {"ready_total": len(ready), "ready": ready[:limit],
+            "ready_signature": digest(sorted(ready)),
             "raw_unfinished_total": sum(row.get("status") in UNFINISHED for row in event_rows),
             "superseded_total": sum(row.get("status") == "superseded" for row in event_rows),
             "blocked_total": len(signatures), "blocked_revision_total": len(blocked), "blocked": blocked[:limit],
             "blocked_signature": digest(sorted(signatures)) if signatures else None,
             "recovery_total": len(recovery_work) + len(operations), "recovery_source_total": len(recovery_work), "recovery": sorted(recovery_work)[:limit],
             "recovery_operation_total": len(operations), "recovery_operations": sorted(operations)[:limit],
+            "recovery_signature": digest(sorted((identity, snapshot["operations"][identity].get("phase")) for identity in operations)),
             "historical_conflict_total": len(historical_conflicts), "historical_conflicts": historical_conflicts[:limit]}

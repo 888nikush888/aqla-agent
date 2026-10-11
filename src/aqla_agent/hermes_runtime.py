@@ -44,6 +44,7 @@ def install_strict_profile():
     from gateway.run_turn_runner import TurnRunner
 
     from .events import (
+        gateway_extension,
         gateway_ready,
         ingress_identity,
         intercept_native_setup,
@@ -68,9 +69,12 @@ def install_strict_profile():
     reconnect = GatewayAdapterLifecycleMixin._install_reconnected_adapter
 
     async def run_agent(self, message, context_prompt, history, source, session_id, **kwargs):
+        from .tool_outputs import capture_scope
         from .tool_runtime import GUIDANCE, owned_profile
         if owned_profile():
             context_prompt = (context_prompt or "") + "\n\n" + GUIDANCE
+            with capture_scope(session_id, "context-history"):
+                return await run_native_turn(self, source, lambda: native_turn(self, message, context_prompt, history, source, session_id, **kwargs))
         return await run_native_turn(self, source, lambda: native_turn(self, message, context_prompt, history, source, session_id, **kwargs))
 
     async def queued_followup(self, turn_ctx, adapter, pending, pending_event, response, result, stream_task):
@@ -82,8 +86,27 @@ def install_strict_profile():
         return await reconnect(self, platform, adapter)
 
     replace(GatewayTurnMixin, "_run_agent", run_agent)
+    import toolsets
+
+    from .efficiency import SOURCE_TOOLS
+    replace(toolsets, "TOOLSETS", {**toolsets.TOOLSETS, "aqla-source": {
+        "description": "Aqla source decisions and evidence, without operator/configuration tools",
+        "tools": list(SOURCE_TOOLS), "includes": []}})
+    resolve_toolsets = GatewayTurnMixin._resolve_turn_toolsets
+
+    def turn_toolsets(self, user_config, source, platform_key):
+        enabled, disabled = resolve_toolsets(self, user_config, source, platform_key)
+        extension = gateway_extension(self)
+        origin = extension.active_context if extension else None
+        if origin and origin[0] == "source" and extension.efficiency.get("source_toolsets", True):
+            enabled = ["aqla-source"] if "mcp-aqla" in enabled else []
+        return enabled, disabled
+
+    replace(GatewayTurnMixin, "_resolve_turn_toolsets", turn_toolsets)
     replace(GatewayTurnMixin, "_run_agent_queued_followup", queued_followup)
     replace(GatewayAdapterLifecycleMixin, "_install_reconnected_adapter", install_reconnected_adapter)
+    from .usage_metrics import install as install_usage_metrics
+    install_usage_metrics(replace)
     original_clarify = TurnRunner._clarify_callback_sync
 
     def clarify_callback(self, questions):

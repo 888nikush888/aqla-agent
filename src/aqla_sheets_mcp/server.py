@@ -92,15 +92,27 @@ def create_server(settings, *, client=None):
                            limit: Annotated[int, Field(ge=1, le=500)] = 100, filters: dict[str, str] | None = None, account_key: str | None = None,
                            scan_cursor: Annotated[str | None, Field(max_length=2048)] = None,
                            view: Literal["full", "compact"] = "full", view_offset: int = 0, view_limit: int = 20,
-                           view_version: str | None = None) -> dict:
+                           view_version: str | None = None, columns: Annotated[list[str] | None, Field(max_length=30)] = None,
+                           start: str | None = None, end: str | None = None, time_column: str | None = None) -> dict:
         """Read a bounded journal page, optionally filtering exact named columns such as Quelle or Symbol."""
         configured()
         selected = scoped_client(account_key) if account_key else client
         if table not in selected.allowed_tables:
             raise AqlaError("This table belongs to the shared analysis/configuration view")
-        result = await asyncio.to_thread(selected.read, table, offset, limit, filters, scan_cursor=scan_cursor)
+        if columns is not None and (not columns or len(set(columns)) != len(columns) or any(key not in HEADERS[table] for key in columns)):
+            raise AqlaError("Select distinct existing journal columns")
+        range_args = {"start": start, "end": end, "time_column": time_column} if any(value is not None for value in (start, end, time_column)) else {}
+        result = await asyncio.to_thread(selected.read, table, offset, limit, filters, scan_cursor=scan_cursor, **range_args)
+        if columns is not None:
+            from .journal import fingerprint
+            names = list(dict.fromkeys(["ID", *columns]))
+            result = {**result, "rows": [{**{key: row[key] for key in names}, "_verified": row["_verified"],
+                        "_original_fingerprint": fingerprint([row[key] for key in HEADERS[table]]) if row["_verified"] else None} for row in result["rows"]],
+                      "projection": {"columns": names, "complete_rows": False, "verified_against": "full_original_row",
+                                     "omitted_columns": [key for key in HEADERS[table] if key not in names]}}
         return compact_view(result, "journal_read", {"table": table, "offset": offset, "limit": limit, "filters": filters,
-                            "account_key": account_key, "scan_cursor": scan_cursor}, view_offset, view_limit, view_version) if view == "compact" else result
+                            "account_key": account_key, "scan_cursor": scan_cursor, "columns": columns,
+                            **range_args}, view_offset, view_limit, view_version) if view == "compact" else result
 
     @server.tool(annotations=read)
     async def journal_statistics(group_by: Literal["gesamt", "Quelle", "Symbol", "Richtung", "Börse", "Pipeline", "Profil", "Währung"] = "gesamt", account_key: str | None = None) -> dict:

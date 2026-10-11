@@ -41,7 +41,16 @@ from .api import Hyperliquid
 from .auth import Authority
 from .catalog import INFO_MODELS, SDK_MODELS, InfoRequest, SdkRequest, validate_info
 from .coverage import audit
-from .models import Address, AqlaError, Interpretation, Policy, Settings, SourceEvent, now_ms
+from .models import (
+    Address,
+    AqlaError,
+    Interpretation,
+    Policy,
+    Settings,
+    SourceClassification,
+    SourceEvent,
+    now_ms,
+)
 from .multisig import Signature
 from .projections import ReaderOverview as ReaderOverview
 from .projections import reader_overview as reader_overview
@@ -136,10 +145,24 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "exchange_atomicity_guaranteed": False, "live_exchange_verified": False}
 
     @server.tool(annotations=read)
-    async def status(context_auth: str = "", view: Literal["full", "compact"] = "full", offset: int = 0, limit: int = 20,
+    async def status(context_auth: str = "", view: Literal["full", "compact", "summary"] = "full", offset: int = 0, limit: int = 20,
                      view_version: str | None = None) -> dict:
         """Read effective user rules, sources, pending work, owned trades and unresolved operations."""
         snapshot = state.snapshot()
+        if view == "summary":
+            claims = authorize(context_auth, operator=True) if context_auth else None
+            lease_id, binding = setup_context(claims)
+            return {"view": "summary", "paused": snapshot["paused"], "network": settings.network,
+                    "setup": setup_gate.status(binding, lease_id, owner_id=settings.telegram_owner_id),
+                    "source_queue": queue_overview(snapshot, limit=8), "notification_pending": len(snapshot["notifications"]),
+                    "open_trade_count": sum(row["status"] in OPEN for row in snapshot["trades"].values()),
+                    "execution_accounts": {key: {name: value for name, value in row.items() if name != "limits"}
+                                           for key, row in trading.accounts_ready(snapshot).items()},
+                    "account_recovery": recovery_diagnostics(snapshot),
+                    "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})),
+                                "last_synced_at": snapshot.get("journal_synced_at")},
+                    "configuration_revision": snapshot["configuration_revision"], "policy_revision": snapshot["policy_revision"],
+                    "inventory_refreshed": False, "details": {"tool": "status", "view": "full"}}
         queue = queue_overview(snapshot)
         ready = trading.ready()
         inventory = await trading.inventory_status()
@@ -218,7 +241,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
 
     @server.tool(annotations=read)
     async def trade_diagnostics(trade_id: str | None = None, symbol: str | None = None, offset: int = 0, limit: int = 20,
-                                view: Literal["full", "compact"] = "full", view_version: str | None = None) -> dict:
+                                view: Literal["full", "compact"] = "full", view_version: str | None = None,
+                                sections: list[Literal["plan", "sources", "orders", "fills", "accounting", "operations", "lifecycle", "prices"]] | None = None) -> dict:
         """Read source, exact sent order type, own fills, price checks and proved closure reason, including closed trades."""
         from aqla_agent.lifecycle import close_reason
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
@@ -251,24 +275,58 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "close_reason": trade.get("close_reason", close_reason(trade)), "lifecycle_events": trade.get("lifecycle_events", {}),
                 "operations": operations, "historical_missing_quotes_are_not_inferred": True,
                 **source_attribution(snapshot, trade["plan"])}
+        if sections is not None:
+            from aqla_agent.efficiency import diagnostic_sections
+            result = diagnostic_sections(result, snapshot, sections)
         return compact_view(result, "trade_diagnostics", {"trade_id": trade_id}, offset, limit, view_version) if view == "compact" else result
 
     @server.tool(annotations=read)
-    async def source_context(event_id: str, view: Literal["full", "compact"] = "full", offset: int = 0, limit: int = 20,
+    async def source_context(event_id: str, view: Literal["full", "compact", "decision"] = "full", offset: int = 0, limit: int = 20,
                              view_version: str | None = None) -> dict:
         """Read source message, bounded same-channel/reply context and open trade bindings."""
-        result = trading.context(event_id)
+        result = trading.context(event_id, decision=view == "decision")
+        if view == "decision":
+            from aqla_agent.efficiency import decision_context
+            return decision_context(result)
         receipt = result.get("source_read_receipt")
         result = {"source_read_receipt": receipt, "percentage_rule": "source-roe-v1: new TP percentages use roe_percent on own initial margin before fees/funding, effective margin leverage and final own entry VWAP", **result}
         return compact_view(result, "source_context", {"event_id": event_id}, offset, limit, view_version) if view == "compact" else result
 
     @server.tool(annotations=write)
-    async def interpret_source(event_id: str, interpretation: Interpretation, context_auth: str = "", source_read_receipt: str = "") -> dict:
+    async def interpret_source(event_id: str, interpretation: Interpretation, context_auth: str = "", source_read_receipt: str = "",
+                               result_view: Literal["full", "ack"] = "full") -> dict:
         """Save contextual classification/evidence for an actual received source; does not trade."""
         authorize(context_auth)
         if interpretation.kind not in ("new_signal", "trade_update"):
-            return trading.source.record_interpretation(event_id, interpretation, read_receipt=source_read_receipt)
-        return trading.record_interpretation(event_id, interpretation)
+            return trading.source.record_interpretation(event_id, interpretation, read_receipt=source_read_receipt, result_view=result_view)
+        return trading.source.record_interpretation(event_id, interpretation, result_view=result_view)
+
+    @server.tool(annotations=read)
+    async def source_context_batch(event_ids: Annotated[list[str], Field(min_length=1, max_length=8)]) -> dict:
+        """Read up to eight distinct source anchors losslessly with shared context and a separate receipt per item."""
+        from aqla_agent.efficiency import decision_batch
+        if len(set(event_ids)) != len(event_ids):
+            raise AqlaError("Source context batch requires distinct event IDs")
+        return decision_batch([trading.context(identity, decision=True) for identity in event_ids])
+
+    @server.tool(annotations=write)
+    async def interpret_source_batch(items: Annotated[list[SourceClassification], Field(min_length=1, max_length=8)],
+                                     context_auth: str = "") -> dict:
+        """Independently classify non-actionable sources with original quotes and own current receipts. Never creates plans/orders. Partial success is explicit."""
+        authorize(context_auth)
+        if len({item.event_id for item in items}) != len(items):
+            raise AqlaError("Classification batch requires distinct event IDs")
+        results = []
+        for item in items:
+            authorize(context_auth)
+            try:
+                interpretation = Interpretation.model_validate(item.model_dump(exclude={"event_id", "source_read_receipt"}))
+                row = trading.source.record_interpretation(item.event_id, interpretation,
+                      read_receipt=item.source_read_receipt, result_view="ack")
+                results.append({"ok": True, **row})
+            except AqlaError as error:
+                results.append({"ok": False, "event_id": item.event_id, "error": str(error), "reread_required": True})
+        return {"items": results, "succeeded": sum(row["ok"] for row in results), "partial_success": any(not row["ok"] for row in results)}
 
     @server.tool(annotations=write)
     async def trade_preview(event_id: str, interpretation: Interpretation, context_auth: str = "", source_read_receipt: str = "") -> dict:
@@ -319,11 +377,12 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return await trading.reconcile(operation_id)
 
     @server.tool(annotations=read)
-    async def notifications_read(cursor: str | None = None, limit: int = 100) -> NotificationReadResult:
+    async def notifications_read(cursor: str | None = None, limit: int = 100,
+                                 view: Literal["full", "facts", "rendered"] = "full") -> NotificationReadResult:
         """Read a bounded versioned page; after ACK/stale begin again with no cursor."""
         # Notification messages use saved account/plan facts; no inventory/status
         # overview is rendered here, so another complete readiness snapshot is unnecessary.
-        return state.notification_page(authority.key if authority else None, cursor=cursor, limit=limit)
+        return state.notification_page(authority.key if authority else None, cursor=cursor, limit=limit, view=view)
 
     @server.tool(annotations=read)
     async def notifications_details(notification_id: str, version: str, cursor: str | None = None, limit: int = 16384) -> NotificationDetailsResult:

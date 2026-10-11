@@ -553,6 +553,9 @@ async def test_slow_google_sync_does_not_stop_source_wakeups(extension, tmp_path
     extension.attach(message(), gateway)
     try:
         await blocked.wait()
+        # Native consumption releases the one admitted wake. Google delivery
+        # must not prevent the bounded retry after that turn finishes.
+        extension.wake_schedule.consumed()
         extension.last_wake = 0
         await asyncio.wait_for(woke_twice.wait(), 5)
         assert len(wakes) == 2

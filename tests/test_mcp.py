@@ -4,6 +4,7 @@ import time
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
+from aqla_hyperliquid_mcp.models import digest
 from aqla_hyperliquid_mcp.server import close_server, create_server
 
 
@@ -49,6 +50,7 @@ def test_reader_overview_single_scan_matches_complete_original_output(chats, cou
     assert actual["source_queue"]["raw_unfinished_total"] == actual["source_queue"]["ready_total"]
     assert actual["source_queue"]["blocked_total"] == 0
     expected["source_queue"] = actual["source_queue"]
+    assert actual.pop("notification_signature") == digest(snapshot["notifications"])
     assert actual == expected and snapshot == before
     print(f"reader overview events={count} chats={chats} old_scans={events.scans} new_scans={count} old_seconds={old_elapsed:.6f} new_seconds={elapsed:.6f}")
 
