@@ -51,6 +51,33 @@ def retry_view(row):
     return output
 
 
+def diagnostic_view(trade, operations=()):
+    """Public error identity only; message/trace/account details never escape."""
+    diagnostic = trade.get("entry_diagnostic")
+    if not isinstance(diagnostic, dict):
+        index = operations if isinstance(operations, EntryOperations) else EntryOperations(operations)
+        result = index.by_id.get(trade.get("entry_operation_id"), {}).get("result")
+        diagnostic = result.get("diagnostic") if isinstance(result, dict) else None
+    if not isinstance(diagnostic, dict):
+        return None
+    output = {}
+    for key in ("code", "stage", "category", "exception_type"):
+        value = diagnostic.get(key)
+        if isinstance(value, str) and len(value) <= 64 and all(char.isalnum() or char in "_-" for char in value):
+            output[key] = value
+    if type(diagnostic.get("retryable")) is bool:
+        output["retryable"] = diagnostic["retryable"]
+    return output or None
+
+
+def operation_diagnostic_view(operation):
+    """Sanitize an embedded diagnostic without rewriting the saved receipt."""
+    result = operation.get("result")
+    if not isinstance(result, dict) or "diagnostic" not in result:
+        return operation
+    return {**operation, "result": {**result, "diagnostic": diagnostic_view({"entry_diagnostic": result["diagnostic"]})}}
+
+
 def trade_outcome(trade, operations=()):
     """Separate receipt-backed entry history from reliable current ownership."""
     operation_id = trade.get("entry_operation_id")
@@ -98,7 +125,8 @@ def trade_outcome(trade, operations=()):
             "confirmed_entry_quantity": str(entered) if entries and entered is not None else None,
             "known_own_remaining_quantity": str(remainder) if ownership_confirmed else None,
             "current_ownership_confirmed": ownership_confirmed,
-            "historical_fill_evidence_missing": missing, "observation_retry": retry}
+            "historical_fill_evidence_missing": missing, "observation_retry": retry,
+            "entry_diagnostic": diagnostic_view(trade, index)}
 
 
 def event_outcomes(snapshot, event, operations=None):

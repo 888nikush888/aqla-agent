@@ -11,8 +11,10 @@ from pydantic import Field
 
 from aqla_agent.execution_outcome import (
     EntryOperations,
+    diagnostic_view,
     event_outcomes,
     execution_counts,
+    operation_diagnostic_view,
     retry_view,
     trade_outcome,
 )
@@ -183,9 +185,9 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "policy": snapshot["policy"], "policy_revision": snapshot["policy_revision"], "sources": snapshot["sources"],
                 "source_names": snapshot.get("source_names", {}), "source_names_revision": snapshot.get("source_names_revision", 0),
                 "pending": queue["ready"], "source_queue": queue,
-                "trades": [{**row, "execution_outcome": trade_outcome(row, entry_operations)} for row in snapshot["trades"].values() if row["status"] in OPEN],
+                "trades": [{**row, "execution_outcome": trade_outcome(row, entry_operations), "entry_diagnostic": diagnostic_view(row, entry_operations)} for row in snapshot["trades"].values() if row["status"] in OPEN],
                 "execution_counts": execution_counts(snapshot),
-                "unresolved_operations": [trading.public_operation(row) for row in snapshot["operations"].values() if row["phase"] in ("prepared", "sending", "unknown")],
+                "unresolved_operations": [operation_diagnostic_view(trading.public_operation(row)) for row in snapshot["operations"].values() if row["phase"] in ("prepared", "sending", "unknown")],
                 "notifications": page["notifications"], "notification_versions": page["notification_versions"],
                 "notifications_page": {"pending": page["pending"], "next_cursor": page["next_cursor"], "pagination_available": authority is not None},
                 "configuration_revision": snapshot["configuration_revision"], "profiles": snapshot["profiles"],
@@ -273,10 +275,11 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         trade = snapshot["trades"].get(trade_id)
         if trade is None:
             raise AqlaError("Unknown Aqla trade ID")
-        operations = [trading.public_operation(row) for row in snapshot["operations"].values()
+        operations = [operation_diagnostic_view(trading.public_operation(row)) for row in snapshot["operations"].values()
                       if trade_id in row["operation_id"]]
         result = {"trade_id": trade_id, "status": trade["status"], "plan": trade["plan"],
                 "execution_outcome": trade_outcome(trade, entry_operations), "observation_retry": retry_view(trade),
+                "entry_diagnostic": diagnostic_view(trade, entry_operations),
                 "sources": [row["source"] for row in snapshot["events"].values() if row["source_id"] in trade["plan"]["source_refs"]],
                 "source_names": snapshot.get("source_names", {}), "orders": trade["orders"], "exit_orders": trade.get("exit_orders", []),
                 "order_observations": trade.get("order_observations", {}), "fill_events": trade.get("fill_events", {}),
@@ -301,7 +304,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         snapshot = state.snapshot()
         entry_operations = EntryOperations(snapshot["operations"])
         result = {**result, "execution_outcome": event_outcomes(snapshot, result["event"], entry_operations),
-                  "trades": [{**row, "execution_outcome": trade_outcome(row, entry_operations)} for row in result["trades"]]}
+                  "trades": [{**row, "execution_outcome": trade_outcome(row, entry_operations), "entry_diagnostic": diagnostic_view(row, entry_operations)} for row in result["trades"]]}
         if view == "decision":
             from aqla_agent.efficiency import decision_context
             return decision_context(result)
@@ -331,7 +334,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         snapshot = state.snapshot()
         entry_operations = EntryOperations(snapshot["operations"])
         return decision_batch([{**context, "execution_outcome": event_outcomes(snapshot, context["event"], entry_operations),
-                                "trades": [{**row, "execution_outcome": trade_outcome(row, entry_operations)} for row in context["trades"]]}
+                                "trades": [{**row, "execution_outcome": trade_outcome(row, entry_operations), "entry_diagnostic": diagnostic_view(row, entry_operations)} for row in context["trades"]]}
                                for context in contexts])
 
     @server.tool(annotations=write)
@@ -394,7 +397,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         row = state.snapshot()["operations"].get(operation_id)
         if row is None:
             raise AqlaError("Unknown operation")
-        return trading.public_operation(row)
+        return operation_diagnostic_view(trading.public_operation(row))
 
     @server.tool(annotations=write)
     async def operation_reconcile(operation_id: str, context_auth: str = "") -> dict:

@@ -48,3 +48,9 @@ Notification IDs, immutable facts, versions, cursors and ACK semantics remain
 unchanged. Retry cards use only bounded diagnostic categories and timestamps;
 they neither expose provider traces nor claim final rejection while a retry is
 pending. Historical stale-price errors do not imply reuse of a preview quote.
+
+`entry_diagnostic` exposes only a bounded code, stage, category, exception class
+and boolean retryability. It can come from a failure saved on the trade before
+an operation existed or from the current operation's result. Provider messages,
+traces and extra diagnostic fields stay out of public projections; stored
+receipts are unchanged. Legacy failures without structured proof remain null.

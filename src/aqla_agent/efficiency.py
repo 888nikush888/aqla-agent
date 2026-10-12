@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from aqla_hyperliquid_mcp.models import AqlaError
 
-from .execution_outcome import trade_outcome
+from .execution_outcome import diagnostic_view, trade_outcome
 
 SOURCE_TOOLS = tuple("mcp__aqla__" + name for name in (
     "status", "source_lookup", "source_context", "source_context_batch", "interpret_source", "interpret_source_batch",
@@ -61,6 +61,7 @@ def decision_context(context):
     for row in context["trades"]:
         plan = row["plan"]
         trades.append({"trade_id": row["trade_id"], "status": row["status"], "execution_outcome": row["execution_outcome"] if "execution_outcome" in row else trade_outcome(row),
+                       "entry_diagnostic": row["execution_outcome"].get("entry_diagnostic") if "execution_outcome" in row else diagnostic_view(row),
                        "plan": {key: plan[key] for key in
                                 ("source_refs", "source_revisions", "market", "side", "account", "account_key", "exchange",
                                  "network", "entry_price", "entry_limit", "entry_kind", "entry_timing", "quantity",
@@ -120,8 +121,8 @@ def diagnostic_sections(result, snapshot, sections):
         "plan": ("plan",), "orders": ("orders", "exit_orders", "order_observations"),
         "fills": ("fill_events", "entry_vwap"),
         "accounting": ("entry_accounting", "initial_sl_risk", "source_tp_finalization", "source_tp_updates"),
-        "operations": ("operations", "execution_incident", "observation_retry"), "lifecycle": ("lifecycle_events",),
-        "prices": ("price_checks", "waiting_snapshot", "waiting_error", "unsent_reason", "observation_retry"), "sources": (),
+        "operations": ("operations", "execution_incident", "observation_retry", "entry_diagnostic"), "lifecycle": ("lifecycle_events",),
+        "prices": ("price_checks", "waiting_snapshot", "waiting_error", "unsent_reason", "observation_retry", "entry_diagnostic"), "sources": (),
     }
     if not sections or len(sections) > 8 or any(section not in groups for section in sections):
         raise AqlaError("Choose 1–8 diagnostic sections")

@@ -3,7 +3,14 @@ import json
 
 import pytest
 
-from aqla_agent.execution_outcome import event_outcomes, execution_counts, retry_view, trade_outcome
+from aqla_agent.efficiency import decision_context
+from aqla_agent.execution_outcome import (
+    diagnostic_view,
+    event_outcomes,
+    execution_counts,
+    retry_view,
+    trade_outcome,
+)
 from aqla_agent.messages import status_text, telegram_view
 from aqla_agent.tool_queries import source_lookup
 from aqla_hyperliquid_mcp.server import close_server, create_server
@@ -140,6 +147,68 @@ def test_historical_not_sent_does_not_obscure_new_confirmed_fill_or_adopt_foreig
     assert facts["state"] == "filled" and facts["entry_submission"] == "accepted"
     assert facts["entry_fill_confirmed"] and facts["known_own_remaining_quantity"] == "2"
     assert facts["current_ownership_confirmed"]
+
+
+@pytest.mark.parametrize("stored_on_trade", [True, False])
+def test_safe_entry_diagnostic_exposes_stage_type_without_provider_body(stored_on_trade):
+    diagnostic = {"code": "entry_guard", "stage": "admission", "category": "validation",
+                  "exception_type": "KeyError", "retryable": False,
+                  "error": "PROVIDER_SECRET_BODY", "trace": "PROVIDER_SECRET_TRACE", "account": "PROVIDER_SECRET_ACCOUNT"}
+    expected = {key: diagnostic[key] for key in ("code", "stage", "category", "exception_type", "retryable")}
+    row = trade("preparing")
+    operations = {"entry:own": {"operation_id": "entry:own", "phase": "rejected", "outcome": "not_sent",
+                                 "result": {"diagnostic": diagnostic}}}
+    if stored_on_trade:
+        row["entry_diagnostic"] = diagnostic
+        operations.clear()  # Early failure before any operation is created.
+    before = copy.deepcopy((row, operations))
+    assert diagnostic_view(row, operations) == expected
+    assert trade_outcome(row, operations)["entry_diagnostic"] == expected
+    projected = {**row, "execution_outcome": trade_outcome(row, operations)}
+    context = {"event": {"event_id": "event", "source_id": "source", "source": {"text": "original"}},
+               "messages": [], "trades": [projected]}
+    decision = decision_context(context)
+    assert decision["trades"][0]["entry_diagnostic"] == expected
+    assert "PROVIDER_SECRET" not in json.dumps(decision)
+    assert (row, operations) == before
+    assert diagnostic_view(trade()) is None
+
+
+@pytest.mark.parametrize("stored_on_trade", [True, False])
+@pytest.mark.asyncio
+async def test_mcp_entry_diagnostic_is_safe_visible_and_read_only(setup, signal, stored_on_trade):
+    settings, state, _, exchange, trading = setup
+    source, interpretation = signal
+    plan = await trading.preview(source.event_id, interpretation)
+    await trading.execute(plan["plan_id"])
+    diagnostic = {"code": "entry_guard", "stage": "pre_send", "category": "validation",
+                  "exception_type": "KeyError", "retryable": False, "error": "PROVIDER_SECRET_BODY", "trace": "PROVIDER_SECRET_TRACE"}
+    def store(snapshot):
+        row = snapshot["trades"][plan["trade_id"]]
+        row.update(status="preparing", fill_events={}, orders=[], filled_quantity="0", remaining_quantity="0")
+        if stored_on_trade:
+            row["entry_diagnostic"] = diagnostic
+            snapshot["operations"].pop(row["entry_operation_id"])
+        else:
+            snapshot["operations"][row["entry_operation_id"]].update(phase="rejected", outcome="not_sent", result={"diagnostic": diagnostic})
+    state.update(store)
+    server = create_server(settings, state=state, exchange=exchange)
+    before = state.snapshot()
+    try:
+        for arguments in ({}, {"sections": ["prices"]}, {"sections": ["operations"]}):
+            result = await call(server, "trade_diagnostics", trade_id=plan["trade_id"], **arguments)
+            assert result["entry_diagnostic"]["exception_type"] == "KeyError"
+            assert result["entry_diagnostic"]["stage"] == "pre_send"
+            assert result["entry_diagnostic"]["retryable"] is False
+            assert result["execution_outcome"]["entry_diagnostic"] == result["entry_diagnostic"]
+            assert "PROVIDER_SECRET" not in json.dumps(result)
+        for view in ("full", "decision"):
+            context = await call(server, "source_context", event_id=source.event_id, view=view)
+            assert context["trades"][0]["entry_diagnostic"]["exception_type"] == "KeyError"
+            assert "PROVIDER_SECRET" not in json.dumps(context)
+        assert state.snapshot() == before
+    finally:
+        await close_server(server)
 
 
 def test_retry_markers_are_bounded_truthful_and_terminal_after_exhaustion():
