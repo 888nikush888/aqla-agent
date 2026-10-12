@@ -4,6 +4,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import zlib
 
@@ -12,6 +13,30 @@ from aqla_hyperliquid_mcp.models import AqlaError, digest, now_ms
 from .source_queue import canonical_sources, content, recovery_ids, version
 
 REREAD = "Source read receipt is missing, invalid, expired or stale; read source_context for the current anchor again"
+
+
+def verify_percentage_classification(interpretation, original):
+    """Reject only the fixed-policy uncertainty; never invent a trade decision."""
+    if "%" not in original:
+        return
+    codes = set(interpretation.reason_codes)
+    if codes - {"percentage_basis", "other"}:
+        return  # An independently specified reason never authorizes a trade.
+    explicit = "percentage_basis" in codes
+    if not explicit and interpretation.kind not in ("ambiguous", "incomplete"):
+        return  # Ordinary result/non-trade commentary can discuss uncertain ROI.
+    # Compatibility for callers without structured codes. This checks only the
+    # stated classification cause, not whether the source constitutes a signal.
+    reason = interpretation.reason.casefold()
+    target = re.search(r"\btps?\b|take.?profits?|targets?|ziele?|тейк|цел[ьи]", reason)
+    source_target = re.search(r"(?:\btps?\b|take.?profits?|targets?|ziele?|тейк|цел[ьи])\s*[:=;\-]?\s*\d+(?:[.,]\d+)?\s*%", original, re.I)
+    percentage = re.search(r"%|percent|prozent|процент", reason)
+    basis = re.search(r"\bro[ei]\b|price movement|course|kurs|margin|equity|цены|ценов|марж|движени|доходност", reason)
+    uncertain = re.search(r"ambig|unclear|unknown|unspecif|missing|not (?:clear|specified)|mehrdeutig|uneindeutig|unklar|unbekannt|nicht eindeutig|nicht .*belegbar|fehl|неяс|неоднознач|неизвест|непонят|не определ|не указан", reason)
+    other = re.search(r"(?:missing|unknown|unclear|ambig|not (?:clear|specified))\s+(?:market|symbol|direction|reference|entry price)|(?:market|symbol|direction|reference|entry price)\s+(?:missing|unknown|unclear|ambig)|(?:markt|symbol|richtung|referenz|einstiegspreis).{0,30}(?:fehl|unbekannt|unklar|mehrdeutig)|(?:fehl|unbekannt|unklar|mehrdeutig).{0,30}(?:markt|symbol|richtung|referenz|einstiegspreis)|(?:рынок|тикер|направлен|ссылк|цен[аы] входа).{0,30}(?:неяс|неизвест|отсутств|не указан)|contradict|widerspr|противореч", reason)
+    percentage_only = not other and (explicit or bool((target or source_target) and percentage and basis and uncertain))
+    if percentage_only:
+        raise AqlaError("Percentage basis alone cannot classify this source as non-actionable: source-roe-v1 defines source TP % as nominal ROE on own initial margin before costs. Re-read source_context and reinterpret with roe_percent; keep all other market, direction, evidence and execution guards.")
 
 
 def fingerprint(events, event_id, refs=None):
@@ -80,3 +105,4 @@ def verify_disposition(snapshot, event_id, interpretation, token, key, *, stamp=
     if not any(proof.field == "classification" and proof.source_id == row["source_id"]
                and proof.quote.strip() and proof.quote in row["source"]["text"] for proof in interpretation.evidence):
         raise AqlaError("Classification requires a classification evidence quote from the original anchor")
+    verify_percentage_classification(interpretation, row["source"]["text"])

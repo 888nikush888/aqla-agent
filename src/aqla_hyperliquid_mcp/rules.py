@@ -6,6 +6,7 @@ from decimal import ROUND_DOWN, ROUND_FLOOR, ROUND_UP, Decimal, InvalidOperation
 from typing import Literal
 
 from .models import (
+    EVIDENCE_FIELDS,
     AccountSnapshot,
     AqlaError,
     BackupValues,
@@ -155,25 +156,42 @@ def verify_evidence(signal: Interpretation, events: dict):
         if proof.source_id not in signal.source_refs or proof.quote not in texts[proof.source_id]:
             raise AqlaError("Evidence does not occur in its original source")
         fields.setdefault(proof.field, []).append(proof.quote)
+    errors = []
+    unsupported = sorted(set(fields) - set(EVIDENCE_FIELDS))
+    if unsupported:
+        errors.append("Unsupported source evidence fields: " + ", ".join(unsupported))
     if signal.kind == "new_signal":
         for field in ("symbol", "side"):
             if not fields.get(field):
-                raise AqlaError(f"Missing contextual source evidence for {field}")
+                errors.append(f"Missing contextual source evidence for {field}")
     numeric = {"stop_loss": signal.stop_loss}
     numeric.update({f"take_profits.{i}": value for i, value in enumerate(signal.take_profits)})
     numeric.update({f"entry_prices.{i}": value for i, value in enumerate(signal.entry_prices)})
     for field, value in numeric.items():
-        if value is not None and not any(value in set(quoted_numbers(quote)) for quote in fields.get(field, [])):
-            raise AqlaError(f"Price not supported by source evidence: {field}")
+        if value is None:
+            continue
+        quotes = fields.get(field, [])
+        supported = [quote for quote in quotes if value in set(quoted_numbers(quote))]
+        if not supported:
+            errors.append(f"Price not supported by source evidence: {field}")
+        elif not any(len(re.findall(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])", quote)) == 1 for quote in supported):
+            errors.append(f"Numeric source evidence must isolate one number: {field}")
     if signal.leverage is not None and not any(
             signal.leverage in set(quoted_leverage_numbers(quote)) for quote in fields.get("leverage", [])):
-        raise AqlaError("Signal leverage is not supported by source evidence")
+        errors.append("Signal leverage is not supported by source evidence")
     if signal.entry_timing == "deferred" and not fields.get("entry_timing"):
-        raise AqlaError("Deferred entry timing needs contextual source evidence")
+        errors.append("Deferred entry timing needs contextual source evidence")
     if signal.source_exchange is not None and not any(signal.source_exchange.casefold() in value.casefold() for value in fields.get("source_exchange", [])):
-        raise AqlaError("Source exchange needs contextual source evidence")
+        errors.append("Source exchange needs contextual source evidence")
     if signal.take_profit_unit not in ("price", "roe_percent") and signal.take_profits and not fields.get("take_profit_unit"):
-        raise AqlaError("Percentage TP unit needs contextual source evidence")
+        errors.append("Percentage TP unit needs contextual source evidence")
+    if errors:
+        required = [field for field, value in numeric.items() if value is not None]
+        repair = "; use one exact original quote per field, including % when present"
+        if required:
+            repair += "; numeric fields required: " + ", ".join(required)
+        # Model fields bound this list to 25 required paths and 60 submitted paths.
+        raise AqlaError("; ".join(errors) + repair)
     if signal.take_profit_unit not in ("price", "roe_percent") and signal.take_profits:
         unit_proof = " ".join(fields["take_profit_unit"])
         roi = re.search(r"\b(?:ROI|ROE)\b|return on (?:equity|investment)|рентабельност", unit_proof, re.I)

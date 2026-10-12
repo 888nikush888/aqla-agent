@@ -224,8 +224,21 @@ class SourceEvent(Model):
         return digest(values)[:32]
 
 
+EVIDENCE_FIELDS = (
+    "classification", "symbol", "side", "leverage", "stop_loss", "reduce_percent", "entry",
+    "entry_timing", "source_exchange", "take_profit_unit", "update_action", "bound_trade_id", "margin_mode",
+    *(f"entry_prices.{index}" for index in range(2)), *(f"take_profits.{index}" for index in range(20)),
+)
+ClassificationReason = Literal["percentage_basis", "missing_market", "missing_direction", "missing_reference",
+    "contradictory_source", "missing_entry_price", "missing_source_text", "non_trade", "result_report", "other"]
+
+
 class Evidence(Model):
-    field: str = Field(min_length=1, max_length=100)
+    # Schema guidance is deliberately separate from deserialization: historical
+    # interpretations can contain old field names without changing their hash.
+    field: str = Field(min_length=1, max_length=100, json_schema_extra={"enum": list(EVIDENCE_FIELDS)},
+        description="Exact field path. Lists require one indexed proof per value: take_profits.0, take_profits.1; entry_prices.0, entry_prices.1. Never use take_profits or entry_prices without an index.",
+        examples=["take_profits.0", "take_profits.1", "classification"])
     source_id: str
     quote: str = Field(min_length=1, max_length=1500,
                        description="Exact original substring. Each numeric price/percentage field needs its own number (and % when present), without other numbers. Never quote a whole multi-price message for one numeric field.")
@@ -239,7 +252,16 @@ class SourceClassification(Model):
     evidence: list[Evidence] = Field(default_factory=list, max_length=60,
         description="Include field=classification, current anchor source_id and an exact original quote; every item needs its own proof. Empty-text incomplete is the only quote exception.")
     reason: str = Field(min_length=1, max_length=2000)
+    reason_codes: list[ClassificationReason] = Field(default_factory=list, max_length=8,
+        description="Independent reasons for a non-actionable classification. percentage_basis alone cannot block a source % TP: source-roe-v1 defines it as nominal ROE on own initial margin. Other genuine ambiguity remains non-actionable.")
     source_read_receipt: str = Field(min_length=1, max_length=32768)
+
+    @model_serializer(mode="wrap")
+    def compatible_reason_codes(self, handler):
+        result = handler(self)
+        if not self.reason_codes:
+            result.pop("reason_codes", None)
+        return result
 
 
 class Interpretation(Model):
@@ -252,9 +274,12 @@ class Interpretation(Model):
     entry: Literal["market", "limit", "range", "unspecified"] = "unspecified"
     entry_timing: Literal["standard", "deferred"] = Field(default="standard", description="Explicitly delayed/not-now entry intent requires entry_timing evidence and a source price; Python waits, never substitute an immediate GTC order.")
     source_exchange: str | None = Field(default=None, min_length=1, max_length=100, description="Evidenced exchange named by the source. Metadata only; the operator pipeline chooses the execution exchange.")
-    entry_prices: list[Positive] = Field(default_factory=list, max_length=2)
-    stop_loss: Positive | None = None
-    take_profits: list[Positive] = Field(default_factory=list, max_length=20)
+    entry_prices: list[Positive] = Field(default_factory=list, max_length=2,
+        description="Positive numbers using JSON numbers or dot-decimal strings, never comma decimals. Evidence uses entry_prices.0 / entry_prices.1.")
+    stop_loss: Positive | None = Field(default=None,
+        description="Positive JSON number or dot-decimal string, never a comma decimal. Keep the original spelling only in the exact evidence quote.")
+    take_profits: list[Positive] = Field(default_factory=list, max_length=20,
+        description="Positive JSON numbers or dot-decimal strings (e.g. [1.3, 1.33]), never comma decimals. Each value needs its own indexed evidence path take_profits.0, take_profits.1, etc.")
     take_profit_unit: Literal["price", "course_percent", "roi_percent", "roe_percent"] = Field(default="price", description="Absolute targets without a source % marker use price. Explicit new source TP percentages use roe_percent: nominal profit on own initial margin before fees/funding, effective executed leverage and final own fill VWAP. Rule source-roe-v1. Legacy course_percent/roi_percent remain readable only.")
     update_action: Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"] | None = Field(default=None,
         description="For trade_update emit only changed action fields: move_stop needs stop_loss; replace_targets needs take_profits; reduce needs reduce_percent. Leave unrelated prices/targets null or empty; do not restate the whole original setup.")
@@ -262,6 +287,8 @@ class Interpretation(Model):
     bound_trade_id: str | None = None
     evidence: list[Evidence] = Field(default_factory=list, max_length=60)
     reason: str = Field(default="", max_length=2000)
+    reason_codes: list[ClassificationReason] = Field(default_factory=list, max_length=8,
+        description="For non-actionable classifications, independent blocking causes. percentage_basis alone is invalid for source % TPs under source-roe-v1; re-read and interpret with roe_percent, without bypassing any other uncertainty.")
 
     @model_serializer(mode="wrap")
     def compatible_entry_fields(self, handler):
@@ -272,7 +299,17 @@ class Interpretation(Model):
             result.pop("source_exchange", None)
         if self.take_profit_unit == "price":
             result.pop("take_profit_unit", None)
+        if not self.reason_codes:
+            result.pop("reason_codes", None)
         return result
+
+    @field_validator("entry_prices", "take_profits", "stop_loss", "reduce_percent", mode="before")
+    @classmethod
+    def dot_decimal_values(cls, value):
+        values = value if isinstance(value, list) else [value]
+        if any(isinstance(item, str) and "," in item for item in values):
+            raise ValueError("Numeric values require dot decimals (e.g. 1.33), not comma decimals; preserve the exact original comma spelling in evidence.quote")
+        return value
 
     @model_validator(mode="after")
     def deferred_has_price(self):
