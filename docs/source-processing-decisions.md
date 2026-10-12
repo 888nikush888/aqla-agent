@@ -11,7 +11,7 @@ source_processing:
   mode: shadow  # legacy, shadow, hybrid
   model: inception/mercury-decide:free
   key_env: OPENROUTER_API_KEY
-  calibration_file: calibration/decision-source-v3.json
+  calibration_file: calibration/decision-source-v5.json
   timeout_seconds: 5
   max_context_characters: 60000
 ```
@@ -28,6 +28,8 @@ Eine gültige Kalibrierung benötigt separate Quellthreads für Kalibrierung und
 
 Python erzeugt Kandidaten aus aktuellen Revisionen mit Quellen-ID, Textposition und Originalzitat. Gleiche Zahlen an verschiedenen Stellen bleiben getrennt. Mehrdeutige Zahlenformate behalten mögliche Normalisierungen. Zahlen aus unverbundenen früheren Setups und Zielnummerierungen stehen nicht als Handelswerte zur Auswahl. Mathematisch eindeutige Mengenwörter wie Viertel/quarter/четверть und Hälfte/half/половину liefern ausschließlich Kandidaten für eine Positionsreduktion; sie bleiben als Originalwort belegt. Überfüllte Auswahlmengen führen zur Ausnahmebehandlung. Standardklassifikationen benötigen einen Decision Model-Aufruf; Entries und Updates eine zweite Prüfung von Absicht, Feldrollen und Setup-Konsistenz.
 
+Der Modellkontext enthält den Originalanker, seine tatsächlichen Reply-Vorfahren und relevante eigene Setups. Unverbundene Kanalnachrichten verbrauchen keine Interpretationstokens und machen gespeicherte Entscheidungen nicht ungültig. Python bestimmt eigene Setup-Bindungen einschließlich bereits akzeptierter Management-Anweisungen über alle Account- und Venue-Scopes. Ein Edit allein beweist keine ausgeführte Position. Explizite Entry-Formulierungen dürfen nicht als `unspecified` verloren gehen; reine Marktkommentare erzwingen keinen Ordertyp. Numerische Rollen, die einer gewählten Update-Aktion widersprechen, werden gemeinsam abgewiesen.
+
 `source_jobs` im privaten Aqla-State speichert Kontextfingerabdruck, Fragen-/Kalibrierungsversion, Ergebnis, Plan-IDs und Bearbeitungsschritt. Geänderte Kontexte oder Worker-Generationen können alte Ergebnisse nicht anwenden. Bereits gebundene Quellen und unklare Finanzoperationen bleiben bei der bestehenden Reconciliation. Unveränderte fehlgeschlagene Jobs starten keine erneute Modellschleife; pro Anker und Politik sind höchstens drei fehlgeschlagene Kontextversuche möglich. Eine neue Nachrichtenrevision oder freigegebene Interpretationspolitik erzeugt einen neuen Auftrag. Fehler bleiben als Quellenarbeit und Systemmeldung sichtbar.
 
 Im Hybrid-Modus ist die automatische Quellenautorität dem Worker vorbehalten. Betreibersteuerung, Entry-Pause und die bestehenden Handelsprüfungen bleiben wirksam. Quellenleserfehler und Inhaltskonflikte werden als versionierte Statusübergänge gemeldet, ohne Modellaufruf.
@@ -35,6 +37,8 @@ Im Hybrid-Modus ist die automatische Quellenautorität dem Worker vorbehalten. B
 Vorübergehend fehlende Börsenvorschauen bleiben als `waiting_preview` gespeichert. Python setzt ausschließlich noch nicht eingereichte Ziele mit derselben belegten Interpretation fort, auch wenn andere Teilpositionen bereits offen sind. Ein MCP-Neustart löst verwaiste reine Vorschau-Lesesperren; bestehende Finanzoperationen behalten ihre Reconciliation. Veränderte Originalnachrichten, Fragenversionen oder Freigabeprofile verhindern weitere Einreichungen aus dem alten Job. Bereits ausgeführte Orders bleiben beim bestehenden Recovery-Pfad. Für einen unveränderten gültigen Wiederanlauf entsteht kein neuer Modellaufruf.
 
 ## Benachrichtigungen
+
+Begründungen und Entscheidungscodes erzeugt Python aus festen Vorlagen. Die Klassifikationsbelege decken den gesamten aktuellen Originaltext ohne zusätzliche Modellfrage ab. Ein unvollständiger oder mehrdeutiger Auftrag mit positiver oder unsicherer Handelsabsicht geht zur begrenzten generativen Prüfung. Nur ausreichend sicher negative, kalibrierte und nicht deaktivierte Intent-Entscheidungen dürfen ohne diese Prüfung gespeichert werden. Berichte und sachfremde Nachrichten dürfen keine neue Handelsanweisung verdecken. Die ursprüngliche Kommunikationsabsicht wird unabhängig vom historischen Empfang oder dem Nachrichtenalter bewertet; die aktuelle Ausführbarkeit bestimmt Python.
 
 Eine private `notification_outbox` friert Texte, Empfänger, Konto, Netzwerk und Meldungsversionen ein. Nur ihr nativer Worker sendet über den vorhandenen Hermes-Adapter. Erfolgreiche Teile bleiben gespeichert; erfolgreicher Gesamtversand und versioniertes Fakten-ACK werden gemeinsam geschrieben. Ein alter ACK entfernt keine neue Meldungsversion.
 
@@ -45,7 +49,7 @@ Bei einem unklaren Sendestand wird eine mögliche Dublette ausdrücklich gekennz
 Das Prüfprogramm besitzt keinerlei Bot-, MCP- oder Orderwerkzeuge:
 
 ```sh
-aqla-evaluate-decisions --dataset annotated-sources.json --output decision-report.json --sources QUELLEN_CHAT_ID --master hermes-home/skills/aqla-master/SKILL.md --write-profile calibration/decision-source-v3.json
+aqla-evaluate-decisions --dataset annotated-sources.json --output decision-report.json --sources QUELLEN_CHAT_ID --master hermes-home/skills/aqla-master/SKILL.md --write-profile calibration/decision-source-v5.json
 ```
 
 Es verwendet den OpenRouter-Key aus der Umgebung und kann API-Kosten verursachen. Jede Dataset-Zeile besitzt `id`, `chat_id`, `messages`, `expected`, `split` (`calibration` oder `holdout`) und `group_id` zur Trennung vollständiger Quellthreads. Replys können `reply_to_id` angeben. `language` nennt `de`, `en` oder `ru`; `tags` verwenden `reply`, `edit`, `percent`, `decimal`, `injection`, `multi_setup`, `report_with_action`. Für eine Aktivierungsfreigabe müssen `annotation_complete: true` und sämtliche kritischen Interpretationsfelder in `expected` vorliegen, auch mit explizitem `null` oder leeren Listen. Die synthetischen `tests/fixtures/context_cases.json` können ohne Aktivierungsprofil geprüft werden; deren Teilannotationen reichen nicht zur Produktionsfreigabe.

@@ -100,6 +100,29 @@ async def test_checkpoint_provider_failure_requires_explicit_retry(tmp_path):
     assert len(calls) == 2
 
 
+@pytest.mark.asyncio
+async def test_invalid_interpretation_schema_defers_case_without_stopping_collection(tmp_path):
+    import json
+
+    import httpx
+    from test_decisions import response_for
+
+    from aqla_agent.decisions import DEFAULT_DECISION_MODEL, OpenRouterDecisionAdapter
+    def upstream(request):
+        body = json.loads(request.content)
+        invalid = body["state"]["messages"][-1]["text"].startswith("BTC")
+        return httpx.Response(200, json=response_for(body["questions"], kind="new_signal" if invalid else "report",
+            overrides={"entry_timing":"deferred"} if invalid else None))
+    dataset = [{"id":"bad-schema", "messages":["BTC long, deferred LIMIT, price missing."], "expected":{"kind":"incomplete"}},
+               {"id":"good-report", "messages":["Result report, no new order."], "expected":{"kind":"report"}}]
+    checkpoint = EvaluationCheckpoint(tmp_path / "checkpoint.json", {"version":"synthetic"})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        rows = await evaluate(dataset, OpenRouterDecisionAdapter("synthetic",client=client,model_revision=DEFAULT_DECISION_MODEL),
+                              collect=True,checkpoint=checkpoint)
+    assert rows[0]["failure_code"] == "decision_schema_invalid" and not rows[0]["accepted"]
+    assert rows[1]["passed"] and len(checkpoint.rows) == 2
+
+
 def test_incomplete_observation_set_cannot_issue_activation_profile():
     kinds = ("new_signal", "trade_update", "report", "unrelated", "incomplete", "ambiguous")
     cases, rows = [], []

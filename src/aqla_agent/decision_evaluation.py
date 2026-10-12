@@ -190,7 +190,8 @@ def question_labels(packet, expected, actual=None):
                       if "." in p["field"] else expected.get(p["field"]))) for p in proofs)}
         labels["role." + identity] = roles or {"ignore"}
     actionable = expected.get("kind") in ("new_signal", "trade_update")
-    labels["live_action"] = {actionable}
+    if expected.get("kind") not in ("incomplete", "ambiguous"):
+        labels["live_action"] = {actionable}
     labels["single_entry_form"] = {expected.get("kind") not in ("ambiguous", "incomplete")}
     values_fields = {"leverage", "entry", "entry_timing", "entry_prices", "stop_loss", "take_profits",
                      "take_profit_unit", "update_action", "reduce_percent", "evidence"}

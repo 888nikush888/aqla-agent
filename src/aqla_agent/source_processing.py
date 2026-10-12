@@ -52,8 +52,26 @@ class SourceProcessor:
         if self.mode == "legacy" or owner != self.owner:
             raise AqlaError("Source processor ownership changed")
 
-    def context(self, event_id):
+    def context(self, event_id, *, source_refs=()):
         context = self.trading.context(event_id, decision=True)
+        snapshot = self.state.snapshot()
+        chat_id = context["event"]["source"]["chat_id"]
+        trade_ids = {identity for identity, trade in snapshot["trades"].items() if trade.get("chat_id") == chat_id}
+        bound_refs = {ref for identity in trade_ids for ref in snapshot["trades"][identity]["plan"].get("source_refs", [])}
+        bindings = [snapshot.get("bindings", {}), *snapshot.get("account_bindings", {}).values(),
+                    *snapshot.get("venue_bindings", {}).values()]
+        for table in bindings:
+            for key, value in table.items():
+                if not key.startswith("update:") or not isinstance(value, dict) or value.get("trade_id") not in trade_ids:
+                    continue
+                row = snapshot["events"].get(key.removeprefix("update:"))
+                if row is not None and row["source"]["chat_id"] == chat_id:
+                    bound_refs.add(row["source_id"])
+        context["bound_source_refs"] = sorted(bound_refs)
+        own_refs = {ref for trade in context.get("trades", []) for ref in trade["plan"].get("source_refs", [])} | set(source_refs)
+        included = {row["event_id"] for row in context["messages"]}
+        context["messages"] += [row for row in latest_sources(snapshot["events"], own_refs).values()
+                                if row["event_id"] not in included]
         packet = build_packet(context)
         binding = {"packet": packet, "configuration_revision": context.get("configuration_revision"),
                    "policy_revision": context.get("policy_revision")}
@@ -96,13 +114,7 @@ class SourceProcessor:
                                 if not self.trading.target_started(data, target):
                                     target.pop("preview_inflight_until", None)
                         self.state.update(reclaim_preview)
-                    context = self.trading.context(job.event_id, decision=True)
-                    included = {row["event_id"] for row in context["messages"]}
-                    context["messages"] += [row for row in latest_sources(snapshot["events"], job.result.interpretation.source_refs).values()
-                                            if row["event_id"] not in included]
-                    packet = build_packet(context)
-                    job.fingerprint = digest({"packet": packet, "configuration_revision": context.get("configuration_revision"),
-                                              "policy_revision": context.get("policy_revision")})
+                    _, packet, job.fingerprint = self.context(job.event_id, source_refs=job.result.interpretation.source_refs)
                     job.owner, job.processor_instance = owner, self.instance
                     self.save(job)
                     return self.response(job, packet)
@@ -179,13 +191,7 @@ class SourceProcessor:
         if job.status == "waiting_preview":
             snapshot = self.state.snapshot()
             self.check_intent(job, snapshot)
-            context = self.trading.context(job.event_id, decision=True)
-            included = {row["event_id"] for row in context["messages"]}
-            context["messages"] += [row for row in latest_sources(snapshot["events"], job.result.interpretation.source_refs).values()
-                                    if row["event_id"] not in included]
-            packet = build_packet(context)
-            fingerprint = digest({"packet": packet, "configuration_revision": context.get("configuration_revision"),
-                                  "policy_revision": context.get("policy_revision")})
+            _, packet, fingerprint = self.context(job.event_id, source_refs=job.result.interpretation.source_refs)
         if fingerprint != job.fingerprint:
             raise AqlaError("Source packet changed during native read")
         body = json.dumps(packet, ensure_ascii=True, separators=(",", ":"))

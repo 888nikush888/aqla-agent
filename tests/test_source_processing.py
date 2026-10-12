@@ -70,7 +70,7 @@ async def test_changed_context_and_native_owner_reject_old_result(native_process
     source = SourceEvent(chat_id="channel", message_id=3, sent_at=now_ms(), text="Result report.")
     server.aqla_trading.ingest(source)
     job = (await rpc(server, "source_prepare", processing_version="p"))["job"]
-    server.aqla_trading.ingest(SourceEvent(chat_id="channel", message_id=4, sent_at=now_ms() + 1, text="New context."))
+    server.aqla_trading.ingest(source.model_copy(update={"edited_at":source.sent_at+1,"text":"Edited original report."}))
     with pytest.raises(Exception, match="context changed"):
         await rpc(server, "source_record", job_id=job["job_id"], decision_result=classification(source).model_dump(mode="json"))
     await rpc(server, "source_configure", processing_mode="hybrid", processing_owner="replacement-worker")
@@ -178,10 +178,42 @@ async def test_large_originals_use_complete_native_pages_and_stale_pages_fail(na
         offset = page["next_offset"]
     packet = json.loads("".join(chunks))
     assert packet["messages"][0]["text"] == text
-    server.aqla_trading.ingest(SourceEvent(chat_id="channel", message_id=10, sent_at=now_ms() + 1, text="New reply context"))
+    server.aqla_trading.ingest(source.model_copy(update={"edited_at":source.sent_at+1,"text":text+"Changed original."}))
     with pytest.raises(Exception, match="changed during native read"):
         await rpc(server, "source_packet", job_id=identity, offset=0)
     assert fake.actions == []
+
+
+@pytest.mark.parametrize("scope", ["bindings", "account_bindings", "venue_bindings"])
+def test_management_reply_binding_is_resolved_across_account_and_venue_scopes(scope):
+    from types import SimpleNamespace
+    accepted = SourceEvent(chat_id="channel", message_id=10, sent_at=1000, text="BTC: stop to entry.")
+    reply = SourceEvent(chat_id="channel", message_id=11, sent_at=1001, reply_to_id=10, text="BTC: close now.")
+    rows = [{"event_id": source.event_id, "source_id": source.source_id, "source": source.model_dump(mode="json")}
+            for source in (accepted, reply)]
+    snapshot = {"events": {row["event_id"]: row for row in rows},
+        "trades": {"owned": {"chat_id": "channel", "plan": {"source_refs": []}}}}
+    binding = {"update:" + accepted.event_id: {"trade_id": "owned"}}
+    snapshot[scope] = binding if scope == "bindings" else {"configured-scope": binding}
+    trading = SimpleNamespace(context=lambda *args, **kwargs: {"event": rows[-1], "messages": rows.copy(), "trades": []})
+    processor = SourceProcessor(SimpleNamespace(snapshot=lambda: snapshot), trading)
+    context, packet, _ = processor.context(reply.event_id)
+    assert context["bound_source_refs"] == [accepted.source_id]
+    assert packet["anchor_setup_bound"]
+    snapshot["trades"]["owned"]["chat_id"] = "another-source"
+    assert not processor.context(reply.event_id)[1]["anchor_setup_bound"]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_channel_post_does_not_invalidate_cached_semantics(native_processor):
+    server,state,fake=native_processor
+    source=SourceEvent(chat_id="channel",message_id=20,sent_at=now_ms(),text="Result report.")
+    server.aqla_trading.ingest(source)
+    selected=await rpc(server,"source_prepare",processing_version="stable")
+    server.aqla_trading.ingest(SourceEvent(chat_id="channel",message_id=21,sent_at=source.sent_at+1,text="Unrelated greeting."))
+    await rpc(server,"source_record",job_id=selected["job"]["job_id"],decision_result=classification(source).model_dump(mode="json"))
+    await rpc(server,"source_apply",job_id=selected["job"]["job_id"])
+    assert state.snapshot()["events"][source.event_id]["status"]=="report" and not fake.actions
 
 
 @pytest.mark.asyncio

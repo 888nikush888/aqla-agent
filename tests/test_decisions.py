@@ -109,6 +109,18 @@ def test_replay_uses_edited_live_caption_and_validates_nonactional_evidence():
     assert "missing_source_text" not in result.interpretation.reason_codes
 
 
+@pytest.mark.parametrize("kind", ["incomplete", "ambiguous"])
+def test_uncertain_new_trading_intent_requires_bounded_review(kind):
+    packet = packet_for("BTC limit order; direction unclear.")
+    questions = questions_for(packet, candidates(packet))
+    response = response_for(questions, kind=kind, overrides={"side":"unclear"})
+    response["answers"]["live_action"]["noul"] = 1
+    with pytest.raises(DecisionFailure,match="uncertain_trading_intent_requires_review"):
+        replay_decision(packet, CalibrationProfile(), [response], model=DEFAULT_DECISION_MODEL,
+                        revision=DEFAULT_DECISION_MODEL)
+    assert "reason_code" not in questions
+
+
 @pytest.mark.parametrize("quote,amount,accepted", [("четверть", 25, True), ("Halbe", 50, True),
                                                    ("25%", 25, True), ("+286% четверть", 25, False),
                                                    ("50%", 25, False), ("quarter", 50, False), ("25", 25, False)])
@@ -330,3 +342,93 @@ def test_unlinked_setup_numbers_and_ordinal_labels_are_never_financial_choices()
         if span.kind == "number" and (span.source_id == older.source_id or span.notation == "ordinal"):
             assert "role." + span.candidate_id not in questions
     assert any(span.notation == "ordinal" and span.quote == "2" for span in spans)
+
+
+def test_packet_keeps_actual_replies_and_own_setup_context_but_prunes_unbound_history():
+    unrelated=SourceEvent(chat_id="channel",message_id=1,sent_at=1000,text="ETH long. Entry 2500. SL 2400.")
+    parent=SourceEvent(chat_id="channel",message_id=2,sent_at=1001,text="BTC long. Entry 100. SL 90.")
+    anchor=SourceEvent(chat_id="channel",message_id=3,sent_at=1002,reply_to_id=2,text="BTC: move stop to 95.")
+    packet=packet_for(messages=[unrelated,parent,anchor])
+    assert [row["source_id"] for row in packet["messages"]]==[parent.source_id,anchor.source_id]
+    rows=[{"event_id":s.event_id,"source_id":s.source_id,"source":s.model_dump(mode="json")} for s in (unrelated,parent,anchor)]
+    owned=build_packet({"event":rows[-1],"messages":rows,"bound_source_refs":[parent.source_id],
+        "trades":[{"trade_id":"owned","status":"open","plan":{"source_refs":[unrelated.source_id],"market":{"symbol":"ETH"},"side":"long"}}]})
+    assert owned["anchor_setup_bound"] and len(owned["messages"])==3
+    unbound_edit=anchor.model_copy(update={"edited_at":1003,"reply_to_id":None})
+    assert not packet_for(messages=[anchor,unbound_edit])["anchor_setup_bound"]
+
+
+@pytest.mark.parametrize("symbol,side,text", [("LINK","short","LINK SHORT. Entry range 14 - 15. Stop 16. Targets 12 / 11. Leverage 6x."),
+                                            ("W","long","W LONG. New setup, no exits or leverage stated.")])
+def test_complete_identity_with_new_intent_cannot_be_silently_stored_incomplete(symbol,side,text):
+    packet=packet_for(text)
+    questions=questions_for(packet,candidates(packet))
+    selected=next(key for key,value in questions["symbol"]["criteria"].items()
+                  if isinstance(value,str) and value.startswith("{") and json.loads(value).get("value")==symbol)
+    response=response_for(questions,kind="incomplete",overrides={"symbol":selected,"side":side})
+    response["answers"]["live_action"]["noul"]=0.999
+    with pytest.raises(DecisionFailure,match="uncertain_trading_intent_requires_review"):
+        replay_decision(packet,CalibrationProfile(),[response],model=DEFAULT_DECISION_MODEL,revision=DEFAULT_DECISION_MODEL)
+
+
+def test_explicit_market_form_cannot_be_lost_as_unspecified():
+    from aqla_agent.decisions import validate_interpretation
+    packet=packet_for("BTC LONG. MARKET entry 100. SL 90. TP 110.")
+    source=packet["anchor_source_id"]
+    interpretation=Interpretation(kind="new_signal",symbol="BTC",side="long",source_refs=[source],
+        entry="unspecified",entry_prices=[100],stop_loss=90,take_profits=[110],evidence=[
+            Evidence(field="symbol",source_id=source,quote="BTC"),Evidence(field="side",source_id=source,quote=packet["messages"][0]["text"]),
+            Evidence(field="entry_prices.0",source_id=source,quote="100"),Evidence(field="stop_loss",source_id=source,quote="90"),
+            Evidence(field="take_profits.0",source_id=source,quote="110")])
+    with pytest.raises(DecisionFailure,match="explicit_entry_form_requires_review"):
+        validate_interpretation(packet,interpretation)
+
+
+def test_classification_proofs_cover_original_text_without_another_semantic_choice():
+    text="Original greeting. "*80
+    packet=packet_for(text)
+    questions=questions_for(packet,candidates(packet))
+    assert "proof.classification" not in questions
+    result=replay_decision(packet,CalibrationProfile(),[response_for(questions,kind="unrelated")],
+                           model=DEFAULT_DECISION_MODEL,revision=DEFAULT_DECISION_MODEL)
+    assert "".join(proof.quote for proof in result.interpretation.evidence)==text
+
+
+@pytest.mark.parametrize("kind", ["incomplete", "ambiguous"])
+@pytest.mark.parametrize("probability,disabled", [(0.49, []), (0.0, ["live_action"])])
+def test_uncertain_or_disabled_negative_intent_cannot_be_stored_without_review(kind, probability, disabled):
+    packet = packet_for("BTC: unclear instruction.")
+    questions = questions_for(packet, candidates(packet))
+    response = response_for(questions, kind=kind)
+    response["answers"]["live_action"]["noul"] = probability
+    with pytest.raises(DecisionFailure, match="conflicting_live_intent"):
+        replay_decision(packet, CalibrationProfile(disabled_questions=disabled), [response],
+                        model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+
+
+@pytest.mark.parametrize("comment", ["Daily market update follows.", "Market cap 100 billion.", "Daily range 98 - 102."])
+def test_market_commentary_does_not_force_an_unstated_order_form(comment):
+    from aqla_agent.decisions import validate_interpretation
+    packet = packet_for("BTC LONG. Entry 100. SL 90. TP 110. " + comment)
+    source = packet["anchor_source_id"]
+    interpretation = Interpretation(kind="new_signal", symbol="BTC", side="long", source_refs=[source],
+        entry="unspecified", entry_prices=[100], stop_loss=90, take_profits=[110], evidence=[
+            Evidence(field="symbol", source_id=source, quote="BTC"),
+            Evidence(field="side", source_id=source, quote=packet["messages"][0]["text"]),
+            Evidence(field="entry_prices.0", source_id=source, quote="100"),
+            Evidence(field="stop_loss", source_id=source, quote="90"),
+            Evidence(field="take_profits.0", source_id=source, quote="110")])
+    validate_interpretation(packet, interpretation)
+
+
+@pytest.mark.parametrize("amount", ["50%", "half"])
+def test_close_action_cannot_discard_a_selected_partial_reduction(amount):
+    packet = packet_for("BTC: close " + amount + " of the position now.")
+    spans = candidates(packet)
+    fraction = next(span for span in spans if span.kind == "number")
+    questions = questions_for(packet, spans)
+    response = response_for(questions, kind="trade_update", overrides={
+        "update_action": "close", "side": "not_present", "role." + fraction.candidate_id: "reduce_percent"})
+    with pytest.raises(DecisionFailure, match="update_role_conflict"):
+        replay_decision(packet, CalibrationProfile(), [response],
+                        model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
