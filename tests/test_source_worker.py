@@ -57,17 +57,29 @@ async def test_short_fallback_runs_once_and_empty_queue_uses_no_model(worker_bou
     source = SourceEvent(chat_id="channel", message_id=8, sent_at=now_ms(), text="BTC result report.")
     server.aqla_trading.ingest(source)
     interpretations = []
+    decision_requests = []
+
+    def upstream(request):
+        body = json.loads(request.content)
+        decision_requests.append(body)
+        return httpx.Response(200, json=response_for(body["questions"], kind="report"))
 
     async def fallback(packet, code, usage):
         interpretations.append(packet)
         assert code == "source_not_calibrated"
+        assert packet["decision_review"]["interpretation"]["kind"] == "report"
+        assert packet["decision_review"]["approved"] is False
+        assert packet["decision_review"]["open_questions"]
         usage.append({"phase": "interpretation_fallback", "model": "synthetic", "usage_available": True,
                       "input_tokens": 100, "output_tokens": 20, "failed": False})
         return DecisionResult(interpretation=report(packet), model="synthetic", fallback=True, usage=usage.copy())
 
-    worker = SourceWorker(extension, {"mode": "hybrid"}, fallback=fallback)
-    await worker.tick()
-    await worker.tick()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        worker = SourceWorker(extension, {"mode": "hybrid"}, fallback=fallback,
+            adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="inception/mercury-decide:free"))
+        await worker.tick()
+        await worker.tick()
+    assert len(decision_requests) == 1
     assert len(interpretations) == 1
     assert state.snapshot()["events"][source.event_id]["status"] == "report"
     assert all(tool == "integration" for tool, _ in calls)
@@ -77,8 +89,88 @@ async def test_short_fallback_runs_once_and_empty_queue_uses_no_model(worker_bou
     assert metrics["workflow"]["source_job_id"] in state.snapshot()["source_jobs"]
     assert metrics["workflow"]["source_job_status"] == "done"
     assert metrics["workflow"]["cache_hit"] is False
-    assert len(metrics["api_responses"]) == 1
+    assert metrics["workflow"]["decision_attempted"] and metrics["workflow"]["decision_reviewed"]
+    assert not metrics["workflow"]["calibration_validated"]
+    assert len(metrics["api_responses"]) == 2
     assert "source_read_receipt" not in json.dumps(interpretations)
+    assert fake.actions == []
+
+
+@pytest.mark.asyncio
+async def test_uncalibrated_decision_is_reviewed_and_can_be_corrected_without_admission(worker_boundary):
+    extension, server, state, fake, _, _ = worker_boundary
+    source = SourceEvent(chat_id="channel", message_id=8, sent_at=now_ms(), text="BTC result report.")
+    server.aqla_trading.ingest(source)
+    requests = []
+
+    def upstream(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(200, json=response_for(body["questions"], kind="unrelated"))
+
+    async def correct(packet, code, usage):
+        assert code == "source_not_calibrated"
+        assert packet["decision_review"]["interpretation"]["kind"] == "unrelated"
+        return DecisionResult(interpretation=report(packet), model="synthetic-review", fallback=True)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        worker = SourceWorker(extension, {"mode": "hybrid"}, fallback=correct,
+            adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="inception/mercury-decide:free"))
+        await worker.tick()
+    assert len(requests) == 1
+    assert state.snapshot()["events"][source.event_id]["interpretation"]["kind"] == "report"
+    assert fake.actions == []
+
+
+@pytest.mark.asyncio
+async def test_actionable_uncalibrated_decision_gets_two_calls_and_never_executes_without_review(worker_boundary, signal):
+    extension, server, state, fake, _, _ = worker_boundary
+    source, _ = signal
+    requests = []
+
+    def upstream(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(200, json=response_for(body["questions"]))
+
+    async def unresolved(packet, code, usage):
+        assert code == "source_not_calibrated"
+        assert packet["decision_review"]["interpretation"]["kind"] == "new_signal"
+        raise DecisionFailure("fallback_unresolved")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        worker = SourceWorker(extension, {"mode": "hybrid"}, fallback=unresolved,
+            adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="inception/mercury-decide:free"))
+        await worker.tick()
+        await worker.tick()
+    assert len(requests) == 2
+    assert state.snapshot()["events"][source.event_id]["status"] == "pending"
+    assert fake.actions == []
+
+
+@pytest.mark.asyncio
+async def test_unavailable_decision_provider_still_uses_bounded_review(worker_boundary):
+    extension, server, state, fake, _, _ = worker_boundary
+    source = SourceEvent(chat_id="channel", message_id=8, sent_at=now_ms(), text="BTC result report.")
+    server.aqla_trading.ingest(source)
+    requests, reviews = [], []
+
+    def unavailable(request):
+        requests.append(request)
+        return httpx.Response(503)
+
+    async def fallback(packet, code, usage):
+        reviews.append(packet["decision_review"])
+        assert code == "decision_api_unavailable"
+        assert packet["decision_review"]["interpretation"] is None
+        return DecisionResult(interpretation=report(packet), model="synthetic", fallback=True)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(unavailable)) as client:
+        worker = SourceWorker(extension, {"mode": "hybrid"}, fallback=fallback,
+            adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="inception/mercury-decide:free"))
+        await worker.tick()
+    assert len(requests) == len(reviews) == 1
+    assert state.snapshot()["events"][source.event_id]["status"] == "report"
     assert fake.actions == []
 
 

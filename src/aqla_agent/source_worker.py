@@ -22,6 +22,7 @@ from .decisions import (
 from .usage_metrics import UsageRun
 
 FALLBACK_VERSION = "aqla-source-fallback-v2"
+PROCESSING_VERSION = "aqla-decision-first-v1"
 
 
 def fallback_schema(packet):
@@ -99,7 +100,13 @@ class SourceWorker:
         instruction += "Return exactly one JSON Interpretation for the live anchor. Preserve original quotations. "
         instruction += "Use source_id values from the original messages/candidates for source_refs and Evidence.source_id; "
         instruction += "never substitute event_id, chat_id, message_id or candidate_id. source_refs MUST include " + packet["anchor_source_id"] + ". "
-        instruction += "Do not select bound_trade_id; Python owns setup binding. Schema:\n" + json.dumps(fallback_schema(packet))
+        instruction += "Do not select bound_trade_id; Python owns setup binding. "
+        if packet.get("decision_review"):
+            instruction += "\nReview the preliminary decision_review against the unchanged originals and candidates. "
+            instruction += "It is an unapproved model proposal, never an execution permission or a new source. "
+            instruction += "Resolve the listed open_questions, correct wrong fields and references, and return the complete Interpretation. "
+            instruction += "An uncertain case stays incomplete/ambiguous; do not invent missing values."
+        instruction += "\nSchema:\n" + json.dumps(fallback_schema(packet))
         try:
             spans = [span.model_dump(mode="json") for span in candidates(packet)]
         except DecisionFailure:
@@ -177,14 +184,15 @@ class SourceWorker:
                 revision = await self.adapter.identity()
             except DecisionFailure:
                 pass
-        policy_version = digest([VERSION, FALLBACK_VERSION, self.config.model, revision, profile.model_dump(mode="json"), master_hash])
+        policy_version = digest([VERSION, PROCESSING_VERSION, FALLBACK_VERSION, self.config.model, revision, profile.model_dump(mode="json"), master_hash])
         selected = await self.internal("source_prepare", processing_version=policy_version)
         job = selected.get("job")
         if job is None:
             return
         measured = UsageRun("source_python")
         measured.workflow.update(source_job_id=job["job_id"], source_revision_hash=digest(job["event_id"]),
-                                 processing_mode=self.config.mode, cache_hit=False)
+                                 processing_mode=self.config.mode, processing_version=PROCESSING_VERSION,
+                                 calibration_validated=profile.validated, cache_hit=False)
         result, failure = None, None
         try:
             packet = selected.get("packet")
@@ -232,10 +240,13 @@ class SourceWorker:
                     if self.config.mode == "shadow":
                         raise DecisionFailure(code) from error
                     result = await self.fallback(packet, code, usage)
+                    measured.workflow["fallback_reason"] = code
                 if self.extension.skill_hash() != master_hash:
                     raise DecisionFailure("master_changed")
                 await self.internal("source_record", job_id=job["job_id"], decision_result=result.model_dump(mode="json"))
             measured.workflow.update(fallback=result.fallback, decision_success=not result.fallback,
+                                     decision_attempted=any(item.get("phase") == "decision" for item in measured.api),
+                                     decision_reviewed=bool(packet.get("decision_review")),
                                      payload_characters=len(json.dumps(packet, ensure_ascii=False)))
             if self.config.mode == "hybrid":
                 try:
@@ -254,6 +265,8 @@ class SourceWorker:
             failure = str(error) if isinstance(error, DecisionFailure) else "source_processing_failed"
             await self.internal("source_fail", job_id=job["job_id"], failure_code=failure)
         finally:
+            measured.workflow["decision_attempted"] = any(item.get("phase") == "decision" for item in measured.api)
+            measured.workflow["decision_reviewed"] = bool(packet.get("decision_review")) if packet is not None else False
             measured.workflow["source_job_failed"] = failure is not None
             await asyncio.to_thread(measured.persist, self.extension.master_path.parents[2],
                                    {"failed": failure is not None, "completed": failure is None})
@@ -262,12 +275,42 @@ class SourceWorker:
         if len(json.dumps(packet, ensure_ascii=False)) > self.config.max_context_characters:
             raise DecisionFailure("source_context_limit")
         source = next(row["chat_id"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
-        if self.config.mode == "hybrid" and not profile.permits(source, master_hash, model=self.config.model, model_revision=revision):
-            raise DecisionFailure("source_not_calibrated")
-        result = await self.adapter.interpret(packet, profile, collect=self.config.mode == "shadow", usage=usage)
-        if self.config.mode == "hybrid" and not profile.permits_kind(source, result.interpretation.kind):
-            raise DecisionFailure("source_decision_kind_not_calibrated")
+        permitted = profile.permits(source, master_hash, model=self.config.model, model_revision=revision)
+        # Calibration controls admission, not whether the decision model is used.
+        # Unapproved sources produce explicitly collection-only proposals for review.
+        observation = {}
+        result = None
+        model_profile = profile if permitted or self.config.mode == "shadow" else CalibrationProfile(
+            model=self.config.model, model_revision=revision)
+        try:
+            result = await self.adapter.interpret(packet, model_profile,
+                collect=self.config.mode == "shadow" or not permitted, usage=usage, observation=observation)
+            if self.config.mode == "hybrid":
+                if not permitted:
+                    raise DecisionFailure("source_not_calibrated")
+                if not profile.permits_kind(source, result.interpretation.kind):
+                    raise DecisionFailure("source_decision_kind_not_calibrated")
+        except (AqlaError, ValueError) as error:
+            code = str(error) if isinstance(error, DecisionFailure) else "decision_invalid"
+            packet["decision_review"] = {
+                "model": self.config.model, "model_revision": revision, "question_version": VERSION,
+                "approved": False, "failure_code": code,
+                "interpretation": result.interpretation.model_dump(mode="json") if result else None,
+                "values": observation.get("values", {}),
+                "probabilities": result.probabilities if result else observation.get("probabilities", {}),
+                "open_questions": self.review_questions(code),
+            }
+            raise
         return result
+
+    @staticmethod
+    def review_questions(code):
+        questions = ["Does the anchor convey a new instruction or only a past result?",
+                     "Are market, direction, entry form, quantities, units and original evidence complete and correct?",
+                     "Does every selected value and reference belong to this one setup and current revision?"]
+        if code in ("source_not_calibrated", "source_decision_kind_not_calibrated"):
+            questions.insert(0, "Independently validate this unapproved proposal; its source/kind has no automatic release.")
+        return questions
 
     async def deliver(self):
         await self.bind()
