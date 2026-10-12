@@ -21,6 +21,19 @@ from .decisions import (
 )
 from .usage_metrics import UsageRun
 
+FALLBACK_VERSION = "aqla-source-fallback-v2"
+
+
+def fallback_schema(packet):
+    """Constrain opaque references to supplied originals, not workflow/event IDs."""
+    schema = Interpretation.model_json_schema()
+    sources = sorted({row["source_id"] for row in packet["messages"]})
+    schema["properties"]["source_refs"]["items"]["enum"] = sources
+    schema["properties"]["source_refs"]["contains"] = {"const": packet["anchor_source_id"]}
+    schema["$defs"]["Evidence"]["properties"]["source_id"]["enum"] = sources
+    schema["properties"]["bound_trade_id"] = {"type": "null", "default": None}
+    return schema
+
 
 class NativeUsageCapture:
     """Request-scoped native accounting, including the observed billing endpoint."""
@@ -84,7 +97,9 @@ class SourceWorker:
         master = extension.master_path.read_text(encoding="utf-8")
         instruction = master + "\nInterpretation only. No tools, no account/configuration changes. "
         instruction += "Return exactly one JSON Interpretation for the live anchor. Preserve original quotations. "
-        instruction += "Do not select bound_trade_id; Python owns setup binding. Schema:\n" + json.dumps(Interpretation.model_json_schema())
+        instruction += "Use source_id values from the original messages/candidates for source_refs and Evidence.source_id; "
+        instruction += "never substitute event_id, chat_id, message_id or candidate_id. source_refs MUST include " + packet["anchor_source_id"] + ". "
+        instruction += "Do not select bound_trade_id; Python owns setup binding. Schema:\n" + json.dumps(fallback_schema(packet))
         try:
             spans = [span.model_dump(mode="json") for span in candidates(packet)]
         except DecisionFailure:
@@ -137,6 +152,8 @@ class SourceWorker:
             if text.startswith("```") and text.endswith("```"):
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0]
             interpretation = Interpretation.model_validate_json(text)
+            if interpretation.bound_trade_id is not None:
+                raise DecisionFailure("fallback_bound_trade_forbidden")
             validate_interpretation(packet, interpretation)
             return DecisionResult(interpretation=interpretation, model=route.get("model", model), fallback=True, usage=usage.copy())
         except Exception as error:
@@ -160,7 +177,7 @@ class SourceWorker:
                 revision = await self.adapter.identity()
             except DecisionFailure:
                 pass
-        policy_version = digest([VERSION, self.config.model, revision, profile.model_dump(mode="json"), master_hash])
+        policy_version = digest([VERSION, FALLBACK_VERSION, self.config.model, revision, profile.model_dump(mode="json"), master_hash])
         selected = await self.internal("source_prepare", processing_version=policy_version)
         job = selected.get("job")
         if job is None:

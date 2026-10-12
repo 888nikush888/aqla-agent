@@ -70,6 +70,11 @@ def main():
         assert result.fallback and result.interpretation.kind == "report"
         assert len(requests) == 1 and len(requests[0]["messages"]) == 2
         assert not requests[0].get("tools")
+        schema = json.loads(requests[0]["messages"][0]["content"].split("Schema:\n", 1)[1])
+        assert schema["properties"]["source_refs"]["items"]["enum"] == [source.source_id]
+        assert schema["properties"]["source_refs"]["contains"] == {"const": source.source_id}
+        assert schema["$defs"]["Evidence"]["properties"]["source_id"]["enum"] == [source.source_id]
+        assert schema["properties"]["bound_trade_id"]["type"] == "null"
         assert usage[0]["input_tokens"] == 100 and usage[0]["output_tokens"] == 20
         assert usage[0]["cost_status"] == "unknown" and usage[0]["cost_usd"] is None
         print(json.dumps({"passed": True, "native_model_calls": 1, "history_messages": 0, "order_tools_available": False}))

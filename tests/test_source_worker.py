@@ -171,10 +171,11 @@ async def test_missing_text_is_deterministic_and_uses_no_model(worker_boundary):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint_changed,price_failed", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("endpoint_changed,price_failed,bound_trade", [(False, False, False), (True, False, False),
+                                                                    (False, True, False), (False, False, True)])
 async def test_fallback_cost_requires_observed_endpoint_and_cannot_block_interpretation(
-        worker_boundary, monkeypatch, endpoint_changed, price_failed):
-    extension, server, _, _, _, _ = worker_boundary
+        worker_boundary, monkeypatch, endpoint_changed, price_failed, bound_trade):
+    extension, server, _, fake, _, _ = worker_boundary
     source = SourceEvent(chat_id="channel", message_id=8, sent_at=now_ms(), text="Result report, no new orders.")
     server.aqla_trading.ingest(source)
     from aqla_agent.decisions import build_packet
@@ -192,7 +193,10 @@ async def test_fallback_cost_requires_observed_endpoint_and_cannot_block_interpr
         kwargs["route_info"].update(provider="custom", model="fixture")
         capture[-1].record_auxiliary_usage("fixture", "source_interpretation", billing_provider="custom",
             billing_base_url="https://other.example/v1" if endpoint_changed else runtime["base_url"])
-        return {"usage": {"prompt_tokens": 100}, "content": report(packet).model_dump_json()}
+        interpretation = report(packet)
+        if bound_trade:
+            interpretation.bound_trade_id = "model-selected-binding"
+        return {"usage": {"prompt_tokens": 100}, "content": interpretation.model_dump_json()}
 
     def price(*args, **kwargs):
         prices.append(kwargs)
@@ -211,6 +215,11 @@ async def test_fallback_cost_requires_observed_endpoint_and_cannot_block_interpr
     monkeypatch.setitem(sys.modules, "hermes_cli", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "hermes_cli.config", SimpleNamespace(load_config_readonly=lambda: {}))
     measured = []
+    if bound_trade:
+        with pytest.raises(DecisionFailure, match="fallback_unresolved"):
+            await SourceWorker(extension, {"mode": "hybrid"}).generative_fallback(packet, "synthetic_unclear", measured)
+        assert measured and fake.actions == []
+        return
     result = await SourceWorker(extension, {"mode": "hybrid"}).generative_fallback(packet, "synthetic_unclear", measured)
     assert result.interpretation.kind == "report" and result.fallback
     assert len(prices) == int(not endpoint_changed)
