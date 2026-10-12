@@ -30,6 +30,8 @@ Beim Live-Start erkannte ungenutzte native Cron-/Housekeeping-Factory wurde im A
 
 ## Bewusst noch zu konfigurieren
 
+Der Decision-Pfad verwendet `inception/mercury-decide:free` über OpenRouter und den allgemeinen System-One-Adapter. Generative Verarbeitung bleibt bei OpenCode Go mit OpenRouter-Fallback. Die Servereinführung erfolgt im unabhängigen Shadow-Worker; Handelsfreigaben aus Decision Models benötigen eine Kalibrierung für die konkrete OpenRouter-Modellrevision. Der bestehende Handelszustand, Betreiber-Skills und Zugangsdaten werden beim Rollout erhalten.
+
 Handelsregeln und Quellen wählt der Nutzer über den Bot; sie wurden nicht automatisch festgelegt. Neue Trades bleiben bis zu gültiger Policy und zulässiger Quelle beziehungsweise Betreiber-Weiterleitung gesperrt. Bereits vorhandene fremde Positionen unterliegen weiterhin dem Entry-Besitzguard.
 
 Google Sheets wurde anschließend im geöffneten Nutzerbrowser eingerichtet und aktiviert: eigenes Dienstkonto ohne zusätzliche Projektrollen, auf die Journaltabelle beschränkte Bearbeiterfreigabe und geschützter Servicekonto-Schlüssel auf dem VPS. Der private RSA-Schlüssel wurde lokal erzeugt; ausschließlich sein öffentliches X509-Zertifikat wurde in Google Cloud registriert. Der ungenutzte Schlüssel aus dem nicht verfügbaren Browserdownload wurde widerrufen.

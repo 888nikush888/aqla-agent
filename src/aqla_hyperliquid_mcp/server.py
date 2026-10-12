@@ -58,6 +58,7 @@ from .models import (
     Settings,
     SourceClassification,
     SourceEvent,
+    digest,
     now_ms,
 )
 from .multisig import Signature
@@ -76,6 +77,10 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     streams = Streams(settings.base_url, timeout=settings.timeout_seconds)
     authority = Authority.from_file(settings.integration_key_file) if settings.integration_key_file else None
     trading.source.disposition_key = authority.key if authority else None
+    from aqla_agent.delivery import NotificationOutbox
+    from aqla_agent.source_processing import SourceProcessor
+    processor = SourceProcessor(state, trading)
+    outbox = NotificationOutbox(state, settings.telegram_owner_id)
     setup_gate = SetupGate(authority is not None and bool(settings.telegram_owner_id) and load_verifier(settings.setup_password_hash_file) is not None)
 
     def setup_context(claims):
@@ -92,7 +97,10 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     def authorize(token, operator=False):
         if authority is None:
             raise AqlaError("Trusted Hermes integration key is not configured")
-        return authority.verify(token, operator=operator)
+        claims = authority.verify(token, operator=operator)
+        if processor.mode == "hybrid" and claims["kind"] == "source":
+            raise AqlaError("Automatic sources are owned by the native Python processor")
+        return claims
 
     async def maintenance():
         while True:
@@ -173,7 +181,9 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                     "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})),
                                 "last_synced_at": snapshot.get("journal_synced_at")},
                     "configuration_revision": snapshot["configuration_revision"], "policy_revision": snapshot["policy_revision"],
-                    "inventory_refreshed": False, "details": {"tool": "status", "view": "full"}}
+                    "inventory_refreshed": False, "details": {"tool": "status", "view": "full"},
+                    **({"source_processing": {**processor.overview(), "delivery": outbox.overview()}}
+                       if processor.mode != "legacy" else {})}
         queue = queue_overview(snapshot)
         ready = trading.ready()
         inventory = await trading.inventory_status()
@@ -422,6 +432,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     async def notifications_ack(notification_ids: list[str], context_auth: str = "", versions: dict[str, str] | None = None) -> NotificationAckResult:
         """Acknowledge status facts processed for the native Hermes response; not a Telegram delivery receipt."""
         authorize(context_auth)
+        if processor.mode == "hybrid":
+            raise AqlaError("Notification acknowledgements are owned by the native outbox")
         def acknowledge(data):
             return acknowledge_notifications(data, notification_ids, versions)
         return state.update_metadata(("notifications",), acknowledge)
@@ -548,7 +560,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.update(apply)
 
     @server.tool(annotations=write)
-    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack", "monthly_job", "monthly_ack", "monthly_request", "monthly_failure", "monthly_page", "setup_bind", "setup_grant", "setup_failed", "setup_revoke", "setup_status", "presentation_snapshot"], token: str, source: SourceEvent | None = None,
+    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack", "monthly_job", "monthly_ack", "monthly_request", "monthly_failure", "monthly_page", "setup_bind", "setup_grant", "setup_failed", "setup_revoke", "setup_status", "presentation_snapshot", "source_configure", "source_prepare", "source_packet", "source_record", "source_apply", "source_fail", "source_overview", "source_notice", "delivery_next", "delivery_complete", "delivery_retry"], token: str, source: SourceEvent | None = None,
                           aliases: dict[str, str] | None = None, cutoffs: dict[str, int] | None = None,
                           context_ids: dict[str, list[int]] | None = None,
                           accepted: dict[str, str] | None = None, month: str | None = None,
@@ -556,12 +568,62 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                           failure: MonthlyFailure | None = None, section: MonthlySection | None = None,
                           setup_binding: dict | None = None, lease_id: str | None = None,
                           generation: str | None = None, selection: dict | None = None,
+                          processing_mode: Literal["legacy", "shadow", "hybrid"] | None = None,
+                          processing_owner: str | None = None, processing_version: str | None = None,
+                          job_id: str | None = None, decision_result: dict | None = None,
+                          failure_code: str | None = None, delivery_id: str | None = None,
+                          delivery_part: int | None = None, delivery_success: bool | None = None,
                           offset: Annotated[int, Field(strict=True, ge=0)] = 0,
                           limit: Annotated[int, Field(strict=True, ge=1, le=100)] = 100) -> dict:
         """Internal native-plugin access, filtered out of agent tools; token never enters model context."""
         if authority is None:
             raise AqlaError("Integration key is not configured")
         authority.internal(token)
+        if action == "source_configure":
+            configured = processor.configure(processing_mode, processing_owner)
+            outbox.bind(processing_owner)
+            return configured
+        if action == "source_prepare":
+            return processor.prepare(processing_owner, processing_version)
+        if action == "source_packet":
+            return processor.packet_page(processing_owner, job_id, offset)
+        if action == "source_record":
+            from aqla_agent.decisions import DecisionResult
+            if decision_result is None:
+                raise AqlaError("A typed native decision is required")
+            return processor.record(processing_owner, job_id, DecisionResult.model_validate(decision_result))
+        if action == "source_apply":
+            return await processor.apply(processing_owner, job_id)
+        if action == "source_fail":
+            return processor.fail(processing_owner, job_id, failure_code)
+        if action == "source_overview":
+            return {**processor.overview(), "delivery": outbox.overview()}
+        if action == "source_notice":
+            processor.require_owner(processing_owner)
+            code = failure_code if isinstance(failure_code, str) and failure_code.isascii() and failure_code.replace("_", "").isalnum() and len(failure_code) <= 80 else "source_status_changed"
+            def notice(data):
+                category = "conflicts" if code.startswith("source_conflict") else "reader"
+                previous = data["source_status"].get(category, {})
+                signature = digest([code, processing_version])
+                if previous.get("signature") == signature:
+                    return
+                transition = previous.get("transition", 0) + 1
+                data["source_status"][category] = {"signature": signature, "transition": transition}
+                identity = "source-status:" + digest([category, transition])
+                data["notifications"].setdefault(identity, {"error": "Quellenstatus: " + code})
+            state.update_metadata(("notifications", "source_status"), notice)
+            return {"recorded": True}
+        if action in ("delivery_next", "delivery_complete", "delivery_retry"):
+            processor.require_owner(processing_owner)
+            if processor.mode != "hybrid":
+                raise AqlaError("Only hybrid processing owns deterministic delivery")
+            if action == "delivery_next":
+                return outbox.next_part(processing_owner)
+            if action == "delivery_retry":
+                return outbox.retry(processing_owner)
+            if type(delivery_part) is not int or type(delivery_success) is not bool:
+                raise AqlaError("A confirmed native send result is required")
+            return outbox.complete(processing_owner, delivery_id, delivery_part, delivery_success)
         if action == "presentation_snapshot":
             return state.presentation_snapshot(selection)
         if action == "setup_revoke":

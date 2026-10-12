@@ -11,7 +11,8 @@ from .storage import SQLiteStore, database_path, read_snapshot
 
 METADATA_ROOTS = {"nonces": dict, "account_nonces": dict, "venue_nonces": dict, "cursors": dict,
                   "notifications": dict, "monthly_jobs": dict, "monthly_requests": list,
-                  "monthly_request_generations": dict, "monthly_reports": dict}
+                  "monthly_request_generations": dict, "monthly_reports": dict,
+                  "source_jobs": dict, "notification_outbox": dict, "source_status": dict}
 
 
 class State:

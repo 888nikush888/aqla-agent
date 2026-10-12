@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from aqla_hyperliquid_mcp.auth import Authority
-from aqla_hyperliquid_mcp.models import AqlaError, Settings, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, Settings, SourceEvent, digest, now_ms
 
 from .native_setup import NativeSetup, load_verifier
 from .setup import SetupBinding
@@ -90,6 +90,8 @@ class HermesExtension:
         self._reader_configuration_valid = True
         self.master_path = Path(ctx.get_config("master_path", self.config_path.parent / "hermes-home" / "skills" / "aqla-master" / "SKILL.md"))
         self.master_hash = self.skill_hash()
+        from .source_worker import SourceWorker
+        self.source_worker = SourceWorker(self, ctx.get_config("source_processing", {}))
 
     @property
     def active_context(self):
@@ -133,6 +135,8 @@ class HermesExtension:
                 origin = self.active_context
                 if origin and origin[0] == "source" and not (getattr(incoming, "metadata", None) or {}).get("hermes_plugin_injection"):
                     await self.call("native_forward", self.forward_event(incoming))
+                    if self.source_worker.config.mode == "hybrid":
+                        return None
                 return await callback()
         finally:
             self.turn_event.reset(token)
@@ -370,6 +374,21 @@ class HermesExtension:
         """Durable wakeups remain independent of reader startup, I/O and failures."""
         while True:
             try:
+                if self.source_worker.config.mode == "hybrid":
+                    await self.source_worker.bind()
+                    observed = await self.call("snapshot")
+                    blocked_signature = observed.get("source_queue", {}).get("blocked_signature")
+                    if self.reader_error != self.reported_reader_error:
+                        await self.source_worker.internal("source_notice", failure_code=(self.reader_error or {}).get("code", "reader_recovered"),
+                                                          processing_version=digest(self.reader_error))
+                        self.reported_reader_error = self.reader_error
+                    if blocked_signature != self.reported_blocked_signature:
+                        await self.source_worker.internal("source_notice", failure_code="source_conflict" if blocked_signature else "source_conflict_resolved",
+                                                          processing_version=blocked_signature or "clear")
+                        self.reported_blocked_signature = blocked_signature
+                    await self.source_worker.tick()
+                    await asyncio.sleep(3)
+                    continue
                 snapshot = await self.call("snapshot")
                 queue = snapshot.get("source_queue", {})
                 blocked_signature = queue.get("blocked_signature")
@@ -406,6 +425,28 @@ class HermesExtension:
                 raise
             except Exception as error:
                 LOG.warning("aqla durable wake unavailable (%s); work remains pending", type(error).__name__)
+            await asyncio.sleep(3)
+
+    async def shadow_worker(self):
+        """Provider latency must not postpone legacy processing during evaluation."""
+        while True:
+            try:
+                if self.turns_active == 0:
+                    await self.source_worker.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                LOG.warning("aqla shadow evaluation unavailable (%s)", type(error).__name__)
+            await asyncio.sleep(3)
+
+    async def delivery_worker(self):
+        while True:
+            try:
+                await self.source_worker.deliver()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                LOG.warning("aqla native outbox unavailable (%s); frozen messages remain pending", type(error).__name__)
             await asyncio.sleep(3)
 
     def yield_clarification(self):
@@ -482,6 +523,10 @@ class HermesExtension:
             self.ctx.on_unload(self.unbind_adapter)
             self.ctx.spawn_task(self.worker(), name="aqla-source-events")
             self.ctx.spawn_task(self.reader_worker(), name="aqla-source-reader")
+            if self.source_worker.config.mode == "hybrid":
+                self.ctx.spawn_task(self.delivery_worker(), name="aqla-notification-outbox")
+            elif self.source_worker.config.mode == "shadow":
+                self.ctx.spawn_task(self.shadow_worker(), name="aqla-source-shadow")
             if self.settings.google_sheets.enabled:
                 self.ctx.spawn_task(self.journal_worker(), name="aqla-sheets-journal")
             self.started = True

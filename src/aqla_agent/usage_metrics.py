@@ -21,6 +21,7 @@ class UsageRun:
     tools: dict = field(default_factory=dict)
     result_hashes: set = field(default_factory=set)
     classified_sources: set = field(default_factory=set)
+    workflow: dict = field(default_factory=dict)
 
     def response(self, usage, model, provider, duration, *, phase="main", failed=False):
         self.api.append({"model": model, "provider": provider, "usage_available": usage is not None,
@@ -66,6 +67,7 @@ class UsageRun:
                    "api_calls_reported": result.get("api_calls"),
                    "failed": bool(result.get("failed", False)), "interrupted": bool(result.get("interrupted", False)),
                    "completed": result.get("completed"), "compression_exhausted": bool(result.get("compression_exhausted", False))}
+            row["workflow"] = self.workflow
             with sqlite3.connect(path, timeout=1) as connection:
                 connection.execute("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, started_at REAL NOT NULL, origin TEXT NOT NULL, metrics TEXT NOT NULL)")
                 connection.execute("INSERT INTO runs(started_at,origin,metrics) VALUES(?,?,?)", (self.started, self.origin, json.dumps(row, separators=(",", ":"))))

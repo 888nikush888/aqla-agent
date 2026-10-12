@@ -102,6 +102,8 @@ jobs:
         run: python scripts/audit_hermes_runtime.py --python .cache/hermes-venv/bin/python
       - name: Native SQLite sessions, search and Telegram commands
         run: .cache/hermes-venv/bin/python tests/native_hermes_smoke.py --hermes-source .cache/hermes-source --home .cache/native-home
+      - name: Tool-free native decision fallback with a local model
+        run: .cache/hermes-venv/bin/python tests/native_decision_smoke.py --hermes-source .cache/hermes-source --home .cache/decision-home
       - name: Operator questions, planning and legacy history migration
         run: .cache/hermes-venv/bin/python tests/native_interaction_smoke.py --hermes-source .cache/hermes-source --home .cache/interaction-home
       - name: Native Telegram message formatting, splitting and persistence
