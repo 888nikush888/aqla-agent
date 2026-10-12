@@ -175,7 +175,7 @@ def test_pending_and_unknown_entries_are_not_reported_as_open(opened,phase,label
     trade=next(iter(opened['trades'].values()))
     trade['status']=phase
     if phase=='opening':
-        trade.update(filled_quantity='0',entry_vwap=None)
+        trade.update(filled_quantity='0',remaining_quantity='0',fill_events={},entry_vwap=None)
     result=text(telegram_view(opened,READY))
     assert label in result and 'Trade eröffnet' not in result
     if phase=='opening':
@@ -185,6 +185,10 @@ def test_pending_and_unknown_entries_are_not_reported_as_open(opened,phase,label
 def test_partial_entry_is_explicit(opened):
     trade=next(iter(opened['trades'].values()))
     trade['filled_quantity']=str(Decimal(trade['plan']['quantity'])/2)
+    trade['remaining_quantity']=trade['filled_quantity']
+    for fill in trade['fill_events'].values():
+        if fill['kind']=='entry':
+            fill['sz']=trade['filled_quantity']
     result=text(telegram_view(opened,READY))
     assert 'Entry teilweise ausgeführt' in result and '50 % der geplanten Menge' in result
 
@@ -192,6 +196,7 @@ def test_partial_entry_is_explicit(opened):
 def test_sl_and_tp_updates_are_bundled_without_repeating_opening(opened):
     identity,trade=next(iter(opened['trades'].items()))
     trade.update(stop_price='100',tp_filled=['1','0'],target_budgets=['1','1'],remaining_quantity='1',filled_quantity='2')
+    trade['fill_events']={'entry':{'kind':'entry','sz':'2','px':'100'},'tp':{'kind':'tp','sz':'1','px':'101'}}
     opened['notifications']={'sl':{'trade_id':identity,'change':{'stop_price':'100'},'previous':{'stop_price':'99'}},
                              'tp':{'trade_id':identity,'change':{'tp_filled':['1','0'],'remaining_quantity':'1'},'previous':{'tp_filled':['0','0']}}}
     result=text(telegram_view(opened,READY))

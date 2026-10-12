@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from decimal import Decimal, InvalidOperation
 
+from .execution_outcome import execution_counts, retry_view, trade_outcome
 from .execution_roles import observed_roles
 
 VENUES = {"hyperliquid": "Hyperliquid", "aster": "Aster", "lighter": "Lighter"}
@@ -16,9 +17,31 @@ ERRORS = {
     "Insufficient risk/margin budget or exchange minimum notional": "Risiko-/Marginbudget oder Mindestpositionswert reicht nicht aus.",
     "Signal deadline expired; it is never renewed": "Die Gültigkeitsfrist des Signals ist abgelaufen.",
     "Source market cannot be resolved uniquely; no substitute market is used": "Der Signalmarkt ist nicht eindeutig auflösbar.",
+    "Entry price observation is stale or has an invalid timestamp": "Die aktuelle Preisbeobachtung ist nicht frisch oder zeitlich nicht bestätigt.",
 }
 CHUNK_UNITS = 3000
 MAX_NOTIFICATIONS = 100
+
+
+def observation_lines(row):
+    retry = retry_view(row)
+    if not retry:
+        return None
+    text = "**Technische Prüfung:** " + ("Wiederaufnahme beendet" if retry.get("exhausted") else "Lesebeleg noch nicht bestätigt; begrenzte Wiederaufnahme ausstehend")
+    labels = {"account": "Konto", "price": "Preis", "quote": "Preis", "market": "Markt"}
+    if retry.get("stage"):
+        text += " · " + literal(labels.get(retry["stage"], retry["stage"]))
+    if retry.get("code"):
+        text += " · " + literal(retry["code"])
+    if retry.get("exception_type"):
+        text += " · " + literal(retry["exception_type"])
+    if not retry.get("exhausted") and type(retry.get("next_retry_at")) is int:
+        text += "\n**Nächste Prüfung:** " + _berlin_time(retry["next_retry_at"]) + " · Berlin"
+    if type(retry.get("deadline_at")) is int:
+        text += "\n**Unveränderte Signalfrist:** " + _berlin_time(retry["deadline_at"]) + " · Berlin"
+    if retry.get("authority") == "preview":
+        text += "\nNur Vorschau: keine automatische Ausführung freigegeben."
+    return text
 
 
 def execution_lines(trade):
@@ -116,7 +139,7 @@ def risk_block(trade):
     if equity is not None:
         text += " · " + number(decimal(equity) * decimal(plan["policy"]["risk_percent"]) / 100) + " " + quote
     risk = trade.get("initial_sl_risk", {}).get("amount")
-    provisional = risk is None and decimal(trade.get("filled_quantity")) and decimal(trade.get("entry_vwap")) and decimal(trade.get("stop_price"))
+    provisional = risk is None and trade_outcome(trade)["entry_fill_confirmed"] and decimal(trade.get("filled_quantity")) and decimal(trade.get("entry_vwap")) and decimal(trade.get("stop_price"))
     if provisional:
         risk = decimal(trade["filled_quantity"]) * abs(decimal(trade["entry_vwap"]) - decimal(trade["stop_price"]))
     text += "\n**Anfängliches SL-Risiko:** " + (number(risk) + " " + quote if risk is not None else "noch nicht finalisiert")
@@ -160,14 +183,21 @@ def trade_block(data, trade, notices):
                   or (decimal(notice.get("previous", {}).get("filled_quantity")) == 0 and (decimal(notice.get("change", {}).get("filled_quantity")) or 0) > 0) for notice in notices)
     filled = decimal(trade.get("filled_quantity")) or Decimal(0)
     planned = decimal(plan.get("quantity"))
+    facts = trade_outcome(trade, data.get("operations", {}))
     if stage == "conflicted":
         title = "⚠️ **Manueller Marktkonflikt**"
     elif stage == "unknown":
         title = "⏳ **Ausführung ungeklärt**"
+    elif facts["state"] == "pending_observation":
+        title = "⏳ **Technische Prüfung ausstehend**"
     elif stage in ("closing", "cleanup"):
         title = "⏳ **Schließung wird abgeglichen**"
     elif stage in ("closed", "cancelled", "rejected"):
         title = {"closed": "🏁 **Trade geschlossen**", "cancelled": "⚪ **Entry storniert**", "rejected": "⚠️ **Trade abgelehnt**"}[stage]
+    elif facts["historical_fill_evidence_missing"]:
+        title = "⚠️ **Ausführungsbelege fehlen**"
+    elif facts["state"] == "unknown":
+        title = "⏳ **Belegabgleich ungeklärt**"
     elif stage == "waiting_entry":
         title = "🕓 **Warte auf Einstieg**"
     elif filled == 0:
@@ -179,6 +209,18 @@ def trade_block(data, trade, notices):
     else:
         title = "✅ **Trade eröffnet**" if opening else "🔄 **Trade aktualisiert**"
     lines = [f"{title} · {market} {direction}", context(data, plan)]
+    if facts["historical_fill_evidence_missing"]:
+        lines.append("**Eigene Entry-Fills:** historisch nicht vollständig belegt; gespeicherte Mengen allein bestätigen keine Ausführung.")
+    elif facts["state"] == "unknown" and stage != "unknown":
+        lines.append("**Mengenabgleich:** gespeicherte Fills und Positionsmengen bestätigen den aktuellen Zustand nicht vollständig.")
+    elif facts["state"] in ("not_sent", "no_entry_fill"):
+        lines.append("**Eigene Entry-Fills:** keine bestätigt" + (" · Entry nicht gesendet" if facts["state"] == "not_sent" else ""))
+    if stage == "conflicted" or trade.get("external_conflict"):
+        lines.append("**Eigene Restposition:** wegen Konflikt nicht zuverlässig bestätigt.")
+    if facts["state"] == "unknown" and facts["observation_retry"] and not facts["observation_retry"].get("exhausted"):
+        lines.append("**Wiederaufnahme:** gesperrt, bis der ungeklärte Börsenausgang beziehungsweise Mengenabgleich geklärt ist.")
+    elif observation_lines(trade):
+        lines.append(observation_lines(trade))
     lines.append(execution_lines(trade))
     if risk_block(trade):
         lines.append(risk_block(trade))
@@ -187,10 +229,11 @@ def trade_block(data, trade, notices):
     quote = literal(plan["market"].get("quote_token", "USDC"))
     full = opening or filled == 0 or stage in ("unknown", "protecting")
     if full:
+        receipt_filled = facts["entry_fill_confirmed"] is True
         entry = trade.get("entry_vwap") if filled else plan.get("entry_price")
-        label = "Entry realisiert" if filled else "Entry geplant"
+        label = "Entry realisiert" if filled and receipt_filled else "Entry gespeichert · unbelegt" if filled else "Entry geplant"
         lines.append(f"**{label}:** {number(entry)} {quote} · **Hebel:** {number(plan.get('effective_leverage', plan.get('policy', {}).get('leverage')))}×")
-        if filled and planned and filled < planned:
+        if filled and receipt_filled and planned and filled < planned:
             lines.append(f"**Gefüllt:** {number(filled / planned * 100)} % der geplanten Menge")
         lines.append(f"**SL:** {number(trade.get('stop_price', plan.get('stop_loss')))} {quote}" + (" · vorgesehen" if stage == "waiting_entry" else " · Bestätigung ausstehend" if stage in ("unknown", "protecting", "opening") else ""))
         targets = trade.get("targets", plan.get("take_profits", []))
@@ -229,7 +272,7 @@ def trade_block(data, trade, notices):
                     budget = (trade.get("target_budgets") or [])[index] if index < len(trade.get("target_budgets", [])) else None
                     complete = budget is not None and decimal(value) >= decimal(budget)
                     lines.append(f"**TP{index + 1}:** " + ("vollständig ausgeführt" if complete else "teilweise ausgeführt"))
-        if "remaining_quantity" in changes and filled:
+        if "remaining_quantity" in changes and filled and facts["current_ownership_confirmed"]:
             lines.append(f"**Position verbleibend:** {number((decimal(trade.get('remaining_quantity')) or 0) / filled * 100)} %")
     if stage == "closed":
         from .lifecycle import close_reason
@@ -239,7 +282,7 @@ def trade_block(data, trade, notices):
             lines.append(f"**Netto vor Funding:** {number(result)} {quote}")
         else:
             lines.append("**Ergebnis:** PnL nicht vollständig bestätigt")
-    if trade.get("unsent_reason"):
+    if trade.get("unsent_reason") and not (facts["observation_retry"] and not facts["observation_retry"].get("exhausted")):
         lines.append("**Grund:** " + literal(ERRORS.get(trade["unsent_reason"], trade["unsent_reason"])))
     remaining = decimal(trade.get("remaining_quantity")) or Decimal(0)
     if trade.get("maker_target_rejection") and stage in ("open", "protecting", "unknown", "conflicted") and remaining > 0:
@@ -328,7 +371,10 @@ def status_text(data, exchanges, sheets_enabled, inventory):
     if data.get("ranking_policy", {}).get("enabled"):
         ranks = data.get("source_ranks", {})
         lines.append("**Kanalränge:** " + " · ".join(f"{source_name(data, source)}: {literal(row['tier'])}" + (" (Startfreigabe)" if row.get("bootstrap") and row.get("metrics", {}).get("score") is None else "") for source, row in ranks.items()))
-    lines.append(f"**Offene Trades:** {len(active)} · **Ausstehende Quellen:** {pending} · **Blockierte Quellen:** {source_queue["blocked_total"]}\n**Quellen-Recovery:** {source_queue["recovery_source_total"]} · **Ungeklärte Vorgänge:** {unknown}")
+    counts = execution_counts(data)
+    lines.append(f"**Belegte eigene offene Positionen:** {counts['known_own_open']} · **Entries ausstehend:** {counts['pending_entries']} · **Eigene Position ungeklärt:** {counts['unsettled_ownership']}\n"
+                 f"**Aktive Trade-Vorgänge:** {len(active)} · **Ausstehende Quellen:** {pending} · **Blockierte Quellen:** {source_queue['blocked_total']}\n"
+                 f"**Quellen-Recovery:** {source_queue['recovery_source_total']} · **Ungeklärte Vorgänge:** {unknown}\nBasis: gespeicherte eigene Fills; Gesamtbestand der Börsenkonten separat.")
     queue = len(data.get("journal_pending", {}))
     lines.append("**Sheets:** " + ("deaktiviert" if not sheets_enabled else f"{queue} Übertragungen ausstehend" if queue else "Journal synchronisiert"))
     for venue, row in inventory.items():
@@ -463,8 +509,13 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None, notif
                 signal = (event or {}).get("interpretation") or {}
                 title = literal(signal.get("symbol") or "Markt nicht zugeordnet")
                 reason = target.get("error", "Ergebnis nicht bestätigt")
-                heading = "⏳ **Börsenziel ungeklärt**" if target.get("status") in ("unknown", "pending", "planned", "opening", "protecting", "needs_reconciliation") else "⚠️ **Signal abgelehnt**"
-                blocks.append(f"{heading} · {title}\n\n{context(data, plan)}\n\n**Grund:** {literal(ERRORS.get(reason, reason))}")
+                retry = retry_view(target)
+                pending_retry = retry and not retry.get("exhausted") and target.get("status") not in ("unknown", "needs_reconciliation")
+                heading = "⏳ **Technische Prüfung ausstehend**" if pending_retry else "⏳ **Börsenziel ungeklärt**" if target.get("status") in ("unknown", "pending", "planned", "opening", "protecting", "needs_reconciliation") else "⚠️ **Signal abgelehnt**"
+                detail = observation_lines(target) if pending_retry else "**Grund:** " + literal(ERRORS.get(reason, reason))
+                if retry and retry.get("exhausted"):
+                    detail += "\n\n" + observation_lines(target)
+                blocks.append(f"{heading} · {title}\n\n{context(data, plan)}\n\n{detail}")
         if not by_trade and len(blocks) == 1:
             notice = items[0][1]
             blocks.append("ℹ️ **Systemmeldung**\n" + literal(notice.get("error") or "Gespeichertes Ereignis ohne vollständige Trade-Zuordnung"))

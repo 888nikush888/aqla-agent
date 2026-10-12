@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from aqla_hyperliquid_mcp.models import AqlaError, digest
 
+from .execution_outcome import source_trade_outcome, trade_outcome
 from .sources import resolve_source
 
 BYTE_CAP = 8192
@@ -180,6 +181,7 @@ def source_lookup(snapshot, start, end, *, source=None, symbol=None, status=None
                 "is_plan_source_revision": plan.get("source_revisions", {}).get(event["source_id"]) == event["event_id"] if plan else None,
                 "confirmed_own_entry_fill_count": len(entries), "confirmed_own_entry_quantity": str(sum((Decimal(fill["sz"]) for fill in entries), Decimal(0))) if entries else None,
                 "event_status_is_fill_proof": False, "uncertain_operation_count": uncertain.get((trade or {}).get("trade_id"), 0),
+                "execution_outcome": source_trade_outcome(event, trade, snapshot.get("operations", {})) if trade else {"state": "unbound", "entry_fill_confirmed": None},
                 "trade_details": {"tool": "trade_diagnostics", "arguments": {"trade_id": trade["trade_id"], "view": "full"}} if trade else None})
     retained_revisions = len({row["event_id"] for row in rows})
     missing = 0
@@ -198,6 +200,7 @@ def source_lookup(snapshot, start, end, *, source=None, symbol=None, status=None
                     "source_time": None, "interval_membership": "unknown_original_timestamp_not_retained",
                     "status_filter_membership": "unknown_original_event_status" if status else None,
                     "account": plan.get("account"), "network": plan["network"], "exchange": plan.get("exchange", "hyperliquid"),
+                    "execution_outcome": trade_outcome(trade, snapshot.get("operations", {})),
                     "trade_details": {"tool": "trade_diagnostics", "arguments": {"trade_id": trade["trade_id"], "view": "full"}}})
     binding = digest([query, rows])
     if cursor is not None:
@@ -209,6 +212,7 @@ def source_lookup(snapshot, start, end, *, source=None, symbol=None, status=None
         except (ValueError, KeyError, TypeError) as error:
             raise AqlaError("Source lookup cursor is invalid or its interval, filters or matching retained projections changed; restart at offset 0") from error
     result = page(rows, offset, limit, {"interval": query, "status_filter_domain": "event_status_or_bound_trade_status",
+        "entry_fill_fields_scope": "bound_trade_history; execution_outcome identifies the exact source revision",
         "retained_event_count": len(snapshot.get("events", {})), "pruned_event_count": len(snapshot.get("event_tombstones", {})),
         "matching_retained_source_revisions": retained_revisions, "undated_saved_source_bindings": missing,
         "cursor_basis": "query_and_matching_retained_projections", "retained_totals_scope": "current_snapshot"}, max_bytes=BYTE_CAP - 768)

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 from aqla_hyperliquid_mcp.models import AqlaError
 
+from .execution_outcome import trade_outcome
+
 SOURCE_TOOLS = tuple("mcp__aqla__" + name for name in (
     "status", "source_lookup", "source_context", "source_context_batch", "interpret_source", "interpret_source_batch",
     "trade_preview", "trade_execute", "trade_update", "trade_diagnostics", "operation_status", "operation_reconcile",
@@ -58,7 +60,7 @@ def decision_context(context):
     trades = []
     for row in context["trades"]:
         plan = row["plan"]
-        trades.append({"trade_id": row["trade_id"], "status": row["status"],
+        trades.append({"trade_id": row["trade_id"], "status": row["status"], "execution_outcome": row["execution_outcome"] if "execution_outcome" in row else trade_outcome(row),
                        "plan": {key: plan[key] for key in
                                 ("source_refs", "source_revisions", "market", "side", "account", "account_key", "exchange",
                                  "network", "entry_price", "entry_limit", "entry_kind", "entry_timing", "quantity",
@@ -109,7 +111,8 @@ def decision_batch(contexts):
 
 def classification_ack(row, changed):
     return {"event_id": row["event_id"], "source_id": row["source_id"], "status": row["status"],
-            "changed": changed, "detail": {"tool": "source_context", "event_id": row["event_id"], "view": "full"}}
+            "changed": changed, "event_status_is_fill_proof": False,
+            "detail": {"tool": "source_context", "event_id": row["event_id"], "view": "full"}}
 
 
 def diagnostic_sections(result, snapshot, sections):
@@ -117,8 +120,8 @@ def diagnostic_sections(result, snapshot, sections):
         "plan": ("plan",), "orders": ("orders", "exit_orders", "order_observations"),
         "fills": ("fill_events", "entry_vwap"),
         "accounting": ("entry_accounting", "initial_sl_risk", "source_tp_finalization", "source_tp_updates"),
-        "operations": ("operations", "execution_incident"), "lifecycle": ("lifecycle_events",),
-        "prices": ("price_checks", "waiting_snapshot", "waiting_error", "unsent_reason"), "sources": (),
+        "operations": ("operations", "execution_incident", "observation_retry"), "lifecycle": ("lifecycle_events",),
+        "prices": ("price_checks", "waiting_snapshot", "waiting_error", "unsent_reason", "observation_retry"), "sources": (),
     }
     if not sections or len(sections) > 8 or any(section not in groups for section in sections):
         raise AqlaError("Choose 1–8 diagnostic sections")
@@ -126,6 +129,7 @@ def diagnostic_sections(result, snapshot, sections):
     keys = {key for section in sections for key in groups[section]}
     output = {key: result[key] for key in keys}
     output.update(trade_id=result["trade_id"], status=result["status"], close_reason=result["close_reason"],
+                  execution_outcome=result["execution_outcome"],
                   scope={key: plan.get(key) for key in ("account", "account_key", "exchange", "network")},
                   selected_sections=list(dict.fromkeys(sections)), details_omitted=True,
                   historical_missing_quotes_are_not_inferred=True)

@@ -1,6 +1,7 @@
 """Pinned Telegram transport/escaping/splitting and native session persistence, offline."""
 import argparse
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -38,6 +39,7 @@ def main():
                       'rank_snapshot': {'tier': 'D', 'factor': '.75'}, 'policy': {'risk_percent': '3.75'},
                       'source_tp': {'unit': 'roi_percent', 'values': ['20', '40']}, 'profile_id': 'standard', 'backup_fields': []},
              'initial_sl_risk': {'amount': '2'}}
+    trade['fill_events'] = {'entry': {'kind': 'entry', 'sz': '2', 'px': '100', 'time': 1000}}
     data = {'trades': {'trade': trade}, 'events': {}, 'operations': {}, 'paused': False,
             'source_names': {'-100123': '[VIP]* Gold_`'}, 'profiles': {'standard': {'name': 'Standard'}},
             'notifications': {'notice': {'trade_id': 'trade', 'change': {'status': 'open', 'filled_quantity': '2'},
@@ -50,6 +52,16 @@ def main():
         'open_trades': [], 'undated_closed_trades': [], 'url': 'https://docs.google.com/spreadsheets/d/ci/edit#gid=1'})
     entry_card = lifecycle_block(data, {'kind': 'entry_fill', 'time': 1791397511739, 'facts': {**trade, 'entry_stop_confirmed': False}})
     closed_card = lifecycle_block(data, {'kind': 'closed', 'time': 1791397512420, 'facts': {**trade, 'status': 'closed', 'fill_events': {}}})
+    retry_data = copy.deepcopy(data)
+    retry_trade = retry_data['trades']['trade']
+    retry_trade.update(status='preparing', filled_quantity='0', remaining_quantity='0', fill_events={},
+                       entry_vwap=None, observation_retry={'attempts': 1, 'next_retry_at': 1791782100000,
+                           'deadline_at': 1791790000000, 'code': 'stale_observation', 'stage': 'account',
+                           'category': 'read', 'exhausted': False, 'authority': 'execute',
+                           'error': 'PRIVATE_PROVIDER_TRACE_MUST_NOT_APPEAR'})
+    retry_card = '\n\n'.join(telegram_view(retry_data, {})['messages'][0]['texts'])
+    assert 'Technische Prüfung ausstehend' in retry_card and 'Nächste Prüfung' in retry_card
+    assert 'Trade abgelehnt' not in retry_card and 'PRIVATE_PROVIDER_TRACE' not in retry_card
     adapter = TelegramAdapter(PlatformConfig(extra={'allow_from': ['12345']}))
     delivered = []
     class Bot:
@@ -75,6 +87,9 @@ def main():
             sent = await adapter.send('12345', message, metadata={'notify': True})
             assert sent.success
         assert '*Einstieg ausgeführt*' in delivered[-2]['text'] and '*Trade geschlossen*' in delivered[-1]['text']
+        sent = await adapter.send('12345', retry_card, metadata={'notify': True})
+        assert sent.success and '*Technische Prüfung ausstehend*' in delivered[-1]['text']
+        assert 'PRIVATE_PROVIDER_TRACE' not in delivered[-1]['text']
         before = len(delivered)
         long = '\n\n'.join(card for _ in range(15))
         result = await adapter.send('12345', long, metadata={'notify': True})
@@ -119,11 +134,14 @@ def main():
         assert db.get_messages_as_conversation('message-view')[-1]['content'] == monthly
         db.append_messages_batch('message-view', [{'role': 'assistant', 'content': entry_card}, {'role': 'assistant', 'content': closed_card}])
         assert [row['content'] for row in db.get_messages_as_conversation('message-view')[-2:]] == [entry_card, closed_card]
+        db.append_messages_batch('message-view', [{'role': 'assistant', 'content': retry_card}])
+        assert db.get_messages_as_conversation('message-view')[-1]['content'] == retry_card
     finally:
         db.close()
     print(json.dumps({'native_markdown_send': True, 'native_split': True, 'saved_reply_matches': True,
                       'normal_gateway_response_router': True, 'no_unexpected_media_or_label_links': True, 'owner_media_extraction_preserved': True,
                       'unknown_fill_price_not_inferred': True,
+                      'pending_read_retry_delivered_without_final_rejection': True,
                       'chunks': len(delivered), 'exchange_actions': 0, 'telegram_network_calls': 0, 'input_chars': len(long)}))
 
 
