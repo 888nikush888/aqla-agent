@@ -131,7 +131,9 @@ async def test_calibrated_source_uses_decision_and_no_generative_model(worker_bo
     source = SourceEvent(chat_id="channel", message_id=8, sent_at=now_ms(), text="BTC result report.")
     server.aqla_trading.ingest(source)
     profile = CalibrationProfile(validated=True, master_hash="master-v1", sources=["channel"],
-        model_revision="inception/mercury-decide:free", dataset_hash="calibration", holdout_hash="holdout", holdout_cases=30, thresholds={"kind": 0.99})
+        model_revision="inception/mercury-decide:free", dataset_hash="calibration", holdout_hash="holdout", holdout_cases=30, thresholds={"kind": 0.99},
+        source_evidence={"channel": {"calibration_groups": 3, "holdout_groups": 5, "accepted_accuracy": 1, "critical_errors": 0}},
+        source_permissions={"channel": ["report"]})
     profile_path = extension.master_path.parents[2] / "profile.json"
     profile_path.write_text(profile.model_dump_json())
     requests = []

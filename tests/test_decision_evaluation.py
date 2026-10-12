@@ -3,13 +3,148 @@ import pytest
 from aqla_agent.decision_evaluation import (
     CRITICAL_FIELDS,
     REQUIRED_SCENARIOS,
+    EvaluationCheckpoint,
     calibration_profile,
+    case_packet,
     equal,
     evaluate,
     evaluate_split,
+    fit_thresholds,
+    revision_time_context,
 )
-from aqla_agent.decisions import DecisionResult
+from aqla_agent.decisions import DecisionFailure, DecisionResult
 from aqla_hyperliquid_mcp.models import Interpretation
+
+
+def test_legacy_revision_identity_preserves_real_reply_anchor_without_rehashing():
+    from aqla_hyperliquid_mcp.models import SourceEvent, digest
+    source = SourceEvent(chat_id="channel", message_id=2, sent_at=1000, received_at=1000, reply_to_id=1, text="Original reply")
+    legacy = digest([source.source_id, source.edited_at, source.text, source.media])[:32]
+    assert legacy != source.event_id
+    case = {"id":"legacy", "messages":[source.model_dump(mode="json")], "message_event_ids":[legacy], "anchor_event_id":legacy}
+    packet = case_packet(case)
+    assert packet["anchor_event_id"] == legacy and packet["messages"][0]["reply_to_id"] == 1
+    with pytest.raises(ValueError, match="identities must match"):
+        case_packet({**case,"message_event_ids":["fabricated"]})
+
+
+def test_revision_time_replay_excludes_future_edits_but_keeps_observed_later_messages():
+    def event(message_id, sent_at, edited_at=None, reply=None):
+        return {"source": {"chat_id": "channel", "message_id": message_id, "sent_at": sent_at,
+                           "edited_at": edited_at, "reply_to_id": reply, "text": "Original"}}
+    parent = event(1, 10)
+    original = event(2, 20, reply=1)
+    future_edit = event(2, 20, 100, reply=1)
+    newer = event(3, 40)
+    anchor_edit = event(2, 20, 60, reply=1)
+    context = revision_time_context([parent, original, future_edit, newer, anchor_edit], anchor_edit, limit=2)
+    assert future_edit not in context and newer in context and parent in context and anchor_edit in context
+
+
+@pytest.mark.asyncio
+async def test_complete_default_fields_do_not_disappear_from_annotation_comparison():
+    from aqla_agent.decision_evaluation import complete_fields
+    from aqla_hyperliquid_mcp.models import Evidence
+    class Adapter:
+        async def interpret(self, packet, profile, **kwargs):
+            return DecisionResult(model="synthetic", interpretation=Interpretation(kind="report",
+                source_refs=[packet["anchor_source_id"]], evidence=[Evidence(field="classification",
+                    source_id=packet["anchor_source_id"], quote="Original report")], reason="Result"))
+    from aqla_hyperliquid_mcp.models import SourceEvent
+    source = SourceEvent(chat_id="default", message_id=1, sent_at=1000, text="Original report")
+    baseline = Interpretation(kind="report", source_refs=[source.source_id], evidence=[Evidence(field="classification",
+        source_id=source.source_id, quote="Original report")], reason="Result")
+    expected = {key: value for key, value in complete_fields(baseline).items() if key in CRITICAL_FIELDS}
+    rows = await evaluate([{"id": "default", "messages": ["Original report"], "expected": expected}], Adapter())
+    assert rows[0]["passed"] and not rows[0]["mismatch_fields"]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_resumes_same_observation_without_another_request(tmp_path):
+    calls = []
+    class Adapter:
+        async def interpret(self, packet, profile, **kwargs):
+            calls.append(packet)
+            return DecisionResult(model="synthetic", collection_only=True,
+                interpretation=Interpretation(kind="report", source_refs=[packet["anchor_source_id"]]))
+    checkpoint = EvaluationCheckpoint(tmp_path / "checkpoint.json", {"model": "synthetic", "version": "v1"})
+    cases = [{"id": "one", "messages": ["Original report"], "expected": {"kind": "report"}}]
+    first = await evaluate(cases, Adapter(), collect=True, master="Approved master", checkpoint=checkpoint)
+    resumed = EvaluationCheckpoint(checkpoint.path, checkpoint.identity)
+    assert await evaluate(cases, Adapter(), collect=True, master="Approved master", checkpoint=resumed) == first
+    assert len(calls) == 1
+    with pytest.raises(ValueError, match="source context changed"):
+        await evaluate(cases, Adapter(), collect=True, master="Changed master", checkpoint=resumed)
+    with pytest.raises(ValueError, match="another dataset"):
+        EvaluationCheckpoint(checkpoint.path, {"model": "changed"})
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_provider_failure_requires_explicit_retry(tmp_path):
+    calls = []
+    class Adapter:
+        async def interpret(self, packet, profile, **kwargs):
+            calls.append(packet)
+            if len(calls) == 1:
+                raise DecisionFailure("decision_api_unavailable")
+            return DecisionResult(model="synthetic", collection_only=True,
+                interpretation=Interpretation(kind="report", source_refs=[packet["anchor_source_id"]]))
+    cases = [{"id": "one", "messages": ["Original report"], "expected": {"kind": "report"}}]
+    checkpoint = EvaluationCheckpoint(tmp_path / "checkpoint.json", {"model": "synthetic"})
+    for _ in range(2):
+        with pytest.raises(DecisionFailure, match="decision_api_unavailable"):
+            await evaluate(cases, Adapter(), collect=True, checkpoint=checkpoint)
+    assert len(calls) == 1
+    explicit_retry = EvaluationCheckpoint(checkpoint.path, checkpoint.identity, retry_provider_failures=True)
+    assert (await evaluate(cases, Adapter(), collect=True, checkpoint=explicit_retry))[0]["passed"]
+    assert len(calls) == 2
+
+
+def test_incomplete_observation_set_cannot_issue_activation_profile():
+    kinds = ("new_signal", "trade_update", "report", "unrelated", "incomplete", "ambiguous")
+    cases, rows = [], []
+    for i in range(72):
+        expected = dict.fromkeys(CRITICAL_FIELDS)
+        expected["kind"] = kinds[i % 6]
+        cases.append({"id": str(i), "split": "calibration" if i < 36 else "holdout", "expected": expected,
+            "group_id": "episode" + str(i), "origin": "real", "annotation_complete": True,
+            "language": ("de", "en", "ru")[i % 3], "tags": sorted(REQUIRED_SCENARIOS)})
+        rows.append({"id": str(i), "kind": kinds[i % 6], "source_id": "channel", "passed": True,
+            "accepted": True, "raw_correct": True, "critical_error": False,
+            "question_results": [{"family": "kind", "confidence": 1, "correct": True}]})
+    assert calibration_profile(rows, cases, ["channel"], "approved-master").validated
+    assert not calibration_profile(rows[:-1], cases, ["channel"], "approved-master").validated
+    rows[-1]["failure_code"] = "decision_api_unavailable"
+    assert not calibration_profile(rows, cases, ["channel"], "approved-master").validated
+
+
+@pytest.mark.asyncio
+async def test_semantic_holdout_does_not_grant_untrained_source_kind_permission():
+    import json
+
+    import httpx
+    from test_decisions import response_for
+
+    from aqla_agent.decisions import DEFAULT_DECISION_MODEL, OpenRouterDecisionAdapter
+    def upstream(request):
+        body = json.loads(request.content)
+        kind = "report" if body["state"].get("anchor_source_id") == training_ref else "new_signal"
+        return httpx.Response(200, json=response_for(body["questions"], kind=kind))
+    from aqla_hyperliquid_mcp.models import SourceEvent
+    training_source = SourceEvent(chat_id="channel", message_id=1, sent_at=1000, received_at=1000, text="Result report")
+    training_ref = training_source.source_id
+    test_source = SourceEvent(chat_id="channel", message_id=2, sent_at=2000, received_at=2000,
+        text="BTC long. Entry 100. SL 90. TP 110 / 120.")
+    dataset = [{"id": "train", "split": "calibration", "group_id": "one", "origin": "real",
+                "messages": [training_source.model_dump(mode="json")], "expected": {"kind": "report"}},
+               {"id": "hold", "split": "holdout", "group_id": "two", "origin": "real",
+                "messages": [test_source.model_dump(mode="json")], "expected": {"kind": "new_signal"}}]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        rows = await evaluate_split(dataset, OpenRouterDecisionAdapter("synthetic", client=client,
+            model_revision=DEFAULT_DECISION_MODEL), ["channel"])
+    assert rows[-1]["accepted"] and rows[-1]["passed"]
+    profile = calibration_profile(rows, dataset, ["channel"], "master")
+    assert not profile.validated and not profile.permits_kind("channel", "new_signal")
 
 
 def test_calibration_rejects_thread_leakage_before_model_calls():
@@ -23,10 +158,13 @@ def test_partial_annotations_and_critical_errors_cannot_activate_profile():
     dataset = [{"id": str(i), "expected": {"kind": "report"}, "annotation_complete": False,
                 "split": "calibration" if i < 30 else "holdout"} for i in range(60)]
     rows = [{"id": c["id"], "kind": "report", "passed": True, "critical_error": False,
-             "probabilities": {"kind": 1.0, "live_action": 0.0}} for c in dataset]
+             "probabilities": {"kind": 1.0, "live_action": 0.0}, "raw_correct": True,
+             "accepted": True, "source_id": "channel",
+             "question_results": [{"family": "kind", "confidence": 1, "correct": True}]} for c in dataset]
     assert not calibration_profile(rows, dataset, ["channel"]).validated
     for case in dataset:
         case["group_id"] = "thread-" + case["id"]
+        case["origin"] = "real"
         case["annotation_complete"] = True
         case["expected"] = dict.fromkeys(CRITICAL_FIELDS)
         case["expected"]["kind"] = "report"
@@ -49,9 +187,17 @@ def test_probability_thresholds_are_fitted_only_to_training_group():
                {"id": "test", "expected": {}, "split": "holdout"}]
     rows = [{"id": "train", "kind": "new_signal", "passed": True, "critical_error": False, "probabilities": {"kind": 0.999}},
             {"id": "test", "kind": "new_signal", "passed": True, "critical_error": False, "probabilities": {"kind": 0.5}}]
+    for row in rows:
+        row.update(raw_correct=True, question_results=[{"family": "kind", "correct": True, "confidence": row["probabilities"]["kind"]}])
     assert calibration_profile(rows, dataset, ["channel"]).thresholds["kind"] == 0.999
     assert equal(["1.00", "2"], [1, 2])
     assert not equal(None, 0)
+
+
+def test_confidence_one_wrong_answer_disables_family_instead_of_accepting_equality():
+    thresholds, disabled = fit_thresholds([{"raw_correct": False, "baseline_gate_passed": True,
+        "question_results": [{"family": "kind", "correct": False, "confidence": 1}]}])
+    assert "kind" in disabled and "kind" not in thresholds
 
 
 @pytest.mark.asyncio

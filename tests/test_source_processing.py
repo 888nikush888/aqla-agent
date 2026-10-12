@@ -409,3 +409,56 @@ async def test_restart_after_final_preview_submits_only_saved_missing_plan(route
     assert boundaries["aster"].position > 0 and len(attempts) == 2
     assert all(len(boundaries[name].actions) == count for name, count in healthy_calls.items())
     await router.close()
+
+
+@pytest.mark.asyncio
+async def test_raw_collection_is_rejected_at_hybrid_record_boundary(native_processor, signal):
+    server, state, fake = native_processor
+    _, interpretation = signal
+    selected = await rpc(server, "source_prepare", processing_version="collection-boundary")
+    raw = DecisionResult(model="inception/mercury-decide:free", interpretation=interpretation,
+                         verified=True, collection_only=True)
+    with pytest.raises(Exception, match="Collection-only"):
+        await rpc(server, "source_record", job_id=selected["job"]["job_id"], decision_result=raw.model_dump(mode="json"))
+    assert not fake.actions and not state.snapshot()["plans"]
+
+
+@pytest.mark.asyncio
+async def test_policy_revocation_stops_unsent_legs_and_preserves_already_sent_operations(routed, setup, signal, monkeypatch):  # noqa: F811
+    router, boundaries = routed
+    state = setup[1]
+    processor = SourceProcessor(state, router)
+    processor.configure("hybrid", "worker")
+    _, interpretation = signal
+    async def unavailable(*args):
+        raise TemporaryObservation("read_unavailable", "preview", "transport")
+    monkeypatch.setattr(router.engines["aster"], "preview", unavailable)
+    job = processor.prepare("worker", "approved-profile")["job"]
+    processor.record("worker", job["job_id"], DecisionResult(model="inception/mercury-decide:free", interpretation=interpretation, verified=True))
+    await processor.apply("worker", job["job_id"])
+    assert boundaries["hyperliquid"].position > 0 and boundaries["lighter"].position > 0
+    before = {name: len(boundary.actions) for name, boundary in boundaries.items()}
+    operations = state.snapshot()["operations"]
+    restarted = SourceProcessor(state, router)
+    restarted.configure("hybrid", "worker")
+    restarted.prepare("worker", "revoked-profile")
+    assert state.snapshot()["source_jobs"][job["job_id"]]["failure_code"] == "source_policy_changed"
+    with pytest.raises(Exception, match="not a validated"):
+        await restarted.apply("worker", job["job_id"])
+    assert state.snapshot()["operations"] == operations
+    assert all(len(boundary.actions) == before[name] for name, boundary in boundaries.items())
+    assert boundaries["aster"].position == 0
+    await router.close()
+
+
+@pytest.mark.asyncio
+async def test_current_policy_is_required_for_cached_unsubmitted_results(native_processor, signal):
+    server, state, fake = native_processor
+    _, interpretation = signal
+    job = (await rpc(server, "source_prepare", processing_version="p1"))["job"]
+    await rpc(server, "source_record", job_id=job["job_id"], decision_result=DecisionResult(
+        model="inception/mercury-decide:free", interpretation=interpretation, verified=True).model_dump(mode="json"))
+    await rpc(server, "source_prepare", processing_version="p2")
+    with pytest.raises(Exception, match="policy changed"):
+        await rpc(server, "source_apply", job_id=job["job_id"])
+    assert not fake.actions and not state.snapshot()["plans"]

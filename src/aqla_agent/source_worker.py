@@ -190,6 +190,15 @@ class SourceWorker:
             packet["approved_source_guidance"] = self.extension.master_path.read_text(encoding="utf-8")
             if job.get("result") is not None:
                 result = DecisionResult.model_validate(job["result"])
+                if job.get("policy_version") != policy_version or result.question_version != VERSION or result.collection_only:
+                    raise DecisionFailure("cached_decision_policy_changed")
+                if not result.fallback and result.model != "python" and (
+                        not profile.permits(source=next(row["chat_id"] for row in packet["messages"]
+                            if row["event_id"] == packet["anchor_event_id"]), master_hash=master_hash,
+                            model=result.model, model_revision=result.model_revision)
+                        or not profile.permits_kind(next(row["chat_id"] for row in packet["messages"]
+                            if row["event_id"] == packet["anchor_event_id"]), result.interpretation.kind)):
+                    raise DecisionFailure("cached_decision_not_calibrated")
                 measured.workflow["cache_hit"] = True
             else:
                 usage = measured.api
@@ -212,6 +221,12 @@ class SourceWorker:
             measured.workflow.update(fallback=result.fallback, decision_success=not result.fallback,
                                      payload_characters=len(json.dumps(packet, ensure_ascii=False)))
             if self.config.mode == "hybrid":
+                try:
+                    current_profile = self.profile()
+                except DecisionFailure:
+                    current_profile = CalibrationProfile()
+                if self.extension.skill_hash() != master_hash or current_profile != profile:
+                    raise DecisionFailure("source_policy_changed")
                 applied = await self.internal("source_apply", job_id=job["job_id"])
                 measured.workflow["source_job_status"] = applied.get("status")
             else:
@@ -232,7 +247,10 @@ class SourceWorker:
         source = next(row["chat_id"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
         if self.config.mode == "hybrid" and not profile.permits(source, master_hash, model=self.config.model, model_revision=revision):
             raise DecisionFailure("source_not_calibrated")
-        return await self.adapter.interpret(packet, profile, collect=self.config.mode == "shadow", usage=usage)
+        result = await self.adapter.interpret(packet, profile, collect=self.config.mode == "shadow", usage=usage)
+        if self.config.mode == "hybrid" and not profile.permits_kind(source, result.interpretation.kind):
+            raise DecisionFailure("source_decision_kind_not_calibrated")
+        return result
 
     async def deliver(self):
         await self.bind()

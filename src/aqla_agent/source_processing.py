@@ -36,12 +36,15 @@ class SourceProcessor:
     def __init__(self, state, trading):
         self.state, self.trading = state, trading
         self.mode, self.owner = "legacy", None
+        self.policy_version = None
         self.instance = secrets.token_hex(16)
         self.active_jobs = set()
 
     def configure(self, mode, owner):
         if mode not in ("legacy", "shadow", "hybrid") or not owner or len(owner) > 100:
             raise AqlaError("Invalid native source processing configuration")
+        if (mode, owner) != (self.mode, self.owner):
+            self.policy_version = None
         self.mode, self.owner = mode, owner
         return {"mode": mode}
 
@@ -60,12 +63,20 @@ class SourceProcessor:
         self.require_owner(owner)
         if not isinstance(version, str) or not 1 <= len(version) <= 100:
             raise AqlaError("A versioned native interpretation policy is required")
+        self.policy_version = version
         snapshot = self.state.snapshot()
         if self.mode == "hybrid":
             for record in snapshot.get("source_jobs", {}).values():
                 if record["status"] != "waiting_preview" or record["job_id"] in self.active_jobs:
                     continue
                 job = SourceJob.model_validate(record)
+                if job.policy_version != version or job.version != VERSION or job.result is None or job.result.question_version != VERSION:
+                    # A policy change revokes ONLY the right to submit remaining
+                    # legs. Already sent operations stay owned by engine recovery.
+                    job.status, job.failure_code = "failed", "source_policy_changed"
+                    self.save(job)
+                    self.fail(owner, job.job_id, job.failure_code)
+                    continue
                 targets = self.pending_previews(snapshot, job)
                 if not targets and not self.unsubmitted_plans(snapshot, job):
                     job.status = "done"
@@ -208,7 +219,9 @@ class SourceProcessor:
             anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
             if anchor["text"].strip() or result.interpretation.kind != "incomplete":
                 raise AqlaError("Python-only interpretation is restricted to missing original text")
-        if not result.fallback and result.interpretation.kind in ("new_signal", "trade_update") and not result.verified:
+        if result.collection_only and self.mode != "shadow":
+            raise AqlaError("Collection-only decisions cannot authorize production processing")
+        if not result.collection_only and not result.fallback and result.interpretation.kind in ("new_signal", "trade_update") and not result.verified:
             raise AqlaError("Actionable decision needs its second verification")
         if job.result is not None and job.result != result:
             raise AqlaError("An already recorded interpretation cannot be replaced")
@@ -254,6 +267,10 @@ class SourceProcessor:
         resume_preview = job.status == "waiting_preview"
         if job.status not in ("interpreted", "waiting_preview") or job.result is None:
             raise AqlaError("Source job is not a validated unsubmitted interpretation")
+        if job.result.collection_only:
+            raise AqlaError("Collection-only decisions cannot execute")
+        if job.policy_version != self.policy_version or job.version != VERSION or job.result.question_version != VERSION:
+            raise AqlaError("Source processing policy changed; no new submission")
         # This read happens immediately before the existing transactional source/entry guards.
         context, packet, fingerprint = self.context(job.event_id)
         if not resume_preview and fingerprint != job.fingerprint:

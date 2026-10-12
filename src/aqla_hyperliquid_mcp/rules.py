@@ -92,8 +92,8 @@ def quoted_numbers(quote):
 def quoted_leverage_numbers(quote):
     # General multiplier notation, not channel patterns. Keep price evidence parsing unchanged.
     numeric = r"\d+(?:[.,]\d+)*"
-    quote = re.sub(rf"(?<![\w.])[x×]\s*({numeric})(?!\w)", r" \1 ", quote, flags=re.I)
-    quote = re.sub(rf"(?<![\w.])({numeric})\s*(?:[x×]|fach)(?!\w)", r" \1 ", quote, flags=re.I)
+    quote = re.sub(rf"(?<![\w.])[xх×]\s*({numeric})(?!\w)", r" \1 ", quote, flags=re.I)
+    quote = re.sub(rf"(?<![\w.])({numeric})\s*(?:[xх×]|fach)(?!\w)", r" \1 ", quote, flags=re.I)
     return quoted_numbers(quote)
 
 
