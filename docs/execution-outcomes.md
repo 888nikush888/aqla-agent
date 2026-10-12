@@ -21,6 +21,11 @@ Readers must use the additive `execution_outcome` projection instead.
   ownership cannot be confirmed. A legacy scalar `filled_quantity` without
   receipts does not repair this. A manual position conflict hides the current
   own remaining quantity without erasing confirmed historical entry fills.
+  Any prepared, sending or unknown associated entry attempt keeps ownership
+  unconfirmed, even if a newer attempt is explicitly unsent. Historical unsent
+  attempts do not obscure a subsequently confirmed entry. Associations use
+  exact `entry:<trade_id>` identities and colon-delimited attempt suffixes;
+  unrelated SL, close, leverage and other-trade operations are excluded.
 - `source_revision_unconfirmed`, `update_only`: a source revision cannot use
   another revision's entry fills as its own execution proof, and an SL/TP update
   does not prove a new entry. Existing fills appear under `bound_trade_history`.

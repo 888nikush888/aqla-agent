@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from aqla_hyperliquid_mcp.models import AqlaError, digest
 
-from .execution_outcome import source_trade_outcome, trade_outcome
+from .execution_outcome import EntryOperations, source_trade_outcome, trade_outcome
 from .sources import resolve_source
 
 BYTE_CAP = 8192
@@ -144,7 +144,9 @@ def source_lookup(snapshot, start, end, *, source=None, symbol=None, status=None
     for trade in snapshot.get("trades", {}).values():
         for source_id in trade["plan"]["source_refs"]:
             by_source.setdefault(source_id, []).append(trade)
-    for operation in snapshot.get("operations", {}).values():
+    operations = list(snapshot.get("operations", {}).values())
+    entry_operations = EntryOperations(operations)
+    for operation in operations:
         if operation["phase"] in ("prepared", "sending", "unknown"):
             for identity in operation["operation_id"].split(":"):
                 if identity in snapshot.get("trades", {}):
@@ -181,7 +183,7 @@ def source_lookup(snapshot, start, end, *, source=None, symbol=None, status=None
                 "is_plan_source_revision": plan.get("source_revisions", {}).get(event["source_id"]) == event["event_id"] if plan else None,
                 "confirmed_own_entry_fill_count": len(entries), "confirmed_own_entry_quantity": str(sum((Decimal(fill["sz"]) for fill in entries), Decimal(0))) if entries else None,
                 "event_status_is_fill_proof": False, "uncertain_operation_count": uncertain.get((trade or {}).get("trade_id"), 0),
-                "execution_outcome": source_trade_outcome(event, trade, snapshot.get("operations", {})) if trade else {"state": "unbound", "entry_fill_confirmed": None},
+                "execution_outcome": source_trade_outcome(event, trade, entry_operations) if trade else {"state": "unbound", "entry_fill_confirmed": None},
                 "trade_details": {"tool": "trade_diagnostics", "arguments": {"trade_id": trade["trade_id"], "view": "full"}} if trade else None})
     retained_revisions = len({row["event_id"] for row in rows})
     missing = 0
@@ -200,7 +202,7 @@ def source_lookup(snapshot, start, end, *, source=None, symbol=None, status=None
                     "source_time": None, "interval_membership": "unknown_original_timestamp_not_retained",
                     "status_filter_membership": "unknown_original_event_status" if status else None,
                     "account": plan.get("account"), "network": plan["network"], "exchange": plan.get("exchange", "hyperliquid"),
-                    "execution_outcome": trade_outcome(trade, snapshot.get("operations", {})),
+                    "execution_outcome": trade_outcome(trade, entry_operations),
                     "trade_details": {"tool": "trade_diagnostics", "arguments": {"trade_id": trade["trade_id"], "view": "full"}}})
     binding = digest([query, rows])
     if cursor is not None:

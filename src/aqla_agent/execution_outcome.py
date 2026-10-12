@@ -4,6 +4,27 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 
 
+class EntryOperations:
+    """Index exact entry identities once; never associate SL/close or substrings."""
+
+    def __init__(self, operations):
+        self.by_id, self.by_trade = {}, {}
+        records = operations.items() if isinstance(operations, dict) else ((None, row) for row in operations)
+        for key, row in records:
+            identity = row.get("operation_id", key)
+            if not isinstance(identity, str):
+                continue
+            self.by_id[identity] = row
+            if identity.startswith("entry:"):
+                trade_id = identity.split(":", 2)[1]
+                self.by_trade.setdefault(trade_id, []).append(row)
+
+    def for_trade(self, trade):
+        rows = self.by_trade.get(trade.get("trade_id"), [])
+        current = self.by_id.get(trade.get("entry_operation_id"))
+        return [*rows, current] if current is not None and all(current is not row for row in rows) else rows
+
+
 def quantity(value):
     try:
         result = Decimal(str(value))
@@ -33,10 +54,10 @@ def retry_view(row):
 def trade_outcome(trade, operations=()):
     """Separate receipt-backed entry history from reliable current ownership."""
     operation_id = trade.get("entry_operation_id")
-    entry_ops = ([operations[operation_id]] if operation_id in operations else []) if isinstance(operations, dict) else [
-        row for row in operations if operation_id and row.get("operation_id") == operation_id]
-    phase = entry_ops[0].get("phase") if entry_ops else None
-    outcome = entry_ops[0].get("outcome") if entry_ops else None
+    index = operations if isinstance(operations, EntryOperations) else EntryOperations(operations)
+    entry_ops = index.for_trade(trade)
+    current = index.by_id.get(operation_id, {})
+    outcome = current.get("outcome")
     fills = list(trade.get("fill_events", {}).values())
     entries = [row for row in fills if row.get("kind") == "entry"]
     valid = all(row.get("kind") in ("entry", "tp", "sl", "close") and quantity(row.get("sz")) is not None and quantity(row.get("sz")) > 0 for row in fills)
@@ -47,9 +68,9 @@ def trade_outcome(trade, operations=()):
     consistent = entered is not None and exited <= entered and recorded == entered and remainder == entered - exited
     stage = trade.get("status")
     conflict = stage == "conflicted" or bool(trade.get("external_conflict"))
-    uncertain = stage == "unknown" or phase in ("prepared", "sending", "unknown")
+    uncertain = stage == "unknown" or any(row.get("phase") in ("prepared", "sending", "unknown") for row in entry_ops)
     missing = recorded is None or entered is None or (recorded > 0 and not entries)
-    submission = ("not_sent" if outcome == "not_sent" else "unconfirmed" if uncertain else
+    submission = ("unconfirmed" if uncertain else "not_sent" if outcome == "not_sent" else
                   "accepted" if outcome in ("accepted", "partial") else "sent_rejected" if outcome == "rejected" else "unknown")
     retry = retry_view(trade)
     if conflict:
@@ -80,16 +101,17 @@ def trade_outcome(trade, operations=()):
             "historical_fill_evidence_missing": missing, "observation_retry": retry}
 
 
-def event_outcomes(snapshot, event):
+def event_outcomes(snapshot, event, operations=None):
     """Use exact immutable source revisions, preserving independent target scopes."""
     rows = []
     covered = set()
     targets = event.get("targets", {})
+    operations = EntryOperations(snapshot.get("operations", {})) if operations is None else operations
     for identity, target in targets.items():
         trade = snapshot.get("trades", {}).get(target.get("trade_id"))
         saved = snapshot.get("plans", {}).get(target.get("plan_id"), {})
         plan = trade.get("plan", {}) if trade else saved.get("plan", {})
-        facts = source_trade_outcome(event, trade, snapshot.get("operations", {})) if trade else {
+        facts = source_trade_outcome(event, trade, operations) if trade else {
             "state": "pending_observation" if (retry := retry_view(target) or retry_view(saved)) and not retry.get("exhausted") else
                      "unknown" if target.get("trade_id") else
                      "planned" if target.get("status") == "planned" else "not_sent" if target.get("status") == "rejected" else "unknown",
@@ -108,7 +130,7 @@ def event_outcomes(snapshot, event):
         rows.append({"trade_id": trade["trade_id"], "plan_id": plan.get("plan_id"),
                      **{key: plan.get(key) for key in ("exchange", "network", "account_key", "profile_id")},
                      "quote_token": plan.get("market", {}).get("quote_token"),
-                     "source_revision_matches": True, **source_trade_outcome(event, trade, snapshot.get("operations", {}))})
+                     "source_revision_matches": True, **source_trade_outcome(event, trade, operations)})
     covered_plans = {row.get("plan_id") for row in rows}
     candidates = sorted(((identity, saved) for identity, saved in snapshot.get("plans", {}).items()
                          if not targets and saved.get("event_id") == event.get("event_id")),
@@ -123,7 +145,7 @@ def event_outcomes(snapshot, event):
                      **{key: plan.get(key) for key in ("exchange", "network", "account_key", "profile_id")},
                      "quote_token": plan.get("market", {}).get("quote_token"),
                      "source_revision_matches": revision_matches(event, plan),
-                     **(source_trade_outcome(event, stored_trade, snapshot.get("operations", {})) if stored_trade else {
+                     **(source_trade_outcome(event, stored_trade, operations) if stored_trade else {
                          "state": "pending_observation" if retry and not retry.get("exhausted") else "not_sent" if retry and retry.get("exhausted") else "planned",
                          "entry_fill_confirmed": False, "observation_retry": retry})})
         covered.add(plan.get("trade_id"))
@@ -148,7 +170,8 @@ def source_trade_outcome(event, trade, operations=()):
 
 def execution_counts(snapshot):
     active = {"waiting_entry", "entry_pending", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
-    facts = [(row.get("status"), trade_outcome(row, snapshot.get("operations", {}))) for row in snapshot.get("trades", {}).values()]
+    operations = EntryOperations(snapshot.get("operations", {}))
+    facts = [(row.get("status"), trade_outcome(row, operations)) for row in snapshot.get("trades", {}).values()]
     return {"known_own_open": sum(status in active and row["current_ownership_confirmed"] and quantity(row["known_own_remaining_quantity"]) > 0 for status, row in facts),
             "pending_entries": sum(status in active and row["state"] in ("waiting_entry", "pending_entry", "pending_observation") for status, row in facts),
             "unsettled_ownership": sum(status in active and row["state"] in ("conflicted", "unknown") for status, row in facts),

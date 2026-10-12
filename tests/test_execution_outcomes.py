@@ -113,6 +113,35 @@ def test_unknown_send_has_priority_over_retry_and_known_zero_quantity():
     assert "Wiederaufnahme:** gesperrt" in message and "Nächste Prüfung" not in message
 
 
+@pytest.mark.parametrize("phase", ["prepared", "sending", "unknown"])
+def test_older_unsettled_entry_attempt_blocks_new_not_sent_retry(phase):
+    marker = {"attempts": 2, "next_retry_at": 2000, "deadline_at": 5000, "exhausted": False, "authority": "execute"}
+    row = trade("preparing", entry_operation_id="entry:own:attempt:2", observation_retry=marker)
+    snapshot = data(row)
+    snapshot["operations"] = {
+        "entry:own": {"operation_id": "entry:own", "phase": phase},
+        "entry:own:attempt:2": {"operation_id": "entry:own:attempt:2", "phase": "rejected", "outcome": "not_sent"}}
+    facts = trade_outcome(row, snapshot["operations"])
+    assert facts["state"] == "unknown" and facts["entry_submission"] == "unconfirmed"
+    assert facts["known_own_remaining_quantity"] is None and not facts["current_ownership_confirmed"]
+    assert facts["entry_fill_confirmed"] is None
+    assert "Wiederaufnahme:** gesperrt" in rendered(snapshot) and "Nächste Prüfung" not in rendered(snapshot)
+
+
+def test_historical_not_sent_does_not_obscure_new_confirmed_fill_or_adopt_foreign_operations():
+    row = trade("open", entry_operation_id="entry:own:attempt:2", filled_quantity="2", remaining_quantity="2",
+                fill_events={"e": {"kind": "entry", "sz": "2"}})
+    operations = {
+        "entry:own": {"operation_id": "entry:own", "phase": "rejected", "outcome": "not_sent"},
+        "entry:own:attempt:2": {"operation_id": "entry:own:attempt:2", "phase": "acknowledged", "outcome": "accepted"},
+        **{identity: {"operation_id": identity, "phase": "unknown"} for identity in (
+            "close:own:entry", "sl:own:entry", "entry:own-other:attempt:2", "leverage:own", "entry:foreign:own")}}
+    facts = trade_outcome(row, operations)
+    assert facts["state"] == "filled" and facts["entry_submission"] == "accepted"
+    assert facts["entry_fill_confirmed"] and facts["known_own_remaining_quantity"] == "2"
+    assert facts["current_ownership_confirmed"]
+
+
 def test_retry_markers_are_bounded_truthful_and_terminal_after_exhaustion():
     marker = {"attempts": 1, "next_retry_at": 2000, "deadline_at": 5000, "exhausted": False,
               "code": "stale_observation", "stage": "account", "category": "read", "authority": "execute", "exception_type": "TimeoutError",

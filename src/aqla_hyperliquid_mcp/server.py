@@ -9,7 +9,13 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from aqla_agent.execution_outcome import event_outcomes, execution_counts, retry_view, trade_outcome
+from aqla_agent.execution_outcome import (
+    EntryOperations,
+    event_outcomes,
+    execution_counts,
+    retry_view,
+    trade_outcome,
+)
 from aqla_agent.messages import telegram_view
 from aqla_agent.monthly import MonthlyFailure, MonthlyJobBinding, MonthlyPublication, MonthlySection
 from aqla_agent.native_setup import load_verifier
@@ -169,6 +175,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         queue = queue_overview(snapshot)
         ready = trading.ready()
         inventory = await trading.inventory_status()
+        entry_operations = EntryOperations(snapshot["operations"])
         page = notification_page(snapshot, authority.key if authority else None, ready, require_key=False)
         claims = authorize(context_auth, operator=True) if context_auth else None
         lease_id, binding = setup_context(claims)
@@ -176,7 +183,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "policy": snapshot["policy"], "policy_revision": snapshot["policy_revision"], "sources": snapshot["sources"],
                 "source_names": snapshot.get("source_names", {}), "source_names_revision": snapshot.get("source_names_revision", 0),
                 "pending": queue["ready"], "source_queue": queue,
-                "trades": [{**row, "execution_outcome": trade_outcome(row, snapshot["operations"])} for row in snapshot["trades"].values() if row["status"] in OPEN],
+                "trades": [{**row, "execution_outcome": trade_outcome(row, entry_operations)} for row in snapshot["trades"].values() if row["status"] in OPEN],
                 "execution_counts": execution_counts(snapshot),
                 "unresolved_operations": [trading.public_operation(row) for row in snapshot["operations"].values() if row["phase"] in ("prepared", "sending", "unknown")],
                 "notifications": page["notifications"], "notification_versions": page["notification_versions"],
@@ -252,13 +259,14 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
             raise AqlaError("Diagnostic page requires offset >= 0 and limit 1–100")
         snapshot = state.snapshot()
+        entry_operations = EntryOperations(snapshot["operations"])
         if trade_id is None:
             if not symbol:
                 raise AqlaError("Supply an Aqla trade ID or a market symbol")
             candidates = [row for row in snapshot["trades"].values() if row["plan"]["market"]["symbol"].casefold() == symbol.casefold()]
             candidates.sort(key=lambda row: (row.get("closed_at", row["plan"]["created_at"]), row["trade_id"]), reverse=True)
             if len(candidates) != 1:
-                return {"candidates": [{"trade_id": row["trade_id"], "market": row["plan"]["market"]["symbol"], "status": row["status"], "execution_outcome": trade_outcome(row, snapshot["operations"]), "created_at": row["plan"]["created_at"], "closed_at": row.get("closed_at")} for row in candidates[offset:offset + limit]],
+                return {"candidates": [{"trade_id": row["trade_id"], "market": row["plan"]["market"]["symbol"], "status": row["status"], "execution_outcome": trade_outcome(row, entry_operations), "created_at": row["plan"]["created_at"], "closed_at": row.get("closed_at")} for row in candidates[offset:offset + limit]],
                         "selection_required": True, "total": len(candidates), "offset": offset,
                         "next_offset": offset + limit if offset + limit < len(candidates) else None}
             trade_id = candidates[0]["trade_id"]
@@ -268,7 +276,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         operations = [trading.public_operation(row) for row in snapshot["operations"].values()
                       if trade_id in row["operation_id"]]
         result = {"trade_id": trade_id, "status": trade["status"], "plan": trade["plan"],
-                "execution_outcome": trade_outcome(trade, snapshot["operations"]), "observation_retry": retry_view(trade),
+                "execution_outcome": trade_outcome(trade, entry_operations), "observation_retry": retry_view(trade),
                 "sources": [row["source"] for row in snapshot["events"].values() if row["source_id"] in trade["plan"]["source_refs"]],
                 "source_names": snapshot.get("source_names", {}), "orders": trade["orders"], "exit_orders": trade.get("exit_orders", []),
                 "order_observations": trade.get("order_observations", {}), "fill_events": trade.get("fill_events", {}),
@@ -291,8 +299,9 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         """Read source message, bounded same-channel/reply context and open trade bindings."""
         result = trading.context(event_id, decision=view == "decision")
         snapshot = state.snapshot()
-        result = {**result, "execution_outcome": event_outcomes(snapshot, result["event"]),
-                  "trades": [{**row, "execution_outcome": trade_outcome(row, snapshot["operations"])} for row in result["trades"]]}
+        entry_operations = EntryOperations(snapshot["operations"])
+        result = {**result, "execution_outcome": event_outcomes(snapshot, result["event"], entry_operations),
+                  "trades": [{**row, "execution_outcome": trade_outcome(row, entry_operations)} for row in result["trades"]]}
         if view == "decision":
             from aqla_agent.efficiency import decision_context
             return decision_context(result)
@@ -320,8 +329,9 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             raise AqlaError("Source context batch requires distinct event IDs")
         contexts = [trading.context(identity, decision=True) for identity in event_ids]
         snapshot = state.snapshot()
-        return decision_batch([{**context, "execution_outcome": event_outcomes(snapshot, context["event"]),
-                                "trades": [{**row, "execution_outcome": trade_outcome(row, snapshot["operations"])} for row in context["trades"]]}
+        entry_operations = EntryOperations(snapshot["operations"])
+        return decision_batch([{**context, "execution_outcome": event_outcomes(snapshot, context["event"], entry_operations),
+                                "trades": [{**row, "execution_outcome": trade_outcome(row, entry_operations)} for row in context["trades"]]}
                                for context in contexts])
 
     @server.tool(annotations=write)
