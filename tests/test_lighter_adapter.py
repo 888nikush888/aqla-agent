@@ -371,3 +371,47 @@ async def test_actual_native_sdk_signs_oto_parent_with_nil_child_quantity_and_id
         assert body["AccountIndex"] == 42 and body["ApiKeyIndex"] == 4 and body["Nonce"] == 1
     finally:
         await signer.close()
+
+
+@pytest.mark.asyncio
+async def test_lighter_grouped_entry_rechecks_after_last_sending_write(lighter, setup, signal, monkeypatch):
+    from aqla_agent import entry, venues
+    from aqla_agent import lighter as lighter_module
+    from aqla_agent import trading as trading_module
+    from aqla_hyperliquid_mcp.models import now_ms
+    adapter, boundary, _, engine = lighter
+    state = setup[1]
+    source, interpretation = signal
+    plan = await engine.preview(source.event_id, interpretation)
+    clock = [now_ms()]
+    for module in (lighter_module, entry, trading_module, venues):
+        monkeypatch.setattr(module, "now_ms", lambda: clock[0])
+    original_account = adapter.account_snapshot
+    async def account(market):
+        return (await original_account(market)).model_copy(update={"observed_at": clock[0]})
+    monkeypatch.setattr(adapter, "account_snapshot", account)
+    original_update, original_transport = state.update, boundary.handle
+    delayed = False
+    def update(callback):
+        nonlocal delayed
+        result = original_update(callback)
+        row = state.snapshot()["operations"].get("entry:" + plan["trade_id"])
+        if not delayed and row and row["phase"] == "sending":
+            delayed = True
+            clock[0] += 2001
+        return result
+    def transport(request):
+        response = original_transport(request)
+        if request.url.path.rsplit("/", 1)[-1] == "orderBookDetails":
+            data = response.json()
+            for row in data.get("order_book_details", []):
+                row["timestamp"] = clock[0]
+            return httpx.Response(200, json=data)
+        return response
+    monkeypatch.setattr(state, "update", update)
+    adapter.client._transport = httpx.MockTransport(transport)
+    result = await engine.execute(plan["plan_id"])
+    assert delayed and result["status"] == "open"
+    assert len([row for row in boundary.orders.values() if not row["reduce_only"]]) == 1
+    assert any(row["reduce_only"] and row["trigger_price"] != "0" for row in boundary.orders.values())
+    await adapter.close()

@@ -284,7 +284,8 @@ class Hyperliquid:
             raw = states.get(market.dex if market else "")
             equity, available = Decimal(raw["marginSummary"]["accountValue"]), Decimal(raw["withdrawable"])
         if now_ms() - stamp > 10000:
-            raise AqlaError("Complete account observation is stale")
+            from aqla_agent.observations import TemporaryObservation
+            raise TemporaryObservation("account_stale", "account")
         snapshot = AccountSnapshot(equity=equity, available_margin=available, position_size=positions.get(market.symbol, Decimal(0)) if market else None,
                                    observed_at=stamp, account_mode=mode or "disabled", positions=positions, entry_orders=entries)
         self.last_inventory = snapshot
@@ -388,12 +389,17 @@ class Hyperliquid:
                 return previous
             if deadline is not None and now_ms() >= deadline:
                 raise AqlaError("Operation deadline has expired")
-            await self.verify_signer()
+            from aqla_agent.observations import read_observation
+            await read_observation(self.verify_signer, "signer")
             if async_prepare_guard is not None:
+                if invalidate := getattr(async_prepare_guard, "invalidate_account", None):
+                    invalidate()
                 await async_prepare_guard()
             nonce = self._nonce(nonce_override, allow_existing=allow_existing_nonce)
             expires = min(now_ms() + 30000, deadline) if deadline is not None else now_ms() + 30000
             payload = json.loads(json.dumps(build(nonce, expires), allow_nan=False))
+            if async_prepare_guard is not None:
+                await async_prepare_guard()
             record = {"operation_id": operation_id, "request_hash": request_hash, "request": request,
                       "wire_action": payload["action"], "nonce": nonce, "expires_after": payload.get("expiresAfter"),
                       "wire_vault_address": payload.get("vaultAddress"),
@@ -408,10 +414,13 @@ class Hyperliquid:
             self.state.update(prepare)
             if async_prepare_guard is not None:
                 try:
+                    if invalidate := getattr(async_prepare_guard, "invalidate_account", None):
+                        invalidate()
                     await async_prepare_guard()
                 except BaseException as error:
-                    message = str(error) if isinstance(error, AqlaError) else "Entry guard failed before any exchange send"
-                    self.state.update(lambda state: state["operations"][operation_id].update(phase="rejected", outcome="not_sent", result={"error": message}))
+                    from aqla_agent.observations import not_sent
+                    fact = not_sent(error, "prepared_guard")
+                    self.state.update(lambda state, fact=fact: state["operations"][operation_id].update(phase="rejected", outcome="not_sent", result=fact))
                     if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
                         raise
                     return self.state.snapshot()["operations"][operation_id]
@@ -424,9 +433,23 @@ class Hyperliquid:
                         raise AqlaError("Entry deadline expired before exchange send")
                     state["operations"][operation_id].update(phase="sending")
                 self.state.update(begin_send)
-            except AqlaError as error:
-                message = str(error)
-                self.state.update(lambda state: state["operations"][operation_id].update(phase="rejected", outcome="not_sent", result={"error": message}))
+                # The durable sending write itself may be slow. Observe again
+                # after it, then make the last synchronous check at transport.
+                if async_prepare_guard is not None:
+                    await async_prepare_guard()
+                if prepare_guard is not None:
+                    prepare_guard(self.state.snapshot())
+                if deadline is not None and now_ms() >= deadline:
+                    raise AqlaError("Entry deadline expired before exchange transport")
+                if payload.get("expiresAfter") is not None and now_ms() >= payload["expiresAfter"]:
+                    from aqla_agent.observations import TemporaryObservation
+                    raise TemporaryObservation("wire_expired", "transport_guard")
+            except BaseException as error:
+                from aqla_agent.observations import not_sent
+                fact = not_sent(error, "transport_guard")
+                self.state.update(lambda state, fact=fact: state["operations"][operation_id].update(phase="rejected", outcome="not_sent", result=fact))
+                if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
                 return self.state.snapshot()["operations"][operation_id]
             try:
                 if sender is None:

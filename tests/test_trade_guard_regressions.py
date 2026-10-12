@@ -10,15 +10,19 @@ from aqla_hyperliquid_mcp.models import AqlaError, Interpretation
 from aqla_hyperliquid_mcp.storage import read_snapshot
 
 
+class SimulatedProcessCrash(BaseException):
+    """Abrupt process death bypasses normal fail-closed exception handling."""
+
+
 async def admitted_without_entry(trading, source, interpretation, monkeypatch):
     plan = await trading.preview(source.event_id, interpretation)
     original = trading._entry_steps
 
     async def crash(*args):
-        raise RuntimeError("Crash after admission, before entry preparation")
+        raise SimulatedProcessCrash("Crash after admission, before entry preparation")
 
     monkeypatch.setattr(trading, "_entry_steps", crash)
-    with pytest.raises(RuntimeError, match="before entry preparation"):
+    with pytest.raises(SimulatedProcessCrash, match="before entry preparation"):
         await trading.execute(plan["plan_id"])
     monkeypatch.setattr(trading, "_entry_steps", original)
     return plan

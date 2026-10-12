@@ -105,9 +105,15 @@ async def test_final_admission_requires_fresh_account_budget(setup, signal, monk
         return account.model_copy(update=values)
 
     monkeypatch.setattr(exchange, "account_snapshot", changed)
-    with pytest.raises(AqlaError):
-        await trading.execute(plan["plan_id"])
-    assert plan["trade_id"] not in state.snapshot()["trades"]
+    if change == "stale":
+        pending = await trading.execute(plan["plan_id"])
+        assert pending["observation_retry"]["attempts"] == 1
+        assert pending["observation_retry"]["code"] == "account_stale"
+        assert pending["reserved_risk"] != "0"
+    else:
+        with pytest.raises(AqlaError):
+            await trading.execute(plan["plan_id"])
+        assert plan["trade_id"] not in state.snapshot()["trades"]
     assert fake.actions == []
 
 
@@ -147,8 +153,13 @@ async def test_unsent_entry_rechecks_after_dispatch_signer_await(setup, signal, 
                 change_admission(state, trading, source, plan, change)
 
     monkeypatch.setattr(exchange, "verify_signer", changed)
-    with pytest.raises(AqlaError):
-        await trading.execute(plan["plan_id"])
+    if change == "stale":
+        pending = await trading.execute(plan["plan_id"])
+        assert pending["observation_retry"]["code"] == "account_stale"
+        assert pending["observation_retry"]["attempts"] == 1
+    else:
+        with pytest.raises(AqlaError):
+            await trading.execute(plan["plan_id"])
     assert [row["type"] for row in fake.actions] == ["updateLeverage"]
     assert "entry:" + plan["trade_id"] not in state.snapshot()["operations"]
 
@@ -160,11 +171,14 @@ async def test_revoked_subscription_cancels_admitted_but_unsent_recovery(setup, 
     plan = await trading.preview(source.event_id, interpretation)
     original = trading._entry_steps
 
+    class SimulatedProcessCrash(BaseException):
+        pass
+
     async def interrupted(*args):
-        raise RuntimeError("Crash after admission")
+        raise SimulatedProcessCrash("Crash after admission")
 
     monkeypatch.setattr(trading, "_entry_steps", interrupted)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(SimulatedProcessCrash):
         await trading.execute(plan["plan_id"])
     state.update(lambda row: row.update(sources=[], source_aliases={}))
     monkeypatch.setattr(trading, "_entry_steps", original)

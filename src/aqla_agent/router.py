@@ -10,6 +10,7 @@ from typing import Literal, NotRequired, TypedDict
 from aqla_hyperliquid_mcp.models import AqlaError, Market, SymbolUnavailable, TradePlan, digest, now_ms
 
 from .accounting import inventory_view
+from .observations import TemporaryObservation, diagnostic, retry_due, retry_marker
 from .pipelines import ConfigurationChanged, VenueState, validate_ranking_binding
 from .trading import OPEN, PendingStopUpdate, StopUpdatePhase, Trading
 from .venues import VenueAdapter, adapter_settings, execution_settings
@@ -264,12 +265,41 @@ class Router:
             if target["status"] != "pending":
                 outputs.append({**target, **({"plan": self.state.snapshot()["plans"][target["plan_id"]]["plan"]} if target.get("plan_id") else {})})
                 continue
+            marker = target.get("observation_retry")
+            if marker:
+                invalid = (marker["exhausted"] or now_ms() >= marker["deadline_at"]
+                           or marker["configuration_revision"] != preview_basis["configuration_revision"]
+                           or marker["ranking_revision"] != preview_basis["ranking_revision"])
+                if invalid:
+                    row = {**target, "status": "rejected", "error": "Original preview retry expired or its configuration changed",
+                           "observation_retry": {**marker, "exhausted": True}}
+                    self.state.update(lambda data, key=identity, value=row: data["events"][event_id]["targets"].__setitem__(key, value))
+                    outputs.append(row)
+                    continue
+                if not retry_due(marker):
+                    outputs.append(target)
+                    continue
+            def claim_preview(data, key=identity):
+                current = data["events"][event_id]["targets"][key]
+                if current["status"] != "pending" or current.get("preview_inflight_until", 0) > now_ms():
+                    return False
+                if current.get("observation_retry") and not retry_due(current["observation_retry"]):
+                    return False
+                current["preview_inflight_until"] = now_ms() + 300000
+                return True
+            if not self.state.update(claim_preview):
+                outputs.append(self.state.snapshot()["events"][event_id]["targets"][identity])
+                continue
             network = rank["network"] if rank else self.engines[target["exchange"]].exchange.settings.network if target["exchange"] in self.engines else "mainnet"
             requested = target["exchange"]
             engine = self.engine_for(requested, network)
             try:
                 if engine is None:
                     raise AqlaError(self.errors.get(requested + ":" + network, self.errors.get(requested, "Required account/network is unavailable")))
+                from aqla_hyperliquid_mcp.rules import latest_sources
+                with engine.state.scope(target, preview_snapshot=preview_basis):
+                    basis = engine.state.preview_snapshot()
+                    deadline = min(item["source"]["sent_at"] for item in latest_sources(basis["events"], interpretation.source_refs).values()) + basis["policy"]["max_signal_age_seconds"] * 1000
                 if ranked:
                     target = {**target, "requested_exchange": requested, "network": network, "rank_snapshot": rank,
                               "setup_id": digest([rank["source_id"], sorted(interpretation.source_refs)])[:32], "leg_id": identity}
@@ -306,12 +336,21 @@ class Router:
                         engine = replacement
                 async with engine.lock:
                     with engine.state.scope(target, preview_snapshot=preview_basis):
+                        basis = engine.state.preview_snapshot()
+                        deadline = min(item["source"]["sent_at"] for item in latest_sources(basis["events"], interpretation.source_refs).values()) + basis["policy"]["max_signal_age_seconds"] * 1000
                         plan = await engine.preview(event_id, interpretation)
                 row = {**target, "status": "planned", "plan_id": plan["plan_id"]}
+                if marker:
+                    row["observation_retry"] = {**marker, "completed": True, "exhausted": True}
                 outputs.append({**row, "plan": plan})
                 reserved.add((engine.state.account_key, interpretation.symbol.upper()))
             except Exception as error:
                 row = {**target, "status": "rejected", "error": str(error) if isinstance(error, AqlaError) else "Exchange preview unavailable"}
+                row["entry_diagnostic"] = diagnostic(error, "preview")
+                if isinstance(error, TemporaryObservation) and engine is not None:
+                    retry = retry_marker(marker, error, deadline, "preview")
+                    retry.update(configuration_revision=preview_basis["configuration_revision"], ranking_revision=preview_basis["ranking_revision"])
+                    row.update(status="rejected" if retry["exhausted"] else "pending", observation_retry=retry)
                 if isinstance(error, ConfigurationChanged):
                     row["preview_invalidated"] = True
                 outputs.append(row)
@@ -320,7 +359,7 @@ class Router:
         # Keep the old one-target interface usable for native Hermes and existing clients.
         if len(outputs) == 1 and outputs[0].get("plan"):
             return {**outputs[0]["plan"], "targets": outputs}
-        if len(outputs) == 1 and outputs[0]["pipeline_id"] == "legacy" and outputs[0].get("error"):
+        if len(outputs) == 1 and outputs[0]["pipeline_id"] == "legacy" and outputs[0]["status"] == "rejected" and outputs[0].get("error"):
             raise AqlaError(outputs[0]["error"])
         outputs.sort(key=lambda row: list(targets).index(row.get("leg_id", row["pipeline_id"] + ":" + row.get("requested_exchange", row["exchange"]))))
         return {"event_id": event_id, "targets": outputs}
@@ -357,6 +396,7 @@ class Router:
             result = {"exchange": venue, "plan_id": plan_id, "error": str(error) if isinstance(error, AqlaError) else "Exchange execution unavailable"}
             trade = self.state.snapshot()["trades"].get(plan["trade_id"])
             outcome = {"status": trade["status"] if trade else "rejected", "error": result["error"]}
+            outcome["entry_diagnostic"] = diagnostic(error, "execute")
             if trade:
                 outcome["trade_id"] = trade["trade_id"]
             elif isinstance(error, ConfigurationChanged):
@@ -365,6 +405,9 @@ class Router:
             for row in data["events"][saved["event_id"]].get("targets", {}).values():
                 if row.get("plan_id") == plan_id:
                     row.update(outcome)
+                    if trade := data["trades"].get(plan["trade_id"]):
+                        if trade.get("observation_retry"):
+                            row["observation_retry"] = trade["observation_retry"]
         self.state.update(record)
         self.finish_event(saved["event_id"])
         return result
@@ -511,6 +554,8 @@ class Router:
                     event["status"] = status
             for event in data["events"].values():
                 for target in event.get("targets", {}).values():
+                    if target["status"] == "pending" and (marker := target.get("observation_retry")) and (marker["deadline_at"] <= now_ms() or marker["configuration_revision"] != data["configuration_revision"] or marker["ranking_revision"] != data["ranking_revision"]):
+                        target.update(status="expired", error="Original preview retry expired or its configuration changed", observation_retry={**marker, "exhausted": True})
                     if target.get("trade_id") in data["trades"]:
                         target["status"] = data["trades"][target["trade_id"]]["status"]
                     if target["status"] == "planned" and data["plans"][target["plan_id"]]["plan"]["deadline_at"] <= now_ms():

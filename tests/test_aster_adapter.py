@@ -227,3 +227,54 @@ async def test_aster_stop_rejection_closes_owned_trade_and_pauses_entries(aster,
     assert engine.state.snapshot()["trades"][result["trade_id"]]["status"] == "closed"
     assert engine.state.root.snapshot()["venue_enabled"]["aster"] is False
     await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_aster_last_sending_write_reobserves_and_protection_survives_pause(aster, setup, signal, monkeypatch):
+    from aqla_agent import aster as aster_module
+    from aqla_agent import entry, venues
+    from aqla_agent import trading as trading_module
+    from aqla_hyperliquid_mcp.models import now_ms
+    adapter, boundary, engine = aster
+    state = setup[1]
+    source, interpretation = signal
+    plan = await engine.preview(source.event_id, interpretation)
+    clock = [now_ms()]
+    for module in (aster_module, entry, trading_module, venues):
+        monkeypatch.setattr(module, "now_ms", lambda: clock[0])
+    original_account = adapter.account_snapshot
+    async def account(market):
+        return (await original_account(market)).model_copy(update={"observed_at": clock[0]})
+    monkeypatch.setattr(adapter, "account_snapshot", account)
+    original_update, original_transport = state.update, boundary.handle
+    delayed = False
+    def update(callback):
+        nonlocal delayed
+        result = original_update(callback)
+        row = state.snapshot()["operations"].get("entry:" + plan["trade_id"])
+        if not delayed and row and row["phase"] == "sending":
+            delayed = True
+            clock[0] += 2001
+        return result
+    def transport(request):
+        response = original_transport(request)
+        path = request.url.path.rsplit("/", 1)[-1]
+        if request.method == "GET" and path in ("price", "bookTicker"):
+            data = response.json()
+            data["time"] = clock[0]
+            return httpx.Response(200, json=data)
+        if request.method == "POST" and path == "order":
+            parameters = {key: values[0] for key, values in parse_qs(request.content.decode()).items()}
+            if parameters.get("reduceOnly") != "true":
+                assert delayed
+                original_update(lambda data: data.update(paused=True))
+        return response
+    monkeypatch.setattr(state, "update", update)
+    adapter.client._transport = httpx.MockTransport(transport)
+    result = await engine.execute(plan["plan_id"])
+    assert delayed and result["status"] == "open"
+    orders = [values for path, values in boundary.posts if path == "order"]
+    assert sum(values.get("reduceOnly") != "true" for values in orders) == 1
+    assert any(values.get("type") == "STOP_MARKET" and values.get("reduceOnly") == "true" for values in orders)
+    assert state.snapshot()["paused"]
+    await adapter.close()

@@ -9,6 +9,8 @@ from pydantic import Field, model_validator
 from aqla_hyperliquid_mcp.models import AqlaError, Model, Positive, now_ms
 from aqla_hyperliquid_mcp.rules import price_grid, slippage_price
 
+from .observations import TemporaryObservation
+
 
 class PriceSnapshot(Model):
     market: str
@@ -30,7 +32,7 @@ class PriceSnapshot(Model):
     def fresh(self):
         stamp = now_ms()
         if any(not 0 <= stamp - value <= 2000 for value in (self.exchange_time, self.started_at, self.observed_at)):
-            raise AqlaError("Entry price observation is stale or has an invalid timestamp")
+            raise TemporaryObservation("price_stale", "price")
         return self
 
 

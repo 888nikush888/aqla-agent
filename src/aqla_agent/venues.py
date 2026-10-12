@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 from aqla_hyperliquid_mcp.models import TERMINAL_ORDER, AccountSnapshot, AqlaError, digest, now_ms
 
+from .observations import not_sent, read_observation
+
 
 def adapter_settings(root, venue):
     selected = root.venues.get(venue)
@@ -85,10 +87,16 @@ class VenueAdapter:
                 return existing
             if deadline is not None and now_ms() >= deadline:
                 raise AqlaError("Entry deadline expired before signing")
-            await self.verify_signer()
+            await read_observation(self.verify_signer, "signer")
             if async_prepare_guard:
+                if invalidate := getattr(async_prepare_guard, "invalidate_account", None):
+                    invalidate()
                 await async_prepare_guard()
             signed = await self.build_requests(action, deadline)
+            if async_prepare_guard:
+                if invalidate := getattr(async_prepare_guard, "invalidate_account", None):
+                    invalidate()
+                await async_prepare_guard()
             record = {"operation_id": operation_id, "exchange": self.settings.venue, "request": request, "request_hash": digest(request),
                       "wire_action": copy.deepcopy(action), "nonce": signed[0]["nonce"] if signed else 0,
                       "expires_after": deadline, "created_at": now_ms(), "phase": "prepared", "result": None,
@@ -103,10 +111,12 @@ class VenueAdapter:
             self.state.update(prepare)
             if async_prepare_guard:
                 try:
+                    if invalidate := getattr(async_prepare_guard, "invalidate_account", None):
+                        invalidate()
                     await async_prepare_guard()
                 except BaseException as error:
-                    message = str(error) if isinstance(error, AqlaError) else "Entry guard failed before any exchange send"
-                    self.state.update(lambda data: data["operations"][operation_id].update(phase="rejected", outcome="not_sent", result={"error": message}))
+                    fact = not_sent(error, "prepared_guard")
+                    self.state.update(lambda data, fact=fact: data["operations"][operation_id].update(phase="rejected", outcome="not_sent", result=fact))
                     if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
                         raise
                     return self.state.snapshot()["operations"][operation_id]
@@ -119,13 +129,38 @@ class VenueAdapter:
                         raise AqlaError("Entry deadline expired before exchange send")
                     data["operations"][operation_id].update(phase="sending")
                 self.state.update(begin_send)
-            except AqlaError as error:
-                message = str(error)
-                self.state.update(lambda data: data["operations"][operation_id].update(phase="rejected", outcome="not_sent", result={"error": message}))
+                if async_prepare_guard:
+                    await async_prepare_guard()
+                if prepare_guard:
+                    prepare_guard(self.state.snapshot())
+                if deadline is not None and now_ms() >= deadline:
+                    raise AqlaError("Entry deadline expired before exchange transport")
+            except BaseException as error:
+                fact = not_sent(error, "transport_guard")
+                self.state.update(lambda data, fact=fact: data["operations"][operation_id].update(phase="rejected", outcome="not_sent", result=fact))
+                if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
                 return self.state.snapshot()["operations"][operation_id]
             try:
                 responses = []
-                for item in signed:
+                for index, item in enumerate(signed):
+                    # Recheck each exposure-increasing leg. Accepted entries must
+                    # retain their protective/reduce-only dispatch independently.
+                    entry_leg = action["type"] == "order" and len(signed) == len(action["orders"]) and not action["orders"][index].get("r", False)
+                    if entry_leg:
+                        try:
+                            if async_prepare_guard:
+                                await async_prepare_guard()
+                            if prepare_guard:
+                                prepare_guard(self.state.snapshot())
+                            if deadline is not None and now_ms() >= deadline:
+                                raise AqlaError("Entry deadline expired before exchange transport")
+                        except Exception as error:
+                            if responses:
+                                raise
+                            fact = not_sent(error, "entry_leg_guard")
+                            self.state.update(lambda data, fact=fact: data["operations"][operation_id].update(phase="rejected", outcome="not_sent", result=fact))
+                            return self.state.snapshot()["operations"][operation_id]
                     # No send of later legs when the entry was definitively rejected.
                     response = await self.send(item)
                     responses.append(response)

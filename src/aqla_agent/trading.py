@@ -38,6 +38,7 @@ from .accounting import foreign_entry_orders, occupied_markets
 from .entry import execution_limit, gate_state, passive_entry_price, validate_entry_prices
 from .evidence import market_fills, order_observations
 from .execution_roles import merge_role, native_role
+from .observations import TemporaryObservation, diagnostic, read_observation, retry_due, retry_marker
 from .pipelines import ConfigurationChanged, validate_ranking_binding
 
 OPEN = {"waiting_entry", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
@@ -81,6 +82,7 @@ class Trading:
     def __init__(self, exchange: Hyperliquid, state: State):
         self.exchange, self.state = exchange, state
         self.lock = asyncio.Lock()
+        self.recovery_lock = asyncio.Lock()
         self.recovery_checked = False
 
     def ingest(self, source: SourceEvent, *, native_forward=False):
@@ -250,7 +252,7 @@ class Trading:
             raise AqlaError("Maximum open trade count reached")
         if any(ref in snapshot["bindings"] for ref in interpretation.source_refs):
             raise AqlaError("This source already owns a trade; process its edit as an update")
-        market = await self.exchange.market(interpretation.symbol, policy.product)
+        market = await read_observation(lambda: self.exchange.market(interpretation.symbol, policy.product), "market")
         if any(trade["plan"]["market"]["quote_token"] != market.quote_token for trade in active):
             raise AqlaError("One account risk budget cannot mix settlement currencies without conversion")
         if any(trade["plan"]["market"]["asset_id"] == market.asset_id for trade in active):
@@ -258,7 +260,7 @@ class Trading:
         positions = await self.positions(market)
         if self.position_size(positions, market) != 0:
             raise AqlaError("Existing exchange exposure has no free logical owner; no additional entry")
-        account = await self.exchange.account_snapshot(market)
+        account = await read_observation(lambda: self.exchange.account_snapshot(market), "account")
         if account.positions is not None:
             if len(occupied_markets(snapshot, account)) >= policy.max_open_trades:
                 raise AqlaError("Combined manual/Aqla market limit reached")
@@ -272,7 +274,7 @@ class Trading:
         maker_quote = None
         maker_price = None
         if policy.entry_execution == "maker_only" and interpretation.entry not in ("limit", "range"):
-            maker_quote = await self.exchange.price_snapshot(market)
+            maker_quote = await read_observation(lambda: self.exchange.price_snapshot(market), "price")
             maker_price = passive_entry_price(market, interpretation.side, maker_quote)
         plan = make_plan(interpretation, market, account, policy, snapshot["policy_revision"], min(refs),
                          (self.exchange.settings.network, self.exchange.account.lower()), reserved_risk=risk,
@@ -281,7 +283,7 @@ class Trading:
         plan.source_revisions = self.source_revisions(snapshot, interpretation.source_refs)
         plan.ranking_policy_revision = snapshot["ranking_revision"]
         plan.ranking_enabled = snapshot["ranking_policy"]["enabled"]
-        quote = maker_quote or await self.exchange.price_snapshot(market)
+        quote = maker_quote or await read_observation(lambda: self.exchange.price_snapshot(market), "price")
         if plan.entry_timing == "deferred":
             plan.entry_gate.update(origin_mid=str(quote.mid), direction="down" if quote.mid > plan.entry_price else "up" if quote.mid < plan.entry_price else "at_entry",
                                    origin_snapshot=quote.model_dump(mode="json"))
@@ -323,7 +325,7 @@ class Trading:
         except AqlaError as error:
             raise ConfigurationChanged(str(error)) from error
 
-    def validate_admission(self, snapshot, plan, account=None, *, owned=False, allowed_prepared=()):
+    def validate_admission(self, snapshot, plan, account=None, *, owned=False, allowed_prepared=(), allowed_sending=()):
         self.assert_plan_binding(snapshot, plan)
         if owned and snapshot["trades"][plan.trade_id]["status"] not in OPEN:
             raise AqlaError("Entry was terminated; no unsent exposure may execute")
@@ -348,13 +350,13 @@ class Trading:
             binding = snapshot["bindings"].get(ref)
             if binding and (not owned or binding["trade_id"] != plan.trade_id):
                 raise AqlaError("Source has already been consumed")
-        if any(row["phase"] in ("prepared", "sending", "unknown") and not (identity in allowed_prepared and row["phase"] == "prepared")
+        if any(row["phase"] in ("prepared", "sending", "unknown") and not (identity in allowed_prepared and row["phase"] == "prepared" or identity in allowed_sending and row["phase"] == "sending")
                for identity, row in snapshot["operations"].items()):
             raise AqlaError("Unresolved exchange operations must be reconciled before new exposure")
         if account is not None:
             reserved = sum(Decimal(trade["reserved_risk"]) for trade in active)
-            if now_ms() - account.observed_at > 10000:
-                raise AqlaError("Account observation is stale")
+            if not 0 <= now_ms() - account.observed_at <= 10000:
+                raise TemporaryObservation("account_stale", "account")
             if account.position_size is None:
                 raise AqlaError("Current exchange position is unknown; no new exposure")
             if account.position_size != 0:
@@ -372,7 +374,7 @@ class Trading:
     async def positions(self, market):
         if market.product == "spot":
             return await self.exchange.info("spotClearinghouseState", user=self.exchange.account)
-        return await self.exchange.info("clearinghouseState", user=self.exchange.account, **({"dex": market.dex} if market.dex else {}))
+        return await read_observation(lambda: self.exchange.info("clearinghouseState", user=self.exchange.account, **({"dex": market.dex} if market.dex else {})), "position")
 
     @staticmethod
     def position_size(raw, market):
@@ -395,58 +397,75 @@ class Trading:
             order["c"] = cloid
         return order
 
+    def new_trade(self, snapshot, saved, plan, quote=None):
+        trade = {"trade_id": plan.trade_id, "chat_id": snapshot["events"][saved["event_id"]]["source"]["chat_id"],
+                 "plan": plan.model_dump(mode="json"), "event_id": saved["event_id"], "status": "waiting_entry" if plan.entry_timing == "deferred" else "preparing",
+                 "lifecycle_version": 1, "lifecycle_events": {}, "price_checks": [{"phase": "admission", "snapshot": quote.model_dump(mode="json")}] if quote else [],
+                 "reserved_risk": str(plan.risk_usdc), "entry_operation_id": "entry:" + plan.trade_id,
+                 "entry_cloid": self.exchange.cloid("entry:" + plan.trade_id), "orders": [],
+                 "filled_quantity": "0", "remaining_quantity": "0", "entry_vwap": None,
+                 "stop_price": str(plan.stop_loss), "tp_filled": ["0"] * len(plan.take_profits), "management_revision": 0,
+                 "fill_events": {}, "exit_orders": [], "updates": {}, "targets": [str(price) for price in plan.take_profits]}
+        return trade
+
     async def execute(self, plan_id):
         async with self.lock:
             if not self.recovery_checked:
                 await self.recover()
                 if not self.recovery_checked:
                     raise AqlaError("Startup reconciliation is incomplete; new exposure remains blocked")
-            snapshot = self.state.snapshot()
-            saved = snapshot["plans"].get(plan_id)
-            if not saved:
-                raise AqlaError("Unknown immutable plan")
-            plan = TradePlan.model_validate(saved["plan"])
-            self.assert_plan_binding(snapshot, plan)
-            if plan.trade_id in snapshot["trades"]:
-                return snapshot["trades"][plan.trade_id]
-            self.validate_admission(snapshot, plan)
-            if self.position_size(await self.positions(plan.market), plan.market) != 0:
-                raise AqlaError("Exchange position changed after preview")
-            await self.exchange.verify_signer()
-            current_market = await self.exchange.market(plan.market.symbol, plan.market.product)
-            if (current_market.asset_id, current_market.size_decimals, current_market.quote_token) != (plan.market.asset_id, plan.market.size_decimals, plan.market.quote_token):
-                raise AqlaError("Exchange market metadata changed after preview")
-            if plan.effective_leverage > current_market.max_leverage:
-                raise AqlaError("Exchange leverage limit decreased after preview; create a new unsent plan")
-            account = await self.exchange.account_snapshot(plan.market)
-            quote = await self.exchange.price_snapshot(plan.market)
-            if plan.entry_timing == "standard":
-                validate_entry_prices(plan, quote)
-            trade = {"trade_id": plan.trade_id, "chat_id": snapshot["events"][saved["event_id"]]["source"]["chat_id"],
-                     "plan": plan.model_dump(mode="json"), "event_id": saved["event_id"], "status": "waiting_entry" if plan.entry_timing == "deferred" else "preparing",
-                     "lifecycle_version": 1, "lifecycle_events": {}, "price_checks": [{"phase": "admission", "snapshot": quote.model_dump(mode="json")}],
-                     "reserved_risk": str(plan.risk_usdc), "entry_operation_id": "entry:" + plan.trade_id,
-                     "entry_cloid": self.exchange.cloid("entry:" + plan.trade_id), "orders": [],
-                     "filled_quantity": "0", "remaining_quantity": "0", "entry_vwap": None,
-                     "stop_price": str(plan.stop_loss), "tp_filled": ["0"] * len(plan.take_profits), "management_revision": 0,
-                     "fill_events": {}, "exit_orders": [], "updates": {}, "targets": [str(price) for price in plan.take_profits]}
+            try:
+                return await self.execute_locked(plan_id)
+            except TemporaryObservation as error:
+                return self.retain_observation_retry(plan_id, error)
 
-            def admit(state):
-                self.validate_admission(state, plan, account)
-                state["trades"][plan.trade_id] = trade
-                for ref in plan.source_refs:
-                    state["bindings"][ref] = {"trade_id": plan.trade_id, "kind": "entry"}
-                state["events"][saved["event_id"]]["status"] = "executed"
+    async def execute_locked(self, plan_id):
+        snapshot = self.state.snapshot()
+        saved = snapshot["plans"].get(plan_id)
+        if not saved:
+            raise AqlaError("Unknown immutable plan")
+        plan = TradePlan.model_validate(saved["plan"])
+        self.assert_plan_binding(snapshot, plan)
+        if plan.trade_id in snapshot["trades"]:
+            trade = snapshot["trades"][plan.trade_id]
+            if trade.get("observation_retry"):
+                return await self.resume_unsent_entry(plan.trade_id)
+            return trade
+        self.validate_admission(snapshot, plan)
+        if self.position_size(await self.positions(plan.market), plan.market) != 0:
+            raise AqlaError("Exchange position changed after preview")
+        await read_observation(self.exchange.verify_signer, "signer")
+        current_market = await read_observation(lambda: self.exchange.market(plan.market.symbol, plan.market.product), "market")
+        if (current_market.asset_id, current_market.size_decimals, current_market.quote_token) != (plan.market.asset_id, plan.market.size_decimals, plan.market.quote_token):
+            raise AqlaError("Exchange market metadata changed after preview")
+        if plan.effective_leverage > current_market.max_leverage:
+            raise AqlaError("Exchange leverage limit decreased after preview; create a new unsent plan")
+        account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
+        quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
+        if plan.entry_timing == "standard":
+            validate_entry_prices(plan, quote)
+        trade = self.new_trade(snapshot, saved, plan, quote)
 
-            self.state.update(admit)
-            if plan.entry_timing == "deferred":
-                self.state.update(lambda data: data["notifications"].setdefault("entry-waiting:" + plan.trade_id,
-                                  {"trade_id": plan.trade_id, "change": {"status": "waiting_entry"}, "observed_at": now_ms()}))
-                return await self.check_waiting_entry(plan.trade_id)
-            return await self.guarded_entry_steps(plan, trade)
+        def admit(state):
+            self.validate_admission(state, plan, account)
+            state["trades"][plan.trade_id] = trade
+            for ref in plan.source_refs:
+                state["bindings"][ref] = {"trade_id": plan.trade_id, "kind": "entry"}
+            state["events"][saved["event_id"]]["status"] = "executed"
+
+        self.state.update(admit)
+        if plan.entry_timing == "deferred":
+            self.state.update(lambda data: data["notifications"].setdefault("entry-waiting:" + plan.trade_id,
+                              {"trade_id": plan.trade_id, "change": {"status": "waiting_entry"}, "observed_at": now_ms()}))
+            return await self.check_waiting_entry(plan.trade_id)
+        return await self.guarded_entry_steps(plan, trade)
+
 
     async def check_waiting_entry(self, trade_id):
         trade = self.state.snapshot()["trades"][trade_id]
+        if marker := trade.get("observation_retry"):
+            if not marker.get("completed") and not marker["exhausted"] and not retry_due(marker):
+                return trade
         plan = TradePlan.model_validate(trade["plan"])
         snapshot = self.state.snapshot()
         if now_ms() >= plan.deadline_at or self.source_revisions(snapshot, plan.source_refs) != plan.source_revisions:
@@ -470,8 +489,10 @@ class Trading:
             self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason=str(error))
             return self.state.snapshot()["trades"][trade_id]
         try:
-            quote = await self.exchange.price_snapshot(plan.market)
+            quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
             state = gate_state(plan, quote)
+        except TemporaryObservation as error:
+            return self.retain_observation_retry(plan.plan_id, error)
         except Exception as error:
             reason = str(error) if isinstance(error, AqlaError) else "Fresh target prices are unavailable"
             self._patch(trade_id, waiting_error=reason)
@@ -483,24 +504,31 @@ class Trading:
             self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Deferred entry was missed outside the source slippage tolerance")
             return self.state.snapshot()["trades"][trade_id]
         try:
-            account = await self.exchange.account_snapshot(plan.market)
+            account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
             self.validate_admission(self.state.snapshot(), plan, account, owned=True)
-            quote = await self.exchange.price_snapshot(plan.market)
+            quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
             validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=trade["targets"])
             self._patch(trade_id, status="preparing", gate_activated_at=now_ms())
             return await self.guarded_entry_steps(plan, self.state.snapshot()["trades"][trade_id])
+        except TemporaryObservation as error:
+            return self.retain_observation_retry(plan.plan_id, error)
         except AqlaError as error:
             if self.state.snapshot()["trades"][trade_id]["entry_operation_id"] not in self.state.snapshot()["operations"]:
                 self._patch(trade_id, status="rejected", reserved_risk="0", unsent_reason=str(error))
                 return self.state.snapshot()["trades"][trade_id]
             raise
 
-    async def live_entry_guard(self, plan):
-        account = await self.exchange.account_snapshot(plan.market)
+    async def live_entry_guard(self, plan, *, dispatch_operation=None, account=None, audit=False):
+        if account is None or not 0 <= now_ms() - account.observed_at <= 10000:
+            account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
         snapshot = self.state.snapshot()
-        allowed = ("leverage:" + plan.trade_id, snapshot["trades"][plan.trade_id]["entry_operation_id"])
-        self.validate_admission(snapshot, plan, account, owned=True, allowed_prepared=allowed)
-        quote = await self.exchange.price_snapshot(plan.market)
+        allowed = (snapshot["trades"][plan.trade_id].get("leverage_operation_id", "leverage:" + plan.trade_id), snapshot["trades"][plan.trade_id]["entry_operation_id"])
+        self.validate_admission(snapshot, plan, account, owned=True, allowed_prepared=allowed, allowed_sending=(dispatch_operation,))
+        # Costly local persistence precedes the final price read. A quote audit
+        # is retained, but its write cannot invalidate the final observation.
+        if audit:
+            self._patch(plan.trade_id, entry_equity_snapshot={"equity": str(account.equity), "currency": plan.market.quote_token, "observed_at": account.observed_at})
+        quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
         trade = self.state.snapshot()["trades"][plan.trade_id]
         try:
             result = validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=trade["targets"])
@@ -508,25 +536,39 @@ class Trading:
             message = str(error)
             self.state.update(lambda data: data["trades"][plan.trade_id].setdefault("price_checks", []).append({"phase": "before_send", "snapshot": quote.model_dump(mode="json"), "error": message}))
             raise
-        self.state.update(lambda data: data["trades"][plan.trade_id].setdefault("price_checks", []).append({"phase": "before_send", "snapshot": quote.model_dump(mode="json"), "result": result}))
-        self._patch(plan.trade_id, entry_equity_snapshot={"equity": str(account.equity), "currency": plan.market.quote_token, "observed_at": account.observed_at})
+        if audit:
+            self.state.update(lambda data: data["trades"][plan.trade_id].setdefault("price_checks", []).append({"phase": "before_send", "snapshot": quote.model_dump(mode="json"), "result": result}))
+        try:
+            quote.fresh()
+        except TemporaryObservation:
+            quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
+            trade = self.state.snapshot()["trades"][plan.trade_id]
+            validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=trade["targets"])
+        self.validate_admission(self.state.snapshot(), plan, account, owned=True, allowed_prepared=allowed, allowed_sending=(dispatch_operation,))
         quote.fresh()
         return account, quote
 
     async def guarded_entry_steps(self, plan, trade):
         try:
             return await self._entry_steps(plan, trade)
+        except TemporaryObservation as error:
+            return self.retain_observation_retry(plan.plan_id, error)
         except AqlaError as error:
             operations = self.state.snapshot()["operations"]
             if trade["entry_operation_id"] in operations or any(row["phase"] in ("prepared", "sending", "unknown") for row in operations.values()):
                 raise
             if self.state.snapshot()["trades"][plan.trade_id]["status"] not in OPEN:
                 raise
-            self._patch(plan.trade_id, status="rejected", reserved_risk="0", orders=[], unsent_reason=str(error))
+            self._patch(plan.trade_id, status="rejected", reserved_risk="0", orders=[], unsent_reason=str(error), entry_diagnostic=diagnostic(error, "entry_preparation"))
+            raise
+        except Exception as error:
+            operations = self.state.snapshot()["operations"]
+            if trade["entry_operation_id"] not in operations and not any(row["phase"] in ("prepared", "sending", "unknown") for row in operations.values()):
+                self._patch(plan.trade_id, status="rejected", reserved_risk="0", orders=[], unsent_reason="Entry preparation failed before any entry send", entry_diagnostic=diagnostic(error, "entry_preparation"))
             raise
 
     async def _entry_steps(self, plan, trade):
-        current_market = await self.exchange.market(plan.market.symbol, plan.market.product)
+        current_market = await read_observation(lambda: self.exchange.market(plan.market.symbol, plan.market.product), "market")
         identity_fields = ("asset_id", "size_decimals", "quote_token", "price_tick", "quantity_step", "margin_leverage_scale")
         if any(getattr(current_market, key) != getattr(plan.market, key) for key in identity_fields) or plan.effective_leverage > current_market.max_leverage:
             raise AqlaError("Market identity, precision or leverage changed while entry was unsent")
@@ -535,24 +577,31 @@ class Trading:
                 or any(size < current_market.min_quantity or size * price < current_market.min_notional for size, price in zip(plan.tp_quantities, plan.take_profits, strict=True))):
             raise AqlaError("Exchange minimum/maximum order sizes changed while entry was unsent")
         latest_account, latest_quote = None, None
+        dispatch_operation = trade.get("leverage_operation_id", "leverage:" + plan.trade_id)
         async def live_guard():
             nonlocal latest_account, latest_quote
-            latest_account, latest_quote = await self.live_entry_guard(plan)
+            latest_account, latest_quote = await self.live_entry_guard(plan, dispatch_operation=dispatch_operation, account=latest_account, audit=latest_quote is None)
+        def invalidate_account():
+            nonlocal latest_account
+            latest_account = None
+        live_guard.invalidate_account = invalidate_account
         def final_guard(data, operation_id):
+            self.validate_admission(data, plan, latest_account, owned=True, allowed_prepared=(operation_id,), allowed_sending=(operation_id,))
             latest_quote.fresh()
-            self.validate_admission(data, plan, latest_account, owned=True, allowed_prepared=(operation_id,))
         await live_guard()
         guards = {"async_prepare_guard": live_guard}
         if plan.market.product == "perp":
-            leverage = await self.exchange.mutate("leverage:" + plan.trade_id,
+            leverage = await self.exchange.mutate(dispatch_operation,
                                                  {"type": "updateLeverage", "asset": plan.market.asset_id,
                                                   "isCross": plan.policy.margin_mode == "cross", "leverage": plan.effective_leverage}, deadline=plan.deadline_at,
-                                                  prepare_guard=lambda data: final_guard(data, "leverage:" + plan.trade_id), **guards)
+                                                  prepare_guard=lambda data: final_guard(data, dispatch_operation), **guards)
             if leverage["phase"] not in ("acknowledged", "reconciled"):
+                self.raise_temporary_not_sent(leverage)
                 self._patch(plan.trade_id, status="unknown" if leverage["phase"] == "unknown" else "rejected",
                             **({"reserved_risk": "0", "unsent_reason": leverage.get("result", {}).get("error", "Leverage configuration was rejected")} if leverage["phase"] == "rejected" else {}))
                 return self.state.snapshot()["trades"][plan.trade_id]
-        account = await self.exchange.account_snapshot(plan.market)
+        account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
+        latest_account = account
         self.validate_admission(self.state.snapshot(), plan, account, owned=True)
         current = self.state.snapshot()["trades"][plan.trade_id]
         stop = Decimal(current["stop_price"])
@@ -564,13 +613,16 @@ class Trading:
         initial_stop["p"] = wire_number(price_grid(Decimal(initial_stop["p"]), plan.market, up=plan.side == "short"))
         action = {"type": "order", "orders": [entry, initial_stop], "grouping": "normalTpsl"}
         self._patch(plan.trade_id, status="opening", orders=[{"kind": "sl", "cloid": initial_stop["c"], "quantity": str(plan.quantity), "price": str(stop)}])
+        dispatch_operation = trade["entry_operation_id"]
         result = await self.exchange.mutate(trade["entry_operation_id"], action, deadline=plan.deadline_at,
                                             prepare_guard=lambda data: final_guard(data, trade["entry_operation_id"]), **guards)
         if result["phase"] == "unknown":
             self._patch(plan.trade_id, status="unknown")
         if result.get("outcome") == "not_sent":
+            self.raise_temporary_not_sent(result)
             self._patch(plan.trade_id, status="rejected", reserved_risk="0", unsent_reason=result["result"]["error"], orders=[])
             return self.state.snapshot()["trades"][plan.trade_id]
+        self.complete_observation_retry(plan.trade_id)
         try:
             await self.refresh_trade(plan.trade_id)
         except ExternalInterference as error:
@@ -582,9 +634,106 @@ class Trading:
                  "source_id": current["chat_id"], "source_name": data.get("source_names", {}).get(current["chat_id"])}))
         return current
 
+    @staticmethod
+    def raise_temporary_not_sent(operation):
+        fact = (operation.get("result") or {}).get("diagnostic", {})
+        if operation.get("outcome") == "not_sent" and fact.get("retryable"):
+            raise TemporaryObservation(fact["code"], fact["stage"], fact["category"])
+
+    def complete_observation_retry(self, trade_id):
+        def complete(data):
+            trade = data["trades"][trade_id]
+            if marker := trade.get("observation_retry"):
+                marker.update(exhausted=True, completed=True)
+                data["plans"][trade["plan"]["plan_id"]]["observation_retry"] = marker.copy()
+        if self.state.snapshot()["trades"][trade_id].get("observation_retry"):
+            self.state.update(complete)
+
+    def retain_observation_retry(self, plan_id, error):
+        def retain(data):
+            saved = data["plans"][plan_id]
+            plan = TradePlan.model_validate(saved["plan"])
+            trade = data["trades"].get(plan.trade_id)
+            if trade:
+                entries = [trade["entry_operation_id"], *trade.get("entry_attempts", [])]
+                if Decimal(trade["filled_quantity"]) or any(identity in data["operations"] and data["operations"][identity].get("outcome") != "not_sent" for identity in entries):
+                    raise error
+            if any(row["phase"] in ("prepared", "sending", "unknown") for row in data["operations"].values()):
+                raise error
+            previous = trade.get("observation_retry") if trade else saved.get("observation_retry")
+            marker = retry_marker(previous, error, plan.deadline_at, "execute")
+            if not trade:
+                self.validate_admission(data, plan)
+                trade = self.new_trade(data, saved, plan)
+                data["trades"][plan.trade_id] = trade
+                for ref in plan.source_refs:
+                    data["bindings"][ref] = {"trade_id": plan.trade_id, "kind": "entry"}
+            trade.update(observation_retry=marker, entry_diagnostic=error.diagnostic(), orders=[],
+                         status="rejected" if marker["exhausted"] else "waiting_entry" if plan.entry_timing == "deferred" and not trade.get("gate_activated_at") else "preparing",
+                         reserved_risk="0" if marker["exhausted"] else str(plan.risk_usdc))
+            saved.update(observation_retry=marker, execution_requested=True)
+            data["events"][saved["event_id"]]["status"] = "executed"
+            return trade
+        return self.state.update(retain)
+
+    def rearm_proven_unsent(self, trade_id):
+        """New attempt IDs/nonces; old signed requests are retained verbatim."""
+        def rearm(data):
+            trade = data["trades"][trade_id]
+            marker = trade["observation_retry"]
+            if marker.get("authority") != "execute" or not retry_due(marker):
+                return None
+            if marker["attempts"] >= 5:
+                raise AqlaError("Original entry observation retry budget exhausted")
+            self.validate_admission(data, TradePlan.model_validate(trade["plan"]), owned=True)
+            marker["attempts"] += 1
+            marker["attempt_inflight"] = True
+            for field, prefix in (("entry_operation_id", "entry"), ("leverage_operation_id", "leverage")):
+                identity = trade.get(field, prefix + ":" + trade_id)
+                prior = data["operations"].get(identity)
+                if prior is None or prefix == "leverage" and prior["phase"] in ("acknowledged", "reconciled"):
+                    continue
+                if prior.get("outcome") != "not_sent" or prior["phase"] != "rejected" or prior.get("legs"):
+                    raise AqlaError("Only a locally proven completely unsent entry may resume")
+                history = "entry_attempts" if prefix == "entry" else "leverage_attempts"
+                trade.setdefault(history, []).append(identity)
+                identity = prefix + ":" + trade_id + ":observation:" + str(marker["attempts"])
+                if identity in data["operations"]:
+                    raise AqlaError("Observation attempt already has a durable request; reconcile it")
+                trade[field] = identity
+                if prefix == "entry":
+                    trade["entry_cloid"] = self.exchange.cloid(identity)
+            # An interrupted active attempt cannot immediately bypass the delay.
+            marker["next_retry_at"] = min(now_ms() + 300000, marker["deadline_at"])
+            data["plans"][trade["plan"]["plan_id"]]["observation_retry"] = marker.copy()
+            return trade
+        return self.state.update(rearm)
+
     async def resume_unsent_entry(self, trade_id):
         snapshot = self.state.snapshot()
         trade = snapshot["trades"][trade_id]
+        if marker := trade.get("observation_retry"):
+            operation = snapshot["operations"].get(trade["entry_operation_id"])
+            if operation and operation.get("outcome") != "not_sent":
+                self.complete_observation_retry(trade_id)
+                return await self.refresh_trade(trade_id)
+            if marker.get("completed"):
+                return trade
+            if marker.get("authority") != "execute" or trade["status"] not in OPEN:
+                return trade
+            if marker["exhausted"] or now_ms() >= marker["deadline_at"]:
+                self._patch(trade_id, status="cancelled", reserved_risk="0", orders=[], observation_retry={**marker, "exhausted": True}, unsent_reason="Original entry observation retry deadline/budget expired")
+                return self.state.snapshot()["trades"][trade_id]
+            if not retry_due(marker):
+                return trade
+            try:
+                trade = self.rearm_proven_unsent(trade_id)
+                if trade is None:
+                    return self.state.snapshot()["trades"][trade_id]
+            except AqlaError as error:
+                self._patch(trade_id, status="cancelled", reserved_risk="0", orders=[], observation_retry={**marker, "exhausted": True}, unsent_reason=str(error), entry_diagnostic=diagnostic(error, "retry_admission"))
+                return self.state.snapshot()["trades"][trade_id]
+            snapshot = self.state.snapshot()
         if trade["status"] == "waiting_entry":
             return await self.check_waiting_entry(trade_id)
         plan = TradePlan.model_validate(trade["plan"])
@@ -593,15 +742,17 @@ class Trading:
         self.assert_plan_binding(snapshot, plan)
         try:
             self.validate_admission(snapshot, plan, owned=True)
-            market = await self.exchange.market(plan.market.symbol, plan.market.product)
+            market = await read_observation(lambda: self.exchange.market(plan.market.symbol, plan.market.product), "market")
             if (market.asset_id, market.size_decimals, market.quote_token) != (plan.market.asset_id, plan.market.size_decimals, plan.market.quote_token):
                 raise AqlaError("Exchange market metadata changed after preview")
             if plan.effective_leverage > market.max_leverage:
                 raise AqlaError("Exchange leverage limit decreased after preview; create a new unsent plan")
             if self.position_size(await self.positions(plan.market), plan.market) != 0:
                 raise AqlaError("Unsent entry cannot resume against an existing foreign position")
-            account = await self.exchange.account_snapshot(plan.market)
+            account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
             self.validate_admission(self.state.snapshot(), plan, account, owned=True)
+        except TemporaryObservation as error:
+            return self.retain_observation_retry(plan.plan_id, error)
         except AqlaError as error:
             if any(row["phase"] in ("prepared", "sending", "unknown") for row in self.state.snapshot()["operations"].values()):
                 raise
@@ -625,6 +776,8 @@ class Trading:
                     and state["bindings"].get(pending["operation_id"]) == pending["source_binding"]):
                 pending["management_revision"] = changed["management_revision"]
             row.update(changed)
+            if "observation_retry" in changed:
+                state["plans"][row["plan"]["plan_id"]]["observation_retry"] = changed["observation_retry"].copy()
             important = {key: value for key, value in changed.items() if key in ("status", "filled_quantity", "remaining_quantity", "stop_price", "tp_filled", "maker_target_rejection")}
             if row.get("lifecycle_version") and row["status"] == "closed":
                 from .lifecycle import record_lifecycle
@@ -851,8 +1004,8 @@ class Trading:
         plan = TradePlan.model_validate(trade["plan"])
         entry, size, stop = Decimal(trade["entry_vwap"]), Decimal(trade["filled_quantity"]), Decimal(trade["stop_price"])
         targets = [Decimal(price) for price in trade["targets"]]
-        account = await self.exchange.account_snapshot(plan.market)
-        quote = await self.exchange.price_snapshot(plan.market)
+        account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
+        quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
         safe = (stop < min(entry, quote.stop_reference) and all(price > entry for price in targets) if plan.side == "long"
                 else stop > max(entry, quote.stop_reference) and all(price < entry for price in targets))
         notional = entry * size
@@ -1036,7 +1189,7 @@ class Trading:
             sizes = split_targets(Decimal(trade["filled_quantity"]), len(targets), plan.policy, plan.market)
             if any(size < plan.market.min_quantity or size * price < plan.market.min_notional for size, price in zip(sizes, targets, strict=True)):
                 raise AqlaError("Final Backup TP is below the exchange minimum")
-            account = await self.exchange.account_snapshot(plan.market)
+            account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
             snapshot = self.state.snapshot()
             limits = self.state.limits(plan) if hasattr(self.state, "limits") else plan.policy
             others = sum(Decimal(row["reserved_risk"]) for identity, row in snapshot["trades"].items() if identity != trade_id and row["status"] in OPEN)
@@ -1371,7 +1524,7 @@ class Trading:
         self.validate_stop_budget(trade, plan, stop, remaining, initialize_backup=initialize_backup)
         if not remaining:
             return {"already_closed": True}
-        market = await self.exchange.market(plan.market.symbol, plan.market.product)
+        market = await read_observation(lambda: self.exchange.market(plan.market.symbol, plan.market.product), "market")
         if (plan.side == "long" and stop >= market.mid) or (plan.side == "short" and stop <= market.mid):
             return await self.close_position(trade_id, Decimal(100), operation_id="stop-crossed:" + (operation_id or trade_id))
         operation_id = operation_id or "stop:" + trade_id + ":" + str(trade["management_revision"])
@@ -1491,7 +1644,7 @@ class Trading:
         amount = quantity_grid(size * percent / 100, plan.market)
         if amount <= 0:
             raise AqlaError("Reduction rounds to zero")
-        market = await self.exchange.market(plan.market.symbol, plan.market.product)
+        market = await read_observation(lambda: self.exchange.market(plan.market.symbol, plan.market.product), "market")
         limit = slippage_price(market.mid, plan.policy.max_slippage_percent, plan.market, buy=plan.side == "short")
         order = self.order(plan, amount, limit, reduce=True, cloid=self.exchange.cloid(operation_id))
         order["t"] = {"limit": {"tif": "Ioc"}}
@@ -1802,8 +1955,9 @@ class Trading:
                         "reason": "Native maker TP was rejected; target remains unfilled"})
 
     async def recover(self):
-        with order_observations(self.exchange):
-            return await self._recover()
+        async with self.recovery_lock:
+            with order_observations(self.exchange):
+                return await self._recover()
 
     async def _recover(self):
         snapshot = self.state.snapshot()
@@ -1832,7 +1986,7 @@ class Trading:
                         reports.append(await self.finish_cleanup(trade_id))
                     elif trade["status"] == "waiting_entry":
                         await self.check_waiting_entry(trade_id)
-                    elif trade["entry_operation_id"] not in self.state.snapshot()["operations"]:
+                    elif trade.get("observation_retry") or trade["entry_operation_id"] not in self.state.snapshot()["operations"]:
                         reports.append(await self.resume_unsent_entry(trade_id))
                     else:
                         for identity, intent in trade.get("close_intents", {}).items():

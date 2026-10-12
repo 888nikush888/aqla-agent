@@ -67,3 +67,51 @@ async def test_unproved_aggregate_snapshot_cannot_admit_entry(failure):
         frames.insert(0, {"channel": "error"})
     with pytest.raises(AqlaError):
         await observe(adapter, names, connector=lambda *args, **kwargs: Socket(frames))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_clock", ["stale", "unclocked"])
+async def test_followup_aggregate_within_same_subscription_recovers(first_clock):
+    import copy
+    adapter, names, frames = inputs()
+    followup = copy.deepcopy(frames[0])
+    if first_clock == "stale":
+        frames[0]["data"]["clearinghouseStates"][0][1]["time"] -= 11000
+    else:
+        frames[0]["data"]["clearinghouseStates"][0][1].pop("time")
+    frames.append(followup)
+    class NoDuplicateSubscription(Socket):
+        async def send(self, text):
+            assert json.loads(text) not in self.sent, "Real sockets must not be subscribed twice"
+            await super().send(text)
+    socket = NoDuplicateSubscription(frames)
+    result = await observe(adapter, names, connector=lambda *args, **kwargs: socket)
+    assert len(result) == len(names) and len(socket.sent) == len(names) + 1
+    assert result[0][1]["time"] == followup["data"]["clearinghouseStates"][0][1]["time"]
+
+
+@pytest.mark.asyncio
+async def test_nonempty_rest_details_recheck_exchange_age_and_consume_fresh_aggregate(monkeypatch):
+    import copy
+
+    from aqla_agent import inventory_stream
+    adapter, names, frames = inputs()
+    stamp = now_ms()
+    current = [stamp]
+    for _, raw in frames[0]["data"]["clearinghouseStates"]:
+        raw["time"] = stamp - 9000
+    followup = copy.deepcopy(frames[0])
+    for _, raw in followup["data"]["clearinghouseStates"]:
+        raw["time"] = stamp + 2001
+    frames.append(followup)
+    frames[1]["data"]["orders"] = [{"coin": "BTC"}]
+    calls = 0
+    async def info(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        current[0] = stamp + 2001
+        return [{"coin": "BTC", "reduceOnly": False}]
+    adapter.info = info
+    monkeypatch.setattr(inventory_stream, "now_ms", lambda: current[0])
+    result = await observe(adapter, names, connector=lambda *args, **kwargs: Socket(frames))
+    assert calls == 2 and result[0][1]["time"] == stamp + 2001
