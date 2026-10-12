@@ -85,11 +85,14 @@ async def test_unsent_recovery_rechecks_individual_risk_against_fresh_equity(set
     plan = await trading.preview(source.event_id, interpretation)
     original = trading._entry_steps
 
+    class SimulatedProcessCrash(BaseException):
+        """Process death bypasses caught admission failures."""
+
     async def crash(*args):
-        raise RuntimeError("Crash after admission")
+        raise SimulatedProcessCrash("Crash after admission")
 
     monkeypatch.setattr(trading, "_entry_steps", crash)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(SimulatedProcessCrash):
         await trading.execute(plan["plan_id"])
     monkeypatch.setattr(trading, "_entry_steps", original)
     account = await exchange.account_snapshot(await exchange.market("BTC", "perp"))

@@ -137,12 +137,15 @@ async def test_restart_after_leverage_ack_keeps_resolved_value_without_resending
     state.update(lambda data: data["policy"].update(leverage_mode="signal"))
     plan = await trading.preview(source.event_id, interpretation)
     original = exchange.mutate
+    class SimulatedProcessCrash(BaseException):
+        """Process death preserves the durable admission and leverage ACK."""
+
     async def crash_before_entry(identity, *args, **kwargs):
         if identity.startswith("entry:"):
-            raise RuntimeError("Simulated service interruption before entry dispatch")
+            raise SimulatedProcessCrash("Simulated service interruption before entry dispatch")
         return await original(identity, *args, **kwargs)
     monkeypatch.setattr(exchange, "mutate", crash_before_entry)
-    with pytest.raises(RuntimeError, match="Simulated service interruption"):
+    with pytest.raises(SimulatedProcessCrash, match="Simulated service interruption"):
         await trading.execute(plan["plan_id"])
     assert [action["leverage"] for action in fake.actions if action["type"] == "updateLeverage"] == [20]
     monkeypatch.setattr(exchange, "mutate", original)
