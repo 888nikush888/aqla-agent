@@ -9,19 +9,25 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
+import portalocker
 import yaml
 
 BOOTSTRAP = '''import json
+import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 import httpx
+import portalocker
 sys.path.insert(0, str(Path(sys.argv[2]) / "tests"))
 from conftest import FakeExchange
 from aqla_agent.observations import TemporaryObservation
@@ -32,26 +38,46 @@ from aqla_hyperliquid_mcp.state import State
 home = Path(sys.argv[1]).parent
 control_path = home / "fixture-control.json"
 audit_path = home / "fixture-exchange.json"
+def write_json(path, value):
+    with portalocker.Lock(str(path) + ".fixture.lock", timeout=5):
+        fd, name = tempfile.mkstemp(prefix=".fixture-" + str(os.getpid()) + "-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(value, stream)
+            os.replace(name, path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+def read_json(path):
+    with portalocker.Lock(str(path) + ".fixture.lock", timeout=5):
+        return json.loads(path.read_text())
 def control():
-    return json.loads(control_path.read_text())
+    return read_json(control_path)
 # Model/default-factory/adapter clocks all use the real models.now_ms path.
 time.time_ns = lambda: control()["time_ms"] * 1000000
 settings = Settings.load(sys.argv[1])
 state = State(settings)
 fake = FakeExchange(settings.account)
 if audit_path.exists():
-    for key, value in json.loads(audit_path.read_text()).items():
+    for key, value in read_json(audit_path).items():
         setattr(fake, key, value)
 def persist():
-    temporary = audit_path.with_suffix(".tmp")
-    temporary.write_text(json.dumps({key: getattr(fake, key) for key in
-        ("actions", "orders", "fills", "position", "oid")}), encoding="utf-8")
-    temporary.replace(audit_path)
+    write_json(audit_path, {key: getattr(fake, key) for key in
+        ("actions", "orders", "fills", "position", "oid")})
 def response(request):
     assert request.url.path in ("/info", "/exchange")
-    result = fake.handle(request)
-    persist()
-    return result
+    try:
+        result = fake.handle(request)
+        persist()
+        return result
+    except Exception as error:
+        payload = json.loads(request.content)
+        report = {"exception_type": type(error).__name__, "errno": getattr(error, "errno", None),
+            "winerror": getattr(error, "winerror", None), "request_kind": payload.get("type", payload.get("action", {}).get("type"))}
+        fd, name = tempfile.mkstemp(prefix="fixture-error-", suffix=".json", dir=home)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(report, stream)
+        raise
 persist()
 exchange = Hyperliquid(settings, state,
     httpx.AsyncClient(base_url=settings.base_url, transport=httpx.MockTransport(response)))
@@ -60,7 +86,7 @@ async def account(market):
     flags = control()
     if flags["arm_account_fault"] and not flags["fault_consumed"]:
         flags["fault_consumed"] = True
-        control_path.write_text(json.dumps(flags), encoding="utf-8")
+        write_json(control_path, flags)
         raise TemporaryObservation("read_unavailable", "account", "transport")
     return await original_account(market)
 exchange.account_snapshot = account
@@ -68,20 +94,51 @@ create_server(settings, state=state, exchange=exchange).run(transport="stdio")
 '''
 
 
+def read_fixture(path):
+    with portalocker.Lock(str(path) + ".fixture.lock", timeout=5):
+        return json.loads(path.read_text())
+
+
+def write_fixture(path, value):
+    with portalocker.Lock(str(path) + ".fixture.lock", timeout=5):
+        fd, name = tempfile.mkstemp(prefix=".fixture-" + str(os.getpid()) + "-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(value, stream)
+            os.replace(name, path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+
+
 def entries(destination):
-    audit = json.loads((destination / "fixture-exchange.json").read_text())
+    audit = read_fixture(destination / "fixture-exchange.json")
     return [row for row in audit["actions"] if row["type"] == "order"
         and any(not order["r"] for order in row["orders"])]
 
 
 def fixture_control(destination, **changes):
     path = destination / "fixture-control.json"
-    value = json.loads(path.read_text())
+    value = read_fixture(path)
     value.update(changes)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value), encoding="utf-8")
-    temporary.replace(path)
+    write_fixture(path, value)
     return value
+
+
+def stopped_mcp(destination):
+    from gateway.status import _pid_exists
+    from tools.mcp_tool_lifecycle import _snapshot_child_pids, shutdown_mcp_servers
+
+    children = _snapshot_child_pids()
+    shutdown_mcp_servers()
+    deadline = time.monotonic() + 15
+    while any(_pid_exists(pid) for pid in children):
+        if time.monotonic() >= deadline:
+            raise AssertionError("Synthetic MCP child did not exit before restart")
+        time.sleep(0.05)
+    # Verify actual writer ownership ended before opening the next MCP process.
+    with portalocker.Lock(str(destination / "data" / "state.sqlite3") + ".lock", timeout=5):
+        pass
 
 
 def main():
@@ -124,8 +181,8 @@ config.update(account=signer.address, private_key_file=str(secret))
 config_path.write_text(yaml.safe_dump(config))
 ''')
     initial_time = now_ms()
-    (destination / "fixture-control.json").write_text(json.dumps({"time_ms": initial_time,
-        "arm_account_fault": False, "fault_consumed": False}), encoding="utf-8")
+    write_fixture(destination / "fixture-control.json", {"time_ms": initial_time,
+        "arm_account_fault": False, "fault_consumed": False})
     bootstrap = destination / "synthetic-entry-retry-mcp.py"
     bootstrap.write_text(BOOTSTRAP, encoding="utf-8")
     native_config_path = destination / "hermes-home" / "config.yaml"
@@ -251,7 +308,7 @@ config_path.write_text(yaml.safe_dump(config))
             assert immutable["effective_leverage"] == 20
             # A real MCP restart runs backend recovery, but preview alone grants
             # no execution authority, even with a later valid fixture clock.
-            shutdown_mcp_servers()
+            stopped_mcp(destination)
             fixture_control(destination, time_ms=initial_time + 30001)
             assert "mcp__aqla__trade_execute" in discover_mcp_tools()
             assert not entries(destination) and not read_snapshot(destination / "data" / "state.sqlite3")["trades"]
@@ -266,12 +323,13 @@ config_path.write_text(yaml.safe_dump(config))
             marker = trade["observation_retry"]
             assert trade["status"] == "preparing" and trade["filled_quantity"] == "0"
             assert marker["attempts"] == 1 and marker["authority"] == "execute"
-            assert (marker["code"], marker["stage"], marker["category"]) == ("read_unavailable", "account", "transport")
+            assert (marker["code"], marker["stage"], marker["category"]) == ("read_unavailable", "account", "transport"), marker
+            assert read_fixture(destination / "fixture-control.json")["fault_consumed"]
             assert marker["deadline_at"] == immutable["deadline_at"] and not marker["exhausted"]
             assert pending["plans"][identity]["execution_requested"] and pending["plans"][identity]["plan"] == immutable
             assert trade["reserved_risk"] == immutable["risk_usdc"] and not entries(destination)
             before_recovery_calls = len(requests)
-            shutdown_mcp_servers()
+            stopped_mcp(destination)
             fixture_control(destination, time_ms=marker["next_retry_at"] + 1)
             assert "mcp__aqla__trade_execute" in discover_mcp_tools()
             recovered = read_snapshot(destination / "data" / "state.sqlite3")
@@ -286,6 +344,7 @@ config_path.write_text(yaml.safe_dump(config))
             assert len(entries(destination)) == 1 and not failures
             assert [row[1] for row in issued] == ["source_context", "interpret_source", "trade_preview", "trade_execute", "trade_execute"]
             assert issued[-1][2]["plan_id"] == issued[-2][2]["plan_id"] == identity
+            assert not list(destination.glob("fixture-error-*.json")), "Synthetic exchange fixture I/O failed"
         finally:
             agent.close()
 
@@ -300,6 +359,9 @@ config_path.write_text(yaml.safe_dump(config))
         shutdown_mcp_servers()
         model.shutdown()
         undo()
+        errors = [json.loads(path.read_text()) for path in destination.glob("fixture-error-*.json")]
+        if errors:
+            print(json.dumps({"synthetic_fixture_errors": errors}))
 
 
 if __name__ == "__main__":
