@@ -480,25 +480,30 @@ class Router:
                                 else "updated" if "confirmed" in values else "superseded" if all(phase == "superseded" for phase in values) else "rejected")
         return result
 
-    async def recover(self):
+    async def recover(self, *, diagnostics_sink=None):
+        if diagnostics_sink is not None:
+            diagnostics_sink.clear()
         if self._closing:
             raise AqlaError("Account recovery is closed")
         owner = asyncio.current_task()
         self._recovery_owners.add(owner)
         try:
-            return await self._recover()
+            return await self._recover(diagnostics_sink=diagnostics_sink)
         finally:
             self._recovery_owners.discard(owner)
 
-    async def _recover(self):
+    async def _recover(self, *, diagnostics_sink=None):
         from .ranking import evaluate
         self.state.update_if_changed(evaluate)
         reports = []
         diagnostics: dict[str, RecoveryDiagnostic] = {}
-        for venue in self.errors:
-            if any((row["plan"].get("account_key") == venue if ":" in venue else row["plan"].get("exchange", "hyperliquid") == venue)
-                   and row["status"] in OPEN for row in self.state.snapshot()["trades"].values()):
-                reports.append({"exchange": venue, "error": "The original account adapter is unavailable; existing exposure needs attention"})
+        missing_accounts = {row["plan"].get("account_key") or row["plan"].get("exchange", "hyperliquid") + ":" + row["plan"]["network"]
+                            for row in self.state.snapshot()["trades"].values()
+                            if row["status"] in OPEN and self.engine_for_plan(row["plan"]) is None}
+        for key in sorted(missing_accounts):
+            reports.append({"exchange": key.split(":", 1)[0], "account_key": key,
+                            "error": "The original account adapter is unavailable; existing exposure needs attention"})
+            diagnostics[key] = {"last_attempt_at": now_ms(), "duration_ms": 0, "category": "unavailable", "error_count": 1}
         async def account(venue, engine):
             async with self._recovery_semaphore:
                 started, attempted = time.monotonic(), now_ms()
@@ -510,7 +515,7 @@ class Router:
                     unresolved = any(row["phase"] in ("prepared", "sending", "unknown") for row in view["operations"].values())
                     unsettled = any(row["status"] in OPEN and (row["status"] not in ("open", "opening", "waiting_entry")
                         or row.get("quantity_evidence_pending")) for row in view["trades"].values())
-                    category = "incomplete" if not engine.recovery_checked or unresolved or unsettled or any(row.get("error") or row.get("market_conflict") for row in rows) else "complete"
+                    category = "incomplete" if not engine.recovery_checked or unresolved or unsettled or any(row.get("error") or row.get("market_conflict") or row.get("replacement_unconfirmed") for row in rows) else "complete"
                 except TimeoutError:
                     engine.recovery_checked = False
                     category = "timeout"
@@ -525,7 +530,7 @@ class Router:
                 finally:
                     old = self.state.read("account_recovery").get("account_recovery", {}).get(engine.state.account_key, {})
                     fact: RecoveryDiagnostic = {"last_attempt_at": attempted, "duration_ms": max(0, int((time.monotonic() - started) * 1000)),
-                        "category": category, "error_count": sum(bool(row.get("error") or row.get("market_conflict")) for row in rows)}
+                        "category": category, "error_count": sum(bool(row.get("error") or row.get("market_conflict") or row.get("replacement_unconfirmed")) for row in rows)}
                     if "last_success_at" in old:
                         fact["last_success_at"] = old["last_success_at"]
                     if category == "complete":
@@ -563,6 +568,11 @@ class Router:
                 if event.get("targets") and all(target["status"] not in ("planned", "pending") for target in event["targets"].values()):
                     event["status"] = "executed" if any(target.get("trade_id") for target in event["targets"].values()) else "rejected"
         self.state.update(expire)
+        if diagnostics_sink is not None:
+            # Call-scoped completion evidence: readers must not infer a positive
+            # current pass from an older durable account_recovery snapshot.
+            diagnostics_sink.clear()
+            diagnostics_sink.update(diagnostics)
         return reports
 
     async def _recover_account(self, engine):

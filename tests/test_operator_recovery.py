@@ -28,9 +28,115 @@ def test_recovery_notices_transitions_survive_ack_restart_and_keep_accounts_dist
     assert len(restarted["notifications"]) == 1
     assert next(iter(restarted["notifications"].values()))["severity"] == "urgent"
     restarted["notifications"].clear()
-    record_recovery_notices(restarted, [])
+    stamp = now_ms()
+    complete = {account: {"category": "complete", "last_attempt_at": stamp, "last_success_at": stamp, "duration_ms": 0, "error_count": 0}
+                for account in ("hyperliquid:mainnet", "hyperliquid:testnet")}
+    record_recovery_notices(restarted, [], complete)
     assert len(restarted["notifications"]) == 2
     assert all(row["resolved"] for row in restarted["notifications"].values())
+
+
+@pytest.mark.parametrize("category", ["timeout", "unavailable", "cancelled", "incomplete"])
+def test_partial_account_pass_never_claims_unobserved_trade_protection_recovered(category):
+    data = {"source_status": {}, "notifications": {}}
+    protection = {"account_key": "hyperliquid:mainnet", "trade_id": "protected", "error": "No confirmed effective stop loss"}
+    record_recovery_notices(data, [protection])
+    data["notifications"].clear()
+    stamp = now_ms()
+    account_error = {"account_key": "hyperliquid:mainnet", "error": "Account recovery timed out; protection reconciliation is unconfirmed"}
+    incomplete = {"hyperliquid:mainnet": {"category": category, "last_attempt_at": stamp, "last_success_at": stamp - 1,
+                                        "duration_ms": 1, "error_count": 1}}
+    record_recovery_notices(data, [account_error], incomplete)
+    assert data["notifications"] and not any(row["resolved"] for row in data["notifications"].values())
+    assert all(row["severity"] == "urgent" for row in data["notifications"].values())
+    assert any(any(fact["code"] == "recovery_timeout" for fact in notice["recovery_reports"]) for notice in data["notifications"].values())
+    prior = [row for row in data["source_status"]["recovery"].values() if any(fact.get("trade_id") == "protected" for fact in row["reports"])]
+    assert prior[0]["active"] and prior[0]["reports"][0]["code"] == "protection_unconfirmed"
+    data["notifications"].clear()
+    complete = {"hyperliquid:mainnet": {"category": "complete", "last_attempt_at": stamp, "last_success_at": stamp,
+                                      "duration_ms": 0, "error_count": 0}}
+    record_recovery_notices(data, [], complete)
+    assert len(data["notifications"]) == 2 and all(row["resolved"] for row in data["notifications"].values())
+    data["notifications"].clear()
+    record_recovery_notices(data, [], complete)
+    assert data["notifications"] == {}
+
+
+def test_missing_or_stale_account_success_never_resolves_a_prior_notice():
+    data = {"source_status": {}, "notifications": {}}
+    record_recovery_notices(data, [{"account_key": "hyperliquid:mainnet", "trade_id": "t", "error": "No confirmed effective stop loss"}])
+    data["notifications"].clear()
+    record_recovery_notices(data, [])
+    assert data["notifications"] == {}
+    old = now_ms() - 120001
+    stale = {"hyperliquid:mainnet": {"category": "complete", "last_attempt_at": old, "last_success_at": old, "duration_ms": 0, "error_count": 0}}
+    record_recovery_notices(data, [], stale)
+    assert data["notifications"] == {} and all(row["active"] for row in data["source_status"]["recovery"].values())
+
+
+def test_success_on_another_account_does_not_clear_unobserved_mainnet_protection():
+    data = {"source_status": {}, "notifications": {}}
+    record_recovery_notices(data, [{"account_key": "hyperliquid:mainnet", "trade_id": "t", "error": "No confirmed effective stop loss"}])
+    data["notifications"].clear()
+    stamp = now_ms()
+    complete = {"hyperliquid:testnet": {"category": "complete", "last_attempt_at": stamp, "last_success_at": stamp,
+                                      "duration_ms": 0, "error_count": 0}}
+    record_recovery_notices(data, [], complete)
+    assert data["notifications"] == {} and all(row["active"] for row in data["source_status"]["recovery"].values())
+
+
+@pytest.mark.asyncio
+async def test_router_current_pass_diagnostics_replace_reused_or_stale_sink(setup, monkeypatch):
+    from aqla_agent.router import Router
+    settings, state, _, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    sink = {"old:account": {"category": "complete"}}
+    async def healthy(engine):
+        engine.recovery_checked = True
+        return []
+    monkeypatch.setattr(router, "_recover_account", healthy)
+    await router.recover(diagnostics_sink=sink)
+    assert set(sink) == {"hyperliquid:testnet"}
+    assert sink["hyperliquid:testnet"]["category"] == "complete"
+    assert sink["hyperliquid:testnet"]["last_success_at"] >= sink["hyperliquid:testnet"]["last_attempt_at"]
+    async def lost_stop(engine):
+        engine.recovery_checked = True
+        return [{"trade_id": "t", "replacement_unconfirmed": True}]
+    monkeypatch.setattr(router, "_recover_account", lost_stop)
+    await router.recover(diagnostics_sink=sink)
+    assert sink["hyperliquid:testnet"]["category"] == "incomplete" and sink["hyperliquid:testnet"]["error_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_actual_router_timeout_cannot_publish_false_trade_recovery(setup, monkeypatch):
+    from aqla_agent.router import Router
+    settings, state, _, exchange, _ = setup
+    router = Router(settings, state, exchange)
+    data = {"source_status": {}, "notifications": {}}
+    sink = {}
+    async def unprotected(engine):
+        engine.recovery_checked = False
+        return [{"trade_id": "protected", "error": "No confirmed effective stop loss"}]
+    monkeypatch.setattr(router, "_recover_account", unprotected)
+    record_recovery_notices(data, await router.recover(diagnostics_sink=sink), sink)
+    data["notifications"].clear()
+    async def timeout(engine):
+        raise TimeoutError
+    monkeypatch.setattr(router, "_recover_account", timeout)
+    record_recovery_notices(data, await router.recover(diagnostics_sink=sink), sink)
+    assert len(data["notifications"]) == 1
+    assert not next(iter(data["notifications"].values()))["resolved"]
+    assert sink["hyperliquid:testnet"]["category"] == "timeout"
+    data["notifications"].clear()
+    async def protected(engine):
+        engine.recovery_checked = True
+        return []
+    monkeypatch.setattr(router, "_recover_account", protected)
+    record_recovery_notices(data, await router.recover(diagnostics_sink=sink), sink)
+    assert len(data["notifications"]) == 2 and all(row["resolved"] for row in data["notifications"].values())
+    data["notifications"].clear()
+    record_recovery_notices(data, await router.recover(diagnostics_sink=sink), sink)
+    assert data["notifications"] == {}
 
 
 def test_safe_recovery_renderer_discards_rpc_secrets_and_names_real_account():

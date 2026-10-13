@@ -105,10 +105,12 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         while True:
             started = asyncio.get_running_loop().time()
             try:
+                account_passes = {}
                 async with trading.lock:
-                    reports = await trading.recover()
+                    reports = await trading.recover(diagnostics_sink=account_passes)
                 from aqla_agent.recovery_notices import record_recovery_notices
-                state.update_metadata(("notifications", "source_status"), lambda data, rows=reports: record_recovery_notices(data, rows))
+                state.update_metadata(("notifications", "source_status"), lambda data, rows=reports, passes=account_passes:
+                    record_recovery_notices(data, rows, passes))
             except Exception:
                 # Native logging only; no second Telegram sender and no resubmission.
                 import logging
