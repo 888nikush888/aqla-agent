@@ -432,7 +432,10 @@ class Lighter(VenueAdapter):
             seen.add(cursor)
         raise AqlaError("Lighter order history exceeded the bounded cursor budget")
 
-    async def fills(self, start, end):
+    async def fill_history(self, market: Market, start: int, end: int):
+        return await self.fills(start, end, market=market)
+
+    async def fills(self, start, end, *, market: Market | None = None):
         result, cursor = [], None
         for _ in range(64):
             raw = await self.read("trades", {"account_index": self.account, "sort_by": "timestamp", "sort_dir": "desc", "limit": 100, **({"cursor": cursor} if cursor else {})}, private=True)
@@ -448,8 +451,10 @@ class Lighter(VenueAdapter):
                 is_bid = str(row["bid_account_id"]) == self.account
                 if not is_ask and not is_bid:
                     raise AqlaError("Lighter returned another account's fill")
-                market = self.native_market(row["market_id"])
-                result.append({"oid": int(row["ask_id"] if is_ask else row["bid_id"]), "tid": row["trade_id"], "coin": market.symbol,
+                if market is not None and row["market_id"] != market.asset_id:
+                    continue
+                selected = self.native_market(row["market_id"])
+                result.append({"oid": int(row["ask_id"] if is_ask else row["bid_id"]), "tid": row["trade_id"], "coin": selected.symbol,
                                "sz": row["size"], "px": row["price"], "time": stamp, "fee": "0" if row.get("maker_fee") == row.get("taker_fee") == 0 else None, "feeToken": "USDC",
                                "native_fee": {"maker_fee": row.get("maker_fee"), "taker_fee": row.get("taker_fee"), "is_maker_ask": row.get("is_maker_ask")},
                                "execution_role": ("maker" if is_ask == row["is_maker_ask"] else "taker")

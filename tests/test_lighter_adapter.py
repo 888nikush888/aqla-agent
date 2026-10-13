@@ -329,6 +329,162 @@ async def test_lighter_grouped_entry_stop_targets_integer_sizes_and_close(lighte
 
 
 @pytest.mark.asyncio
+async def test_uncached_other_market_fill_preserves_recovery_and_owned_close(lighter, setup, signal):
+    from aqla_agent.router import Router
+
+    settings, state, _, exchange, _ = setup
+    adapter, boundary, _, _ = lighter
+    router = Router(settings, state, exchange, adapters={"lighter": adapter})
+    engine = router.engine_for("lighter", settings.network)
+    try:
+        source, interpretation = signal
+        plan = await engine.preview(source.event_id, interpretation)
+        trade = await engine.execute(plan["plan_id"])
+        assert trade["status"] == "open"
+        original_fills = trade["fill_events"]
+        original_orders = trade["orders"]
+        boundary.trades.append({**boundary.trades[0], "market_id": 99, "trade_id": 99999,
+                                "ask_id": 99998, "bid_id": 99997, "timestamp": time.time_ns() // 1_000_000})
+        before = len(boundary.posts)
+        reports = await router.recover()
+        assert not any(row.get("error") for row in reports)
+        assert engine.recovery_checked is True and len(boundary.posts) == before
+        current = state.snapshot()["trades"][trade["trade_id"]]
+        assert current["status"] == "open" and current["fill_events"] == original_fills
+        assert current["orders"] == original_orders and set(adapter.market_cache) == {"BTC"}
+        result = await router.close_trade(trade["trade_id"], "selected-market-close")
+        assert result["phase"] == "acknowledged" and boundary.position == 0
+        close = state.snapshot()["operations"]["operator-close:selected-market-close"]["wire_action"]["orders"][0]
+        assert close["a"] == plan["market"]["asset_id"] == 1
+        assert close["r"] is True and close["b"] is False
+        assert Decimal(close["s"]) == Decimal(trade["remaining_quantity"])
+        assert len(boundary.posts) == before + 1
+        await router.recover()
+        closed = state.snapshot()["trades"][trade["trade_id"]]
+        assert closed["status"] == "closed" and engine.recovery_checked is True
+        assert all(row["coin"] == "BTC" and row["tid"] != 99999 for row in closed["fill_events"].values())
+        assert all(order["a"] == 1 for operation in state.snapshot()["operations"].values()
+                   for order in operation["wire_action"].get("orders", []))
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
+async def test_selected_fill_history_preserves_general_reader_facts(lighter):
+    adapter, boundary, _, _ = lighter
+    try:
+        market = await adapter.market("BTC")
+        adapter.market_cache["ETH"] = market.model_copy(update={"symbol": "ETH", "native_symbol": "ETH", "asset_id": 99})
+        stamp = time.time_ns() // 1_000_000
+        own = {"trade_id": 1, "market_id": 1, "ask_account_id": 42, "bid_account_id": 77,
+               "ask_id": 111, "bid_id": 222, "timestamp": stamp, "size": "1.23", "price": "100.1",
+               "maker_fee": 0, "taker_fee": 0, "is_maker_ask": True}
+        boundary.trades = [own, {**own, "trade_id": 2, "market_id": 99, "ask_id": 333,
+                               "maker_fee": 1, "taker_fee": 2, "is_maker_ask": False}]
+        general = await adapter.fills(stamp, stamp)
+        assert [row["coin"] for row in general] == ["ETH", "BTC"]
+        assert general[0]["fee"] is None and general[0]["execution_role"] == "taker"
+        assert general[1] == {"oid": 111, "tid": 1, "coin": "BTC", "sz": "1.23", "px": "100.1",
+                              "time": stamp, "fee": "0", "feeToken": "USDC", "execution_role": "maker",
+                              "native_fee": {"maker_fee": 0, "taker_fee": 0, "is_maker_ask": True}}
+        assert await adapter.fill_history(market, stamp, stamp) == [general[1]]
+        adapter.market_cache.pop("ETH")
+        with pytest.raises(AqlaError, match="immutable native market"):
+            await adapter.fills(stamp, stamp)
+        assert await adapter.fill_history(market, stamp, stamp) == [general[1]]
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("complete", [True, False], ids=["pages-and-window", "cursor-budget"])
+async def test_selected_fill_history_keeps_page_window_and_request_budget(lighter, monkeypatch, complete):
+    adapter, boundary, _, _ = lighter
+    try:
+        market = await adapter.market("BTC")
+        stamp = time.time_ns() // 1_000_000
+        own = {"trade_id": 1, "market_id": 1, "ask_account_id": 77, "bid_account_id": 42,
+               "ask_id": 111, "bid_id": 222, "timestamp": stamp, "size": "1", "price": "100",
+               "maker_fee": 0, "taker_fee": 0, "is_maker_ask": False}
+        foreign = {**own, "trade_id": 2, "market_id": 99}
+        requests = []
+        def pages(request):
+            if request.url.path.rsplit("/", 1)[-1] != "trades":
+                return boundary.handle(request)
+            requests.append(dict(request.url.params))
+            if complete and request.url.params.get("cursor"):
+                return httpx.Response(200, json={"code": 200, "trades": [own, {**foreign, "timestamp": stamp - 1}]})
+            return httpx.Response(200, json={"code": 200, "trades": [{**foreign, "timestamp": stamp + 1}, foreign], "next_cursor": "next"})
+        monkeypatch.setattr(adapter.client, "_transport", httpx.MockTransport(pages))
+        if complete:
+            facts = await adapter.fill_history(market, stamp, stamp)
+            assert len(facts) == 1 and facts[0]["oid"] == 222 and facts[0]["time"] == stamp
+            assert len(requests) == 2
+        else:
+            with pytest.raises(AqlaError, match="bounded cursor budget"):
+                await adapter.fill_history(market, stamp, stamp)
+            assert len(requests) == 64
+        expected = {"account_index": "42", "sort_by": "timestamp", "sort_dir": "desc", "limit": "100"}
+        assert requests[0] == expected
+        assert all(row == {**expected, "cursor": "next"} for row in requests[1:])
+        assert not boundary.posts and set(adapter.market_cache) == {"BTC"}
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["account", "market_id", "size"])
+async def test_selected_relevant_malformed_fill_still_blocks_management(lighter, signal, damage):
+    adapter, boundary, _, engine = lighter
+    try:
+        source, interpretation = signal
+        plan = await engine.preview(source.event_id, interpretation)
+        trade = await engine.execute(plan["plan_id"])
+        before = len(boundary.posts)
+        boundary.trades.append({**boundary.trades[0], "market_id": 99, "trade_id": 99999})
+        if damage == "account":
+            boundary.trades[0].update(ask_account_id=77, bid_account_id=78)
+        else:
+            boundary.trades[0].pop(damage)
+        reports = await engine.recover()
+        assert any(row.get("error") for row in reports) and engine.recovery_checked is False
+        assert len(boundary.posts) == before and boundary.position > 0
+        current = engine.state.snapshot()["trades"][trade["trade_id"]]
+        assert current["fill_events"] == trade["fill_events"]
+        assert any(row["status"] == "open" and row["reduce_only"] and Decimal(row["trigger_price"]) > 0
+                   for row in boundary.orders.values())
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_selected_history_without_own_entry_fill_never_adopts_other_market(lighter, signal, monkeypatch):
+    adapter, boundary, _, engine = lighter
+    original = boundary.handle
+    def missing_own(request):
+        response = original(request)
+        if request.url.path.rsplit("/", 1)[-1] == "trades":
+            return httpx.Response(200, json={"code": 200, "trades": [
+                {**row, "market_id": 99, "trade_id": 99999} for row in boundary.trades]})
+        return response
+    try:
+        monkeypatch.setattr(adapter.client, "_transport", httpx.MockTransport(missing_own))
+        source, interpretation = signal
+        plan = await engine.preview(source.event_id, interpretation)
+        trade = await engine.execute(plan["plan_id"])
+        assert trade["status"] == "unknown" and trade["fill_evidence_pending"] is True
+        assert trade["filled_quantity"] == "0" and trade["fill_events"] == {}
+        assert not any(row["kind"] == "tp" for row in trade["orders"])
+        assert boundary.position > 0 and any(row["status"] == "open" and row["reduce_only"]
+                                              for row in boundary.orders.values())
+        before = len(boundary.posts)
+        await engine.recover()
+        assert len(boundary.posts) == before and engine.state.snapshot()["trades"][trade["trade_id"]]["status"] == "unknown"
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.asyncio
 async def test_lighter_accepted_lost_response_reconciles_without_signing_again(lighter, signal):
     adapter, boundary, signer, engine = lighter
     source, interpretation = signal
