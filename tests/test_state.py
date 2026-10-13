@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from aqla_hyperliquid_mcp.models import AqlaError, Settings, digest
+from aqla_hyperliquid_mcp.models import AqlaError, GoogleSheetsSettings, Settings, SourceEvent, digest
 from aqla_hyperliquid_mcp.state import State
 from aqla_hyperliquid_mcp.storage import database_path, read_snapshot
 
@@ -73,6 +73,37 @@ def test_json_migration_retains_all_identities_and_original_backup(setup, tmp_pa
     path.write_text('{invalid old backup')
     with State(settings) as resumed:
         assert resumed.snapshot() == data
+
+
+def test_json_import_with_sheets_preserves_opaque_events_and_exports_valid_sources(setup, tmp_path):
+    from aqla_sheets_mcp.journal import project
+
+    settings, state, *_ = setup
+    data = state.snapshot()
+    source = SourceEvent(chat_id="channel", message_id=7, sent_at=1_800_000_000_000, text="Stored report")
+    data["events"] = {"opaque": {"event_id": "original-opaque-id", "classification": "report"},
+        source.event_id: {"event_id": source.event_id, "source_id": source.source_id,
+                          "source": source.model_dump(mode="json"), "status": "report", "interpretation": None}}
+    data["bindings"] = {"opaque": "historical-trade"}
+    path = tmp_path / "sheets-legacy" / "state.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps(data), encoding="utf-8")
+    original = path.read_bytes()
+    sheets = GoogleSheetsSettings(enabled=True, spreadsheet_id="offline-sheet-" + "0" * 25,
+                                 credentials_file=tmp_path / "not-read.secret")
+    settings = settings.model_copy(update={"state_path": path, "google_sheets": sheets})
+    with State(settings) as migrated:
+        saved = migrated.snapshot()
+        assert saved["events"] == data["events"] and saved["bindings"] == data["bindings"]
+        signals = [row for row in project(saved).values() if row["table"] == "Signale"]
+        assert [row["record_id"] for row in signals] == [source.event_id]
+        assert "Signale:" + source.event_id in saved["journal_pending"]
+        assert "Signale:opaque" not in saved["journal_pending"]
+        assert read_snapshot(migrated.path)["events"] == data["events"]
+    assert path.read_bytes() == original
+    with State(settings) as restarted:
+        assert restarted.snapshot()["events"] == data["events"]
+        assert restarted.snapshot()["bindings"] == data["bindings"]
 
 
 @pytest.mark.asyncio

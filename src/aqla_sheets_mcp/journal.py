@@ -8,7 +8,8 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from aqla_agent.monthly import accounting_facts, accounting_issues
+from aqla_agent.monthly import accounting_facts, accounting_issues, fill_identity
+from aqla_agent.source_queue import is_source_row
 from aqla_hyperliquid_mcp.models import AqlaError, Model, digest, now_ms
 
 from .parameters import parameter_values
@@ -115,7 +116,7 @@ def _selected_record(data, key, fallback, history):
         row = history.get(key)
         if row is not None:
             return row
-        if table == "Signale" and identity in data["events"]:
+        if table == "Signale" and identity in data["events"] and is_source_row(data["events"][identity]):
             aliases = {value: name for name, value in data.get("source_aliases", {}).items()}
             return _signal_record(data, identity, data["events"][identity], aliases)
         return None
@@ -131,7 +132,8 @@ def project(data):
     aliases = {value: name for name, value in data.get("source_aliases", {}).items()}
     actions = {order.get("c"): order for operation in data["operations"].values() for order in operation["wire_action"].get("orders", []) if order.get("c")}
     for identity, event in data["events"].items():
-        add(_signal_record(data, identity, event, aliases))
+        if is_source_row(event):
+            add(_signal_record(data, identity, event, aliases))
     for identity, trade in data["trades"].items():
         plan = trade["plan"]
         fills = trade.get("fill_events", {})
@@ -139,8 +141,9 @@ def project(data):
         exits = [fill for fill in fills.values() if fill["kind"] != "entry"]
         gross = sum((Decimal(fill["sz"]) * (Decimal(fill["px"]) - entry) * (1 if plan["side"] == "long" else -1) for fill in exits), Decimal(0)) if entry is not None else None
         quote = plan["market"].get("quote_token", "USDC")
-        fees_known = bool(fills) and all(fill.get("fee") is not None and fill.get("feeToken") == quote for fill in fills.values())
-        fees = sum((Decimal(fill["fee"]) for fill in fills.values()), Decimal(0)) if fees_known else None
+        fee_facts = {identity: trade.get("report_fee_evidence", {}).get(fill_identity(fill), fill) for identity, fill in fills.items()}
+        fees_known = bool(fills) and all(fact.get("fee") is not None and fact.get("feeToken") == quote for fact in fee_facts.values())
+        fees = sum((Decimal(fact["fee"]) for fact in fee_facts.values()), Decimal(0)) if fees_known else None
         net = gross - fees if gross is not None and fees is not None else None
         if accounting_issues(trade, {**trade, **accounting_facts(trade)}):
             net = None
@@ -151,7 +154,8 @@ def project(data):
             observed = trade.get("order_observations", {}).get(order["cloid"], {})
             add(record("Orders", order["cloid"], identity, order["kind"], order.get("index"), number(order.get("quantity", action.get("s"))), number(order.get("price", action.get("p"))), order.get("retired", False), observed.get("status", ""), str(observed["oid"]) if observed.get("oid") is not None else "", timestamp(observed.get("changed_at"))))
         for fill_id, fill in fills.items():
-            add(record("Fills", fill_id, identity, timestamp(fill.get("time")), fill.get("coin", plan["market"]["symbol"]), fill["kind"], fill.get("index"), str(fill["oid"]), number(fill["sz"]), number(fill["px"]), number(fill.get("fee")), fill.get("feeToken") or quote))
+            fee = fee_facts[fill_id]
+            add(record("Fills", fill_id, identity, timestamp(fill.get("time")), fill.get("coin", plan["market"]["symbol"]), fill["kind"], fill.get("index"), str(fill["oid"]), number(fill["sz"]), number(fill["px"]), number(fee.get("fee")), fee.get("feeToken")))
     for identity, operation in data["operations"].items():
         add(record("Vorgänge", identity, timestamp(operation["created_at"]), operation["wire_action"].get("type", ""), operation["phase"], operation.get("outcome", ""), str(operation["nonce"]), timestamp(operation.get("expires_after")), text(operation["request"]), text(operation.get("result"))))
     add(record("Regeln", "aktuell", data["network"], data["account"], data["policy_revision"], data["paused"], text(data["sources"]), text(data["policy"])))

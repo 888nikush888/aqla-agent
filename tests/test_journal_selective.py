@@ -65,6 +65,31 @@ def test_signal_pending_batch_projects_only_selected_keys(journal_data, monkeypa
     assert journal.batch(journal_data, 1) == expected
 
 
+@pytest.mark.parametrize("opaque", ["legacy text", {"event_id": "opaque", "classification": "report"}, None])
+def test_opaque_events_are_preserved_and_skipped_by_full_and_selective_journal(journal_data, monkeypatch, opaque):
+    journal_data["events"]["opaque"] = opaque
+    journal_data["bindings"]["opaque"] = "historical-trade"
+    events, bindings = copy.deepcopy(journal_data["events"]), copy.deepcopy(journal_data["bindings"])
+    rows = journal.project(journal_data)
+    assert "Signale:opaque" not in rows
+    journal.seed(journal_data)
+    previous = copy.deepcopy(journal_data)
+    journal_data["sequence"] += 1
+    journal.enqueue_changes(previous, journal_data)
+    assert journal_data["events"] == events and journal_data["bindings"] == bindings
+    assert "Signale:opaque" not in journal_data["journal_pending"]
+    valid = next(row for row in rows.values() if row["table"] == "Signale")
+    key = journal.record_key(valid)
+    journal_data["journal_pending"] = {"Signale:opaque": "unknown", key: valid["fingerprint"]}
+    monkeypatch.setattr(journal, "project", lambda *_: pytest.fail("Selective source batch used full projection"))
+    result = journal.batch(journal_data)
+    assert [row["record_id"] for row in result["records"]] == [valid["record_id"]]
+    assert journal.acknowledge(journal_data, {"Signale:opaque": "unknown", key: valid["fingerprint"]}) == {
+        "acknowledged": 1, "pending": 1}
+    assert journal_data["journal_pending"] == {"Signale:opaque": "unknown"}
+    assert journal_data["events"] == events and journal_data["bindings"] == bindings
+
+
 def test_history_override_with_noncanonical_map_key_matches_complete_oracle(journal_data):
     key = next(key for key in oracle.project(journal_data) if key.startswith("Signale:"))
     row = copy.deepcopy(oracle.project(journal_data)[key])

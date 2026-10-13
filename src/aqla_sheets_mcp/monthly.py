@@ -207,6 +207,8 @@ def _publish(client, report):
         # Blank the old tail in the same bounded writes; a shrinking revision leaves no stale rows.
         padded = values + [[""] * len(HEADERS) for _ in range(extent - len(values))]
         legacy_confirmed = manifest is None and not created and _read_values(client, title, extent) == padded
+        resumed = _read_values(client, title, extent) if (manifest is not None and not manifest.confirmed
+            and (manifest.revision, manifest.fingerprint) == (report["revision"], report["fingerprint"])) else None
         if manifest is not None:
             _guard(client, title, sheet_id, report, manifest)
         pending = MonthlyManifest(revision=report["revision"], fingerprint=report["fingerprint"], length=len(values),
@@ -218,6 +220,8 @@ def _publish(client, report):
         if not legacy_confirmed:
             for offset in range(0, write_extent, 100):
                 chunk = padded[offset:min(offset + 100, write_extent)]
+                if resumed is not None and resumed[offset:offset + len(chunk)] == chunk:
+                    continue
                 client.request("POST", "/values:batchUpdate", json={"valueInputOption": "RAW", "data": [{
                     "range": f"'{title}'!A{offset + 1}:{last}{offset + len(chunk)}", "values": chunk}]})
         # Verify every written cell, not merely a returned digest or a successful first chunk.

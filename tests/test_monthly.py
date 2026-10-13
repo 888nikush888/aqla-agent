@@ -498,6 +498,46 @@ def test_partial_monthly_write_retries_same_generation():
     assert written_rows(google) <= len(expected)
 
 
+@pytest.mark.parametrize("lost_reply", [False, True])
+def test_large_monthly_publication_resumes_accepted_chunks_after_write_quota_reset(lost_reply):
+    class QuotaGoogle(MonthlyGoogle):
+        writes_in_minute = 0
+        def request(self, method, url, **kwargs):
+            if method == "POST":
+                self.writes_in_minute += 1
+                if self.writes_in_minute > 60:
+                    raise OSError("Synthetic per-minute write quota exhausted")
+            return super().request(method, url, **kwargs)
+
+    google, initial = sheet_client()
+    google = QuotaGoogle()
+    google.lose_reply = lost_reply
+    report = report_at(data(*(trade(f"quota-{index:05d}") for index in range(6500))), 1)
+    expected = table_values(report)[0]
+    assert len(expected) == 6520
+    title = "aqla Mainnet Monatsbericht 2026-10"
+    all_ranges, outcomes = [], []
+    for _ in range(3):
+        google.writes_in_minute = 0
+        google.calls.clear()
+        client = SheetsClient(initial.settings, session=google, scope=initial.scope)
+        outcome = client.publish_monthly(report)
+        outcomes.append(outcome["status"])
+        all_ranges.extend(update["range"] for call in values_writes(google) for update in call["data"])
+        manifest = json.loads(next(item for item in google.metadata if item["metadataKey"].startswith("aqla.monthly."))["metadataValue"])
+        assert manifest["confirmed"] == (outcome["status"] == "published")
+        full_reads = [query for method, url, kwargs in google.calls if method == "GET" and url.endswith("/values:batchGet")
+                      for query in kwargs["params"]["ranges"] if Google.coordinates(query)[0] == title and Google.coordinates(query)[4] == len(expected)]
+        assert len(full_reads) <= 3
+        if outcome["status"] == "published":
+            break
+        assert outcome == {"status": "retry", "publication": None, "error_code": "temporary"}
+    assert outcomes == (["retry", "retry", "published"] if lost_reply else ["retry", "published"])
+    assert len(all_ranges) == len(set(all_ranges)) == 66
+    assert google.tables[title] == expected
+    assert len([name for name in google.tables if name == title]) == 1
+
+
 def test_monthly_shrink_clears_old_content_tail():
     google, client = sheet_client()
     old = report_at(data(*(trade(f"old-{index}") for index in range(15))), 1)

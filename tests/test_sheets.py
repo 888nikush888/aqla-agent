@@ -3,6 +3,7 @@ import json
 import re
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -285,6 +286,91 @@ def test_complete_journal_outcome_does_not_require_funding(completed_journal_tra
     sheets[2].sync([exported])
     group = sheets[2].statistics()["groups"]["gesamt"]
     assert group["wins"] == 1 and group["incomplete_pnl"] == 0
+
+
+@pytest.mark.asyncio
+async def test_verified_late_fees_refresh_journal_and_statistics_without_mutating_fills(setup, completed_journal_trade, sheets, monkeypatch):
+    from aqla_agent.reporting import Reporting
+    from aqla_hyperliquid_mcp.models import AccountSnapshot, Interpretation, Market, TradePlan
+    from aqla_hyperliquid_mcp.rules import make_plan
+
+    settings, state, fake, exchange, trading = setup
+    _, row = completed_journal_trade
+    created = row["plan"]["created_at"]
+    plan = make_plan(Interpretation(kind="new_signal", source_refs=["historical-owned-source"], symbol="BTC",
+        side="long", entry="limit", entry_prices=["101"], stop_loss="90", take_profits=["105", "110"]),
+        Market.model_validate(row["plan"]["market"]),
+        AccountSnapshot(equity="10000", available_margin="10000", observed_at=created),
+        Policy(sizing_mode="fixed_notional", fixed_notional_usdc="202", leverage=20),
+        1, created, (settings.network, settings.account.lower()), stamp=created)
+    row.update(plan=plan.model_dump(mode="json"), trade_id=plan.trade_id, funding_coverage={})
+    assert TradePlan.model_validate(row["plan"]) == plan
+    observed = copy.deepcopy(list(row["fill_events"].values()))
+    for fill in row["fill_events"].values():
+        fill["fee"] = fill["feeToken"] = None
+    before = copy.deepcopy(row["fill_events"])
+    state.journal_enabled = True
+    state.update(lambda data: data["trades"].__setitem__(plan.trade_id, row))
+    initial = project(state.snapshot())
+    assert all(record["values"][HEADERS["Fills"].index("Gebühren-Token")] == ""
+               for record in initial.values() if record["table"] == "Fills")
+    fake.fills = observed
+    reads = []
+    def transport(request):
+        assert request.url.path == "/info"
+        kind = json.loads(request.content)["type"]
+        reads.append(kind)
+        return httpx.Response(200, json=[]) if kind == "userFunding" else fake.handle(request)
+    async with httpx.AsyncClient(base_url=settings.base_url, transport=httpx.MockTransport(transport)) as client:
+        monkeypatch.setattr(exchange, "client", client)
+        result = await Reporting(state, SimpleNamespace(engines={"hyperliquid": trading})).refresh(plan.trade_id)
+    assert result["complete"] and reads == ["userFillsByTime", "userFunding"] and not fake.actions
+    saved = state.snapshot()
+    assert saved["trades"][plan.trade_id]["fill_events"] == before
+    exported = project(saved)
+    key = "Trades:" + plan.trade_id
+    assert exported[key]["fingerprint"] != initial[key]["fingerprint"]
+    assert saved["journal_pending"][key] == exported[key]["fingerprint"]
+    cells = dict(zip(HEADERS["Trades"], exported[key]["values"], strict=True))
+    assert cells["Gebühren USD"] == .4 and cells["Netto vor Funding USD"] == 15.1
+    assert all(record["values"][HEADERS["Fills"].index("Gebühr")] == .1
+               and record["values"][HEADERS["Fills"].index("Gebühren-Token")] == "USDC"
+               for record in exported.values() if record["table"] == "Fills")
+    saved["trades"][plan.trade_id].pop("funding_coverage")
+    saved["trades"][plan.trade_id].pop("funding_events")
+    assert project(saved)[key] == exported[key]
+    sheets[2].sync([exported[key]])
+    group = sheets[2].statistics()["groups"]["gesamt"]
+    assert group["wins"] == 1 and group["incomplete_pnl"] == 0 and group["net_before_funding_usd"] == 15.1
+
+
+@pytest.mark.parametrize("damage", ["fee", "currency", "foreign_currency", "manual", "partial_exit"])
+def test_late_fee_evidence_keeps_incomplete_or_foreign_outcomes_unknown(completed_journal_trade, damage):
+    from aqla_agent.monthly import fill_identity
+
+    snapshot, row = completed_journal_trade
+    row["report_fee_evidence"] = {fill_identity(fill): {"fee": fill["fee"], "feeToken": fill["feeToken"]}
+                                  for fill in row["fill_events"].values()}
+    for fill in row["fill_events"].values():
+        fill["fee"] = fill["feeToken"] = None
+    fee = next(iter(row["report_fee_evidence"].values()))
+    if damage in ("fee", "currency"):
+        fee["fee" if damage == "fee" else "feeToken"] = None
+    elif damage == "foreign_currency":
+        fee["feeToken"] = "HYPE"
+    elif damage == "manual":
+        row["manual_closure"] = True
+    else:
+        row["fill_events"].pop(list(row["fill_events"])[-1])
+    before = copy.deepcopy(row["fill_events"])
+    exported = project(snapshot)
+    cells = dict(zip(HEADERS["Trades"], exported["Trades:" + row["trade_id"]]["values"], strict=True))
+    assert cells["Netto vor Funding USD"] == "" and row["fill_events"] == before
+    if damage in ("fee", "currency", "foreign_currency"):
+        assert cells["Gebühren USD"] == ""
+    if damage in ("currency", "foreign_currency"):
+        first_fill = next(record for record in exported.values() if record["table"] == "Fills")
+        assert first_fill["values"][HEADERS["Fills"].index("Gebühren-Token")] == ("" if damage == "currency" else "HYPE")
 
 
 def test_restart_requeues_changed_financial_projection_with_stable_ids(setup, completed_journal_trade, sheets):
