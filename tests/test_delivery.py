@@ -109,3 +109,46 @@ def test_fifth_lost_confirmation_is_exhausted_and_recoverable(setup, restart):
     assert outbox.overview()["exhausted"] == 1
     assert outbox.retry(owner)["requeued"] == 1
     assert outbox.next_part(owner)["delivery_id"] == first["delivery_id"]
+
+
+def test_fresh_notification_is_queued_past_one_hundred_exhausted_notices(setup):
+    _, state, fake, _, _ = setup
+    state.update_metadata(("notifications",), lambda data: data["notifications"].update({
+        f"old-{index:03}": {"error": "old fact", "observed_at": index} for index in range(100)}))
+    outbox = NotificationOutbox(state, "operator")
+    outbox.bind("first")
+    outbox.prepare()
+    state.update_metadata(("notification_outbox",), lambda data: [
+        row.update(status="exhausted", attempts=5) for row in data["notification_outbox"].values()])
+    before = state.read("notification_outbox")["notification_outbox"]
+    notice(state, identity="fresh", error="new fact")
+    part = outbox.next_part("first")
+    assert part["delivery_id"] not in before and "new fact" in part["text"]
+    current = state.read("notification_outbox")["notification_outbox"]
+    assert all(current[identity] == row for identity, row in before.items())
+    outbox.complete("first", part["delivery_id"], part["part"], True)
+    assert "fresh" not in state.read("notifications")["notifications"]
+    assert len(state.read("notifications")["notifications"]) == 100 and not fake.actions
+
+
+def test_fresh_grouped_sibling_does_not_rewrite_exhausted_frozen_delivery(setup):
+    _, state, fake, _, _ = setup
+    state.update(lambda data: data["events"].__setitem__("event", {
+        "event_id": "event", "source_id": "channel:1", "source": {"chat_id": "channel"},
+        "interpretation": {"source_refs": ["channel:1"]}}))
+    state.update_metadata(("notifications",), lambda data: data["notifications"].__setitem__(
+        "old", {"event_id": "event", "error": "old fact"}))
+    outbox = NotificationOutbox(state, "operator")
+    outbox.bind("first")
+    old = outbox.next_part("first")
+    state.update_metadata(("notification_outbox",), lambda data: data["notification_outbox"][old["delivery_id"]].update(attempts=5))
+    outbox.complete("first", old["delivery_id"], old["part"], False)
+    frozen = state.read("notification_outbox")["notification_outbox"][old["delivery_id"]]
+    state.update_metadata(("notifications",), lambda data: data["notifications"].__setitem__(
+        "fresh", {"event_id": "event", "error": "new fact"}))
+    fresh = outbox.next_part("first")
+    assert fresh["delivery_id"] != old["delivery_id"]
+    queued = state.read("notification_outbox")["notification_outbox"]
+    assert queued[old["delivery_id"]] == frozen and set(queued[fresh["delivery_id"]]["versions"]) == {"fresh"}
+    outbox.complete("first", fresh["delivery_id"], fresh["part"], True)
+    assert set(state.read("notifications")["notifications"]) == {"old"} and not fake.actions

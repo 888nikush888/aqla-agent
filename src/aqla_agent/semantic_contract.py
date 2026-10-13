@@ -20,7 +20,7 @@ LIMIT = pattern(WORD + r"(?:limit|лимит(?:ный|ная|ные|ка|кой|
 ENTRY = pattern(WORD + r"(?:entry|enter|buy|sell|einstieg|einsteigen|вход|входим|войти)" + END)
 PORTION = pattern(WORD + r"(?:half|quarter|hälfte|halbe\w*|viertel|половин\w*|четверть|[1-3]\s*/\s*[24]|\d+\s*%)" + END)
 PAST = pattern(WORD + r"(?:yesterday|previously|already|earlier|gestern|bereits|zuvor|вчера|ранее|уже)" + END)
-NEGATED = pattern(WORD + r"(?:do\s+not|don't|never|not|nicht|kein\w*|не|нельзя)\s+(?:\w+\s+){0,2}$")
+NEGATED = pattern(WORD + r"(?:do\s+not|don't|never|not|no|nicht|kein\w*|не|нельзя)\s+(?:\w+\s+){0,2}$")
 PAST_PREFIX = pattern(WORD + r"(?:did|had|have|has|was|were|habe|haben|hatte|hat|wurde|был\w*)\s+(?:\w+\s+){0,3}$")
 PAST_VERB = (r"(?:перестав(?:ил[аио]?|лял[аио]?|лен[аоы]?)|обнов(?:ил[аио]?|лял[аио]?|лен[аоы]?)|"
              r"замен(?:ил[аио]?|ял[аио]?|ен[аоы]?)|отмен(?:ил[аио]?|ял[аио]?|ен[аоы]?)|"
@@ -31,7 +31,8 @@ PAST_VERB = (r"(?:перестав(?:ил[аио]?|лял[аио]?|лен[аоы
 PAST_MATCH = pattern(r"^" + PAST_VERB + END)
 PAST_GOVERNOR = pattern(WORD + PAST_VERB + r"\s+(?:\w+\s+){0,3}$")
 CLAUSES = pattern(r"\n+|[;!?]+|(?<!\d)\.(?!\d)|\b(?:and|und|и|затем)\b|\s*[,+]\s*")
-SENTENCES = pattern(r"\n+|[;!?]+|(?<!\d)\.(?!\d)")
+# Integer prices can end a sentence; a decimal point still precedes a digit.
+SENTENCES = pattern(r"\n+|[;!?]+|\.(?!\d)")
 CONJUNCTIONS = pattern(r"\b(?:and|und|и|затем|but|aber|но)\b|\s*[,+]\s*")
 CURRENT = pattern(WORD + r"(?:now|jetzt|сейчас|теперь)" + END)
 HYPOTHETICAL = pattern(WORD + r"(?:example(?:\s+only)?|hypothetical\w*|for\s+example|"
@@ -211,20 +212,25 @@ def entry_structure_failure(text):
     text = current_structure_text(text)
     if STOP_CONDITION.search(text):
         return "conditional_stop_not_representable"
-        # A legitimate zone has one form and two bounds. Separate MARKET and
-        # LIMIT entry legs cannot be silently merged into that zone or one order.
+    # A legitimate zone has one form and two bounds. Separate MARKET and
+    # LIMIT entry legs cannot be silently merged into that zone or one order.
     forms = set()
-    for clause_group in re.split(r"[;!?]|(?<!\d)\.(?!\d)", text.casefold()):
+    for clause_group in SENTENCES.split(text):
         if not PAST.search(clause_group) and (ENTRY.search(clause_group) or PORTION.search(clause_group)
                 or re.search(r"(?:market|рынок|маркет\w*|limit|лимит\w*)\s*[:@=-]?\s*\d", clause_group)):
-            if MARKET.search(clause_group):
-                forms.add("market")
-            if LIMIT.search(clause_group):
-                forms.add("limit")
+            for kind, matcher in (("market", MARKET), ("limit", LIMIT)):
+                for match in matcher.finditer(clause_group):
+                    before, after = clause_group[:match.start()], clause_group[match.end():]
+                    if NEGATED.search(before):
+                        continue
+                    if kind == "limit" and (re.search(r"\b(?:risk|risiko|риск\w*)\s*$", before)
+                            or re.match(r"\s*(?:(?:of|for|für|des)\s+)?(?:risk|risiko|риск\w*)\b", after)):
+                        continue
+                    forms.add(kind)
     if len(forms) > 1:
         return "entry_legs_not_representable"
-    for clause in re.split(r"[;!?\n]|(?<!\d)\.(?!\d)", text):
-        if DISCRETE_ENTRIES.search(clause) and not ENTRY_ZONE.search(clause) and len(
+    for clause in SENTENCES.split(text):
+        if any(not NEGATED.search(clause[:match.start()]) for match in DISCRETE_ENTRIES.finditer(clause)) and not ENTRY_ZONE.search(clause) and len(
                 re.findall(r"(?<![\w.])\d+(?:[.,]\d+)*(?!\w)", clause)) > 1:
             return "entry_legs_not_representable"
     if (ENTRY.search(text) or MARKET.search(text)) and any(

@@ -1,0 +1,12 @@
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Public Sheets presentation metadata key"
+condition = "AND"
+regexTarget = "secret"
+paths = ['(^|[/\\])src[/\\]aqla_sheets_mcp[/\\]presentation\.py$']
+regexes = ['^aqla\.presentation\.v1$']

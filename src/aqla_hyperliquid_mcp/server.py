@@ -304,7 +304,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         if sections is not None:
             from aqla_agent.efficiency import diagnostic_sections
             result = diagnostic_sections(result, snapshot, sections)
-        return compact_view(result, "trade_diagnostics", {"trade_id": trade_id}, offset, limit, view_version) if view == "compact" else result
+        return compact_view(result, "trade_diagnostics", {"trade_id": trade_id, "sections": sections}, offset, limit, view_version) if view == "compact" else result
 
     @server.tool(annotations=read)
     async def source_context(event_id: str, view: Literal["full", "compact", "decision"] = "full", offset: int = 0, limit: int = 20,

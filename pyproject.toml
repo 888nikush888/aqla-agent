@@ -45,7 +45,7 @@ packages = ["src/aqla_agent", "src/aqla_hyperliquid_mcp", "src/aqla_sheets_mcp"]
 include = [
   "/src", "/hermes_plugin", "/skills", "/tests", "/docs", "/scripts",
   "/.github", "/plans", "/README.md", "/IMPLEMENTATION_STATUS.md",
-  "/pyproject.toml", "/uv.lock", "/config.example.yaml", "/hermes-runtime-overrides.txt", "/.gitignore", "/.gitattributes",
+  "/pyproject.toml", "/uv.lock", "/config.example.yaml", "/hermes-runtime-overrides.txt", "/.gitignore", "/.gitattributes", "/.gitleaks.toml",
 ]
 exclude = ["**/__pycache__/**", "**/*.pyc"]
 

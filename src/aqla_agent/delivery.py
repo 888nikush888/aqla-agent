@@ -42,13 +42,13 @@ class NotificationOutbox:
         snapshot = self.state.snapshot()
         existing = snapshot.get("notification_outbox", {})
         covered = {pair for row in existing.values() for pair in row["versions"].items()}
+        snapshot["notifications"] = {identity: notice for identity, notice in snapshot["notifications"].items()
+                                     if (identity, digest(notice)) not in covered}
         # Use the existing full renderer internally, not a possibly overflowed model-facing page.
-        view = telegram_view(snapshot, {})
+        view = telegram_view(snapshot, {}, include_status=False)
         fresh = []
         for message in view["messages"]:
             versions = message["notification_versions"]
-            if any(pair in covered for pair in versions.items()):
-                continue
             chunks = [chunk for text in message["texts"] for chunk in text_chunks(text)]
             identity = digest([self.owner, snapshot["account"], snapshot["network"], versions, chunks, "aqla-delivery-v1"])
             fresh.append({"delivery_id": identity, "owner": self.owner, "account": snapshot["account"],

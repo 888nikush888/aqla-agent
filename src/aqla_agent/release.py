@@ -16,7 +16,7 @@ from aqla_agent.artifact_rules import validate_member, validate_zip_members
 SHIPPING_DIRS = ("src", "hermes_plugin", "skills", "tests", "docs", "scripts")
 SHIPPING_FILES = (
     "README.md", "IMPLEMENTATION_STATUS.md", "pyproject.toml", "uv.lock",
-    "config.example.yaml", "hermes-runtime-overrides.txt",
+    "config.example.yaml", "hermes-runtime-overrides.txt", ".gitleaks.toml",
 )
 
 

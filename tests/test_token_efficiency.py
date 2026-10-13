@@ -243,6 +243,27 @@ async def test_diagnostic_sections_deduplicate_source_revisions(efficiency_serve
 
 
 @pytest.mark.asyncio
+async def test_filtered_diagnostic_compact_continuations_preserve_sections_and_version(efficiency_server, setup):
+    from test_notifications import lifecycle_fixture
+    _, state, *_ = setup
+    state.update(lambda data: lifecycle_fixture(data, setup[0], count=1, fills=2))
+    identity = next(iter(state.snapshot()["trades"]))
+    first = await call(efficiency_server, "trade_diagnostics", trade_id=identity, sections=["fills"], view="compact", limit=1)
+    result, rows = first, list(first["rows"])
+    while result.get("next_page"):
+        arguments = result["next_page"]["arguments"]
+        assert arguments["sections"] == ["fills"]
+        result = await call(efficiency_server, "trade_diagnostics", **arguments)
+        rows.extend(result["rows"])
+    assert result["retained_page_complete"] and result["next_offset"] is None
+    assert {row["section"] for row in rows}.issuperset({"fill_events", "entry_vwap"})
+    assert not {row["section"] for row in rows}.intersection({"plan", "orders", "sources"})
+    state.update(lambda data: data["trades"][identity].update(entry_vwap="101"))
+    with pytest.raises(ToolError, match="view_version"):
+        await call(efficiency_server, "trade_diagnostics", **first["next_page"]["arguments"])
+
+
+@pytest.mark.asyncio
 async def test_journal_projection_verifies_full_row_and_filters_time(setup, sheets):  # noqa: F811 -- imported fixture
     from aqla_sheets_mcp.journal import HEADERS, record
     from aqla_sheets_mcp.server import create_server as sheets_server

@@ -124,3 +124,57 @@ async def test_actual_legacy_status_keeps_previous_decision_jobs_as_history(lega
     assert processing["jobs"] == {} and processing["historical_jobs"]["applying"] == 1 and processing["historical_jobs"]["done"] == 1
     assert processing["decision"] == {} and processing["diagnostics"] == []
     assert not fake.actions and not state.snapshot()["operations"]
+
+
+@pytest.mark.parametrize("tool", ["interpret_source", "trade_preview"])
+@pytest.mark.parametrize("tail", [
+    "", "Do not use limit orders.", "No limit orders.", "Risk limit 1%.", "Limit risk to 1%.",
+    "Keine Limit Orders.", "Risiko Limit 1%.", "Limit für Risiko 1%.",
+    "Не используйте лимитные ордера.", "Лимит риска 1%.", "Риск лимит 1%.",
+    "Do not use limit orders at 95 and 96.",
+])
+async def test_single_legacy_entry_ignores_negated_order_forms_and_risk_commentary(legacy_server, tool, tail):
+    server, state, fake = legacy_server
+    source, value, _ = original(server, "BTC LONG. Entry MARKET 100. SL 90. TP 110. " + tail,
+        kind="new_signal", symbol="BTC", side="long", entry="market", entry_prices=[100], stop_loss=90,
+        take_profits=[110], quotes=[("symbol", "BTC"), ("side", "LONG"), ("entry_prices.0", "100"),
+                                  ("stop_loss", "90"), ("take_profits.0", "110")])
+    await server.call_tool(tool, {"event_id": source.event_id, "interpretation": value.model_dump(mode="json"),
+                                 "context_auth": server.aqla_authority.sign("source", "legacy-one-entry")})
+    row = state.snapshot()["events"][source.event_id]
+    assert row["interpretation"] == value.model_dump(mode="json")
+    assert bool(state.snapshot()["plans"]) is (tool == "trade_preview")
+    assert not fake.actions and not state.snapshot()["operations"]
+
+
+@pytest.mark.parametrize("tool", ["interpret_source", "trade_preview"])
+@pytest.mark.parametrize("entry", [
+    "Entry half MARKET 100 and half LIMIT 95",
+    "Einstieg Hälfte Markt 100 und Hälfte LIMIT 95",
+    "Вход половина по рынку 100 и половина лимит 95",
+    "Entry MARKET 100. No limit orders except LIMIT 95",
+])
+async def test_affirmative_mixed_legacy_legs_still_reject_before_orders(legacy_server, tool, entry):
+    server, state, fake = legacy_server
+    source, value, _ = original(server, "BTC LONG. " + entry + ". SL 90. TP 110.",
+        kind="new_signal", symbol="BTC", side="long", entry="market", entry_prices=[100], stop_loss=90,
+        take_profits=[110], quotes=[("symbol", "BTC"), ("side", "LONG"), ("entry_prices.0", "100"),
+                                  ("stop_loss", "90"), ("take_profits.0", "110")])
+    with pytest.raises(ToolError, match="entry_legs_not_representable"):
+        await server.call_tool(tool, {"event_id": source.event_id, "interpretation": value.model_dump(mode="json"),
+                                     "context_auth": server.aqla_authority.sign("source", "legacy-mixed-entry")})
+    assert state.snapshot()["events"][source.event_id]["interpretation"] is None
+    assert not state.snapshot()["plans"] and not state.snapshot()["operations"] and not fake.actions
+
+
+@pytest.mark.parametrize("tool", ["interpret_source", "trade_preview"])
+async def test_integer_sentence_boundaries_preserve_decimal_legacy_prices(legacy_server, tool):
+    server, state, fake = legacy_server
+    source, value, _ = original(server, "BTC LONG. Entry MARKET 100.25. SL 90.5. TP 110.75. Do not use limit orders.",
+        kind="new_signal", symbol="BTC", side="long", entry="market", entry_prices=["100.25"], stop_loss="90.5",
+        take_profits=["110.75"], quotes=[("symbol", "BTC"), ("side", "LONG"), ("entry_prices.0", "100.25"),
+                                       ("stop_loss", "90.5"), ("take_profits.0", "110.75")])
+    await server.call_tool(tool, {"event_id": source.event_id, "interpretation": value.model_dump(mode="json"),
+                                 "context_auth": server.aqla_authority.sign("source", "legacy-decimal-entry")})
+    assert state.snapshot()["events"][source.event_id]["interpretation"] == value.model_dump(mode="json")
+    assert not fake.actions and not state.snapshot()["operations"]
