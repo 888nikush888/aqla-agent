@@ -1,5 +1,7 @@
 # Python und Decision Models für die automatische Quellenverarbeitung
 
+Aktueller Betriebsentscheid (13.10.2026): `legacy` — Hermes + DeepSeek + Tools. Der optionale Decision-/Hybridpfad unten ist deaktiviert. Tokenoptimierung und allgemeine Handels-/Beleg-/Recoverykorrekturen bleiben aktiv; das Hybrid-Ausgabebudget gilt nicht für den normalen Hermes-Agenten.
+
 Die native Hermes-Erweiterung besitzt einen optionalen Python-Worker. Er liest den aktuellen Quellenkontext, lässt ein Decision Model typisierte Entscheidungen treffen, validiert Originalbelege und verwendet die vorhandenen MCP-Handelspfade. Preise und Zitate stammen aus Python-Kandidaten; das Decision Model besitzt keine ausführbaren Werkzeuge. Der Betreiberchat bleibt bei Hermes. Standard ist `inception/mercury-decide:free` über OpenRouter; generative Aufgaben verwenden OpenCode Go mit OpenRouter-Fallback.
 
 ## Konfiguration
