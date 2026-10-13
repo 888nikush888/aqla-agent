@@ -449,6 +449,17 @@ async def test_complete_outgoing_decision_size_is_checked_before_catalog_or_prov
 
 
 @pytest.mark.asyncio
+async def test_invalid_successful_response_is_not_logged_as_transport_failure():
+    usage = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"model": "changed"}))) as client:
+        adapter = OpenRouterDecisionAdapter("synthetic", client=client, model_revision=DEFAULT_DECISION_MODEL)
+        with pytest.raises(DecisionFailure, match="decision_model_changed"):
+            await adapter.evaluate({}, {}, usage=usage)
+    assert usage[0]["response_success"] is True
+    assert usage[0]["failed"] and usage[0]["usage_available"] is False
+
+
+@pytest.mark.asyncio
 async def test_prepared_candidates_are_reused_without_changing_request(monkeypatch):
     import aqla_agent.decisions as decision_module
     packet = packet_for()

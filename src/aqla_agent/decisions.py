@@ -757,11 +757,13 @@ class OpenRouterDecisionAdapter:
         client = self.client or httpx.AsyncClient(timeout=self.timeout, follow_redirects=False, trust_env=False)
         started = time.monotonic()
         recorded = False
+        received_ok = False
         try:
             response = await client.post(OPENROUTER_DECISIONS_URL,
                 headers={"Authorization": "Bearer " + self.api_key},
                 json=body, timeout=self.timeout)
             response.raise_for_status()
+            received_ok = True
             if len(response.content) > 2_000_000:
                 raise DecisionFailure("decision_response_limit")
             value = response.json()
@@ -795,7 +797,7 @@ class OpenRouterDecisionAdapter:
         finally:
             if usage is not None and not recorded:
                 usage.append({"phase": phase, "model": self.model, "provider": "openrouter", "failed": True,
-                              "response_success": False, "request_hash": digest(body),
+                              "response_success": received_ok, "request_hash": digest(body),
                               "usage_available": False, "duration_seconds": time.monotonic() - started})
             if owned:
                 await client.aclose()
