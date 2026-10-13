@@ -108,10 +108,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             try:
                 async with trading.lock:
                     reports = await trading.recover()
-                if reports:
-                    meaningful = [row for row in reports if row.get("error") or row.get("replacement_unconfirmed")]
-                    if meaningful:
-                        state.update(lambda data, reports=meaningful: data["notifications"].__setitem__(str(now_ms()), {"reports": reports}))
+                from aqla_agent.recovery_notices import record_recovery_notices
+                state.update_metadata(("notifications", "source_status"), lambda data, rows=reports: record_recovery_notices(data, rows))
             except Exception:
                 # Native logging only; no second Telegram sender and no resubmission.
                 import logging
@@ -172,6 +170,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             return {"view": "summary", "paused": snapshot["paused"], "network": settings.network,
                     "setup": setup_gate.status(binding, lease_id, owner_id=settings.telegram_owner_id),
                     "source_queue": queue_overview(snapshot, limit=8), "notification_pending": len(snapshot["notifications"]),
+                    "source_processing": processor.overview(),
                     "open_trade_count": sum(row["status"] in OPEN for row in snapshot["trades"].values()),
                     "open_trade_count_meaning": "active_work_including_pending_and_unsettled",
                     "execution_counts": execution_counts(snapshot),
@@ -194,7 +193,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         result = {"network": settings.network, "account": exchange.account, "paused": snapshot["paused"], "setup": setup_gate.status(binding, lease_id, owner_id=settings.telegram_owner_id),
                 "policy": snapshot["policy"], "policy_revision": snapshot["policy_revision"], "sources": snapshot["sources"],
                 "source_names": snapshot.get("source_names", {}), "source_names_revision": snapshot.get("source_names_revision", 0),
-                "pending": queue["ready"], "source_queue": queue,
+                "pending": queue["ready"], "source_queue": queue, "source_processing": processor.overview(),
                 "trades": [{**row, "execution_outcome": trade_outcome(row, entry_operations), "entry_diagnostic": diagnostic_view(row, entry_operations)} for row in snapshot["trades"].values() if row["status"] in OPEN],
                 "execution_counts": execution_counts(snapshot),
                 "unresolved_operations": [operation_diagnostic_view(trading.public_operation(row)) for row in snapshot["operations"].values() if row["phase"] in ("prepared", "sending", "unknown")],
@@ -439,14 +438,15 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.update_metadata(("notifications",), acknowledge)
 
     @server.tool(annotations=write)
-    async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "set_source_name", "set_source_rank", "close_trade", "clear_notification", "set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled", "set_ranking_policy", "set_account_limits", "set_account_enabled"],
+    async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "add_sources", "remove_sources", "set_source_name", "set_source_rank", "close_trade", "resolve_conflict", "clear_notification", "set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled", "set_ranking_policy", "set_account_limits", "set_account_enabled"],
                       expected_revision: int | None = None, policy: Policy | None = None, sources: list[str] | None = None,
                       trade_id: str | None = None, notification_id: str | None = None, context_auth: str = "",
                       profile: TradingProfile | None = None, pipeline: Pipeline | None = None, exchange_id: Venue | None = None,
                       limits: AccountLimits | None = None, enabled: bool | None = None, identity: str | None = None,
                       source_id: str | None = None, source_name: str | None = None,
-                      ranking_policy: RankingPolicy | None = None, account_key: str | None = None, tier: Tier | None = None) -> dict:
-        """Apply an authenticated natural-language user request. Source turns cannot change rules."""
+                      ranking_policy: RankingPolicy | None = None, account_key: str | None = None, tier: Tier | None = None,
+                      review_fingerprint: str | None = None) -> dict:
+        """Authenticated operator controls. add_sources/remove_sources preserve other sources; set_sources replaces the COMPLETE list. Source selection requires current configuration_revision."""
         claims = authorize(context_auth, operator=True)
         protected = action not in ("pause", "set_source_name", "close_trade", "clear_notification") and not (
             action in ("set_account_enabled", "set_exchange_enabled") and enabled is False)
@@ -520,6 +520,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             if trade_id is None:
                 raise AqlaError("trade_id is required")
             return await trading.close_trade(trade_id, claims["request_id"])
+        if action == "resolve_conflict":
+            return await trading.resolve_conflict(trade_id, review_fingerprint, commit_check)
         if action == "set_exchange_enabled" and enabled is True:
             if expected_revision != state.snapshot()["configuration_revision"]:
                 raise AqlaError("Read the current configuration revision before activation")
@@ -542,22 +544,21 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 sync_legacy_policy(data)
             elif action in ("pause", "resume"):
                 data["paused"] = action == "pause"
-            elif action == "set_sources":
-                if sources is None or any(not source for source in sources):
-                    raise AqlaError("Supply the complete explicit source list")
-                from aqla_agent.sources import resolve_source
-                resolved = [resolve_source(data, item) for item in sources]
-                data["sources"] = sorted(set(resolved))
-                from aqla_agent.ranking import source_rank
-                for source in data["sources"]:
-                    source_rank(data, source)
-                data["source_aliases"] = {key: value for key, value in data.get("source_aliases", {}).items() if key in data["sources"]}
+            elif action in ("set_sources", "add_sources", "remove_sources"):
+                from aqla_agent.sources import change_sources
+                return change_sources(data, action, sources, expected_revision)
             elif action == "clear_notification":
                 data["notifications"].pop(notification_id, None)
             return {"policy": data["policy"], "policy_revision": data["policy_revision"], "paused": data["paused"], "sources": data["sources"],
                     **({"previous_paused": previous_paused} if action in ("pause", "resume") else {})}
 
         return state.update(apply)
+
+    @server.tool(annotations=write)
+    async def conflict_review(trade_id: str, context_auth: str = "") -> dict:
+        """Authenticated ownership review with fresh original-account evidence; records a short-lived review fingerprint. Never creates/cancels an order. Unproved/mixed exposure remains reserved."""
+        authorize(context_auth, operator=True)
+        return await trading.conflict_review(trade_id)
 
     @server.tool(annotations=write)
     async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack", "monthly_job", "monthly_ack", "monthly_request", "monthly_failure", "monthly_page", "setup_bind", "setup_grant", "setup_failed", "setup_revoke", "setup_status", "presentation_snapshot", "source_configure", "source_prepare", "source_packet", "source_record", "source_apply", "source_fail", "source_overview", "source_notice", "delivery_next", "delivery_complete", "delivery_retry"], token: str, source: SourceEvent | None = None,
@@ -572,6 +573,11 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                           processing_owner: str | None = None, processing_version: str | None = None,
                           job_id: str | None = None, decision_result: dict | None = None,
                           failure_code: str | None = None, delivery_id: str | None = None,
+                          failure_detail: dict | None = None,
+                          decision_status: dict | None = None,
+                          retry_max_attempts: Annotated[int, Field(strict=True, ge=1, le=5)] = 3,
+                          retry_backoff_seconds: Annotated[int, Field(strict=True, ge=1, le=300)] = 15,
+                          retry_max_age_seconds: Annotated[int, Field(strict=True, ge=30, le=3600)] = 900,
                           delivery_part: int | None = None, delivery_success: bool | None = None,
                           offset: Annotated[int, Field(strict=True, ge=0)] = 0,
                           limit: Annotated[int, Field(strict=True, ge=1, le=100)] = 100) -> dict:
@@ -580,7 +586,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             raise AqlaError("Integration key is not configured")
         authority.internal(token)
         if action == "source_configure":
-            configured = processor.configure(processing_mode, processing_owner)
+            configured = processor.configure(processing_mode, processing_owner, retry_max_attempts=retry_max_attempts,
+                retry_backoff_seconds=retry_backoff_seconds, retry_max_age_seconds=retry_max_age_seconds, decision_status=decision_status)
             outbox.bind(processing_owner)
             return configured
         if action == "source_prepare":
@@ -595,7 +602,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         if action == "source_apply":
             return await processor.apply(processing_owner, job_id)
         if action == "source_fail":
-            return processor.fail(processing_owner, job_id, failure_code)
+            return processor.fail(processing_owner, job_id, failure_code, detail=failure_detail)
         if action == "source_overview":
             return {**processor.overview(), "delivery": outbox.overview()}
         if action == "source_notice":
@@ -604,13 +611,15 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             def notice(data):
                 category = "conflicts" if code.startswith("source_conflict") else "reader"
                 previous = data["source_status"].get(category, {})
+                if not previous and code in ("reader_recovered", "source_conflict_resolved"):
+                    return
                 signature = digest([code, processing_version])
                 if previous.get("signature") == signature:
                     return
                 transition = previous.get("transition", 0) + 1
                 data["source_status"][category] = {"signature": signature, "transition": transition}
                 identity = "source-status:" + digest([category, transition])
-                data["notifications"].setdefault(identity, {"error": "Quellenstatus: " + code})
+                data["notifications"].setdefault(identity, {"source_notice": {"code": code, "category": category}})
             state.update_metadata(("notifications", "source_status"), notice)
             return {"recorded": True}
         if action in ("delivery_next", "delivery_complete", "delivery_retry"):
