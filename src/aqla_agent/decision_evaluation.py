@@ -23,6 +23,7 @@ from .decisions import (
     build_packet,
     calibration_family,
     candidates,
+    numeric_occurrences,
     replay_decision,
 )
 
@@ -232,7 +233,10 @@ def annotated_numeric_roles(packet, expected, spans, candidate_occurrences=None)
         matching = [span for span in matching if any(covered_by_proof(packet, span, proof) for proof in proofs)]
         if len(matching) != 1:
             raise ValueError("Candidate occurrence must uniquely match gold value, original position and Evidence")
-        if any(matching[0].candidate_id in identities for identities in selected.values()):
+        by_id = {span.candidate_id: span for span in spans}
+        occurrence = (matching[0].source_id, matching[0].start, matching[0].end)
+        if any((by_id[identity].source_id, by_id[identity].start, by_id[identity].end) == occurrence
+               for identities in selected.values() for identity in identities):
             raise ValueError("Candidate occurrence cannot be annotated twice or as different fields")
         selected.setdefault(field, []).append(matching[0].candidate_id)
     roles = {span.candidate_id: set() for span in spans if span.kind == "number"}
@@ -261,7 +265,6 @@ def annotated_numeric_roles(packet, expected, spans, candidate_occurrences=None)
 def question_labels(packet, expected, actual=None, candidate_occurrences=None):
     """Independent annotated values/quotes map prepared choices to correct answers."""
     spans = candidates(packet)
-    by_id = {s.candidate_id: s for s in spans}
     proofs = expected.get("evidence", []) or []
     labels = {"kind": {expected.get("kind")}, "side": {expected.get("side") or "not_present"},
         "entry": {expected.get("entry", "unspecified")}, "entry_timing": {expected.get("entry_timing", "standard")},
@@ -286,10 +289,20 @@ def question_labels(packet, expected, actual=None, candidate_occurrences=None):
                    for role in ("entry0", "entry1")]
         if all(len(entry) == 1 for entry in entries) and bounded_live_entry_range(packet, [entry[0] for entry in entries]):
             labels["entry"].add("unspecified")
-    for identity, span in by_id.items():
-        if span.kind != "number":
-            continue
-        labels["role." + identity] = {"unclear"} if "unclear" in numeric_roles[identity] else numeric_roles[identity] or {"ignore"}
+    for identity, alternatives in numeric_occurrences(spans):
+        roles = set().union(*(numeric_roles[span.candidate_id] for span in alternatives))
+        if "unclear" in roles:
+            labels["role." + identity] = {"unclear"}
+        elif len(roles) > 1:
+            raise ValueError("One original numeric occurrence cannot name different trading fields")
+        else:
+            labels["role." + identity] = roles or {"ignore"}
+        if len(alternatives) > 1:
+            # Only gold value + exact annotated original occurrence determine
+            # normalization. Unused numbers do not require a decimal convention.
+            labels["normalization." + identity] = ({"unclear"} if "unclear" in roles else
+                {span.candidate_id for span in alternatives if numeric_roles[span.candidate_id]} if roles else
+                {"not_present", *(span.candidate_id for span in alternatives)})
     actionable = expected.get("kind") in ("new_signal", "trade_update")
     if expected.get("kind") not in ("incomplete", "ambiguous"):
         labels["live_action"] = {actionable}
@@ -317,7 +330,7 @@ def calibration_question_results(packet, expected, observation, result, candidat
     for key in dict.fromkeys(required):
         if key not in probabilities or key not in labels:
             continue
-        if key.startswith("role.") and labels[key] == {"unclear"}:
+        if key.startswith(("role.", "normalization.")) and labels[key] == {"unclear"}:
             # Missing gold occurrence identity is not a model mistake. Keep it
             # out of fitting rather than disabling a genuinely correct family.
             continue
@@ -514,9 +527,9 @@ async def evaluate(dataset, adapter, *, profile=None, master="", collect=False, 
                                  case.get("candidate_occurrences"))
         required_questions = result.required_questions if result else observation.get("required_questions", [])
         unlabelled = [question for question in dict.fromkeys(required_questions)
-                      if question.startswith("role.") and labels.get(question) == {"unclear"}]
+                       if question.startswith(("role.", "normalization.")) and labels.get(question) == {"unclear"}]
         if (result and result.interpretation.kind in ("new_signal", "trade_update") and case.get("annotation_complete")
-                and any(row["question"].startswith("role.") and not row["correct"] for row in question_results)):
+                and any(row["question"].startswith(("role.", "normalization.")) and not row["correct"] for row in question_results)):
             mismatches.append("candidate_occurrences")
         predicted = result.interpretation.kind if result else None
         expected_kind = case["expected"].get("kind")
@@ -586,7 +599,7 @@ async def evaluate_split(dataset, adapter, sources, master="", *, checkpoint_pat
             row["accepted"], row["deferred"] = True, False
             row["mismatch_fields"] = annotation_mismatches(accepted.interpretation, case["expected"])
             if (case.get("annotation_complete") and accepted.interpretation.kind in ("new_signal", "trade_update")
-                    and any(question["question"].startswith("role.") and not question["correct"]
+                    and any(question["question"].startswith(("role.", "normalization.")) and not question["correct"]
                             for question in row["question_results"])):
                 row["mismatch_fields"].append("candidate_occurrences")
             row["passed"] = not row["mismatch_fields"]

@@ -15,6 +15,7 @@ from aqla_agent.decisions import (
     build_packet,
     candidates,
     checked_answers,
+    numeric_occurrences,
     questions_for,
     replay_decision,
     verification_questions,
@@ -49,6 +50,8 @@ def response_for(questions, *, kind="new_signal", overrides=None):
             instructions = json.loads(question["instructions"]) if isinstance(question["instructions"], str) else question["instructions"]
             raw = instructions["occurrence"]["quote"]
             selected = {"100": "entry0", "90": "stop_loss", "110": "target_1", "120": "target_2", "50%": "target_1", "100%": "target_2"}.get(raw, "ignore")
+        elif key.startswith("normalization."):
+            selected = "not_present"
         selected = (overrides or {}).get(key, selected)
         assert selected in options, (key, selected)
         answers[key] = {"type": "choice", "choice": selected,
@@ -76,6 +79,181 @@ def test_candidates_preserve_occurrences_percentages_and_ambiguous_normalization
     assert any(s.quote == "50%" and s.value == "50" for s in spans)
     for s in spans:
         assert packet["messages"][0]["text"][s.start:s.end] == s.quote
+
+
+def test_ambiguous_numeric_occurrence_has_one_normalization_choice_and_one_role():
+    packet = packet_for("BTC long. Entry limit 12.473. SL 12.473. TP 100%.")
+    spans = candidates(packet)
+    questions = questions_for(packet, spans)
+    ambiguous = [(identity, group) for identity, group in numeric_occurrences(spans) if len(group) > 1]
+    assert len(ambiguous) == 2 and ambiguous[0][0] != ambiguous[1][0]
+    for identity, group in ambiguous:
+        assert {span.value for span in group} == {"12.473", "12473"}
+        assert "role." + identity in questions and "normalization." + identity in questions
+        assert all("role." + span.candidate_id not in questions for span in group)
+        prepared = {key: json.loads(value) for key, value in questions["normalization." + identity]["criteria"].items()
+                    if key not in ("not_present", "unclear")}
+        assert prepared == {span.candidate_id: span.model_dump(mode="json") for span in group}
+        role_occurrence = json.loads(questions["role." + identity]["instructions"])["occurrence"]
+        assert role_occurrence["quote"] == "12.473" and "value" not in role_occurrence
+        assert role_occurrence["candidate_ids"] == [span.candidate_id for span in group]
+    unique = next(span for span in spans if span.quote == "100%")
+    assert "role." + unique.candidate_id in questions
+    assert "normalization." + unique.candidate_id not in questions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quote,value", [("12.473", "12.473"), ("12.473", "12473"),
+    ("3,963", "3.963"), ("1,206", "1.206"), ("1.984", "1.984"), ("1.984", "1984")])
+async def test_only_model_selected_normalization_receives_shared_occurrence_role(quote, value):
+    packet = packet_for("BTC long. Entry limit " + quote + ".")
+    identity, group = numeric_occurrences(candidates(packet))[0]
+    selected = next(span for span in group if Decimal(span.value) == Decimal(value))
+    requests, observation = [], {}
+
+    def upstream(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(200, json=response_for(body["questions"], overrides={
+            "role." + identity: "entry0", "normalization." + identity: selected.candidate_id}))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        result = await OpenRouterDecisionAdapter("synthetic", client=client, model_revision=DEFAULT_DECISION_MODEL).interpret(
+            packet, CalibrationProfile(), observation=observation)
+    assert len(requests) == 2 and result.verified
+    assert result.interpretation.entry_prices == [Decimal(value)]
+    assert [(proof.source_id, proof.quote) for proof in result.interpretation.evidence if proof.field == "entry_prices.0"] == [
+        (selected.source_id, quote)]
+    assert observation["values"]["normalization." + identity] == selected.candidate_id
+    assert observation["responses"][0]["answers"]["normalization." + identity]["choice"] == selected.candidate_id
+    assert "normalization." + identity in result.required_questions
+    assert result.probabilities["normalization." + identity] == 1
+    assert not any(key.startswith("normalization.") for key in requests[1]["questions"])
+
+
+@pytest.mark.parametrize("normalization,failure", [("not_present", "numeric_normalization_missing"),
+                                                   ("unclear", "uncertain_decision")])
+def test_requested_ambiguous_value_cannot_be_silently_dropped_or_normalized(normalization, failure):
+    packet = packet_for("BTC long. Entry limit 12.473.")
+    identity, _ = numeric_occurrences(candidates(packet))[0]
+    questions = questions_for(packet, candidates(packet))
+    response = response_for(questions, overrides={"role." + identity: "entry0", "normalization." + identity: normalization})
+    with pytest.raises(DecisionFailure, match=failure):
+        replay_decision(packet, CalibrationProfile(), [response], model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+
+
+@pytest.mark.asyncio
+async def test_uncertain_numeric_normalization_stops_before_second_model_call():
+    packet = packet_for("BTC long. Entry limit 12.473.")
+    identity, group = numeric_occurrences(candidates(packet))[0]
+    requests, observation = [], {}
+
+    def upstream(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        response = response_for(body["questions"], overrides={"role." + identity: "entry0",
+            "normalization." + identity: group[0].candidate_id})
+        answer = response["answers"]["normalization." + identity]
+        answer["probabilities"] = {key: 0.51 if key == group[0].candidate_id else 0.49 if key == group[1].candidate_id else 0
+                                   for key in answer["probabilities"]}
+        return httpx.Response(200, json=response)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        with pytest.raises(DecisionFailure, match="uncertain_decision"):
+            await OpenRouterDecisionAdapter("synthetic", client=client, model_revision=DEFAULT_DECISION_MODEL).interpret(
+                packet, CalibrationProfile(thresholds={"number_normalization": 0.99}), observation=observation)
+    assert len(requests) == 1 and observation["probabilities"]["normalization." + identity] == 0.51
+    assert observation["values"]["normalization." + identity] == group[0].candidate_id
+
+
+def test_separate_equal_quotes_choose_values_independently_and_dates_stay_unrequested():
+    packet = packet_for("BTC long. Date 13.10.2026. Entry limit 1.234. SL 1.234.")
+    groups = numeric_occurrences(candidates(packet))
+    assert len(groups) == 2
+    first, second = groups
+    assert first[0] != second[0] and first[1][0].quote == second[1][0].quote == "1.234"
+    overrides = {}
+    for (identity, group), role, value in zip(groups, ("entry0", "stop_loss"), ("1234", "1.234"), strict=True):
+        overrides["role." + identity] = role
+        overrides["normalization." + identity] = next(span.candidate_id for span in group if span.value == value)
+    result = replay_decision(packet, CalibrationProfile(), [response_for(questions_for(packet, candidates(packet)), overrides=overrides),
+        response_for(verification_questions())], model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+    assert result.interpretation.entry_prices == [1234] and result.interpretation.stop_loss == Decimal("1.234")
+
+
+def test_percent_normalization_preserves_original_quote_and_unit():
+    packet = packet_for("BTC long. Entry 100. TP1 1.234%.")
+    identity, group = next((identity, group) for identity, group in numeric_occurrences(candidates(packet)) if len(group) > 1)
+    selected = next(span for span in group if span.value == "1.234")
+    overrides = {"role." + identity: "target_1", "normalization." + identity: selected.candidate_id}
+    result = replay_decision(packet, CalibrationProfile(), [response_for(questions_for(packet, candidates(packet)), overrides=overrides),
+        response_for(verification_questions())], model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+    assert result.interpretation.take_profits == [Decimal("1.234")]
+    assert result.interpretation.take_profit_unit == "roe_percent"
+    assert next(proof.quote for proof in result.interpretation.evidence if proof.field == "take_profits.0") == "1.234%"
+
+
+def test_ignored_ambiguous_number_does_not_require_a_guessed_normalization():
+    packet = packet_for("BTC long. Entry 100. Historical reference 12.473.")
+    identity, _ = next((identity, group) for identity, group in numeric_occurrences(candidates(packet)) if len(group) > 1)
+    response = response_for(questions_for(packet, candidates(packet)), overrides={"normalization." + identity: "unclear"})
+    result = replay_decision(packet, CalibrationProfile(), [response, response_for(verification_questions())],
+        model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+    assert result.interpretation.entry_prices == [100]
+    assert "normalization." + identity not in result.required_questions
+
+
+@pytest.mark.asyncio
+async def test_native_worker_reviews_uncertain_normalization_without_any_financial_mutation(setup, tmp_path):
+    from types import SimpleNamespace
+
+    from aqla_agent.source_worker import SourceWorker
+    from aqla_hyperliquid_mcp.models import now_ms
+    from aqla_hyperliquid_mcp.server import close_server, create_server
+
+    settings, state, fake, exchange, _ = setup
+    server = create_server(settings, state=state, exchange=exchange)
+    source = SourceEvent(chat_id="channel", message_id=31, sent_at=now_ms(), text="BTC long. Entry limit 12.473.")
+    server.aqla_trading.ingest(source)
+    master = tmp_path / "home/skills/aqla-master/SKILL.md"
+    master.parent.mkdir(parents=True)
+    master.write_text("Synthetic source guidance", encoding="utf-8")
+    calls, fallbacks = [], []
+
+    async def mcp_call(_, tool, args):
+        result = await server.call_tool(tool, args)
+        return result.structured_content or json.loads(result.content[0].text)
+
+    extension = SimpleNamespace(authority=server.aqla_authority, server="aqla", mcp_call=mcp_call,
+        gateway_identity="worker-v11", owner="42", master_path=master, skill_hash=lambda: "master-v11", binding=None)
+
+    def upstream(request):
+        body = json.loads(request.content)
+        calls.append(body)
+        normalization = next(key for key in body["questions"] if key.startswith("normalization."))
+        identity = normalization.removeprefix("normalization.")
+        return httpx.Response(200, json=response_for(body["questions"], overrides={
+            "role." + identity: "entry0", normalization: "unclear"}))
+
+    async def unresolved(packet, code, usage):
+        fallbacks.append(code)
+        assert code == "uncertain_decision" and packet["decision_review"]["values"]
+        assert any(key.startswith("normalization.") and value == "unclear"
+                   for key, value in packet["decision_review"]["values"].items())
+        raise DecisionFailure("uncertain_decision")
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+            worker = SourceWorker(extension, {"mode": "hybrid"}, fallback=unresolved,
+                adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision=DEFAULT_DECISION_MODEL))
+            await worker.tick()
+            await worker.tick()
+        assert len(calls) == len(fallbacks) == 1
+        assert len(state.snapshot()["source_jobs"]) == 1
+        assert not fake.actions and not state.snapshot()["operations"] and not state.snapshot()["plans"]
+        assert state.snapshot()["events"][source.event_id]["status"] == "pending"
+    finally:
+        await close_server(server)
 
 
 @pytest.mark.parametrize("word,value", [("четверть", 25), ("quarter", 25), ("Viertel", 25),

@@ -14,8 +14,8 @@ from pydantic import Field, model_validator
 from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, Model, digest
 from aqla_hyperliquid_mcp.rules import quoted_leverage_numbers, verify_evidence
 
-VERSION = "aqla-decisions-v10"
-QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v2"
+VERSION = "aqla-decisions-v11"
+QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v3"
 # The original-context wire shape is unchanged. Keeping its independent schema
 # version permits exact-state, exact-question observations to be reused for
 # development while decision/validation policy has its own version and cache key.
@@ -31,7 +31,8 @@ ROLES = ("ignore", "entry0", "entry1", "stop_loss", "leverage", "reduce_percent"
 
 
 def calibration_family(question, prediction=None):
-    base = "number_role" if question.startswith("role.") else question
+    base = ("number_role" if question.startswith("role.") else
+            "number_normalization" if question.startswith("normalization.") else question)
     if prediction is not None and base in ("number_role", "kind", "live_action"):
         return base + "." + str(prediction).lower()
     return base
@@ -121,6 +122,20 @@ class CandidateSpan(Model):
     kind: Literal["number", "symbol", "text", "exchange"]
     value: str | None = None
     notation: Literal["value", "ordinal", "position_fraction"] = "value"
+
+
+def numeric_occurrences(spans):
+    """Group alternative values of one exact original span, never equal mentions."""
+    grouped = {}
+    for span in spans:
+        if span.kind == "number":
+            grouped.setdefault((span.source_id, span.start, span.end, span.quote), []).append(span)
+    result = []
+    for occurrence, alternatives in grouped.items():
+        identity = (alternatives[0].candidate_id if len(alternatives) == 1 else
+                    "o" + digest(occurrence)[:20])
+        result.append((identity, alternatives))
+    return result
 
 
 class DecisionResult(Model):
@@ -402,10 +417,29 @@ def questions_for(packet, spans):
             "criteria": {"true": "One current action: change stop, break-even stop, replace targets, reduce, close, or cancel. Closing AT break-even is one CLOSE action. Past results and waiting/status comments are not extra actions. No management instruction also means yes.",
                          "false": "Several distinct current actions: reduce AND move stop; break-even AND cancel; close several independent markets. A scheduled future update such as 'close tomorrow' or an unrepresented future trigger also cannot execute now. Do not execute only one part, discard an instruction, or turn a future action into an immediate one."}},
     }
-    for span in spans:
-        if span.kind == "number" and span.notation != "ordinal" and span.source_id in linked:
+    for identity, alternatives in numeric_occurrences(spans):
+        span = alternatives[0]
+        if span.notation != "ordinal" and span.source_id in linked:
             original = next(row["text"] for row in reversed(packet["messages"]) if row["source_id"] == span.source_id)
-            questions["role." + span.candidate_id] = choice(
+            occurrence = span.model_dump(mode="json")
+            if len(alternatives) > 1:
+                # There is one role for the original text, independent of which
+                # decimal convention is selected in the parallel Choice below.
+                occurrence = {key: occurrence[key] for key in ("source_id", "start", "end", "quote", "kind", "notation")}
+                occurrence["occurrence_id"] = identity
+                occurrence["candidate_ids"] = [candidate.candidate_id for candidate in alternatives]
+                questions["normalization." + identity] = choice(
+                    {"question": "Choose exactly ONE prepared numeric value for this original occurrence in its source context. "
+                                 "A separator such as 1.234 or 1,234 may mean decimal or grouped thousands. "
+                                 "Do not rank separate role predictions or silently choose a convention. "
+                                 "All options retain the same original quote and position. Return unclear if the numeric "
+                                 "convention cannot be established. Return not_present only when this occurrence is "
+                                 "not a requested trade value, such as a date, label, advertisement or past result.",
+                     "occurrence": occurrence,
+                     "verbatim_neighbourhood": original[max(0, span.start - 80):span.end + 80]},
+                    [(candidate.candidate_id, candidate.model_dump(mode="json")) for candidate in alternatives]
+                    + [(NONE, "Not a requested trade value"), (UNKNOWN, "Numeric convention is ambiguous")])
+            questions["role." + identity] = choice(
                 {"question": "Which SINGLE role does this occurrence have in the LIVE anchor's setup? "
                              "Historical numbers/TP labels/allocations/unrelated setups are ignore. "
                              "For UPDATE: only NEW changed values from the live anchor get a role; all old entry/SL/TP/leverage numbers are ignore. "
@@ -414,8 +448,11 @@ def questions_for(packet, spans):
                              "the PRICE has the trading role and the explanatory percent is IGNORE; never assign both to one role. "
                              "A TP stated ONLY as a percent is a real target value. "
                              "For position fractions like 1/2 or 1/4, select the prepared WHOLE fraction as the reduction quantity; its separate numerator and denominator are IGNORE. "
-                             "Select unclear if ambiguous. Only one normalization of the same occurrence can be used.",
-                 "occurrence": span.model_dump(mode="json"),
+                             "Select unclear if ambiguous. Only one normalization of the same occurrence can be used."
+                             + (" This is ONE role question for the whole original occurrence; choose its role "
+                                "independently of the parallel normalization Choice, not one role per alternative value."
+                                if len(alternatives) > 1 else ""),
+                 "occurrence": occurrence,
                  "is_live_anchor": span.source_id == packet["anchor_source_id"],
                  "verbatim_neighbourhood": original[max(0, span.start - 80):span.end + 80]}, list({
                     "ignore": "Not a NEW requested trade VALUE: numbering labels, allocations/deposit percentages, dates, ads, old/unrelated setup values.",
@@ -428,7 +465,7 @@ def questions_for(packet, spans):
                     UNKNOWN: "Role or numeric normalization cannot be established without guessing.",
                  }.items()))
             if span.notation == "position_fraction":
-                question = questions["role." + span.candidate_id]
+                question = questions["role." + identity]
                 question["criteria"] = {key: value for key, value in question["criteria"].items()
                                         if key in ("ignore", "reduce_percent", UNKNOWN)}
     return questions
@@ -551,19 +588,26 @@ def assemble(packet, spans, values, probabilities, profile, *, collect=False, re
         fields["update_action"] = action
         proof("update_action")
     used_occurrences = set()
-    for span in spans:
-        if span.kind != "number":
-            continue
+    for identity, alternatives in numeric_occurrences(spans):
+        span = alternatives[0]
         if kind == "trade_update" and span.source_id != packet["anchor_source_id"]:
             # Older setup values cannot become newly changed update values.
             # This temporal/source constraint is Python-owned, not a confidence vote.
             continue
-        question = "role." + span.candidate_id
+        question = "role." + identity
         if question not in values:
             continue
         role = read(question)
         if role == "ignore":
             continue
+        if len(alternatives) > 1:
+            normalized = read("normalization." + identity)
+            if normalized == NONE:
+                raise DecisionFailure("numeric_normalization_missing")
+            selected_span = next((candidate for candidate in alternatives if candidate.candidate_id == normalized), None)
+            if selected_span is None:
+                raise DecisionFailure("numeric_normalization_invalid")
+            span = selected_span
         if role in selected and redundant_numeric_mention(packet, selected[role], span, role):
             continue
         occurrence = (span.source_id, span.start, span.end)

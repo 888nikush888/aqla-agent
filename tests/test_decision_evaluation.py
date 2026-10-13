@@ -364,6 +364,89 @@ def test_equal_bare_quotes_require_distinct_original_occurrence_annotations():
     assert fit_thresholds([{"raw_correct": True, "question_results": question_results}]) == ({}, [])
 
 
+@pytest.mark.parametrize("quote,expected_value", [("12.473", "12.473"), ("3,963", "3.963"),
+                                                  ("1.234%", "1.234"), ("1.984", "1984")])
+def test_gold_labels_one_role_and_exact_normalization_choice_per_original_occurrence(quote, expected_value):
+    from aqla_agent.decision_evaluation import question_labels
+    from aqla_agent.decisions import candidates, numeric_occurrences
+    field = "take_profits.0" if "%" in quote else "entry_prices.0"
+    role = "target_1" if "%" in quote else "entry0"
+    packet = case_packet({"id": "numeric-convention", "messages": ["BTC LONG. Value " + quote + "."]})
+    identity, group = numeric_occurrences(candidates(packet))[0]
+    expected = {field.split(".")[0]: [expected_value], "evidence": [
+        {"field": field, "source_id": packet["anchor_source_id"], "quote": "Value " + quote}]}
+    selected = next(span for span in group if span.value == expected_value)
+    labels = question_labels(packet, expected)
+    assert labels["role." + identity] == {role}
+    assert labels["normalization." + identity] == {selected.candidate_id}
+    assert all("role." + span.candidate_id not in labels for span in group)
+    observed = {"values": {"role." + identity: role, "normalization." + identity: selected.candidate_id},
+                "probabilities": {"role." + identity: 0.9999, "normalization." + identity: 0.9991},
+                "required_questions": ["role." + identity, "normalization." + identity]}
+    measured = calibration_question_results(packet, expected, observed, None)
+    assert [row["correct"] for row in measured] == [True, True]
+    assert [row["family"] for row in measured] == ["number_role." + role, "number_normalization"]
+    assert measured[1]["prediction"] == selected.candidate_id and measured[1]["confidence"] == 0.9991
+    observed["values"]["normalization." + identity] = next(span.candidate_id for span in group if span != selected)
+    wrong = calibration_question_results(packet, expected, observed, None)
+    assert wrong[0]["correct"] and not wrong[1]["correct"]
+
+
+def test_equal_ambiguous_quotes_need_occurrence_annotations_for_both_role_and_normalization():
+    from aqla_agent.decision_evaluation import question_labels
+    from aqla_agent.decisions import candidates, numeric_occurrences
+    packet = case_packet({"id": "equal-normalizations", "messages": ["BTC LONG. SL 1.234. TP1 1.234."]})
+    groups = numeric_occurrences(candidates(packet))
+    expected = {"stop_loss": "1.234", "take_profits": ["1.234"], "evidence": [
+        {"field": field, "source_id": packet["anchor_source_id"], "quote": "1.234"}
+        for field in ("stop_loss", "take_profits.0")]}
+    labels = question_labels(packet, expected)
+    assert all(labels["role." + identity] == labels["normalization." + identity] == {"unclear"}
+               for identity, group in groups)
+    annotations = [{"field": field, "source_id": group[0].source_id, "start": group[0].start,
+                    "end": group[0].end, "quote": group[0].quote}
+                   for (_, group), field in zip(groups, ("stop_loss", "take_profits.0"), strict=True)]
+    labels = question_labels(packet, expected, candidate_occurrences=annotations)
+    for (identity, group), role in zip(groups, ("stop_loss", "target_1"), strict=True):
+        selected = next(span for span in group if span.value == "1.234")
+        assert labels["role." + identity] == {role} and labels["normalization." + identity] == {selected.candidate_id}
+    observed = {"values": {"normalization." + groups[0][0]: groups[0][1][0].candidate_id},
+                "probabilities": {"normalization." + groups[0][0]: 1},
+                "required_questions": ["normalization." + groups[0][0]]}
+    assert calibration_question_results(packet, expected, observed, None) == []
+
+
+def test_gold_cannot_assign_two_normalizations_of_same_occurrence_to_different_fields():
+    from aqla_agent.decision_evaluation import question_labels
+    from aqla_agent.decisions import candidates, numeric_occurrences
+    packet = case_packet({"id": "impossible-normalization", "messages": ["BTC LONG. Value 12.473."]})
+    _, group = numeric_occurrences(candidates(packet))[0]
+    expected = {"stop_loss": "12.473", "take_profits": ["12473"], "evidence": [
+        {"field": field, "source_id": packet["anchor_source_id"], "quote": "Value 12.473"}
+        for field in ("stop_loss", "take_profits.0")]}
+    with pytest.raises(ValueError, match="cannot name different trading fields"):
+        question_labels(packet, expected)
+    annotations = [{"field": field, "source_id": group[0].source_id, "start": group[0].start,
+                    "end": group[0].end, "quote": group[0].quote}
+                   for field in ("stop_loss", "take_profits.0")]
+    with pytest.raises(ValueError, match="annotated twice or as different fields"):
+        question_labels(packet, expected, candidate_occurrences=annotations)
+
+
+def test_unused_ambiguous_dates_and_past_values_do_not_fit_normalization_thresholds():
+    from aqla_agent.decision_evaluation import question_labels
+    from aqla_agent.decisions import candidates, numeric_occurrences
+    packet = case_packet({"id": "unused-normalization", "messages": ["Date 13.10.2026; past value 12.473."]})
+    identity, group = numeric_occurrences(candidates(packet))[0]
+    labels = question_labels(packet, {"kind": "report"})
+    assert labels["role." + identity] == {"ignore"}
+    assert labels["normalization." + identity] == {"not_present", *(span.candidate_id for span in group)}
+    observed = {"values": {"kind": "report", "normalization." + identity: "unclear"},
+                "probabilities": {"kind": 1, "normalization." + identity: 1}, "required_questions": ["kind"]}
+    rows = calibration_question_results(packet, {"kind": "report"}, observed, None)
+    assert len(rows) == 1 and rows[0]["family"] == "kind.report"
+
+
 def test_exact_repeat_annotations_can_name_equivalent_mentions_of_one_field():
     from aqla_agent.decision_evaluation import question_labels
     from aqla_agent.decisions import candidates
