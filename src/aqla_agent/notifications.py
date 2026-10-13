@@ -78,7 +78,7 @@ def native_response_bytes(payload) -> int:
 def notification_sort_key(identity: str, notice) -> SortKey:
     event = notice.get("lifecycle", {})
     timestamp = event.get("time", notice.get("time", notice.get("observed_at", 0)))
-    return (0 if identity.startswith("protection:") else 1, timestamp if type(timestamp) is int else 0,
+    return (0 if identity.startswith("protection:") or notice.get("severity") == "urgent" else 1, timestamp if type(timestamp) is int else 0,
             int(event.get("kind", notice.get("kind")) == "closed"), identity)
 
 

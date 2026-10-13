@@ -74,10 +74,15 @@ def decimal(value):
         return None
 
 
-def number(value):
+def number(value, *, places=None):
     value = decimal(value)
     if value is None:
         return "nicht bestätigt"
+    if places is not None:
+        try:
+            value = value.quantize(Decimal(1).scaleb(-places))
+        except InvalidOperation:
+            return "nicht bestätigt"
     raw = format(value, "f")
     whole, _, fraction = raw.partition(".")
     sign = "−" if whole.startswith("-") else ""
@@ -85,6 +90,33 @@ def number(value):
     groups = [whole[max(0, end - 3):end] for end in range(len(whole), 0, -3)]
     fraction = fraction.rstrip("0")
     return sign + ".".join(reversed(groups)) + ("," + fraction if fraction else "")
+
+
+RECOVERY_LABELS = {
+    "market_conflict": "Manueller/gemischter Positionsverlauf; Eigentumsprüfung erforderlich",
+    "replacement_unconfirmed": "SL-Ersatz unbestätigt; vorhandenen Schutz erhalten",
+    "protection_unconfirmed": "Kein wirksamer SL bestätigt; Positionsschutz dringend prüfen",
+    "reconciliation_unavailable": "Börsenabgleich vorübergehend nicht bestätigt",
+    "recovery_timeout": "Börsenabgleich hat das Zeitlimit erreicht",
+    "owned_order_cancellation_unconfirmed": "Aufhebung eigener Orders unbestätigt; Markt bleibt reserviert",
+    "entry_cancellation_unconfirmed": "Entry-Aufhebung/Fill-Abgleich unbestätigt",
+    "account_binding_mismatch": "Ursprüngliche Kontobindung stimmt nicht überein",
+}
+
+
+def recovery_block(notice):
+    from .recovery_notices import safe_report
+    reports = notice.get("recovery_reports")
+    if reports is None:
+        reports = [fact for row in notice.get("reports", []) if (fact := safe_report(row))]
+    lines = ["✅ **Börsenabgleich wiederhergestellt**" if notice.get("resolved") else "⚠️ **Börsenabgleich benötigt Aufmerksamkeit**"]
+    for row in reports:
+        label = RECOVERY_LABELS.get(row.get("code"), RECOVERY_LABELS["reconciliation_unavailable"])
+        details = [literal(row[key]) for key in ("account_key", "market", "trade_id", "operation_id") if row.get(key)]
+        lines.append((" · ".join(details) + "\n" if details else "") + label)
+    if not notice.get("resolved"):
+        lines.append("Aktuellen Status prüfen; ungeklärte Operationen abgleichen. Bei Marktkonflikten /aqla_konflikt <Trade-ID> verwenden.")
+    return "\n\n".join(lines)
 
 
 def split_blocks(text, limit=CHUNK_UNITS):
@@ -234,12 +266,12 @@ def trade_block(data, trade, notices):
         label = "Entry realisiert" if filled and receipt_filled else "Entry gespeichert · unbelegt" if filled else "Entry geplant"
         lines.append(f"**{label}:** {number(entry)} {quote} · **Hebel:** {number(plan.get('effective_leverage', plan.get('policy', {}).get('leverage')))}×")
         if filled and receipt_filled and planned and filled < planned:
-            lines.append(f"**Gefüllt:** {number(filled / planned * 100)} % der geplanten Menge")
+            lines.append(f"**Gefüllt:** {number(filled / planned * 100, places=2)} % der geplanten Menge")
         lines.append(f"**SL:** {number(trade.get('stop_price', plan.get('stop_loss')))} {quote}" + (" · vorgesehen" if stage == "waiting_entry" else " · Bestätigung ausstehend" if stage in ("unknown", "protecting", "opening") else ""))
         targets = trade.get("targets", plan.get("take_profits", []))
         budgets = trade.get("target_budgets") or plan.get("tp_quantities", [])
         total = sum((decimal(value) or Decimal(0) for value in budgets), Decimal(0))
-        legs = [f"TP{index + 1}: {number(price)} {quote}" + target_label(plan, index) + (f" · {number((decimal(budgets[index]) or Decimal(0)) / total * 100)} % Position" if total and index < len(budgets) else " · Anteil nicht bestätigt") for index, price in enumerate(targets)]
+        legs = [f"TP{index + 1}: {number(price)} {quote}" + target_label(plan, index) + (f" · {number((decimal(budgets[index]) or Decimal(0)) / total * 100, places=2)} % Position" if total and index < len(budgets) else " · Anteil nicht bestätigt") for index, price in enumerate(targets)]
         if legs:
             lines.append("**Ziele · Positionsanteil**\n" + "\n".join(legs))
         raw, rounded, effective = plan.get("signal_leverage_original", plan.get("signal_leverage")), plan.get("signal_leverage"), plan.get("effective_leverage")
@@ -273,7 +305,7 @@ def trade_block(data, trade, notices):
                     complete = budget is not None and decimal(value) >= decimal(budget)
                     lines.append(f"**TP{index + 1}:** " + ("vollständig ausgeführt" if complete else "teilweise ausgeführt"))
         if "remaining_quantity" in changes and filled and facts["current_ownership_confirmed"]:
-            lines.append(f"**Position verbleibend:** {number((decimal(trade.get('remaining_quantity')) or 0) / filled * 100)} %")
+            lines.append(f"**Position verbleibend:** {number((decimal(trade.get('remaining_quantity')) or 0) / filled * 100, places=2)} %")
     if stage == "closed":
         from .lifecycle import close_reason
         lines.append("**Grund:** " + literal(trade.get("close_reason", close_reason(trade))["label"]))
@@ -354,7 +386,7 @@ def lifecycle_block(data, event):
     total = sum((decimal(value) or Decimal(0) for value in budgets), Decimal(0))
     if targets:
         lines.append("**Ziele vorgesehen · Positionsanteil**\n" + "\n".join(
-            f"TP{index + 1}: {number(price)} {quote}" + target_label(plan, index) + (" · " + number((decimal(budgets[index]) or 0) / total * 100) + " % Position" if total and index < len(budgets) else "")
+            f"TP{index + 1}: {number(price)} {quote}" + target_label(plan, index) + (" · " + number((decimal(budgets[index]) or 0) / total * 100, places=2) + " % Position" if total and index < len(budgets) else "")
             for index, price in enumerate(targets)))
     return "\n\n".join(lines)
 
@@ -445,6 +477,8 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None, notif
         event = data["events"].get(notice.get("event_id") or (trade or {}).get("event_id"))
         if notice.get("detail_level") == "summary":
             key = ("summary", identity)
+        elif "recovery_reports" in notice or "reports" in notice or "source_notice" in notice:
+            key = ("recovery", identity)
         elif notice.get("rank_change"):
             key = ("rank", identity)
         elif notice.get("monthly_report"):
@@ -465,6 +499,18 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None, notif
     messages = []
     for key, items in groups.items():
         ids = [row[0] for row in items]
+        if key[0] == "recovery":
+            notice = items[0][1]
+            if "source_notice" in notice:
+                code = notice["source_notice"].get("code", "source_status_changed")
+                text = "ℹ️ **Quellenstatus**\n" + literal(ERRORS.get(code, code))
+                sources = notice["source_notice"].get("sources", [])
+                if sources:
+                    text += "\nKanäle: " + ", ".join(literal(value) for value in sources)
+            else:
+                text = recovery_block(notice)
+            messages.append({"notification_ids": ids, "severity": notice.get("severity", "normal"), "texts": split_blocks(text)})
+            continue
         if key[0] == "summary":
             messages.append({"notification_ids": ids, "severity": "urgent" if ids[0].startswith("protection:") else "normal",
                              "texts": split_blocks(summary_block(items[0][1]))})

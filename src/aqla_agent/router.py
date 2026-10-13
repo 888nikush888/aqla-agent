@@ -531,7 +531,7 @@ class Router:
                     if category == "complete":
                         fact["last_success_at"] = now_ms()
                     diagnostics[engine.state.account_key] = fact
-                return [{"exchange": venue, **row} for row in rows]
+                return [{"exchange": venue, "account_key": engine.state.account_key, **row} for row in rows]
         tasks = [asyncio.create_task(account(venue, engine)) for venue, engine in self.engines.items()]
         self._recovery_tasks.update(tasks)
         try:
@@ -604,6 +604,59 @@ class Router:
             raise AqlaError("This trade's original exchange account is unavailable")
         async with engine.lock:
             return self.public_operation(await engine.close_position(trade_id, Decimal(100), "operator-close:" + request_id))
+
+    def conflict_engine(self, trade_id):
+        row = self.state.snapshot()["trades"].get(trade_id)
+        if row is None or row["status"] != "conflicted":
+            raise AqlaError("Select one current conflicted trade ID")
+        engine = self.engine_for_plan(row["plan"])
+        if engine is None:
+            raise AqlaError("This trade's original exchange account is unavailable")
+        return engine
+
+    async def conflict_review(self, trade_id):
+        from .conflict_review import observe_conflict
+        engine = self.conflict_engine(trade_id)
+        async with engine.lock:
+            review, _ = await observe_conflict(engine, trade_id)
+            def record(data):
+                data.setdefault("source_status", {}).setdefault("ownership_reviews", {})[trade_id] = {
+                    "fingerprint": review["fingerprint"], "expires_at": now_ms() + 90000}
+            self.state.update_metadata(("source_status",), record)
+            return review
+
+    async def resolve_conflict(self, trade_id, fingerprint, commit_check):
+        from .conflict_review import observe_conflict
+        engine = self.conflict_engine(trade_id)
+        async with engine.lock:
+            saved = self.state.snapshot().get("source_status", {}).get("ownership_reviews", {}).get(trade_id, {})
+            if not fingerprint or saved.get("fingerprint") != fingerprint or saved.get("expires_at", 0) <= now_ms():
+                raise AqlaError("Read a current ownership review before resolution")
+            review, evidence = await observe_conflict(engine, trade_id)
+            if review["fingerprint"] != fingerprint:
+                raise AqlaError("Ownership evidence changed; read a fresh review")
+            if not review["resolvable"]:
+                return {"resolved": False, "review": review}
+            commit_check()
+            def commit(data):
+                commit_check()
+                current = data["trades"][trade_id]
+                latest = data.get("source_status", {}).get("ownership_reviews", {}).get(trade_id, {})
+                if latest.get("fingerprint") != fingerprint or latest.get("expires_at", 0) <= now_ms():
+                    raise AqlaError("Ownership review expired; read a fresh review")
+                if (current["status"] != "conflicted" or digest(current) != evidence["trade_hash"]
+                        or digest(engine.state.snapshot()["operations"]) != evidence["operations_hash"]):
+                    raise AqlaError("Trade changed during ownership review")
+                engine.assert_plan_binding(engine.state.snapshot(), TradePlan.model_validate(current["plan"]))
+                current.update(status="closed", remaining_quantity="0", reserved_risk="0", cleanup_complete=True,
+                    fill_events=evidence["fills"], closed_at=evidence["closed_at"],
+                    manual_closure={"confirmed_at": now_ms(), "review_fingerprint": fingerprint, "pnl_complete": False,
+                        "order_statuses": review["order_statuses"], "basis": "proved_original_account_closure"})
+                from .monthly import accounting_facts
+                current.update(accounting_facts(current))
+                data["notifications"].setdefault("ownership-resolved:" + fingerprint, {"trade_id": trade_id, "change": {"status": "closed"}, "observed_at": now_ms()})
+                return {"resolved": True, "trade_id": trade_id, "pnl_complete": False}
+            return self.state.update(commit)
 
     async def reconcile(self, operation_id):
         row = self.state.snapshot()["operations"].get(operation_id)

@@ -18,7 +18,7 @@ def controls():
     generation = gate.bind(current[0])
     gate.register(current[0], "a" * 64, None, generation)
     parameters = Parameters().model_dump(mode="json")
-    data = {"configuration_revision": 7, "paused": False,
+    data = {"configuration_revision": 7, "paused": False, "sources": ["-101", "-102"], "source_names_revision": 0,
             "profiles": {"standard": {"id": "standard", "name": "Standard", "parameters": parameters, "revision": 4},
                          **{f"p{i}": {"id": f"p{i}", "name": f"Profil {i}", "parameters": parameters, "revision": 1} for i in range(10)}},
             "source_names": {"-101": "Kanalname", "-102": "Zweiter Kanal"},
@@ -62,6 +62,12 @@ def controls():
             row = data["source_ranks"][args["source_id"]]
             assert row["revision"] == args["expected_revision"]
             row["tier"], row["revision"] = args["tier"], row["revision"] + 1
+        elif args["action"] in ("add_sources", "remove_sources"):
+            from aqla_agent.sources import change_sources
+            change_sources(data, args["action"], args["sources"], args["expected_revision"])
+        elif args["action"] == "set_source_name":
+            from aqla_agent.sources import set_source_name
+            set_source_name(data, args["source_id"], args["source_name"], args["expected_revision"])
         return {**copy.deepcopy(data), "previous_paused": previous_paused}
 
     async def send(_chat, text):
@@ -81,6 +87,36 @@ def callback(token, *, actor="12345", chat="12345", chat_type="private", bot=Fal
     query = SimpleNamespace(data=token, from_user=SimpleNamespace(id=actor, is_bot=bot),
         message=SimpleNamespace(chat=SimpleNamespace(id=chat, type=chat_type), text="Untrusted button label"), answer=answer)
     return SimpleNamespace(callback_query=query, effective_message=query.message)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["ALLE AKTUELLEN KANÄLE", "ALLEAKTUELLENKANÄLE", "zeig mir alle kanäle", "zeigmirallekanäle", "wie ist Status?", "wieistStatus", "alle profile", "was kannst du?"])
+async def test_routine_german_queries_are_native_authenticated_and_no_model(controls, text):
+    commands, bot, _, mutations, *_ = controls
+    commands.extension.setup.lease = None
+    assert await commands.intercept(update(text), bot)
+    assert bot.sent and mutations == []
+    assert not await commands.intercept(update("Warum wurde das Signal gestern abgelehnt?"), bot)
+    before = len(bot.sent)
+    assert await commands.intercept(update(text, owner="99999"), bot)
+    assert len(bot.sent) == before
+
+
+@pytest.mark.asyncio
+async def test_native_add_remove_and_name_preserve_existing_channels(controls):
+    commands, bot, data, mutations, *_ = controls
+    assert await commands.intercept(update('/aqla_hinzufuegen -103 @newchannel'), bot)
+    assert set(data["sources"]) == {"-101", "-102", "-103", "@newchannel"}
+    assert await commands.intercept(update('/aqla_kanalname -103 "Neuer Kanal"'), bot)
+    assert data["source_names"]["-103"] == "Neuer Kanal"
+    assert await commands.intercept(update('/aqla_entfernen "Neuer Kanal"'), bot)
+    assert set(data["sources"]) == {"-101", "-102", "@newchannel"}
+    assert [row["action"] for row in mutations] == ["add_sources", "set_source_name", "remove_sources"]
+    assert all(row["action"] != "set_sources" for row in mutations)
+    commands.extension.setup.lease = None
+    before = copy.deepcopy(data)
+    assert await commands.intercept(update('/aqla_hinzufuegen -104'), bot)
+    assert data == before
 
 
 def button(bot, label):

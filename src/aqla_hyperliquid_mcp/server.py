@@ -58,7 +58,6 @@ from .models import (
     Settings,
     SourceClassification,
     SourceEvent,
-    digest,
     now_ms,
 )
 from .multisig import Signature
@@ -439,7 +438,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
 
     @server.tool(annotations=write)
     async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "add_sources", "remove_sources", "set_source_name", "set_source_rank", "close_trade", "resolve_conflict", "clear_notification", "set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled", "set_ranking_policy", "set_account_limits", "set_account_enabled"],
-                      expected_revision: int | None = None, policy: Policy | None = None, sources: list[str] | None = None,
+                      expected_revision: Annotated[int | None, Field(strict=True, ge=0)] = None, policy: Policy | None = None, sources: list[str] | None = None,
                       trade_id: str | None = None, notification_id: str | None = None, context_auth: str = "",
                       profile: TradingProfile | None = None, pipeline: Pipeline | None = None, exchange_id: Venue | None = None,
                       limits: AccountLimits | None = None, enabled: bool | None = None, identity: str | None = None,
@@ -575,6 +574,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                           failure_code: str | None = None, delivery_id: str | None = None,
                           failure_detail: dict | None = None,
                           decision_status: dict | None = None,
+                          notice_sources: Annotated[list[str] | None, Field(max_length=100)] = None,
                           retry_max_attempts: Annotated[int, Field(strict=True, ge=1, le=5)] = 3,
                           retry_backoff_seconds: Annotated[int, Field(strict=True, ge=1, le=300)] = 15,
                           retry_max_age_seconds: Annotated[int, Field(strict=True, ge=30, le=3600)] = 900,
@@ -607,19 +607,9 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             return {**processor.overview(), "delivery": outbox.overview()}
         if action == "source_notice":
             processor.require_owner(processing_owner)
-            code = failure_code if isinstance(failure_code, str) and failure_code.isascii() and failure_code.replace("_", "").isalnum() and len(failure_code) <= 80 else "source_status_changed"
+            from aqla_agent.recovery_notices import record_source_notice
             def notice(data):
-                category = "conflicts" if code.startswith("source_conflict") else "reader"
-                previous = data["source_status"].get(category, {})
-                if not previous and code in ("reader_recovered", "source_conflict_resolved"):
-                    return
-                signature = digest([code, processing_version])
-                if previous.get("signature") == signature:
-                    return
-                transition = previous.get("transition", 0) + 1
-                data["source_status"][category] = {"signature": signature, "transition": transition}
-                identity = "source-status:" + digest([category, transition])
-                data["notifications"].setdefault(identity, {"source_notice": {"code": code, "category": category}})
+                record_source_notice(data, failure_code, processing_version, notice_sources or ())
             state.update_metadata(("notifications", "source_status"), notice)
             return {"recorded": True}
         if action in ("delivery_next", "delivery_complete", "delivery_retry"):

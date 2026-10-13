@@ -60,6 +60,9 @@ def main():
     host_config = yaml.safe_load(host_path.read_text())
     for value in host_config["mcp_servers"].values():
         value["command"] = str(Path(args.mcp_python).absolute())
+        # MCP's sanitized subprocess environment does not inherit PYTHONPATH.
+        # Pin the smoke to this checkout instead of a shared editable install.
+        value["env"] = {**value.get("env", {}), "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
     host_path.write_text(yaml.safe_dump(host_config))
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.run import GatewayRunner
@@ -254,6 +257,24 @@ def main():
             assert admitted == []
             await app.process_update(Update.de_json(payload("/aqla_status", 25), app.bot))
             assert any("Setup:" in row["text"] for row in sent) and admitted == []
+            # New source controls run through the actual native registry/PTB
+            # dispatcher and real MCP revision/setup gates, with no model turn.
+            existing_sources = set(read_snapshot(home / "data/state.sqlite3")["sources"])
+            synthetic_sources = [str(-9000 - index) for index in range(14)]
+            await app.process_update(Update.de_json(payload("/aqla_hinzufuegen " + " ".join(synthetic_sources), 40), app.bot))
+            await app.process_update(Update.de_json(payload("/aqla_hinzufuegen -9991 -9992 -9993", 41), app.bot))
+            state = read_snapshot(home / "data/state.sqlite3")
+            assert set(state["sources"]) == existing_sources | set(synthetic_sources) | {"-9991", "-9992", "-9993"}
+            await app.process_update(Update.de_json(payload('/aqla_kanalname -9991 "Synthetic channel"', 42), app.bot))
+            await app.process_update(Update.de_json(payload('/aqla_entfernen "Synthetic channel"', 43), app.bot))
+            state = read_snapshot(home / "data/state.sqlite3")
+            assert set(state["sources"]) == existing_sources | set(synthetic_sources) | {"-9992", "-9993"}
+            before_invalid = state["configuration_revision"]
+            await app.process_update(Update.de_json(payload('/aqla_hinzufuegen "Unknown free title"', 44), app.bot))
+            assert read_snapshot(home / "data/state.sqlite3")["configuration_revision"] == before_invalid
+            for identity, text in ((45, "ALLE AKTUELLEN KANÄLE"), (46, "zeig mir alle kanäle"), (47, "wie ist Status?"), (48, "/aqla_funktionen"), (49, "/aqla_konflikt")):
+                await app.process_update(Update.de_json(payload(text, identity), app.bot))
+            assert admitted == [] and any("Aktuell ausgewählte Kanäle" in row["text"] for row in sent)
             from aqla_agent.messages import literal
             long_text = "**Status**\n" + "\n".join(literal("😀[untrusted]_*`\\" * 50) for _ in range(20))
             sent_before = len(sent)
@@ -307,7 +328,7 @@ def main():
             fresh = next(iter(EXTENSIONS))
             fresh.boot(gateway, adapter=replacement)
             assert fresh.binding[0] is replacement and fresh.setup.claims() is None
-            assert "module=hermes_plugins.platforms__telegram.adapter hooks=true setup_handler=True system_handler=True catalog_count=11" in captured.getvalue()
+            assert f"module=hermes_plugins.platforms__telegram.adapter hooks=true setup_handler=True system_handler=True catalog_count={len(COMMANDS)}" in captured.getvalue()
             assert all(marker not in captured.getvalue() for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD))
             assert extension.authority.key.decode() not in captured.getvalue()
             assert all(marker not in json.dumps(read_snapshot(home / "data/state.sqlite3")) for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD))
@@ -325,6 +346,7 @@ def main():
                           "edited_candidate_deleted": True, "restart_late_reply_deleted": True,
                           "actual_factory": True, "native_registry": True, "owner_menu_complete": True,
                           "native_direct_guided_controls": True, "callback_once": True, "factory_reload_rebuild": True,
+                          "native_add_remove_source_controls": True, "native_german_routine_queries": True,
                           "early_not_ready_failclosed": True, "native_catalog_pages_acl": True, "native_long_status_chunks": True,
                           "authentic_wrong_password_rejected": True, "authentic_delete_ack_false_rejected": True,
                           "rejected_passwords_absent_from_tools_history_logs": True,

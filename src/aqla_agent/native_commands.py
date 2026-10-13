@@ -10,6 +10,7 @@ import copy
 import json
 import re
 import secrets
+import shlex
 from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -34,8 +35,14 @@ COMMANDS = {
     "aqla_limits": ("Kontolimits ändern", "[Börse:Netzwerk Feld Wert]"),
     "aqla_pause": ("Neue Entries pausieren; Schutz läuft weiter", ""),
     "aqla_fortsetzen": ("Neue Entries freigeben", ""),
+    "aqla_hinzufuegen": ("Kanäle ergänzen; bestehende bleiben erhalten", "[ID|@username|Name ...]"),
+    "aqla_entfernen": ("Nur ausgewählte Kanäle entfernen", "[ID|@username|Name ...]"),
+    "aqla_kanalname": ("Telegram-ID benennen", '[ID "Name"]'),
+    "aqla_konflikt": ("Eigentumskonflikt anhand aktueller Belege prüfen", "[Trade-ID]"),
+    "aqla_konflikt_loesen": ("Nur belegte Schließung lokal bestätigen", "[Trade-ID Fingerabdruck]"),
+    "aqla_funktionen": ("Verfügbare native Funktionen", ""),
 }
-PROTECTED = {"aqla_rang", "aqla_parameter", "aqla_maker", "aqla_limits", "aqla_fortsetzen"}
+PROTECTED = {"aqla_rang", "aqla_parameter", "aqla_maker", "aqla_limits", "aqla_fortsetzen", "aqla_hinzufuegen", "aqla_entfernen", "aqla_kanalname", "aqla_konflikt_loesen"}
 RESET_COMMANDS = {"stop", "new", "reset", "restart"}
 CALLBACK_PREFIX = "aqla:"
 UNITS = {
@@ -49,6 +56,18 @@ UNITS = {
 BACKUP_UNIT_LABELS = {"course_percent": "% Kursbewegung", "roe_percent": "% ROE (ursprüngliche Margin)"}
 LIMIT_FIELDS = {"offene_trades": "max_open_trades", "offene trades": "max_open_trades",
                 "gesamtrisiko": "max_total_risk_percent"}
+
+
+def routine_query(text):
+    value = " ".join(text.casefold().strip().rstrip("?!. ").split())
+    aliases = {
+        "aqla_kanaele": {"alle aktuellen kanäle", "zeig mir alle kanäle", "zeige mir alle kanäle", "alle kanäle", "welche kanäle sind aktiv", "liste alle kanäle", "kanalliste"},
+        "aqla_status": {"wie ist status", "wie ist der status", "status", "aktueller status", "wie ist unser status", "wie ist der aktuelle status"},
+        "aqla_profile": {"alle profile", "zeige mir alle profile", "welche profile gibt es", "profile"},
+        "aqla_funktionen": {"was kannst du", "welche funktionen gibt es", "welche befehle gibt es", "funktionen"},
+    }
+    compact = value.replace(" ", "")
+    return next((command for command, values in aliases.items() if compact in {item.replace(" ", "") for item in values}), None)
 
 
 def parameter_unit(field, parameters):
@@ -463,19 +482,74 @@ class NativeCommands:
                                  for identity, row in snapshot.get("execution_accounts", {}).items())
             await self.reply(bot, "Konten:\n" + (accounts or "—"))
             await self.reply(bot, f"Setup: {setup.get('remaining_seconds', 0)} Sekunden übrig\nJournal: {journal.get('pending', 0)} ausstehend; letzter Sync: {journal.get('last_synced_at') or '—'}")
+            queue = snapshot.get("source_queue", {})
+            processing = snapshot.get("source_processing", {})
+            jobs = processing.get("jobs", processing.get("states", {}))
+            decisions = processing.get("decision_status", {})
+            await self.reply(bot, f"Quellenwarteschlange: bereit {queue.get('ready_total', 0)} · blockiert {queue.get('blocked_total', 0)} · Recovery {queue.get('recovery_total', 0)}\n"
+                + "Verarbeitung: " + json.dumps(jobs, ensure_ascii=False) + "\n"
+                + "Eigentumskonflikte: " + str(sum(row.get("status") == "conflicted" for row in snapshot.get("trades", []))) + "\n"
+                + "Decision-Modell: " + str(decisions.get("model", "nicht gemeldet")) + " · kalibriert: " + ("ja" if decisions.get("validated") else "nein") + "\n"
+                + "Decision-Freigabe: " + json.dumps(decisions.get("permissions", {}), ensure_ascii=False)
+                + "\nBenachrichtigungen und abgeschlossene Verarbeitung sind getrennte Zähler.")
         elif command == "aqla_kanaele":
             ranking = await self.extension.mcp_call(self.extension.server, "ranking_status", {})
             lines = [f"{row.get('name', identity)} · {identity}: {row['tier']} · Nachweise {row.get('proof_total', 0)} · ausgeschlossen {row.get('excluded_count', 0)}\nMetriken: {json.dumps(row.get('metrics', {}), ensure_ascii=False)}\nNachweise: {json.dumps(row.get('evidence', []), ensure_ascii=False)}\nAusschlüsse: {json.dumps(row.get('exclusions', []), ensure_ascii=False)}" for identity, row in ranking["sources"].items()]
-            await self.reply(bot, "\n\n".join(lines) or "Keine Kanäle konfiguriert.")
+            selected = snapshot.get("sources", list(ranking["sources"]))
+            title = "Aktuell ausgewählte Kanäle · Konfigurationsrevision " + str(snapshot.get("configuration_revision", "—"))
+            selection = [snapshot.get("source_names", {}).get(identity, identity) + " · " + identity for identity in selected]
+            await self.reply(bot, title + "\n" + ("\n".join(selection) or "Keine Kanäle konfiguriert.") + "\n\nRanghistorie/Nachweise:\n" + ("\n\n".join(lines) or "—"))
         elif command == "aqla_profile":
             lines = [f"{row['name']} · {identity}\n" + "\n".join(f"{name}: {getattr(Parameters.model_validate(row['parameters']), name)}" + (" · " + parameter_unit(name, row['parameters']) if name in ("fallback_stop_loss_percent", "fallback_take_profit_percentages") else "") for name in Parameters.model_fields)
                      for identity, row in snapshot["profiles"].items() if row.get("parameters")]
             await self.reply(bot, "\n\n".join(lines) or "Keine Profile konfiguriert.")
+        elif command == "aqla_funktionen":
+            await self.reply(bot, "aqla Agent-System\n" + system_catalog())
         else:
             journal = snapshot.get("journal", {})
             settings = self.extension.settings.google_sheets
             link = "https://docs.google.com/spreadsheets/d/" + settings.spreadsheet_id if settings.spreadsheet_id else "Kein Journal-Buch konfiguriert."
             await self.reply(bot, f"{link}\nSync: {'aktiv' if journal.get('enabled') else 'aus'} · {journal.get('pending', 0)} ausstehend\nLetzter Sync: {journal.get('last_synced_at') or '—'}")
+
+    async def source_change(self, bot, command, raw):
+        self.cancel()
+        self.auth(protected=True)
+        if not raw:
+            await self.reply(bot, f"/{command} " + COMMANDS[command][1] + "\nIDs, @usernames oder registrierte Namen verwenden. Namen mit Leerzeichen in Anführungszeichen setzen.")
+            return
+        snapshot = await self.status()
+        parts = shlex.split(raw)
+        if command == "aqla_kanalname":
+            if len(parts) != 2:
+                raise ValueError("Supply ID and exact name")
+            result = await self.control(action="set_source_name", source_id=parts[0], source_name=parts[1], expected_revision=snapshot.get("source_names_revision", 0))
+            await self.reply(bot, "Kanalname gespeichert · Revision " + str(result["source_names_revision"]))
+        else:
+            result = await self.control(action="add_sources" if command == "aqla_hinzufuegen" else "remove_sources",
+                sources=parts, expected_revision=snapshot["configuration_revision"])
+            await self.reply(bot, "Kanalauswahl gespeichert · Revision " + str(result["configuration_revision"]) + "\n" + "\n".join(result["sources"]))
+
+    async def ownership(self, bot, command, raw):
+        parts = raw.split()
+        if command == "aqla_konflikt":
+            if len(parts) != 1:
+                snapshot = await self.status()
+                rows = [row for row in snapshot.get("trades", []) if row.get("status") == "conflicted"]
+                await self.reply(bot, "Eigentumskonflikte:\n" + ("\n".join(row["plan"]["market"]["symbol"] + " · " + row["trade_id"] for row in rows) or "Keine.") + "\n/aqla_konflikt <Trade-ID>")
+                return
+            result = await self.extension.mcp_call(self.extension.server, "conflict_review", {"trade_id": parts[0], "context_auth": self.auth()})
+            labels = {"position_not_flat": "Position noch offen", "owned_orders_not_terminal": "Eigene Orders noch offen/ungeklärt", "unknown_operation": "Börsenoperation ungeklärt", "foreign_or_unproved_fill": "Fremde oder unbelegte Ausführung", "foreign_exposure_in_history": "Fremde Position im Verlauf", "own_closure_not_proved": "Eigene Schließung nicht vollständig belegt", "fill_history_incomplete": "Ausführungsverlauf unvollständig", "immutable_fill_changed": "Gespeicherter Beleg widersprüchlich", "unsent_close_intention": "Gespeicherte Schließabsicht noch nicht ausgeführt", "entry_quantity_not_reconciled": "Neue Entry-Fills zuerst über den bestehenden Belegabgleich bestätigen; gespeicherte Entry-Menge weicht ab"}
+            text = f"Eigentumsprüfung · {result['account_key']} · {result['market']}\nPosition: {result['position_size']}\n"
+            text += "\n".join(labels.get(code, code) for code in result["reasons"]) or "Eigene vollständige Schließung belegt."
+            if result["resolvable"]:
+                text += "\nFür lokale Bestätigung innerhalb 90 Sekunden mit aktivem Setup:\n/aqla_konflikt_loesen " + parts[0] + " " + result["fingerprint"]
+            await self.reply(bot, text + "\nPnL bleibt unvollständig. Es wird keine Order erstellt oder storniert.")
+        else:
+            self.auth(protected=True)
+            if len(parts) != 2:
+                raise ValueError("Trade ID and fresh fingerprint required")
+            result = await self.control(action="resolve_conflict", trade_id=parts[0], review_fingerprint=parts[1])
+            await self.reply(bot, "Eigene Schließung bestätigt; Marktreservierung freigegeben. PnL unvollständig." if result["resolved"] else "Schließung nicht belegt; Reservierung bleibt bestehen. Neue Eigentumsprüfung lesen.")
 
     async def intercept(self, update, bot):
         query = getattr(update, "callback_query", None)
@@ -520,6 +594,8 @@ class NativeCommands:
         text = getattr(message, "text", None) or ""
         head, _, raw = text.partition(" ")
         command = head.split("@", 1)[0].lstrip("/").lower() if head.startswith("/") else ""
+        if not command and self.dialog is None:
+            command = routine_query(text) or ""
         if not addressed_to_bot(head, bot):
             return command in COMMANDS
         authentic = self.extension.setup.private_owner(message) and not any(getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))
@@ -553,8 +629,14 @@ class NativeCommands:
                         self.cancel()
                         result = await self.control(action="resume")
                         await self.reply(bot, f"Entries: {'pausiert' if result['previous_paused'] else 'aktiv'} → freigegeben.")
+                    elif command in ("aqla_hinzufuegen", "aqla_entfernen", "aqla_kanalname"):
+                        await self.source_change(bot, command, raw.strip())
+                    elif command == "aqla_konflikt_loesen":
+                        await self.ownership(bot, command, raw.strip())
                     else:
                         await self.start(bot, command, raw.strip())
+                elif command == "aqla_konflikt":
+                    await self.ownership(bot, command, raw.strip())
                 elif command in COMMANDS:
                     await self.read(bot, command)
                 elif dialog is not None:

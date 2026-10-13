@@ -17,6 +17,16 @@ Die Systembefehle funktionieren ausschließlich für den tatsächlichen Betreibe
 | `/aqla_limits` | Offene Trades oder Gesamtrisiko eines Kontos ändern | Ja |
 | `/aqla_pause` | Neue Entries sofort pausieren; Schutz läuft weiter | Nein |
 | `/aqla_fortsetzen` | Neue Entries nach den konfigurierten Regeln freigeben | Ja |
+| `/aqla_hinzufuegen ID @username ...` | Quellen ergänzen; bestehende Auswahl erhalten | Ja |
+| `/aqla_entfernen ID @username ...` | Nur die ausdrücklich genannten Quellen entfernen | Ja |
+| `/aqla_kanalname ID "Name"` | Einen eindeutigen Kanalnamen registrieren | Ja |
+| `/aqla_konflikt [Trade-ID]` | Konflikte auflisten oder mit frischen Kontobelegen prüfen | Nein |
+| `/aqla_konflikt_loesen Trade-ID Fingerabdruck` | Nur vollständig belegte eigene Schließung lokal bestätigen | Ja |
+| `/aqla_funktionen` | Tatsächlichen nativen Funktionskatalog anzeigen | Nein |
+
+Routinefragen wie „ALLE AKTUELLEN KANÄLE“, „zeig mir alle Kanäle“ und „wie ist Status?“ werden ebenfalls vor dem Sprachmodell auf Deutsch aus aktuellen Daten beantwortet. Die Kanalliste trennt aktuell ausgewählte Quellen von Ranghistorie und Nachweisen. Status trennt bereit/blockiert/Recovery, Verarbeitungszustände, Eigentumskonflikte und die tatsächlich gemeldete Decision-Freigabe. Null ausstehende Benachrichtigungen bedeutet keine leere Verarbeitung.
+
+Quellenänderungen verwenden die frisch gelesene Konfigurationsrevision. Unterstützt sind numerische Telegram-IDs, öffentliche @usernames beziehungsweise deren t.me-Links und zuvor registrierte eindeutige Namen. Unbekannte freie Titel werden abgelehnt. `control(add_sources/remove_sources)` verändert nur die genannten Quellen; `control(set_sources)` ist ein expliziter vollständiger Ersatz und darf nicht zum Ergänzen benutzt werden.
 
 Ohne Argumente führen Rang, Parameter, Maker und Limits durch **Ziel → Feld → Wert**. Eine Seite hat höchstens acht Auswahlwerte. Boolesche Werte und Aufzählungen besitzen Schaltflächen. Zahlen und JSON-Listen werden gezielt mit aktuellem Wert, Einheit und Beispiel abgefragt. `/cancel`, die Schaltfläche **Abbrechen** oder ein neuer Dialog beendet die vorherige Eingabe.
 
