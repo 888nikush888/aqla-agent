@@ -416,6 +416,20 @@ def test_digit_prefixed_asset_candidates_preserve_original_positions(symbol):
     assert selected.candidate_id in options
 
 
+@pytest.mark.parametrize("symbol", ["wld", "near", "ena", "fartcoin"])
+def test_lowercase_explicit_setup_headings_are_generic_symbol_candidates(symbol):
+    packet = packet_for(symbol + " short\nEntry 100. SL 110. TP 90.")
+    span = next(span for span in candidates(packet) if span.kind == "symbol" and span.value == symbol)
+    assert span.quote == symbol and span.start == 0
+    assert span.candidate_id in questions_for(packet, candidates(packet))["symbol"]["criteria"]
+
+
+def test_prose_word_next_to_direction_does_not_become_lowercase_asset():
+    packet = packet_for("the long position is open.\nWe have a near short-term target.")
+    values = {span.value for span in candidates(packet) if span.kind == "symbol"}
+    assert not values & {"the", "near", "position"}
+
+
 def test_timeframes_numeric_sizes_and_multipliers_are_not_new_digit_prefixed_symbols():
     packet = packet_for("BTC LONG. 4H 15x 15X 30m $250K 1000 1/2/2026.")
     values = {span.value for span in candidates(packet) if span.kind == "symbol"}
@@ -470,6 +484,54 @@ def test_python_bound_setup_cannot_become_a_second_entry():
                   Evidence(field="side", source_id=packet["anchor_source_id"], quote="LONG")])
     with pytest.raises(DecisionFailure, match="bound_setup_cannot_reenter"):
         validate_interpretation(packet, result)
+
+
+@pytest.mark.parametrize("wording", ["Deferred, not now; strictly at the specified price.",
+    "Вход отложенный, не сейчас, а строго по указанной цене.", "Später einsteigen, nur zum angegebenen Preis."])
+def test_exact_live_price_gate_derives_supported_limit_without_changing_raw_model_choice(wording):
+    packet = packet_for("BTC LONG. Entry 100. " + wording)
+    questions = questions_for(packet, candidates(packet))
+    response = response_for(questions, overrides={"entry": "unspecified", "entry_timing": "deferred"})
+    observed = {}
+    result = replay_decision(packet, CalibrationProfile(), [response, response_for(verification_questions())],
+        model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL, observation=observed)
+    assert result.interpretation.entry == "limit" and result.interpretation.entry_timing == "deferred"
+    assert result.interpretation.entry_prices == [100]
+    assert observed["values"]["entry"] == "unspecified" and observed["probabilities"]["entry"] == 1
+
+
+def test_time_delay_or_ordinary_reference_does_not_invent_price_bound_entry():
+    packet = packet_for("BTC LONG. Entry 100. Enter later.")
+    response = response_for(questions_for(packet, candidates(packet)), overrides={"entry": "unspecified", "entry_timing": "deferred"})
+    with pytest.raises(DecisionFailure, match="decision_schema_invalid"):
+        replay_decision(packet, CalibrationProfile(), [response], model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+
+
+def test_exact_same_live_tp_role_repetition_coalesces_without_merging_target_roles():
+    packet = packet_for("BTC LONG. Entry 100. SL 90. TP1: 110. First target 110.")
+    spans = candidates(packet)
+    response = response_for(questions_for(packet, spans))
+    result = replay_decision(packet, CalibrationProfile(), [response, response_for(verification_questions())],
+        model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+    assert result.interpretation.take_profits == [110]
+    assert len([span for span in spans if span.kind == "number" and span.value == "110"]) == 2
+    packet = packet_for("BTC LONG. Entry 100. SL 90. TP1: 110. TP2: 110.")
+    spans = candidates(packet)
+    targets = [span for span in spans if span.kind == "number" and span.value == "110"]
+    response = response_for(questions_for(packet, spans), overrides={"role." + targets[1].candidate_id: "target_2"})
+    result = replay_decision(packet, CalibrationProfile(), [response, response_for(verification_questions())],
+        model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+    assert result.interpretation.take_profits == [110, 110]
+
+
+@pytest.mark.parametrize("extra", ["TP1: 120.", "ETH LONG. TP1: 110.", "TP1: 110%."])
+def test_same_role_unequal_or_independent_or_different_unit_mentions_still_conflict(extra):
+    packet = packet_for("BTC LONG. Entry 100. SL 90. TP1: 110. " + extra)
+    spans = candidates(packet)
+    overrides = {"role." + span.candidate_id: "target_1" for span in spans if span.kind == "number" and span.value in ("110", "120")}
+    response = response_for(questions_for(packet, spans), overrides=overrides)
+    with pytest.raises(DecisionFailure, match="conflicting_numeric_roles"):
+        replay_decision(packet, CalibrationProfile(), [response], model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
 
 
 def test_calibrated_kind_and_intent_polarities_do_not_share_error_thresholds():

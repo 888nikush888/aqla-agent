@@ -34,6 +34,13 @@ TP_BE_FOOTER = pattern(WORD + r"(?:after|when|once|после|при|nach|wenn|f
                        r"(?:break[-\s]?even|breakeven|безубыт\w*|б[./\s]?у|einstand)")
 DISCRETE_ENTRIES = pattern(WORD + r"(?:limit\s+(?:orders|entries|bids)|(?:orders|entries|bids)\s+at|лимитк(?:и|ами)|лимитны\w*\s+(?:заявк\w*|ордер\w*)|einstiegsorders|limitorders)" + END)
 ENTRY_ZONE = pattern(WORD + r"(?:range|zone|диапазон|зона|bereich)" + END)
+STRICT_ENTRY_PRICE = pattern(WORD + r"(?:strictly|only|exclusively)\s+(?:\w+\s+){0,4}(?:specified|stated|given)\s+price\b|"
+    + WORD + r"(?:строго|только|исключительно)\s+(?:по\s+)?(?:указанной|обозначенной|заданной)\s+цене\b|"
+    + WORD + r"(?:nur|ausschließlich|ausschliesslich)\s+(?:zum?\s+)?(?:angegebenen|genannten)\s+preis\b")
+
+
+def strict_deferred_price(text, entry_timing, entry_prices):
+    return entry_timing == "deferred" and len(entry_prices) == 1 and bool(STRICT_ENTRY_PRICE.search(text))
 VERB = r"(?:move|set|put|bring|raise|lower|trail|adjust|переносим|перенести|переводим|перевести|перестав\w*|двигаем|подтягиваем|ставим|ставлю|ставь|setz\w*|zieh\w*|verschieb\w*)"
 STOP = r"(?:the\s+)?(?:stop(?:[-\s]+loss)?|стоп\w*)"
 BREAK_EVEN = r"(?:break[-\s]?even|breakeven|entry|einstand|безубыт\w*|б[./\s]?у|вход\w*)"

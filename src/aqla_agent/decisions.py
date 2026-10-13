@@ -263,9 +263,14 @@ def candidates(packet):
                 # Durations, timeframe ordinals, multipliers and currency-size
                 # shorthand are numeric notation, not digit-prefixed assets.
                 continue
+            before = text[text.rfind("\n", 0, match.start()) + 1:match.start()]
+            after = text[match.end():]
+            heading = bool(re.fullmatch(r"\s*[#$]?\s*", before) and re.match(
+                r"\s+(?:long|short|лонг|шорт)(?!\w)(?:\s*(?:[.;:\n]|$)|\s+[xх]\s*\d)", after, re.I))
             # Broad lexical candidates; these patterns never assign a trading role.
             if (raw.startswith("$") or raw.isupper() or "/" in raw or ":" in raw
                     or text[max(0, match.start() - 1):match.start()] == "#"
+                    or heading
                     or raw.lower() in ("btc", "eth", "sol", "gold", "xau")):
                 value = raw.lstrip("$").split("/")[0]
                 add(*match.span(), "symbol", value)
@@ -581,6 +586,14 @@ def assemble(packet, spans, values, probabilities, profile, *, collect=False, re
         required = {"move_stop": "stop_loss", "replace_targets": "take_profits", "reduce": "reduce_percent"}.get(fields["update_action"])
         if required and not fields.get(required):
             raise DecisionFailure("update_value_missing")
+    if kind == "new_signal" and fields.get("entry") == "unspecified":
+        from .semantic_contract import strict_deferred_price
+        anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+        if (selected.get("entry0") and selected["entry0"].source_id == packet["anchor_source_id"]
+                and strict_deferred_price(anchor["text"], fields.get("entry_timing"), fields.get("entry_prices", []))):
+            # An expressly strict deferred price gate is one price-bound entry,
+            # unlike an ordinary reference price or a time-delayed market order.
+            fields["entry"] = "limit"
     interpretation = Interpretation(kind=kind, source_refs=sorted(refs), evidence=evidence, **fields)
     validate_interpretation(packet, interpretation)
     return interpretation

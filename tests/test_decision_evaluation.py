@@ -12,6 +12,7 @@ from aqla_agent.decision_evaluation import (
     evaluate_split,
     fit_thresholds,
     revision_time_context,
+    source_gate_diagnostics,
 )
 from aqla_agent.decisions import DecisionFailure, DecisionResult
 from aqla_hyperliquid_mcp.models import Interpretation
@@ -303,3 +304,160 @@ async def test_evaluation_preserves_real_edit_and_reply_metadata():
     assert edited["edited_at"] == 2000 and edited["received_at"] == 2100
     assert edited["reply_to_id"] == 16 and edited["thread_id"] == 8
     assert observed[0]["anchor_event_id"] == edited["event_id"]
+
+
+def test_source_kind_diagnostics_do_not_credit_two_cases_from_one_holdout_group():
+    cases = [{"id": "cal", "split": "calibration", "origin": "real", "group_id": "cal-group"},
+             {"id": "h1", "split": "holdout", "origin": "real", "group_id": "same-thread"},
+             {"id": "h2", "split": "holdout", "origin": "real", "group_id": "same-thread"}]
+    rows = [{"id": case["id"], "kind": "report", "source_id": "channel", "passed": True,
+             "accepted": True, "critical_error": False} for case in cases]
+    diagnostic = source_gate_diagnostics(rows, cases, ["channel"])["channel"]
+    proof = diagnostic["evidence"]["kinds"]["report"]
+    assert proof["calibration_correct_groups"] == 1
+    assert proof["holdout_correct_accepted_groups"] == 1
+    assert proof["blocking_reasons"] == ["kind_holdout_correct_accepted_groups_below_2"]
+    assert "source_no_tested_kind" in diagnostic["blocking_reasons"]
+    assert "report" not in diagnostic["eligible_kinds"]
+
+
+def test_failed_calibration_explicitly_reports_global_and_source_kind_blockers():
+    cases = [{"id": "one", "split": "calibration", "expected": {"kind": "report"},
+              "origin": "real", "group_id": "one-group"}]
+    rows = [{"id": "one", "source_id": "channel", "kind": "report", "passed": True,
+             "accepted": True, "raw_correct": True, "question_results": []}]
+    profile = calibration_profile(rows, cases, ["channel"])
+    reasons = profile.activation_diagnostics["blocking_reasons"]
+    assert not profile.validated
+    assert "calibration_cases_below_30" in reasons and "holdout_cases_below_30" in reasons
+    assert "approved_master_hash_missing" in reasons
+    proof = profile.activation_diagnostics["sources"]["channel"]
+    assert "source_holdout_groups_below_5" in proof["blocking_reasons"]
+    assert "kind_holdout_correct_accepted_groups_below_2" in proof["evidence"]["kinds"]["report"]["blocking_reasons"]
+
+
+def test_equal_bare_quotes_require_distinct_original_occurrence_annotations():
+    from aqla_agent.decision_evaluation import question_labels
+    from aqla_agent.decisions import candidates
+    packet = case_packet({"id": "equal", "messages": ["BTC LONG. SL 7. TP1 7."]})
+    source = packet["anchor_source_id"]
+    spans = [span for span in candidates(packet) if span.kind == "number" and span.quote == "7"]
+    expected = {"stop_loss": 7, "take_profits": [7], "evidence": [
+        {"field": "stop_loss", "source_id": source, "quote": "7"},
+        {"field": "take_profits.0", "source_id": source, "quote": "7"}]}
+    labels = question_labels(packet, expected)
+    assert all(labels["role." + span.candidate_id] == {"unclear"} for span in spans)
+    annotations = [{"field": field, "source_id": source, "start": span.start, "end": span.end, "quote": span.quote}
+                   for field, span in zip(("stop_loss", "take_profits.0"), spans, strict=True)]
+    labels = question_labels(packet, expected, candidate_occurrences=annotations)
+    assert labels["role." + spans[0].candidate_id] == {"stop_loss"}
+    assert labels["role." + spans[1].candidate_id] == {"target_1"}
+    with pytest.raises(ValueError, match="original position and Evidence"):
+        question_labels(packet, expected, candidate_occurrences=[{**annotations[0], "start": 0}])
+    with pytest.raises(ValueError, match="annotated twice"):
+        question_labels(packet, expected, candidate_occurrences=[annotations[0], annotations[0]])
+    question_results = calibration_question_results(packet, expected, {
+        "values": {"role." + spans[0].candidate_id: "stop_loss", "role." + spans[1].candidate_id: "target_1"},
+        "probabilities": {"role." + span.candidate_id: 1 for span in spans},
+        "required_questions": ["role." + span.candidate_id for span in spans]}, None)
+    assert question_results == []
+    assert fit_thresholds([{"raw_correct": True, "question_results": question_results}]) == ({}, [])
+
+
+def test_exact_repeat_annotations_can_name_equivalent_mentions_of_one_field():
+    from aqla_agent.decision_evaluation import question_labels
+    from aqla_agent.decisions import candidates
+    packet = case_packet({"id": "repeat", "messages": ["BTC LONG. TP1 7. First target 7."]})
+    source = packet["anchor_source_id"]
+    spans = [span for span in candidates(packet) if span.kind == "number" and span.quote == "7"]
+    expected = {"take_profits": [7], "evidence": [{"field": "take_profits.0", "source_id": source, "quote": "7"}]}
+    annotations = [{"field": "take_profits.0", "source_id": source, "start": span.start, "end": span.end, "quote": "7"}
+                   for span in spans]
+    labels = question_labels(packet, expected, candidate_occurrences=annotations)
+    assert all(labels["role." + span.candidate_id] == {"target_1"} for span in spans)
+
+
+@pytest.mark.asyncio
+async def test_changed_gold_cannot_resume_cached_observation_under_same_input(tmp_path):
+    calls = []
+    class Adapter:
+        async def interpret(self, packet, profile, **kwargs):
+            calls.append(packet)
+            return DecisionResult(model="synthetic", interpretation=Interpretation(kind="report",
+                source_refs=[packet["anchor_source_id"]]))
+    checkpoint = EvaluationCheckpoint(tmp_path / "immutable.json", {"model": "synthetic"})
+    cases = [{"id": "one", "messages": ["Original report"], "expected": {"kind": "report"}}]
+    await evaluate(cases, Adapter(), checkpoint=checkpoint)
+    cases[0]["expected"]["kind"] = "unrelated"
+    with pytest.raises(ValueError, match="annotation provenance changed"):
+        await evaluate(cases, Adapter(), checkpoint=checkpoint)
+    assert len(calls) == 1
+
+
+def test_calibration_freeze_cannot_change_after_holdout_started(tmp_path):
+    from aqla_agent.decisions import CalibrationProfile
+    checkpoint = EvaluationCheckpoint(tmp_path / "frozen.json", {"model": "synthetic"})
+    original = CalibrationProfile(thresholds={"kind.report": 0.99})
+    checkpoint.freeze(original)
+    checkpoint.freeze(original)
+    with pytest.raises(ValueError, match="cannot be retuned"):
+        checkpoint.freeze(original.model_copy(update={"thresholds": {"kind.report": 0.5}}))
+
+
+def test_proven_strict_deferred_gate_labels_raw_unspecified_as_correct():
+    from aqla_agent.decision_evaluation import question_labels
+    packet = case_packet({"id": "gate", "messages": ["BTC LONG. Entry 100. Deferred; strictly at the specified price."]})
+    expected = {"entry": "limit", "entry_timing": "deferred", "entry_prices": [100]}
+    assert question_labels(packet, expected)["entry"] == {"limit", "unspecified"}
+    packet = case_packet({"id": "ordinary", "messages": ["BTC LONG. Entry 100. Enter later."]})
+    assert question_labels(packet, expected)["entry"] == {"limit"}
+
+
+@pytest.mark.asyncio
+async def test_swapped_same_value_occurrence_roles_are_a_critical_error_even_when_public_values_match():
+    import json
+
+    import httpx
+    from test_decisions import response_for
+
+    from aqla_agent.decision_evaluation import complete_fields
+    from aqla_agent.decisions import DEFAULT_DECISION_MODEL, OpenRouterDecisionAdapter, candidates
+    from aqla_hyperliquid_mcp.models import Evidence
+    case = {"id": "swapped", "messages": ["BTC LONG. Entry 100. SL 7. TP1 7."], "annotation_complete": True}
+    packet = case_packet(case)
+    source = packet["anchor_source_id"]
+    occurrences = [span for span in candidates(packet) if span.kind == "number" and span.quote == "7"]
+    gold = Interpretation(kind="new_signal", symbol="BTC", side="long", entry="limit", entry_prices=[100],
+        stop_loss=7, take_profits=[7], source_refs=[source], evidence=[
+            Evidence(field="symbol", source_id=source, quote="BTC"),
+            Evidence(field="side", source_id=source, quote=packet["messages"][0]["text"]),
+            Evidence(field="entry_prices.0", source_id=source, quote="100"),
+            Evidence(field="take_profits.0", source_id=source, quote="7"),
+            Evidence(field="stop_loss", source_id=source, quote="7")])
+    case["expected"] = complete_fields(gold)
+    case["candidate_occurrences"] = [{"field": field, "source_id": source, "start": span.start, "end": span.end, "quote": "7"}
+                                     for field, span in zip(("stop_loss", "take_profits.0"), occurrences, strict=True)]
+
+    def upstream(request):
+        body = json.loads(request.content)
+        return httpx.Response(200, json=response_for(body["questions"], overrides={
+            "role." + occurrences[0].candidate_id: "target_1", "role." + occurrences[1].candidate_id: "stop_loss"}))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        rows = await evaluate([case], OpenRouterDecisionAdapter("synthetic", client=client, model_revision=DEFAULT_DECISION_MODEL))
+    assert rows[0]["accepted"] and not rows[0]["passed"] and rows[0]["critical_error"]
+    assert rows[0]["mismatch_fields"] == ["candidate_occurrences"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_occurrence_annotation_is_rejected_before_any_catalog_or_model_request():
+    class Forbidden:
+        async def identity(self):
+            raise AssertionError("Invalid gold must not fetch a model catalog")
+        async def interpret(self, *args, **kwargs):
+            raise AssertionError("Invalid gold must not make a model request")
+    source = {"chat_id": "channel", "message_id": 1, "sent_at": 1000, "text": "BTC LONG. SL 7."}
+    case = {"id": "invalid", "messages": [source], "expected": {"stop_loss": 7}, "split": "calibration",
+            "candidate_occurrences": [{"field": "stop_loss", "source_id": "unknown", "start": 0, "end": 1, "quote": "7"}]}
+    with pytest.raises(ValueError, match="original position and Evidence"):
+        await evaluate_split([case], Forbidden(), [])
