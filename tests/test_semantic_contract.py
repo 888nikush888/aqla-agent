@@ -43,11 +43,12 @@ def test_exact_proofs_do_not_authorize_omitting_original_instruction(form):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("form", ["market", "range", "reduce"])
 async def test_native_generative_admission_rejects_all_three_partial_action_probes(form, monkeypatch, tmp_path):
-    packet, interpretation, _ = unsupported_probe(form)
+    packet, interpretation, code = unsupported_probe(form)
     master = tmp_path / "master.md"
     master.write_text("Synthetic original-source interpretation rules", encoding="utf-8")
     runtime = {"provider": "custom", "base_url": "https://opencode.ai/zen/go/v1", "api_key": "synthetic"}
-    extension = SimpleNamespace(master_path=master, session_key="synthetic",
+    orders = []
+    extension = SimpleNamespace(master_path=master, session_key="synthetic", mcp_call=lambda *args: orders.append(args),
         gateway=SimpleNamespace(_resolve_session_agent_runtime=lambda **_: ("synthetic", runtime)))
     calls = []
 
@@ -62,9 +63,9 @@ async def test_native_generative_admission_rejects_all_three_partial_action_prob
         call_llm=call_llm, extract_content_or_reasoning=lambda response, **_: response["content"]))
     monkeypatch.setitem(sys.modules, "agent.usage_pricing", SimpleNamespace(normalize_usage=lambda *_: None,
         estimate_usage_cost=lambda *_: None))
-    with pytest.raises(DecisionFailure, match="fallback_unresolved"):
+    with pytest.raises(DecisionFailure, match=code):
         await SourceWorker(extension, {"mode": "hybrid"}).generative_fallback(packet, "synthetic_review", [])
-    assert len(calls) == 1 and calls[0]["tools"] is None
+    assert len(calls) == 1 and calls[0]["tools"] is None and orders == []
 
 
 @pytest.mark.asyncio
@@ -233,6 +234,24 @@ def test_future_take_profit_stop_policy_footer_is_not_a_current_management_actio
     assert supported_action_failure("BTC LONG. MARKET 100. SL 90. TP1 110. After TP1 move stop to break-even.", interpretation) is None
     update = Interpretation(kind="trade_update", symbol="BTC", update_action="break_even", source_refs=["synthetic:1"])
     assert supported_action_failure("BTC: after TP1 move stop to break-even.", update) == "scheduled_management_not_representable"
+
+
+@pytest.mark.parametrize("footer", ["Move stop to break-even after TP1.", "Move stop to entry after TP1.",
+    "After TP1 move stop to break-even.", "Стоп в бу после первого тейка.", "Stop auf Einstand nach TP1."])
+def test_original_only_guard_agrees_with_new_entry_for_fixed_future_be_footer(footer):
+    packet = packet_for("BTC LONG. Entry: 100. SL 90. TP1 110. " + footer)
+    signal = Interpretation(kind="new_signal", source_refs=[packet["anchor_source_id"]], symbol="BTC", side="long")
+    assert supported_action_failure(packet["messages"][0]["text"], signal) is None
+    assert unsupported_structure(packet) is None
+    standalone_update = packet_for("BTC: " + footer)
+    update = Interpretation(kind="trade_update", source_refs=[standalone_update["anchor_source_id"]], symbol="BTC", update_action="break_even")
+    assert supported_action_failure(standalone_update["messages"][0]["text"], update) == "scheduled_management_not_representable"
+    assert unsupported_structure(standalone_update) == "scheduled_management_not_representable"
+
+
+def test_a_future_be_rule_does_not_hide_another_unsupported_action_in_the_same_clause():
+    packet = packet_for("BTC LONG. Entry: 100. After TP1 reduce half and move stop to break-even.")
+    assert unsupported_structure(packet) == "management_actions_not_representable"
 
 
 @pytest.mark.parametrize("text,accepted", [

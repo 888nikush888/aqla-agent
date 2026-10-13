@@ -33,14 +33,16 @@ PAST_GOVERNOR = pattern(WORD + PAST_VERB + r"\s+(?:\w+\s+){0,3}$")
 CLAUSES = pattern(r"\n+|[;!?]+|(?<!\d)\.(?!\d)|\b(?:and|und|и|затем)\b|\s*[,+]\s*")
 FUTURE = pattern(WORD + r"(?:tomorrow|tonight|later|next\s+\w+|in\s+\d+\s*(?:min\w*|hours?|days?)|"
                  r"morgen|später|spaeter|nach\s+\d+\s*\w+|завтра|позже|потом|через\s+\d+\s*\w+)" + END)
-CONDITION = pattern(WORD + r"(?:if|when|once|after|until|falls|wenn|sobald|nachdem|если|когда|после|при\s+(?:достижении|касании|пробое))" + END)
+CONDITION = pattern(WORD + r"(?:if|when|once|after|until|falls|wenn|sobald|nachdem|nach\s+(?:tp\s*\d|ziel\w*|erreich\w*)|"
+                    r"если|когда|после|при\s+(?:достижении|касании|пробое|tp\s*\d|тейк\w*|цел\w*))" + END)
 STOP_CONDITION = pattern(WORD + r"(?:stop(?:[-\s]+loss)?|sl|стоп(?:[-\s]*лосс)?)\s*[:=-]?\s*"
                          r"(?:\w+\s+){0,4}(?:h\d+|\d+\s*[hm]|hourly|daily|candle\w*|свеч\w*|часов\w*|kerz\w*)" + END)
 EXTRA_ENTRY = pattern(WORD + r"(?:bids?|averag(?:e|ing)|additional\s+(?:limit|entries|entry)|"
                       r"усреднен\w*|докуп\w*|nachkauf\w*|zusätzlich\w*\s+(?:limit|einstieg))" + END)
-TP_BE_FOOTER = pattern(WORD + r"(?:after|when|once|после|при|nach|wenn|future)\b.{0,50}"
-                       r"(?:tp\s*\d|target\s*\d|тейк\w*|цел\w*|ziel\w*).{0,70}"
-                       r"(?:break[-\s]?even|breakeven|безубыт\w*|б[./\s]?у|einstand)")
+TP_LABEL = pattern(WORD + r"(?:tp\s*\d|target\s*\d|тейк\w*|цел\w*|ziel\w*)" + END)
+NEW_ENTRY = pattern(WORD + r"(?:entry|einstieg|вход)\s*[:=@]|"
+                    + WORD + r"(?:enter|buy|sell|einsteigen|входим|войти)" + END)
+SETUP_HEADING = pattern(r"(?:^|\n)\s*[#$]?[a-z0-9]+\s+(?:long|short|лонг|шорт)" + END)
 DISCRETE_ENTRIES = pattern(WORD + r"(?:limit\s+(?:orders|entries|bids)|(?:orders|entries|bids)\s+at|лимитк(?:и|ами)|лимитны\w*\s+(?:заявк\w*|ордер\w*)|einstiegsorders|limitorders)" + END)
 ENTRY_ZONE = pattern(WORD + r"(?:range|zone|диапазон|зона|bereich)" + END)
 STRICT_ENTRY_PRICE = pattern(WORD + r"(?:strictly|only|exclusively)\s+(?:\w+\s+){0,4}(?:specified|stated|given)\s+price\b|"
@@ -81,7 +83,7 @@ def current_actions(text, *, include_tp_footers=True):
     normalized = text.casefold().replace("ё", "е")
     if not include_tp_footers:
         normalized = ";".join(sentence for sentence in re.split(r"[;!?\n]|(?<!\d)\.(?!\d)", normalized)
-                              if not TP_BE_FOOTER.search(sentence))
+                              if not tp_break_even_footer(sentence))
     for clause in CLAUSES.split(normalized):
         clause = clause.strip()
         if not clause:
@@ -106,6 +108,12 @@ def current_actions(text, *, include_tp_footers=True):
                 action = "reduce" if quantities or match.group().startswith(("reduce", "reducing", "trim", "cut", "сократ", "reduzier")) else "close"
             actions.append((action, clause))
     return actions
+
+
+def tp_break_even_footer(sentence):
+    """One conditional TP-triggered BE rule, in either original word order."""
+    return (bool(CONDITION.search(sentence) and TP_LABEL.search(sentence))
+            and [action for action, _ in current_actions(sentence)] == ["break_even"])
 
 
 def entry_structure_failure(text):
@@ -134,19 +142,19 @@ def entry_structure_failure(text):
     return None
 
 
-def management_structure_failure(text):
+def management_structure_failure(text, *, ignore_tp_footers=False):
     actions = current_actions(text)
     if STOP_CONDITION.search(text) and any(action in ("move_stop", "break_even") for action, _ in actions):
         return "conditional_stop_not_representable"
     immediate_actions = current_actions(text, include_tp_footers=False)
-    if immediate_actions:
+    if immediate_actions or ignore_tp_footers:
         actions = immediate_actions
     if len(actions) > 1:
         return "management_actions_not_representable"
     # One future update is still unsupported: Interpretation has no update
     # scheduler/trigger. Deferred ENTRY remains supported by its explicit field.
     if any(current_actions(sentence) and (FUTURE.search(sentence) or CONDITION.search(sentence))
-           and not (immediate_actions and TP_BE_FOOTER.search(sentence))
+           and not ((immediate_actions or ignore_tp_footers) and tp_break_even_footer(sentence))
            for sentence in re.split(r"[;!?\n]|(?<!\d)\.(?!\d)", text)):
         return "scheduled_management_not_representable"
     return None
@@ -163,7 +171,7 @@ def unsupported_structure(packet):
         failure = entry_structure_failure(text)
         if failure:
             return failure
-    return management_structure_failure(text)
+    return management_structure_failure(text, ignore_tp_footers=bool(NEW_ENTRY.search(text) or SETUP_HEADING.search(text)))
 
 
 def supported_action_failure(text, interpretation):
