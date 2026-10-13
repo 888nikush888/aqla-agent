@@ -486,3 +486,83 @@ async def test_interrupted_model_work_is_never_measured_as_completed_interpretat
     assert not metrics["workflow"]["interpretation_valid"]
     assert next(iter(state.snapshot()["source_jobs"].values()))["status"] == "prepared"
     assert not fake.actions
+
+
+@pytest.mark.asyncio
+async def test_original_signal_expiry_stops_retry_before_any_further_model_or_dispatch(worker_boundary, monkeypatch):
+    extension, server, state, fake, _, _ = worker_boundary
+    clock = now_ms()
+    monkeypatch.setattr("aqla_agent.source_processing.now_ms", lambda: clock)
+    state.update(lambda data: data["policy"].update(max_signal_age_seconds=5))
+    source = SourceEvent(chat_id="channel", message_id=105, sent_at=clock - 4000,
+                        text="BTC long entry market 100. SL 90.")
+    server.aqla_trading.ingest(source)
+    requests, fallbacks = [], []
+
+    def upstream(request):
+        requests.append(request)
+        return httpx.Response(503)
+
+    async def failed_fallback(*args):
+        fallbacks.append(True)
+        raise httpx.ReadTimeout("Synthetic transient provider failure")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        worker = SourceWorker(extension, {"mode": "hybrid", "retry_max_age_seconds": 900}, fallback=failed_fallback,
+            adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="fixture/revision"))
+        await worker.tick()
+        job = next(iter(state.snapshot()["source_jobs"].values()))
+        assert job["status"] == "retry_wait" and job["retry_deadline_at"] == source.sent_at + 5000
+        assert job["retry_deadline_at"] < job["created_at"] + 900000
+        clock = job["retry_deadline_at"]
+        await worker.tick()
+        await worker.tick()
+    saved = state.snapshot()["source_jobs"][job["job_id"]]
+    assert saved["status"] == "review" and saved["outcome"] == "provider_retry_exhausted"
+    assert saved["attempt_count"] == 1 and len(requests) == len(fallbacks) == 1
+    assert not fake.actions and not state.snapshot()["operations"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("calibrated", [True, False])
+async def test_only_the_actual_model_route_must_fit_its_input_budget(worker_boundary, calibrated):
+    from aqla_agent.decisions import build_packet, candidates, questions_for
+    extension, server, state, fake, _, _ = worker_boundary
+    source = SourceEvent(chat_id="channel", message_id=106, sent_at=now_ms(), text="Result report.")
+    server.aqla_trading.ingest(source)
+    profile = CalibrationProfile(validated=True, master_hash="master-v1", sources=["channel"],
+        model_revision="inception/mercury-decide:free", dataset_hash="calibration", holdout_hash="holdout", holdout_cases=30,
+        thresholds={"kind": 0.99}, source_evidence={"channel": {"calibration_groups": 3, "holdout_groups": 5,
+            "accepted_accuracy": 1, "critical_errors": 0, "kinds": {"report": {
+                "calibration_correct_groups": 1, "holdout_correct_accepted_groups": 2}}}}, source_permissions={"channel": ["report"]})
+    path = extension.master_path.parents[2] / "route-profile.json"
+    path.write_text(profile.model_dump_json())
+    probe = SourceWorker(extension, {"mode": "hybrid"})
+    packet = build_packet(server.aqla_trading.context(source.event_id, decision=True))
+    packet["approved_source_guidance"] = extension.master_path.read_text(encoding="utf-8")
+    spans = candidates(packet)
+    decision_size = len(json.dumps({"model": probe.config.model, "state": packet, "questions": questions_for(packet, spans)}, ensure_ascii=False))
+    fallback_size = len(json.dumps(probe.fallback_messages(packet, "decision_review_required", spans), ensure_ascii=False))
+    limit = decision_size + 10
+    assert decision_size < limit < fallback_size
+    requests, fallbacks = [], []
+
+    def upstream(request):
+        requests.append(request)
+        return httpx.Response(200, json=response_for(json.loads(request.content)["questions"], kind="report"))
+
+    async def forbidden(*args):
+        fallbacks.append(True)
+        raise AssertionError("The oversized fallback route must never be invoked")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        worker = SourceWorker(extension, {"mode": "hybrid", "max_context_characters": limit,
+            "calibration_file": str(path) if calibrated else None}, fallback=forbidden,
+            adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="inception/mercury-decide:free"))
+        await worker.tick()
+    job = next(iter(state.snapshot()["source_jobs"].values()))
+    if calibrated:
+        assert job["status"] == "done" and state.snapshot()["events"][source.event_id]["status"] == "report"
+    else:
+        assert job["status"] == "review" and job["failure_code"] == "source_context_limit"
+    assert len(requests) == 1 and not fallbacks and not fake.actions

@@ -708,3 +708,40 @@ async def test_provider_retry_expiry_never_refreshes_original_deadline(native_pr
     assert saved["status"] == "review" and saved["outcome"] == "provider_retry_exhausted"
     assert saved["retry_deadline_at"] == job["retry_deadline_at"] and saved["attempt_count"] == 1
     assert not fake.actions and not state.snapshot()["operations"]
+
+
+@pytest.mark.parametrize("invalid", [{"retry_max_attempts": True}, {"retry_max_attempts": 0},
+                                   {"retry_backoff_seconds": 301}, {"retry_max_age_seconds": 29}])
+def test_invalid_retry_configuration_cannot_change_admission_owner_or_policy(native_processor, invalid):
+    server, state, _ = native_processor
+    processor = SourceProcessor(state, server.aqla_trading)
+    processor.configure("hybrid", "original", retry_backoff_seconds=20,
+                        decision_status={"model": "fixture/model", "validated": False})
+    processor.policy_version = "approved-policy"
+    previous = (processor.mode, processor.owner, processor.policy_version, processor.retry_max_attempts,
+                processor.retry_backoff_seconds, processor.retry_max_age_seconds, processor.decision_status)
+    with pytest.raises(Exception, match="Invalid bounded"):
+        processor.configure("shadow", "replacement", decision_status={"model": "different/model"}, **invalid)
+    assert (processor.mode, processor.owner, processor.policy_version, processor.retry_max_attempts,
+            processor.retry_backoff_seconds, processor.retry_max_age_seconds, processor.decision_status) == previous
+    processor.require_owner("original")
+
+
+def test_entry_retry_deadline_does_not_apply_signal_ttl_to_updates_or_historical_qa(native_processor):
+    server, state, _ = native_processor
+    processor = SourceProcessor(state, server.aqla_trading)
+    processor.configure("hybrid", "worker", retry_max_age_seconds=900)
+    context = {"event": {"source": {"sent_at": 1000, "historical": False}},
+               "policy": {"max_signal_age_seconds": 5}, "trades": []}
+    packet = {"anchor_setup_bound": False}
+    assert processor.retry_deadline(context, packet, 5000) == 6000
+    assert processor.retry_deadline(context, packet, 5000, kind="trade_update") == 905000
+    assert processor.retry_deadline(context, {"anchor_setup_bound": True}, 5000) == 905000
+    assert processor.retry_deadline({**context, "trades": [{"trade_id": "own"}]}, packet, 5000) == 905000
+    # A confirmed entry still uses its original deadline alongside other trades.
+    assert processor.retry_deadline({**context, "trades": [{"trade_id": "own"}]}, packet, 5000, kind="new_signal") == 6000
+    context["event"]["source"]["historical"] = True
+    assert processor.retry_deadline(context, packet, 5000, kind="new_signal") == 905000
+    context["event"]["source"]["historical"] = False
+    processor.configure("shadow", "worker")
+    assert processor.retry_deadline(context, packet, 5000, kind="new_signal") == 905000

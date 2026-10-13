@@ -53,22 +53,25 @@ class SourceProcessor:
         self.decision_status = {}
 
     def configure(self, mode, owner, *, retry_max_attempts=3, retry_backoff_seconds=15, retry_max_age_seconds=900, decision_status=None):
-        if mode not in ("legacy", "shadow", "hybrid") or not owner or len(owner) > 100:
+        if mode not in ("legacy", "shadow", "hybrid") or not isinstance(owner, str) or not owner or len(owner) > 100:
             raise AqlaError("Invalid native source processing configuration")
-        if (mode, owner) != (self.mode, self.owner):
-            self.policy_version = None
-        self.mode, self.owner = mode, owner
         if (type(retry_max_attempts) is not int or not 1 <= retry_max_attempts <= 5
                 or type(retry_backoff_seconds) is not int or not 1 <= retry_backoff_seconds <= 300
                 or type(retry_max_age_seconds) is not int or not 30 <= retry_max_age_seconds <= 3600):
             raise AqlaError("Invalid bounded source retry configuration")
-        self.retry_max_attempts, self.retry_backoff_seconds, self.retry_max_age_seconds = retry_max_attempts, retry_backoff_seconds, retry_max_age_seconds
+        status = self.decision_status
         if isinstance(decision_status, dict):
             permissions = decision_status.get("permissions", {})
-            self.decision_status = {"provider": "openrouter", "model": str(decision_status.get("model", ""))[:200],
+            status = {"provider": "openrouter", "model": str(decision_status.get("model", ""))[:200],
                 "validated": decision_status.get("validated") is True,
                 "permissions": {str(source)[:100]: [kind for kind in kinds if kind in KINDS]
                     for source, kinds in list(permissions.items())[:100] if isinstance(kinds, list)} if isinstance(permissions, dict) else {}}
+        # Admission ownership changes only after every proposed field is valid.
+        if (mode, owner) != (self.mode, self.owner):
+            self.policy_version = None
+        self.mode, self.owner = mode, owner
+        self.retry_max_attempts, self.retry_backoff_seconds, self.retry_max_age_seconds = retry_max_attempts, retry_backoff_seconds, retry_max_age_seconds
+        self.decision_status = status
         return {"mode": mode}
 
     def require_owner(self, owner):
@@ -115,6 +118,20 @@ class SourceProcessor:
                 row.pop("received_at", None)
         return digest([packet, context.get("configuration_revision"), context.get("policy_revision")])
 
+    def retry_deadline(self, context, packet, created_at, *, kind=None):
+        deadline = created_at + self.retry_max_age_seconds * 1000
+        source = context["event"]["source"]
+        kind = kind or (context["event"].get("interpretation") or {}).get("kind")
+        # Entry freshness is not an update TTL or an offline semantic QA TTL.
+        # Until interpreted, Python-owned setup context may represent management.
+        if (self.mode != "hybrid" or source.get("historical") or kind is not None and kind != "new_signal"
+                or kind is None and (packet.get("anchor_setup_bound") or context.get("trades"))):
+            return deadline
+        age = (context.get("policy") or {}).get("max_signal_age_seconds")
+        if type(age) is int and age > 0:
+            deadline = min(deadline, source["sent_at"] + age * 1000)
+        return deadline
+
     @staticmethod
     def event_operations(snapshot, job):
         trade_ids = {row.get("trade_id") for row in snapshot["events"].get(job.event_id, {}).get("targets", {}).values()}
@@ -150,6 +167,14 @@ class SourceProcessor:
                 self.save(job)
                 continue
             if job.status == "retry_wait":
+                try:
+                    context, packet, _ = self.context(job.event_id)
+                    job.retry_deadline_at = min(job.retry_deadline_at or 0, self.retry_deadline(context, packet, job.created_at))
+                    self.save(job)
+                except AqlaError:
+                    job.status, job.outcome = "review", "retry_source_changed"
+                    self.save(job)
+                    continue
                 if (job.policy_version != version or job.version != VERSION or now_ms() >= (job.retry_deadline_at or 0)
                         or job.attempt_count >= self.retry_max_attempts):
                     job.status, job.outcome = "review", "provider_retry_exhausted"
@@ -266,6 +291,12 @@ class SourceProcessor:
                 processor_instance=self.instance, policy_version=version, processing_mode=self.mode,
                 content_fingerprint=self.content_identity(context, packet), retry_deadline_at=now_ms() + self.retry_max_age_seconds * 1000)
             if not previous:
+                job.retry_deadline_at = self.retry_deadline(context, packet, job.created_at)
+                if self.mode == "hybrid" and now_ms() >= job.retry_deadline_at:
+                    job.status, job.outcome = "review", "source_retry_deadline_expired"
+                    job.review_sources = {packet["anchor_source_id"]: event_id}
+                    self.save(job)
+                    continue
                 # Reuse only exact semantics under the same complete admission
                 # policy. Binding changes invalidate identity; entries already
                 # consumed by any owned setup must never become a second trade.
@@ -348,7 +379,7 @@ class SourceProcessor:
         job = self.read_job(owner, job_id)
         if job.status not in ("prepared", "interpreted"):
             raise AqlaError("Source job result is immutable")
-        _, packet, fingerprint = self.context(job.event_id)
+        context, packet, fingerprint = self.context(job.event_id)
         if job.fingerprint != fingerprint:
             raise AqlaError("Source job context changed; prepare a current job")
         validate_interpretation(packet, result.interpretation)
@@ -365,6 +396,8 @@ class SourceProcessor:
         if job.result is not None and job.result != result:
             raise AqlaError("An already recorded interpretation cannot be replaced")
         job.result, job.status = result, "shadow" if self.mode == "shadow" else "interpreted"
+        job.retry_deadline_at = min(job.retry_deadline_at or job.created_at + self.retry_max_age_seconds * 1000,
+                                   self.retry_deadline(context, packet, job.created_at, kind=result.interpretation.kind))
         job.intent_revisions = {ref: row["event_id"] for ref, row in latest_sources(
             self.state.snapshot()["events"], result.interpretation.source_refs).items()}
         self.save(job)

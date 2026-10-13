@@ -280,15 +280,13 @@ class SourceWorker:
                             kind="incomplete", source_refs=[anchor["source_id"]], reason="Originaltext fehlt.",
                             reason_codes=["missing_source_text"]))
                     else:
-                        # Bound the COMPLETE outgoing bodies, including master,
-                        # questions/schema and prepared candidates, before either API.
+                        # Bound this actual Decision request, including master
+                        # and questions. An unused fallback must not gate Mercury.
                         phase = "decision"
                         self.check_input(packet)
                         spans = candidates(packet)
-                        sizes = [self.check_input({"model": self.config.model, "state": packet,
-                                                   "questions": questions_for(packet, spans)}),
-                                 self.check_input(self.fallback_messages(packet, "decision_review_required", spans))]
-                        measured.workflow["checked_input_characters"] = max(sizes)
+                        measured.workflow["checked_input_characters"] = self.check_input({"model": self.config.model, "state": packet,
+                                                   "questions": questions_for(packet, spans)})
                         result = await self.interpret(packet, profile, master_hash, revision, usage, spans=spans)
                         veto = unsupported_structure(packet)
                         if veto:
