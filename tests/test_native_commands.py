@@ -373,3 +373,15 @@ async def test_native_formatter_send_owns_markup_and_plain_chunks_use_utf16(cont
     await commands.reply(bot, text)
     assert ''.join(row['text'] for row in bot.sent) == text
     assert all(len(row['text'].encode('utf-16-le')) // 2 <= 3500 and row['parse_mode'] is None for row in bot.sent)
+
+
+@pytest.mark.asyncio
+async def test_legacy_status_names_hermes_deepseek_tools_and_labels_old_jobs_historical(controls):
+    commands, bot, data, mutations, *_ = controls
+    data["source_processing"] = {"mode": "legacy", "historical_jobs": {"applying": 2, "done": 10},
+        "decision": {"model": "inception/mercury-decide:free", "validated": True, "permissions": {"channel": ["new_signal"]}}}
+    assert await commands.intercept(update("/aqla_status"), bot)
+    text = "\n".join(row["text"] for row in bot.sent)
+    assert "Hermes + DeepSeek + Tools" in text and "Historische Quellenjobs:" in text
+    assert "Mercury" not in text and "mercury" not in text and "kalibriert" not in text and "Decision-Freigabe" not in text
+    assert not mutations

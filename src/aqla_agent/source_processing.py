@@ -530,6 +530,9 @@ class SourceProcessor:
         counts = {status: 0 for status in ("prepared", "interpreted", "applying", "waiting_preview", "retry_wait", "recovering", "review", "done", "failed", "shadow")}
         for row in rows:
             counts[row["status"]] += 1
+        if self.mode == "legacy":
+            return {"mode": "legacy", "processor": "Hermes + DeepSeek + Tools", "jobs": {},
+                    "historical_jobs": counts, "decision": {}, "diagnostics": []}
         diagnostics = [{"job_id": row["job_id"], "status": row["status"], "outcome": row.get("outcome"),
                         "failure": row.get("failure_detail"), "attempt_count": row.get("attempt_count", 1),
                         "next_retry_at": row.get("next_retry_at"), "retry_deadline_at": row.get("retry_deadline_at")}

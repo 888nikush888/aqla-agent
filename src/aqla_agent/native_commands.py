@@ -485,13 +485,18 @@ class NativeCommands:
             queue = snapshot.get("source_queue", {})
             processing = snapshot.get("source_processing", {})
             jobs = processing.get("jobs", processing.get("states", {}))
-            decisions = processing.get("decision_status", {})
+            decisions = processing.get("decision", processing.get("decision_status", {}))
             permissions = decisions.get("permissions", {}) if processing.get("mode") == "hybrid" and decisions.get("validated") else {}
+            if processing.get("mode") == "legacy":
+                processing_text = "Verarbeitung: Hermes + DeepSeek + Tools\nHistorische Quellenjobs: " + json.dumps(
+                    processing.get("historical_jobs", jobs), ensure_ascii=False)
+            else:
+                processing_text = "Verarbeitung: " + json.dumps(jobs, ensure_ascii=False) + "\n"
+                processing_text += "Decision-Modell: " + str(decisions.get("model", "nicht gemeldet")) + " · kalibriert: " + ("ja" if decisions.get("validated") else "nein") + "\n"
+                processing_text += "Aktive Decision-Freigabe: " + json.dumps(permissions, ensure_ascii=False)
             await self.reply(bot, f"Quellenwarteschlange: bereit {queue.get('ready_total', 0)} · blockiert {queue.get('blocked_total', 0)} · Recovery {queue.get('recovery_total', 0)}\n"
-                + "Verarbeitungsmodus: " + str(processing.get("mode", "nicht gemeldet")) + "\nVerarbeitung: " + json.dumps(jobs, ensure_ascii=False) + "\n"
+                + "Verarbeitungsmodus: " + str(processing.get("mode", "nicht gemeldet")) + "\n" + processing_text + "\n"
                 + "Eigentumskonflikte: " + str(sum(row.get("status") == "conflicted" for row in snapshot.get("trades", []))) + "\n"
-                + "Decision-Modell: " + str(decisions.get("model", "nicht gemeldet")) + " · kalibriert: " + ("ja" if decisions.get("validated") else "nein") + "\n"
-                + "Aktive Decision-Freigabe: " + json.dumps(permissions, ensure_ascii=False)
                 + "\nBenachrichtigungen und abgeschlossene Verarbeitung sind getrennte Zähler.")
         elif command == "aqla_kanaele":
             ranking = await self.extension.mcp_call(self.extension.server, "ranking_status", {})
