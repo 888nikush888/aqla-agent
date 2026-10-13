@@ -94,6 +94,29 @@ def add_terminal_events(state, stamp, count=120):
     return sources
 
 
+def test_retention_and_fresh_ingestion_preserve_opaque_legacy_history(setup):
+    settings, state, fake, _, trading = setup
+    settings.max_events = 100
+    opaque = {"old-report": {"event_id": "old-report", "classification": "report"},
+              "old-pending": {"event_id": "old-pending", "status": "pending"},
+              "partial-source": {"event_id": "partial-source", "source_id": "old", "source": {"text": "old"}, "status": "pending"}}
+    state.update(lambda data: data["events"].update(opaque))
+    sources = add_terminal_events(state, now_ms() - 100000)
+    fresh = SourceEvent(chat_id="channel", message_id=2000, sent_at=now_ms(), text="Fresh report")
+    assert trading.ingest(fresh)["status"] == "pending"
+    data = state.snapshot()
+    assert len(data["events"]) == settings.max_events
+    assert all(data["events"][identity] == row for identity, row in opaque.items())
+    assert not set(opaque).intersection(data["event_tombstones"])
+    assert len(data["event_tombstones"]) == len(sources) + len(opaque) + 1 - settings.max_events
+    assert trading.context(fresh.event_id)["event"]["source"] == fresh.model_dump(mode="json")
+    value = Interpretation(kind="report", source_refs=[fresh.source_id], reason="Report", evidence=[
+        Evidence(field="classification", source_id=fresh.source_id, quote=fresh.text)])
+    assert trading.record_interpretation(fresh.event_id, value)["status"] == "report"
+    assert all(state.snapshot()["events"][identity] == row for identity, row in opaque.items())
+    assert not fake.actions
+
+
 @pytest.mark.asyncio
 async def test_retention_preserves_unexpired_plan_revision_then_releases_it(setup, signal, monkeypatch):
     settings, state, fake, _, trading = setup

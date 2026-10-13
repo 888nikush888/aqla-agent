@@ -13,7 +13,7 @@ from aqla_hyperliquid_mcp.rules import latest_sources, verify_evidence
 from .decisions import KINDS, VERSION, DecisionResult, build_packet, validate_interpretation
 from .observations import retry_due
 from .source_failure import classify_failure, safe_code, sanitize_detail
-from .source_queue import queue_overview
+from .source_queue import is_source_row, queue_overview
 
 
 class SourceJob(Model):
@@ -91,7 +91,7 @@ class SourceProcessor:
                 if not key.startswith("update:") or not isinstance(value, dict) or value.get("trade_id") not in trade_ids:
                     continue
                 row = snapshot["events"].get(key.removeprefix("update:"))
-                if row is not None and row["source"]["chat_id"] == chat_id:
+                if is_source_row(row) and row["source"]["chat_id"] == chat_id:
                     bound_refs.add(row["source_id"])
         context["bound_source_refs"] = sorted(bound_refs)
         own_refs = {ref for trade in context.get("trades", []) for ref in trade["plan"].get("source_refs", [])} | set(source_refs)

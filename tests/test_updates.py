@@ -10,6 +10,111 @@ from aqla_agent.router import Router
 from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, TradePlan, now_ms
 
 
+@pytest.fixture
+async def selectable_updates(setup, monkeypatch):
+    from aqla_hyperliquid_mcp.server import close_server, create_server
+
+    settings, state, fake, exchange, _ = setup
+    original = fake.handle
+
+    def markets(request):
+        payload = json.loads(request.content)
+        if request.url.path == "/info":
+            universe = [{"name": symbol, "szDecimals": 2, "maxLeverage": 20} for symbol in ("BTC", "ETH")]
+            if payload.get("type") == "allMids":
+                return httpx.Response(200, json={"BTC": "100", "ETH": "100"})
+            if payload.get("type") == "meta":
+                return httpx.Response(200, json={"universe": universe})
+            if payload.get("type") == "metaAndAssetCtxs":
+                return httpx.Response(200, json=[{"universe": universe}, [{"markPx": "100"}] * 2])
+        return original(request)
+
+    monkeypatch.setattr(exchange.client, "_transport", httpx.MockTransport(markets))
+    server = create_server(settings, state=state, exchange=exchange)
+    sources, trades = [], []
+    try:
+        for index, symbol in enumerate(("BTC", "ETH"), 1):
+            source = SourceEvent(chat_id="channel", message_id=index, sent_at=now_ms(),
+                                 text=f"{symbol} long Entry 95 später. SL 90 TP 110")
+            server.aqla_trading.ingest(source)
+            interpretation = Interpretation(kind="new_signal", source_refs=[source.source_id], symbol=symbol,
+                side="long", entry="limit", entry_prices=[95], entry_timing="deferred", stop_loss=90, take_profits=[110],
+                evidence=[Evidence(field=field, source_id=source.source_id, quote=quote) for field, quote in (
+                    ("symbol", symbol), ("side", "long"), ("entry_prices.0", "95"), ("entry_timing", "später"),
+                    ("stop_loss", "90"), ("take_profits.0", "110"))])
+            plan = await server.aqla_trading.preview(source.event_id, interpretation)
+            trade = await server.aqla_trading.execute(plan["plan_id"])
+            assert trade["status"] == "waiting_entry"
+            sources.append(source)
+            trades.append(trade)
+        yield server, state, fake, sources, trades
+    finally:
+        await close_server(server)
+
+
+@pytest.mark.asyncio
+async def test_explicit_trade_id_selects_one_same_source_setup_through_public_mcp(selectable_updates):
+    server, state, fake, _, trades = selectable_updates
+    source = SourceEvent(chat_id="channel", message_id=3, sent_at=now_ms(), text="Close this trade")
+    server.aqla_trading.ingest(source)
+    value = Interpretation(kind="trade_update", source_refs=[source.source_id], update_action="close",
+                           bound_trade_id=trades[0]["trade_id"], evidence=[
+                               Evidence(field="update_action", source_id=source.source_id, quote="Close")])
+    arguments = {"event_id": source.event_id, "interpretation": value.model_dump(mode="json"),
+                 "context_auth": server.aqla_authority.sign("operator", "explicit-owner-selection")}
+    result = await server.call_tool("trade_update", arguments)
+    assert not result.is_error
+    result = result.structured_content or json.loads(result.content[0].text)
+    assert result["trade_id"] == trades[0]["trade_id"] and "error" not in result
+    after = state.snapshot()
+    assert after["trades"][trades[0]["trade_id"]]["status"] == "cancelled"
+    assert after["trades"][trades[1]["trade_id"]] == trades[1]
+    assert after["bindings"]["update:" + source.event_id]["trade_id"] == trades[0]["trade_id"]
+    await server.call_tool("trade_update", arguments)
+    assert state.snapshot()["bindings"]["update:" + source.event_id] == after["bindings"]["update:" + source.event_id]
+    assert not fake.actions
+    with pytest.raises(AqlaError, match="immutable|bound|independent setups"):
+        await server.aqla_trading.update_trade(source.event_id, value.model_copy(update={"bound_trade_id": trades[1]["trade_id"]}))
+    assert not fake.actions and state.snapshot()["trades"][trades[1]["trade_id"]] == trades[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("constraint", ["unknown_id", "channel", "reply", "unknown_reply", "symbol", "side", "conflicted", "cleanup"])
+async def test_explicit_trade_id_cannot_override_authoritative_update_constraints(selectable_updates, constraint):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    server, state, fake, sources, trades = selectable_updates
+    fields, text = {}, "Close this trade"
+    if constraint == "channel":
+        state.update(lambda data: data["sources"].append("another-source"))
+    if constraint == "symbol":
+        fields["symbol"], text = "ETH", "ETH Close this trade"
+    if constraint == "side":
+        fields["side"], text = "short", "Close this short trade"
+    if constraint in ("conflicted", "cleanup"):
+        state.update(lambda data: data["trades"][trades[0]["trade_id"]].update(status=constraint))
+    source = SourceEvent(chat_id="another-source" if constraint == "channel" else "channel", message_id=3,
+                         sent_at=now_ms(), reply_to_id=sources[1].message_id if constraint == "reply" else 777 if constraint == "unknown_reply" else None,
+                         text=text)
+    server.aqla_trading.ingest(source)
+    value = Interpretation(kind="trade_update", source_refs=[source.source_id], update_action="close", **fields,
+                           bound_trade_id="unknown-trade" if constraint == "unknown_id" else trades[0]["trade_id"],
+                           evidence=[Evidence(field="update_action", source_id=source.source_id, quote="Close")])
+    before = state.snapshot()
+    arguments = {"event_id": source.event_id, "interpretation": value.model_dump(mode="json"),
+                 "context_auth": server.aqla_authority.sign("operator", "explicit-owner-selection")}
+    if constraint in ("conflicted", "cleanup"):
+        result = await server.call_tool("trade_update", arguments)
+        result = result.structured_content or json.loads(result.content[0].text)
+        assert result["targets"][0]["error"]
+    else:
+        with pytest.raises(ToolError, match="independent setups|replied source"):
+            await server.call_tool("trade_update", arguments)
+    after = state.snapshot()
+    assert after["trades"] == before["trades"] and after["operations"] == before["operations"]
+    assert "update:" + source.event_id not in after["bindings"] and not fake.actions
+
+
 async def opened(setup, signal):
     *_, trading = setup
     source, interpretation = signal

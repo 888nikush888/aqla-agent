@@ -42,7 +42,7 @@ COMMANDS = {
     "aqla_konflikt_loesen": ("Nur belegte Schließung lokal bestätigen", "[Trade-ID Fingerabdruck]"),
     "aqla_funktionen": ("Verfügbare native Funktionen", ""),
 }
-PROTECTED = {"aqla_rang", "aqla_parameter", "aqla_maker", "aqla_limits", "aqla_fortsetzen", "aqla_hinzufuegen", "aqla_entfernen", "aqla_kanalname", "aqla_konflikt_loesen"}
+PROTECTED = {"aqla_rang", "aqla_parameter", "aqla_maker", "aqla_limits", "aqla_fortsetzen", "aqla_hinzufuegen", "aqla_entfernen", "aqla_konflikt_loesen"}
 RESET_COMMANDS = {"stop", "new", "reset", "restart"}
 CALLBACK_PREFIX = "aqla:"
 UNITS = {
@@ -248,7 +248,7 @@ class NativeCommands:
 
     async def control(self, **arguments):
         # Read authority immediately before RPC. MCP rechecks again at its write.
-        protected = arguments.get("action") != "pause"
+        protected = arguments.get("action") not in ("pause", "set_source_name")
         return await self.extension.mcp_call(self.extension.server, "control", {**arguments, "context_auth": self.auth(protected=protected)})
 
     async def reply(self, bot, text, buttons=None, *, markdown=False):
@@ -519,7 +519,7 @@ class NativeCommands:
 
     async def source_change(self, bot, command, raw):
         self.cancel()
-        self.auth(protected=True)
+        self.auth(protected=command != "aqla_kanalname")
         if not raw:
             await self.reply(bot, f"/{command} " + COMMANDS[command][1] + "\nIDs, @usernames oder registrierte Namen verwenden. Namen mit Leerzeichen in Anführungszeichen setzen.")
             return
@@ -630,7 +630,7 @@ class NativeCommands:
             return True
         async with self.serial:
             try:
-                if command in PROTECTED:
+                if command in PROTECTED or command == "aqla_kanalname":
                     if command == "aqla_fortsetzen":
                         self.cancel()
                         result = await self.control(action="resume")

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from aqla_hyperliquid_mcp.models import AqlaError
 
 from .execution_outcome import diagnostic_view, trade_outcome
+from .source_queue import is_source_row
 
 SOURCE_TOOLS = tuple("mcp__aqla__" + name for name in (
     "status", "source_lookup", "source_context", "source_context_batch", "interpret_source", "interpret_source_batch",
@@ -137,7 +138,7 @@ def diagnostic_sections(result, snapshot, sections):
     if "sources" in sections:
         refs = set(plan["source_refs"])
         output["source_messages"] = {row["event_id"]: {"source_id": row["source_id"], "source": row["source"]}
-                                      for row in snapshot["events"].values() if row["source_id"] in refs}
+                                      for row in snapshot["events"].values() if is_source_row(row) and row["source_id"] in refs}
         output["source_revisions"] = result["source_revisions"]
         output["missing_original_sources"] = result["missing_original_sources"]
         output["original_sources"] = {key: {"event_id": row["event_id"]} for key, row in result["original_sources"].items()}

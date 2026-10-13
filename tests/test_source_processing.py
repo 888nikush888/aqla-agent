@@ -204,6 +204,27 @@ def test_management_reply_binding_is_resolved_across_account_and_venue_scopes(sc
     assert not processor.context(reply.event_id)[1]["anchor_setup_bound"]
 
 
+@pytest.mark.parametrize("scope", ["bindings", "account_bindings", "venue_bindings"])
+@pytest.mark.parametrize("opaque", [{"event_id": "old-update", "status": "pending"},
+                                   {"event_id": "old-update", "source_id": "old", "source": {"text": "old"}, "status": "pending"}])
+def test_opaque_bound_update_history_cannot_supply_packet_context(scope, opaque):
+    from types import SimpleNamespace
+
+    source = SourceEvent(chat_id="channel", message_id=11, sent_at=1001, reply_to_id=10, text="BTC close now")
+    row = {"event_id": source.event_id, "source_id": source.source_id, "source": source.model_dump(mode="json")}
+    snapshot = {"events": {"old-update": opaque, source.event_id: row},
+                "trades": {"owned": {"chat_id": "channel", "plan": {"source_refs": []}}}}
+    binding = {"update:old-update": {"trade_id": "owned"}}
+    snapshot[scope] = binding if scope == "bindings" else {"configured-scope": binding}
+    before = json.loads(json.dumps(snapshot))
+    trading = SimpleNamespace(context=lambda *args, **kwargs: {"event": row, "messages": [row], "trades": []})
+    processor = SourceProcessor(SimpleNamespace(snapshot=lambda: snapshot), trading)
+    context, packet, _ = processor.context(source.event_id)
+    assert context["bound_source_refs"] == [] and not packet["anchor_setup_bound"]
+    assert [message["event_id"] for message in packet["messages"]] == [source.event_id]
+    assert snapshot == before
+
+
 @pytest.mark.asyncio
 async def test_unrelated_channel_post_does_not_invalidate_cached_semantics(native_processor):
     server,state,fake=native_processor

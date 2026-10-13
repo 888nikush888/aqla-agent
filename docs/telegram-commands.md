@@ -19,7 +19,7 @@ Die Systembefehle funktionieren ausschließlich für den tatsächlichen Betreibe
 | `/aqla_fortsetzen` | Neue Entries nach den konfigurierten Regeln freigeben | Ja |
 | `/aqla_hinzufuegen ID @username ...` | Quellen ergänzen; bestehende Auswahl erhalten | Ja |
 | `/aqla_entfernen ID @username ...` | Nur die ausdrücklich genannten Quellen entfernen | Ja |
-| `/aqla_kanalname ID "Name"` | Einen eindeutigen Kanalnamen registrieren | Ja |
+| `/aqla_kanalname ID "Name"` | Einen eindeutigen Kanalnamen registrieren | Nein |
 | `/aqla_konflikt [Trade-ID]` | Konflikte auflisten oder mit frischen Kontobelegen prüfen | Nein |
 | `/aqla_konflikt_loesen Trade-ID Fingerabdruck` | Nur vollständig belegte eigene Schließung lokal bestätigen | Ja |
 | `/aqla_funktionen` | Tatsächlichen nativen Funktionskatalog anzeigen | Nein |

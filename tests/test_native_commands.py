@@ -42,7 +42,7 @@ def controls():
             return {"sources": {identity: {**row, "name": data["source_names"][identity], "proof_total": 4, "evidence": [{"net_r": "1"}], "exclusions": []} for identity, row in data["source_ranks"].items()}}
         assert tool == "control"
         claims = authority.verify(args["context_auth"], operator=True)
-        if args["action"] != "pause":
+        if args["action"] not in ("pause", "set_source_name"):
             setup = claims.get("setup") or {}
             from aqla_agent.setup import SetupBinding
             gate.require(setup["identity"], SetupBinding(**setup["binding"]))
@@ -117,6 +117,65 @@ async def test_native_add_remove_and_name_preserve_existing_channels(controls):
     before = copy.deepcopy(data)
     assert await commands.intercept(update('/aqla_hinzufuegen -104'), bot)
     assert data == before
+
+
+@pytest.mark.asyncio
+async def test_native_cosmetic_name_works_without_setup_and_subscription_changes_stay_protected(controls):
+    commands, bot, data, mutations, *_ = controls
+    commands.extension.setup.lease = None
+    commands.extension.setup.verifier = None
+    before_sources = data["sources"].copy()
+    assert await commands.intercept(update('/aqla_kanalname -101 "New display name"'), bot)
+    assert data["source_names"]["-101"] == "New display name" and data["source_names_revision"] == 1
+    assert data["sources"] == before_sources
+    assert [row["action"] for row in mutations] == ["set_source_name"]
+    assert "setup" not in commands.extension.authority.verify(mutations[0]["context_auth"], operator=True)
+    for text in ('/aqla_hinzufuegen -103', '/aqla_entfernen -101'):
+        assert await commands.intercept(update(text), bot)
+    assert data["sources"] == before_sources and len(mutations) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kwargs", [{"owner": "999"}, {"forwarded": True}, {"edited": True}, {"via_bot": True}, {"chat_type": "group"}, {"bot": True}])
+async def test_native_cosmetic_name_still_requires_actual_private_owner(controls, kwargs):
+    commands, bot, data, mutations, *_ = controls
+    commands.extension.setup.lease = None
+    before = copy.deepcopy(data)
+    assert await commands.intercept(update('/aqla_kanalname -101 "Untrusted name"', **kwargs), bot)
+    assert data == before and not mutations and not bot.sent
+
+
+@pytest.mark.asyncio
+async def test_native_cosmetic_name_uses_actual_mcp_when_setup_is_unconfigured(controls, setup):
+    from aqla_hyperliquid_mcp.server import close_server, create_server
+
+    commands, bot, *_ = controls
+    settings, state, fake, exchange, _ = setup
+    settings.telegram_owner_id = commands.extension.owner
+    commands.extension.setup.lease = commands.extension.setup.verifier = None
+    server = create_server(settings, state=state, exchange=exchange)
+    commands.extension.authority = server.aqla_authority
+    calls = []
+
+    async def actual_mcp(_server, tool, arguments):
+        calls.append((tool, arguments))
+        result = await server.call_tool(tool, arguments)
+        return result.structured_content or json.loads(result.content[0].text)
+
+    commands.extension.mcp_call = actual_mcp
+    try:
+        assert not server._aqla_setup_gate.configured
+        before = state.snapshot()
+        assert await commands.intercept(update('/aqla_kanalname -101 "New display name"'), bot)
+        after = state.snapshot()
+        assert after["source_names"]["-101"] == "New display name"
+        assert after["source_names_revision"] == before["source_names_revision"] + 1
+        assert after["sources"] == before["sources"] and after["configuration_revision"] == before["configuration_revision"]
+        control_args = next(arguments for tool, arguments in calls if tool == "control")
+        assert "setup" not in server.aqla_authority.verify(control_args["context_auth"], operator=True)
+        assert not after["trades"] and not after["plans"] and not after["operations"] and not fake.actions
+    finally:
+        await close_server(server)
 
 
 def button(bot, label):

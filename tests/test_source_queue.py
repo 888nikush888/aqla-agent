@@ -4,7 +4,7 @@ import pytest
 
 from aqla_agent.source_disposition import issue_receipt
 from aqla_agent.source_queue import queue_overview, repair_queue
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, digest
+from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, digest, now_ms
 from aqla_hyperliquid_mcp.projections import reader_overview
 from aqla_hyperliquid_mcp.rules import latest_sources
 
@@ -68,6 +68,75 @@ def test_opaque_legacy_history_is_preserved_and_never_ready_during_startup_or_re
         assert imported.reader_snapshot(20)["pending"] == []
         assert imported.snapshot()["sequence"] == 88
     assert path.read_bytes() == original_bytes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("view", ["full", "compact", "decision"])
+async def test_imported_opaque_history_does_not_block_fresh_public_source_work(setup, tmp_path, view):
+    import json
+
+    import httpx
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from aqla_agent.source_disposition import verify_disposition
+    from aqla_hyperliquid_mcp.api import Hyperliquid
+    from aqla_hyperliquid_mcp.server import close_server, create_server
+    from aqla_hyperliquid_mcp.state import State
+
+    settings, state, fake, *_ = setup
+    source = SourceEvent(chat_id="channel", message_id=1, sent_at=now_ms(), text="Result report without a new instruction")
+    opaque = {"old-report": {"event_id": "old-report", "classification": "report"},
+              "old-pending": {"event_id": "old-pending", "status": "pending"},
+              "partial-source": {"event_id": "partial-source", "source_id": source.source_id,
+                                 "source": {"text": "old"}, "status": "pending"}}
+    data = state.snapshot()
+    data["events"] = copy.deepcopy(opaque)
+    path = tmp_path / "mixed-legacy.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    original = path.read_bytes()
+    selected = settings.model_copy(update={"state_path": path})
+    imported = State(selected)
+    exchange = Hyperliquid(selected, imported, httpx.AsyncClient(base_url=selected.base_url, transport=httpx.MockTransport(fake.handle)))
+    server = create_server(selected, state=imported, exchange=exchange)
+    try:
+        server.aqla_trading.ingest(source)
+        before = imported.snapshot()
+        result = await server.call_tool("source_context", {"event_id": source.event_id, "view": view})
+        assert not result.is_error and imported.snapshot() == before
+        context = server.aqla_trading.context(source.event_id)
+        assert [item["event_id"] for item in context["messages"]] == [source.event_id]
+        value = Interpretation(kind="report", source_refs=[source.source_id], reason="Result report", evidence=[
+            Evidence(field="classification", source_id=source.source_id, quote=source.text)])
+        receipt = issue_receipt(before["events"], source.event_id, server.aqla_authority.key,
+                                context_rows=list(before["events"].values()))
+        verify_disposition(before, source.event_id, value, receipt, server.aqla_authority.key)
+        result = await server.call_tool("interpret_source", {"event_id": source.event_id,
+            "interpretation": value.model_dump(mode="json"), "source_read_receipt": context["source_read_receipt"],
+            "context_auth": server.aqla_authority.sign("source", "fixture")})
+        assert not result.is_error and imported.snapshot()["events"][source.event_id]["status"] == "report"
+        for identity, legacy in opaque.items():
+            assert imported.snapshot()["events"][identity] == legacy
+            with pytest.raises(ToolError, match="Unknown source event"):
+                await server.call_tool("source_context", {"event_id": identity, "view": view})
+            with pytest.raises(AqlaError, match="Unknown source event"):
+                server.aqla_trading.source.record_interpretation(identity, value)
+            with pytest.raises(AqlaError, match="receipt"):
+                issue_receipt(imported.snapshot()["events"], identity, server.aqla_authority.key)
+        assert not fake.actions and not imported.snapshot()["plans"] and not imported.snapshot()["operations"]
+    finally:
+        await close_server(server)
+    assert path.read_bytes() == original
+
+
+def test_receipt_preserves_pure_evidence_source_rows_without_processing_metadata():
+    from aqla_agent.source_disposition import fingerprint
+    source = SourceEvent(chat_id="channel", message_id=1, sent_at=1000, text="Original")
+    events = {source.event_id: {"event_id": source.event_id, "source_id": source.source_id,
+                               "source": source.model_dump(mode="json")}}
+    before = copy.deepcopy(events)
+    assert fingerprint(events, source.event_id)
+    assert issue_receipt(events, source.event_id, b"fixture-only-receipt-key")
+    assert events == before
 
 
 def test_true_current_conflict_blocks_but_unique_newer_edit_is_processable():

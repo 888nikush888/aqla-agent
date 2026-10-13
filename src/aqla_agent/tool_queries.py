@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from aqla_hyperliquid_mcp.models import AqlaError, digest
 
 from .execution_outcome import EntryOperations, source_trade_outcome, trade_outcome
+from .source_queue import is_source_row
 from .sources import resolve_source
 
 BYTE_CAP = 8192
@@ -111,17 +112,19 @@ def source_attribution(snapshot, plan):
     for source_id in plan.get("source_refs", []):
         identity = revisions.get(source_id)
         original = snapshot["events"].get(identity)
-        if original is None:
-            missing.append({"source_id": source_id, "event_id": identity, "reason": "original_revision_not_retained" if identity else "legacy_plan_has_no_revision_binding"})
+        if not is_source_row(original):
+            missing.append({"source_id": source_id, "event_id": identity, "reason":
+                            "original_revision_unavailable" if original is not None else
+                            "original_revision_not_retained" if identity else "legacy_plan_has_no_revision_binding"})
             unbound_edits.extend({"event_id": row["event_id"], "source_id": source_id, "source": row["source"],
                                   "relative_to_missing_original": "unknown", "is_edited_source": row["source"].get("edited_at") is not None}
-                                 for row in snapshot["events"].values() if row["source_id"] == source_id)
+                                 for row in snapshot["events"].values() if is_source_row(row) and row["source_id"] == source_id)
         else:
             originals[source_id] = {"event_id": identity, "source": original["source"]}
-        if original:
+        if is_source_row(original):
             version = original["source"].get("edited_at") or original["source"]["sent_at"]
             later.extend({"event_id": row["event_id"], "source_id": source_id, "source": row["source"]} for row in snapshot["events"].values()
-                         if row["source_id"] == source_id and (row["source"].get("edited_at") or row["source"]["sent_at"]) > version)
+                         if is_source_row(row) and row["source_id"] == source_id and (row["source"].get("edited_at") or row["source"]["sent_at"]) > version)
     return {"source_revisions": copy.deepcopy(revisions), "original_sources": originals,
             "missing_original_sources": missing, "later_source_edits": later, "retained_revisions_with_missing_original": unbound_edits}
 
@@ -137,7 +140,8 @@ def source_lookup(snapshot, start, end, *, source=None, symbol=None, status=None
     selector = snapshot.get("source_aliases", {}).get(selector, selector)
     query = {"start": lower, "end": upper, "source": selector, "symbol": symbol, "status": status,
              "account": account, "network": network, "time_field": time_field}
-    valid_statuses = TRADE_STATUSES | EVENT_STATUSES | {row["status"] for group in (snapshot.get("events", {}), snapshot.get("trades", {})) for row in group.values()}
+    valid_statuses = TRADE_STATUSES | EVENT_STATUSES | {row["status"] for group in (snapshot.get("events", {}), snapshot.get("trades", {})) for row in group.values()
+                                                     if isinstance(row, dict) and isinstance(row.get("status"), str)}
     if status and status not in valid_statuses:
         raise AqlaError("Unknown retained status. Available statuses: " + ", ".join(sorted(valid_statuses)))
     by_source, uncertain = {}, {}
@@ -152,7 +156,8 @@ def source_lookup(snapshot, start, end, *, source=None, symbol=None, status=None
                 if identity in snapshot.get("trades", {}):
                     uncertain[identity] = uncertain.get(identity, 0) + 1
     rows = []
-    relevant = [event for event in snapshot.get("events", {}).values() if lower <= event["source"][time_field] < upper
+    relevant = [event for event in snapshot.get("events", {}).values() if is_source_row(event)
+                and isinstance(event["source"].get(time_field), int) and lower <= event["source"][time_field] < upper
                 and (selector is None or event["source"]["chat_id"] == selector)]
     for event in sorted(relevant, key=lambda row: (row["source"][time_field], row["source"].get("edited_at") or 0, row["event_id"])):
         body = event["source"]
@@ -164,7 +169,7 @@ def source_lookup(snapshot, start, end, *, source=None, symbol=None, status=None
             event_symbol = (event.get("interpretation") or {}).get("symbol")
             if symbol and symbol.casefold() not in {str(event_symbol).casefold(), str(plan.get("market", {}).get("symbol")).casefold()}:
                 continue
-            if (status and status not in (event["status"], trade["status"] if trade else None)
+            if (status and status not in (event.get("status"), trade["status"] if trade else None)
                     or account and account.casefold() not in {str(plan.get("account")).casefold(), str(plan.get("account_key")).casefold()}
                     or network and plan.get("network") != network):
                 continue
@@ -172,7 +177,7 @@ def source_lookup(snapshot, start, end, *, source=None, symbol=None, status=None
             rows.append({"event_id": event["event_id"], "source_id": event["source_id"], "revision_event_id": event["event_id"],
                 "source_chat_id": body["chat_id"], "source_name": snapshot.get("source_names", {}).get(body["chat_id"]),
                 "sent_at": timestamp(body["sent_at"]), "received_at": timestamp(body.get("received_at")), "edited_at": timestamp(body.get("edited_at")),
-                "event_status": event["status"], "symbol": plan.get("market", {}).get("symbol", event_symbol),
+                "event_status": event.get("status"), "symbol": plan.get("market", {}).get("symbol", event_symbol),
                 "body_excerpt": body.get("text", "")[:200], "body_complete": len(body.get("text", "")) <= 200,
                 "source_body_sha256": hashlib.sha256(body.get("text", "").encode()).hexdigest(),
                 "source_details": {"tool": "source_context", "arguments": {"event_id": event["event_id"], "view": "full"}},
@@ -195,7 +200,7 @@ def source_lookup(snapshot, start, end, *, source=None, symbol=None, status=None
             continue
         for source_id in plan["source_refs"]:
             original = plan.get("source_revisions", {}).get(source_id)
-            if original not in snapshot.get("events", {}):
+            if not is_source_row(snapshot.get("events", {}).get(original)):
                 missing += 1
                 rows.append({"kind": "missing_original_source_revision", "source_id": source_id, "event_id": original,
                     "trade_id": trade["trade_id"], "plan_id": plan["plan_id"], "trade_status": trade["status"],

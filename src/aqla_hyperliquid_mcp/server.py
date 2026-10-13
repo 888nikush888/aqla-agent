@@ -40,7 +40,7 @@ from aqla_agent.ranking import RankingPolicy, Tier, set_manual_rank, status_view
 from aqla_agent.reporting import Reporting
 from aqla_agent.router import Router, recovery_diagnostics
 from aqla_agent.setup import SetupBinding, SetupGate
-from aqla_agent.source_queue import queue_overview
+from aqla_agent.source_queue import is_source_row, queue_overview
 from aqla_agent.tool_queries import compact_view, source_attribution
 from aqla_agent.tool_queries import source_lookup as lookup_sources
 
@@ -290,7 +290,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         result = {"trade_id": trade_id, "status": trade["status"], "plan": trade["plan"],
                 "execution_outcome": trade_outcome(trade, entry_operations), "observation_retry": retry_view(trade),
                 "entry_diagnostic": diagnostic_view(trade, entry_operations),
-                "sources": [row["source"] for row in snapshot["events"].values() if row["source_id"] in trade["plan"]["source_refs"]],
+                "sources": [row["source"] for row in snapshot["events"].values() if is_source_row(row) and row["source_id"] in trade["plan"]["source_refs"]],
                 "source_names": snapshot.get("source_names", {}), "orders": trade["orders"], "exit_orders": trade.get("exit_orders", []),
                 "order_observations": trade.get("order_observations", {}), "fill_events": trade.get("fill_events", {}),
                 "entry_vwap": trade.get("entry_vwap"), "entry_accounting": trade.get("entry_accounting"),

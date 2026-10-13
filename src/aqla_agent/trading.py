@@ -40,6 +40,7 @@ from .evidence import market_fills, order_observations
 from .execution_roles import merge_role, native_role
 from .observations import TemporaryObservation, diagnostic, read_observation, retry_due, retry_marker
 from .pipelines import ConfigurationChanged, validate_ranking_binding
+from .source_queue import is_source_row
 
 OPEN = {"waiting_entry", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
 UNFINISHED = {"pending", "interpreted", "needs_reconciliation"}
@@ -136,12 +137,15 @@ class Trading:
             protected_events.add(inserted_event)
         by_chat = {}
         for row in state["events"].values():
+            if not is_source_row(row):
+                continue
             by_chat.setdefault(row["source"]["chat_id"], []).append(row)
         for rows in by_chat.values():
             rows.sort(key=lambda row: (row["source"]["sent_at"], row["source"].get("edited_at") or 0))
             protected_events.update(row["event_id"] for row in rows[-self.exchange.settings.max_context_messages:])
-        candidates = [row for row in state["events"].values() if row["source_id"] not in protected_refs and row["event_id"] not in protected_events
-                      and row["status"] in ("report", "unrelated", "ambiguous", "incomplete", "context", "executed", "updated", "rejected", "superseded")]
+        candidates = [row for row in state["events"].values() if is_source_row(row)
+                       and row["source_id"] not in protected_refs and row["event_id"] not in protected_events
+                       and row.get("status") in ("report", "unrelated", "ambiguous", "incomplete", "context", "executed", "updated", "rejected", "superseded")]
         candidates.sort(key=lambda row: row["source"]["received_at"])
         for row in candidates[:max(0, len(state["events"]) - maximum)]:
             state.setdefault("event_tombstones", {})[row["event_id"]] = row["source_id"]
@@ -150,10 +154,10 @@ class Trading:
     def context(self, event_id, *, compact_receipt=False):
         snapshot = self.state.snapshot()
         row = snapshot["events"].get(event_id)
-        if not row:
+        if not is_source_row(row):
             raise AqlaError("Unknown source event")
         source = row["source"]
-        messages = [item for item in snapshot["events"].values() if item["source"]["chat_id"] == source["chat_id"]]
+        messages = [item for item in snapshot["events"].values() if is_source_row(item) and item["source"]["chat_id"] == source["chat_id"]]
         messages.sort(key=lambda item: (item["source"]["sent_at"], item["source"].get("edited_at") or 0))
         included = messages[-self.exchange.settings.max_context_messages:]
         if row not in included:
@@ -189,7 +193,7 @@ class Trading:
         def commit(snapshot):
 
             row = snapshot["events"].get(event_id)
-            if row is None:
+            if not is_source_row(row):
                 raise AqlaError("Unknown source event")
             previous = row.get("interpretation")
             from .efficiency import classification_ack
@@ -210,7 +214,7 @@ class Trading:
             if interpretation.kind not in ("new_signal", "trade_update") and getattr(self, "disposition_key", None):
                 from .source_disposition import verify_disposition
                 verify_disposition(snapshot, event_id, interpretation, read_receipt, self.disposition_key)
-            refs = [item for item in snapshot["events"].values() if item["source_id"] in interpretation.source_refs]
+            refs = [item for item in snapshot["events"].values() if is_source_row(item) and item["source_id"] in interpretation.source_refs]
             if not refs or any(item["source"]["chat_id"] != row["source"]["chat_id"] for item in refs):
                 raise AqlaError("A setup may only combine messages from the same source")
             if interpretation.kind in ("new_signal", "trade_update"):
@@ -1722,6 +1726,8 @@ class Trading:
             trades = [trade for trade in trades if same_symbol(trade)]
         if signal.side:
             trades = [trade for trade in trades if trade["plan"]["side"] == signal.side]
+        if signal.bound_trade_id:
+            trades = [trade for trade in trades if trade["trade_id"] == signal.bound_trade_id]
         return trades
 
     async def update_trade(self, event_id, signal: Interpretation):

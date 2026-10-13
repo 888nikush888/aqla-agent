@@ -69,6 +69,77 @@ def test_pruned_original_is_unknown_in_interval_but_saved_diagnostics_remain_rea
     assert unknown and all(row["source_time"] is None and row["trade_details"]["tool"] == "trade_diagnostics" for row in unknown)
 
 
+@pytest.mark.parametrize("original", ["retained", "missing", "opaque"])
+def test_source_lookup_and_attribution_preserve_opaque_history_without_claiming_originals(original):
+    data, source, edited = retained()
+    if original == "missing":
+        data["events"].pop(source.event_id)
+    elif original == "opaque":
+        data["events"][source.event_id] = {"event_id": source.event_id, "source_id": source.source_id, "status": "executed"}
+    data["events"].update({"old-report": {"event_id": "old-report", "classification": "report"},
+        "old-pending": {"event_id": "old-pending", "status": "pending"},
+        "partial-source": {"event_id": "partial-source", "source_id": source.source_id, "source": {"text": "old"}}})
+    before = copy.deepcopy(data)
+    result = lookup(data)
+    rows = list(result["rows"])
+    while result["next_cursor"]:
+        result = lookup(data, cursor=result["next_cursor"])
+        rows += result["rows"]
+    assert {row["event_id"] for row in rows if row.get("kind") != "missing_original_source_revision"} == (
+        {source.event_id, edited.event_id} if original == "retained" else {edited.event_id})
+    attribution = source_attribution(data, data["trades"]["trade-0"]["plan"])
+    if original == "retained":
+        assert attribution["original_sources"][source.source_id]["source"] == source.model_dump(mode="json")
+        assert attribution["later_source_edits"][0]["event_id"] == edited.event_id
+    else:
+        assert attribution["original_sources"] == {} and attribution["later_source_edits"] == []
+        assert attribution["retained_revisions_with_missing_original"][0]["event_id"] == edited.event_id
+        assert result["undated_saved_source_bindings"] == 3
+        assert attribution["missing_original_sources"][0]["reason"] == (
+            "original_revision_unavailable" if original == "opaque" else "original_revision_not_retained")
+    assert data == before
+
+
+def test_source_lookup_keeps_valid_original_rows_without_processing_metadata():
+    data, source, _ = retained()
+    data.update(trades={}, operations={})
+    data["events"] = {source.event_id: {"event_id": source.event_id, "source_id": source.source_id,
+                                     "source": source.model_dump(mode="json")}}
+    before = copy.deepcopy(data)
+    result = lookup(data)
+    assert result["rows"][0]["event_id"] == source.event_id and result["rows"][0]["event_status"] is None
+    assert data == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("view", ["full", "compact"])
+@pytest.mark.parametrize("sections", [None, ["sources"]])
+async def test_public_trade_diagnostics_ignore_opaque_source_rows(setup, signal, view, sections):
+    settings, state, fake, exchange, trading = setup
+    source, value = signal
+    plan = await trading.preview(source.event_id, value)
+    trade = await trading.execute(plan["plan_id"])
+    opaque = {"old-report": {"event_id": "old-report", "classification": "report"},
+              "partial-source": {"event_id": "partial-source", "source_id": source.source_id,
+                                 "source": {"text": "old"}, "status": "pending"}}
+    state.update(lambda data: data["events"].update(opaque))
+    server = create_server(settings, state=state, exchange=exchange)
+    try:
+        before = state.snapshot()
+        actions = copy.deepcopy(fake.actions)
+        result = await server.call_tool("trade_diagnostics", {"trade_id": trade["trade_id"], "view": view, "sections": sections})
+        assert not result.is_error and state.snapshot() == before and fake.actions == actions
+        result = result.structured_content or json.loads(result.content[0].text)
+        if view == "full":
+            if sections:
+                assert set(result["source_messages"]) == {source.event_id}
+            else:
+                assert result["sources"] == [source.model_dump(mode="json")]
+            assert result["original_sources"][source.source_id]["event_id"] == source.event_id
+    finally:
+        await close_server(server)
+
+
 def test_changed_filters_and_snapshot_reject_cursors_without_reset():
     data, *_ = retained()
     cursor = lookup(data, limit=1)["next_cursor"]

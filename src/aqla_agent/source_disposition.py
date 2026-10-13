@@ -10,7 +10,7 @@ import zlib
 
 from aqla_hyperliquid_mcp.models import AqlaError, digest, now_ms
 
-from .source_queue import canonical_sources, content, recovery_ids, version
+from .source_queue import canonical_sources, content, is_source_row, recovery_ids, version
 
 REREAD = "Source read receipt is missing, invalid, expired or stale; read source_context for the current anchor again"
 
@@ -41,7 +41,7 @@ def verify_percentage_classification(interpretation, original):
 
 def fingerprint(events, event_id, refs=None):
     row = events.get(event_id)
-    if not row:
+    if not is_source_row(row):
         raise AqlaError(REREAD)
     latest = canonical_sources(events, [row["source_id"]])[row["source_id"]]
     if latest["event_id"] != event_id:
@@ -50,13 +50,15 @@ def fingerprint(events, event_id, refs=None):
     if row["source_id"] not in refs:
         raise AqlaError(REREAD)
     return digest({"sources": sorted((item["event_id"], version(item), content(item)) for item in events.values()
-                                      if item["source_id"] in refs),
+                                      if is_source_row(item) and item["source_id"] in refs),
                    "anchor": {key: row.get(key) for key in ("status", "interpretation", "targets")}})
 
 
 def issue_receipt(events, event_id, key, *, stamp=None, context_rows=None, compact=False):
+    if not is_source_row(events.get(event_id)):
+        raise AqlaError(REREAD)
     stamp = now_ms() if stamp is None else stamp
-    refs = sorted({row["source_id"] for row in context_rows}) if context_rows is not None else [events[event_id]["source_id"]]
+    refs = sorted({row["source_id"] for row in context_rows if is_source_row(row)}) if context_rows is not None else [events[event_id]["source_id"]]
     body = json.dumps({"kind": "source_read", "event_id": event_id, "refs": refs,
         "fingerprint": fingerprint(events, event_id, refs), "expires_at": stamp + 900000}, sort_keys=True, separators=(",", ":"))
     if compact:
