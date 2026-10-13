@@ -310,3 +310,16 @@ async def test_new_entry_receipt_requires_existing_quantity_reconciliation(setup
     review, _ = await observe_conflict(trading, identity)
     assert not review["resolvable"] and "entry_quantity_not_reconciled" in review["reasons"]
     assert state.snapshot()["trades"][identity]["filled_quantity"] == str(own)
+
+
+@pytest.mark.asyncio
+async def test_same_millisecond_native_fill_ids_keep_numeric_chronology(setup, signal):
+    state, fake, trading, identity = await conflicted(setup, signal)
+    own = Decimal(state.snapshot()["trades"][identity]["filled_quantity"])
+    entry = fake.fills[0]
+    manual_fill(fake, own, start=own, tid=1000)
+    fake.fills[-1]["time"] = entry["time"]
+    fake.position = 0
+    terminal_orders(fake)
+    review, _ = await observe_conflict(trading, identity)
+    assert review["resolvable"]
