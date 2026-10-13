@@ -29,7 +29,7 @@ def trade(status="rejected", **fields):
 def data(row):
     return {"trades": {"own": row}, "operations": {"entry:own": {"operation_id": "entry:own", "phase": "rejected", "outcome": "not_sent"}},
             "events": {"event": {"event_id": "event", "source_id": "source", "status": "executed",
-                                  "source": {"chat_id": "channel", "text": "AXS", "sent_at": 1000, "received_at": 1000}}},
+                                  "source": {"chat_id": "channel", "message_id": 1, "text": "AXS", "sent_at": 1000, "received_at": 1000}}},
             "notifications": {"notice": {"trade_id": "own", "change": {"status": row["status"]}}},
             "profiles": {}, "source_names": {}, "paused": False}
 
