@@ -29,7 +29,9 @@ def source_efficiency(rows):
         selected["valid"] |= workflow.get("interpretation_valid") is True
         selected["fallback"] |= any(call.get("phase") == "interpretation_fallback" for call in calls)
         api_failures += sum(call.get("response_success") is False or "response_success" not in call and call.get("failed") is True for call in calls)
-        invalid_responses += sum(call.get("response_success") is True and call.get("interpretation_valid") is False for call in calls)
+        invalid_responses += sum(call.get("response_success") is True and (
+            call.get("contract_valid") is False or call.get("interpretation_valid") is False
+            or call.get("failed") is True and call.get("review_deferred") is not True) for call in calls)
     valid = sum(item["valid"] for item in grouped.values())
     decision_only = sum(item["valid"] and not item["fallback"] for item in grouped.values())
     count = len(grouped)

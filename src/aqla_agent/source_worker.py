@@ -18,6 +18,7 @@ from .decisions import (
     OpenRouterDecisionAdapter,
     SourceProcessingConfig,
     candidates,
+    mark_decision_failure,
     questions_for,
     validate_interpretation,
 )
@@ -288,11 +289,12 @@ class SourceWorker:
                         measured.workflow["checked_input_characters"] = self.check_input({"model": self.config.model, "state": packet,
                                                    "questions": questions_for(packet, spans)})
                         result = await self.interpret(packet, profile, master_hash, revision, usage, spans=spans)
-                        veto = unsupported_structure(packet)
-                        if veto:
-                            raise SourceFailure({"phase": "validate", "code": veto, "exception_type": "DecisionFailure", "retryable": False})
+                        # Use the same interpretation-aware admission as offline
+                        # replay. Original-only heuristics belong to failure review.
+                        validate_interpretation(packet, result.interpretation)
                 except (AqlaError, ValueError) as error:
                     code = str(error) if isinstance(error, DecisionFailure) else "decision_invalid"
+                    mark_decision_failure(usage, code)
                     if code in ("source_context_limit", "candidate_limit"):
                         raise
                     veto = unsupported_structure(packet)

@@ -11,6 +11,50 @@ from aqla_agent.source_worker import SourceWorker
 from aqla_hyperliquid_mcp.models import Evidence, Interpretation, SourceEvent
 
 
+@pytest.mark.parametrize("text", [
+    "Earlier we agreed to close half and move stop to95 and cancel entry",
+    "Trading example only: BTC close half and move stop to95",
+    "Gestern vereinbarten wir BTC halb schließen und Stop auf 95 setzen und Entry stornieren",
+    "Ранее решили закрыть половину и переставить стоп на 95 и отменить вход",
+    "Гипотетический пример: BTC закрыть половину и переставить стоп на 95",
+])
+@pytest.mark.parametrize("kind", ["report", "unrelated"])
+def test_sentence_past_and_example_scope_survives_conjunctions_in_common_admission(text, kind):
+    packet = packet_for(text)
+    value = Interpretation(kind=kind, source_refs=[packet["anchor_source_id"]], reason="Past or hypothetical description",
+        reason_codes=["result_report" if kind == "report" else "non_trade"], evidence=[Evidence(
+            field="classification", source_id=packet["anchor_source_id"], quote=text)])
+    assert unsupported_structure(packet) is None
+    validate_interpretation(packet, value)
+
+
+@pytest.mark.parametrize("boundary", ["and now", "und jetzt", "и сейчас", ";", "."])
+def test_current_marker_and_sentence_boundary_reset_previous_report_scope(boundary):
+    packet = packet_for("Earlier we agreed to close half " + boundary + " move stop to95 and cancel entry")
+    assert unsupported_structure(packet) == "management_actions_not_representable"
+    value = Interpretation(kind="report", source_refs=[packet["anchor_source_id"]], reason="Result report",
+        reason_codes=["result_report"], evidence=[Evidence(field="classification", source_id=packet["anchor_source_id"], quote=packet["messages"][0]["text"])])
+    with pytest.raises(DecisionFailure, match="management_actions_not_representable"):
+        validate_interpretation(packet, value)
+
+
+@pytest.mark.parametrize("kind", ["ambiguous", "incomplete"])
+def test_correct_nonaction_review_disposition_persists_for_current_unsupported_instructions(kind):
+    packet = packet_for("BTC close half and move stop to95")
+    value = Interpretation(kind=kind, source_refs=[packet["anchor_source_id"]], reason="Needs review", reason_codes=["other"],
+        evidence=[Evidence(field="classification", source_id=packet["anchor_source_id"], quote=packet["messages"][0]["text"])])
+    validate_interpretation(packet, value)
+
+
+def test_past_candle_condition_does_not_contaminate_new_current_stop_instruction():
+    packet = packet_for("BTC. Yesterday stop after H1 candle close; now move stop to95")
+    assert unsupported_structure(packet) is None
+    value = Interpretation(kind="trade_update", symbol="BTC", update_action="move_stop", stop_loss=95,
+        source_refs=[packet["anchor_source_id"]], evidence=[Evidence(field=field, source_id=packet["anchor_source_id"], quote=quote)
+            for field, quote in (("symbol", "BTC"), ("update_action", "now move stop to95"), ("stop_loss", "95"))])
+    validate_interpretation(packet, value)
+
+
 def unsupported_probe(form):
     if form == "reduce":
         packet = packet_for("BTC: reduce half AND move the stop to entry now.")

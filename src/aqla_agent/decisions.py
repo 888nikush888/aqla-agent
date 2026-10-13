@@ -93,6 +93,25 @@ class DecisionFailure(AqlaError):
     """Safe failure code, never a provider response or model-supplied exception."""
 
 
+ANSWER_FAILURES = {"answer_shape", "answer_type", "answer_options", "answer_probabilities", "answer_choice", "answer_probability"}
+DECISION_DEFERRALS = {"uncertain_decision", "uncertain_trading_intent_requires_review", "conflicting_live_intent",
+    "conflicting_management_intent", "verification_failed", "source_not_calibrated", "source_decision_kind_not_calibrated",
+    "decision_calibration_model_changed", "entry_form_not_representable", "source_context_limit", "candidate_limit"}
+
+
+def mark_decision_failure(usage, code):
+    """Keep HTTP success, response contract, interpretation and admission distinct."""
+    row = next((row for row in reversed(usage) if row.get("phase") in ("decision", "decision_verification")), None)
+    if row is None or row.get("response_success") is not True:
+        return
+    if code in ANSWER_FAILURES:
+        row["contract_valid"] = False
+    elif code in DECISION_DEFERRALS:
+        row["review_deferred"] = True
+    elif row.get("contract_valid") is not False:
+        row["interpretation_valid"] = False
+
+
 class CandidateSpan(Model):
     candidate_id: str
     source_id: str
@@ -773,7 +792,7 @@ class OpenRouterDecisionAdapter:
                 raise DecisionFailure("decision_model_changed")
             raw = value.get("usage")
             measured = {"phase": phase, "model": self.model, "model_revision": revision, "provider": "openrouter", "failed": False,
-                     "response_success": True, "request_hash": digest(body), "question_contract_version": QUESTION_CONTRACT_VERSION,
+                     "response_success": True, "contract_valid": True, "request_hash": digest(body), "question_contract_version": QUESTION_CONTRACT_VERSION,
                      "duration_seconds": time.monotonic() - started, "usage_available": isinstance(raw, dict)}
             if isinstance(raw, dict):
                 for key in ("input_tokens", "output_tokens"):
@@ -800,6 +819,7 @@ class OpenRouterDecisionAdapter:
             if usage is not None and not recorded:
                 usage.append({"phase": phase, "model": self.model, "provider": "openrouter", "failed": True,
                               "response_success": received_ok, "request_hash": digest(body),
+                              "contract_valid": False if received_ok else None,
                               "usage_available": False, "duration_seconds": time.monotonic() - started})
             if owned:
                 await client.aclose()
@@ -818,12 +838,20 @@ class OpenRouterDecisionAdapter:
         responses = [response]
         if observation is not None:
             observation["responses"] = responses
-        interpretation, _, _ = first_decision(packet, profile, response, model=self.model,
-            revision=revision, collect=collect, observation=observation, spans=spans)
-        if interpretation.kind in ("new_signal", "trade_update"):
-            response, _ = await self.evaluate({"original": packet, "interpretation": interpretation.model_dump(mode="json")},
-                verification_questions(), usage=usage, phase="decision_verification", expected_revision=revision,
-                max_context_characters=max_context_characters)
-            responses.append(response)
-        return replay_decision(packet, profile, responses, model=self.model, revision=revision,
-                               collect=collect, usage=usage, observation=observation, spans=spans)
+        try:
+            interpretation, _, _ = first_decision(packet, profile, response, model=self.model,
+                revision=revision, collect=collect, observation=observation, spans=spans)
+            if interpretation.kind in ("new_signal", "trade_update"):
+                response, _ = await self.evaluate({"original": packet, "interpretation": interpretation.model_dump(mode="json")},
+                    verification_questions(), usage=usage, phase="decision_verification", expected_revision=revision,
+                    max_context_characters=max_context_characters)
+                responses.append(response)
+            result = replay_decision(packet, profile, responses, model=self.model, revision=revision,
+                                   collect=collect, usage=usage, observation=observation, spans=spans)
+            for row in usage:
+                if row.get("phase") in ("decision", "decision_verification") and row.get("contract_valid"):
+                    row["interpretation_valid"] = True
+            return result
+        except DecisionFailure as error:
+            mark_decision_failure(usage, str(error))
+            raise

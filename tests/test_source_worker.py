@@ -566,3 +566,54 @@ async def test_only_the_actual_model_route_must_fit_its_input_budget(worker_boun
     else:
         assert job["status"] == "review" and job["failure_code"] == "source_context_limit"
     assert len(requests) == 1 and not fallbacks and not fake.actions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,kind,failure", [
+    ("Trading example only: BTC close half and move stop to95", "report", None),
+    ("Trading example only: BTC close half and move stop to95", "unrelated", None),
+    ("Earlier we agreed to close half and move stop to95 and cancel entry", "report", None),
+    ("BTC close half and move stop to95", "ambiguous", None),
+    ("BTC close half and move stop to95", "incomplete", None),
+    ("BTC close half and move stop to95", "report", "management_actions_not_representable"),
+    ("Earlier we agreed to close half and now move stop to95 and cancel entry", "unrelated", "management_actions_not_representable"),
+])
+async def test_common_nonaction_contract_matches_native_worker_and_offline_replay(worker_boundary, text, kind, failure):
+    from aqla_agent.decisions import DEFAULT_DECISION_MODEL, replay_decision
+    extension, server, state, fake, _, _ = worker_boundary
+    source = SourceEvent(chat_id="channel", message_id=107, sent_at=now_ms(), text=text)
+    server.aqla_trading.ingest(source)
+    profile = CalibrationProfile(validated=True, master_hash="master-v1", sources=["channel"],
+        model_revision=DEFAULT_DECISION_MODEL, dataset_hash="calibration", holdout_hash="holdout", holdout_cases=30,
+        thresholds={"kind": 0.99}, source_evidence={"channel": {"calibration_groups": 3, "holdout_groups": 5,
+            "accepted_accuracy": 1, "critical_errors": 0, "kinds": {kind: {
+                "calibration_correct_groups": 1, "holdout_correct_accepted_groups": 2}}}}, source_permissions={"channel": [kind]})
+    path = extension.master_path.parents[2] / "nonaction-profile.json"
+    path.write_text(profile.model_dump_json())
+    requests, responses, fallbacks = [], [], []
+
+    def upstream(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        value = response_for(body["questions"], kind=kind)
+        responses.append(value)
+        return httpx.Response(200, json=value)
+
+    async def forbidden(*args):
+        fallbacks.append(True)
+        raise AssertionError("Correct nonaction or a hard original veto never needs generative override")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        worker = SourceWorker(extension, {"mode": "hybrid", "calibration_file": str(path)}, fallback=forbidden,
+            adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision=DEFAULT_DECISION_MODEL))
+        await worker.tick()
+    job = next(iter(state.snapshot()["source_jobs"].values()))
+    if failure:
+        with pytest.raises(DecisionFailure, match=failure):
+            replay_decision(requests[0]["state"], profile, responses, model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+        assert job["status"] == "review" and job["failure_code"] == failure
+    else:
+        offline = replay_decision(requests[0]["state"], profile, responses, model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+        assert job["status"] == "done" and state.snapshot()["events"][source.event_id]["status"] == kind
+        assert job["result"]["interpretation"] == offline.interpretation.model_dump(mode="json")
+    assert len(requests) == 1 and not fallbacks and not fake.actions and not state.snapshot()["operations"]

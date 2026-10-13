@@ -31,6 +31,12 @@ PAST_VERB = (r"(?:перестав(?:ил[аио]?|лял[аио]?|лен[аоы
 PAST_MATCH = pattern(r"^" + PAST_VERB + END)
 PAST_GOVERNOR = pattern(WORD + PAST_VERB + r"\s+(?:\w+\s+){0,3}$")
 CLAUSES = pattern(r"\n+|[;!?]+|(?<!\d)\.(?!\d)|\b(?:and|und|и|затем)\b|\s*[,+]\s*")
+SENTENCES = pattern(r"\n+|[;!?]+|(?<!\d)\.(?!\d)")
+CONJUNCTIONS = pattern(r"\b(?:and|und|и|затем|but|aber|но)\b|\s*[,+]\s*")
+CURRENT = pattern(WORD + r"(?:now|jetzt|сейчас|теперь)" + END)
+HYPOTHETICAL = pattern(WORD + r"(?:example(?:\s+only)?|hypothetical\w*|for\s+example|"
+    r"beispiel\w*|hypothetisch\w*|например|пример\w*|гипотет\w*|предположим)" + END)
+PAST_WORD = pattern(WORD + PAST_VERB + END)
 FUTURE = pattern(WORD + r"(?:tomorrow|tonight|later|next\s+\w+|in\s+\d+\s*(?:min\w*|hours?|days?)|"
                  r"morgen|später|spaeter|nach\s+\d+\s*\w+|завтра|позже|потом|через\s+\d+\s*\w+)" + END)
 CONDITION = pattern(WORD + r"(?:if|when|once|after|until|falls|wenn|sobald|nachdem|nach\s+(?:tp\s*\d|ziel\w*|erreich\w*)|"
@@ -84,30 +90,56 @@ def current_actions(text, *, include_tp_footers=True):
     if not include_tp_footers:
         normalized = ";".join(sentence for sentence in re.split(r"[;!?\n]|(?<!\d)\.(?!\d)", normalized)
                               if not tp_break_even_footer(sentence))
-    for clause in CLAUSES.split(normalized):
-        clause = clause.strip()
-        if not clause:
-            continue
-        matches = [(match, "stop") for match in STOP_ACTION.finditer(clause)]
-        matches += [(match, "replace_targets") for match in TARGET_ACTION.finditer(clause)]
-        matches += [(match, "cancel_entry") for match in CANCEL_ACTION.finditer(clause)]
-        matches += [(match, "exit") for match in EXIT_ACTION.finditer(clause)]
-        for match, action in matches:
-            before = clause[:match.start()]
-            history_prefix = re.split(r"\b(?:now|jetzt|сейчас|теперь|но)\b", before)[-1]
-            # Past/negated descriptions do not become new actions. A separate
-            # current clause is still examined even after a past-result clause.
-            if (NEGATED.search(before) or PAST_PREFIX.search(history_prefix) or PAST.search(clause)
-                    or PAST_MATCH.search(match.group()) or PAST_GOVERNOR.search(history_prefix)):
-                continue
-            if action == "stop":
-                action = "break_even" if BE_DESTINATION.search(clause[match.end():]) else "move_stop"
-            elif action == "exit":
-                quantities = [quantity for quantity in PORTION.finditer(clause) if not (
-                    "%" in quantity.group() and re.search(r"(?:[-−+]\s*|(?:at|на|в)\s*)$", clause[:quantity.start()]))]
-                action = "reduce" if quantities or match.group().startswith(("reduce", "reducing", "trim", "cut", "сократ", "reduzier")) else "close"
-            actions.append((action, clause))
+    for sentence in SENTENCES.split(normalized):
+        blocked = False
+        for clause in CONJUNCTIONS.split(sentence):
+            actions.extend(clause_actions(clause.strip(), blocked))
+            markers = [(match.start(), True) for matcher in (PAST, HYPOTHETICAL, PAST_WORD) for match in matcher.finditer(clause)]
+            markers += [(match.start(), False) for match in CURRENT.finditer(clause)]
+            if markers:
+                blocked = max(markers)[1]
     return actions
+
+
+def clause_actions(clause, inherited_blocked):
+    actions = []
+    if not clause:
+        return actions
+    matches = [(match, "stop") for match in STOP_ACTION.finditer(clause)]
+    matches += [(match, "replace_targets") for match in TARGET_ACTION.finditer(clause)]
+    matches += [(match, "cancel_entry") for match in CANCEL_ACTION.finditer(clause)]
+    matches += [(match, "exit") for match in EXIT_ACTION.finditer(clause)]
+    for match, action in matches:
+        before = clause[:match.start()]
+        history_prefix = CURRENT.split(before)[-1]
+        markers = [(point.start(), True) for matcher in (PAST, HYPOTHETICAL, PAST_WORD)
+                   for point in matcher.finditer(clause[:match.end()])]
+        markers += [(point.start(), False) for point in CURRENT.finditer(clause[:match.end()])]
+        blocked = max(markers)[1] if markers else inherited_blocked
+        # A governor scopes coordinated clauses until an explicit current marker
+        # or hard sentence boundary establishes a new instruction.
+        if (blocked or NEGATED.search(before) or PAST_PREFIX.search(history_prefix)
+                or PAST_MATCH.search(match.group()) or PAST_GOVERNOR.search(history_prefix)):
+            continue
+        if action == "stop":
+            action = "break_even" if BE_DESTINATION.search(clause[match.end():]) else "move_stop"
+        elif action == "exit":
+            quantities = [quantity for quantity in PORTION.finditer(clause) if not (
+                "%" in quantity.group() and re.search(r"(?:[-−+]\s*|(?:at|на|в)\s*)$", clause[:quantity.start()]))]
+            action = "reduce" if quantities or match.group().startswith(("reduce", "reducing", "trim", "cut", "сократ", "reduzier")) else "close"
+        actions.append((action, clause))
+    return actions
+
+
+def current_structure_text(text):
+    """Past/examples cannot become current entry constraints after conjunctions."""
+    text = text.casefold().replace("ё", "е")
+    live = []
+    for sentence in SENTENCES.split(text):
+        for index, piece in enumerate(CURRENT.split(sentence)):
+            if not (PAST.search(piece) or HYPOTHETICAL.search(piece) or PAST_WORD.search(piece)):
+                live.append(piece if index == 0 else "now " + piece)
+    return ";".join(live)
 
 
 def tp_break_even_footer(sentence):
@@ -117,6 +149,7 @@ def tp_break_even_footer(sentence):
 
 
 def entry_structure_failure(text):
+    text = current_structure_text(text)
     if STOP_CONDITION.search(text):
         return "conditional_stop_not_representable"
         # A legitimate zone has one form and two bounds. Separate MARKET and
@@ -144,7 +177,7 @@ def entry_structure_failure(text):
 
 def management_structure_failure(text, *, ignore_tp_footers=False):
     actions = current_actions(text)
-    if STOP_CONDITION.search(text) and any(action in ("move_stop", "break_even") for action, _ in actions):
+    if any(STOP_CONDITION.search(clause) and action in ("move_stop", "break_even") for action, clause in actions):
         return "conditional_stop_not_representable"
     immediate_actions = current_actions(text, include_tp_footers=False)
     if immediate_actions or ignore_tp_footers:
@@ -176,9 +209,15 @@ def unsupported_structure(packet):
 
 def supported_action_failure(text, interpretation):
     """Return a stable rejection code for explicitly unrepresentable instructions."""
+    if interpretation.kind in ("report", "unrelated"):
+        if ENTRY.search(text) or re.search(r"\b(?:long|short|лонг|шорт)\b", text, re.I):
+            failure = entry_structure_failure(text)
+            if failure:
+                return failure
+        return management_structure_failure(text, ignore_tp_footers=bool(NEW_ENTRY.search(text) or SETUP_HEADING.search(text)))
     if interpretation.kind not in ("new_signal", "trade_update"):
         return None
-    if interpretation.update_action in ("move_stop", "break_even") and STOP_CONDITION.search(text):
+    if interpretation.update_action in ("move_stop", "break_even") and STOP_CONDITION.search(current_structure_text(text)):
         return "conditional_stop_not_representable"
     if interpretation.kind == "new_signal":
         failure = entry_structure_failure(text)

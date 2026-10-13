@@ -735,3 +735,36 @@ def test_close_action_cannot_discard_a_selected_partial_reduction(amount):
     with pytest.raises(DecisionFailure, match="update_role_conflict"):
         replay_decision(packet, CalibrationProfile(), [response],
                         model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome,code,invalid", [("wrong_model", "decision_model_changed", 1),
+    ("answer_shape", "answer_shape", 1), ("low_confidence", "uncertain_decision", 0)])
+async def test_received_contract_invalid_response_and_valid_confidence_deferral_have_distinct_metrics(outcome, code, invalid):
+    from aqla_agent.usage_metrics import source_efficiency
+    packet = packet_for("BTC result report.")
+    usage, requests = [], []
+
+    def upstream(request):
+        requests.append(request)
+        value = response_for(json.loads(request.content)["questions"], kind="report")
+        if outcome == "wrong_model":
+            value["model"] = "unexpected/model"
+        elif outcome == "answer_shape":
+            value["answers"] = {}
+        else:
+            value["answers"]["kind"]["probabilities"].update(report=0.98, unrelated=0.02)
+        return httpx.Response(200, json=value)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        adapter = OpenRouterDecisionAdapter("synthetic", client=client, model_revision=DEFAULT_DECISION_MODEL)
+        with pytest.raises(DecisionFailure, match=code):
+            await adapter.interpret(packet, CalibrationProfile(thresholds={"kind": 0.99}), usage=usage)
+    metrics = source_efficiency([{"origin": "source_python", "workflow": {"source_revision_hash": outcome}, "api_responses": usage}])
+    assert metrics["api_response_failures"] == 0 and metrics["invalid_model_responses"] == invalid
+    assert len(requests) == 1 and usage[0]["response_success"] is True
+    if outcome == "low_confidence":
+        assert usage[0]["contract_valid"] and usage[0]["review_deferred"]
+        assert usage[0].get("interpretation_valid") is not False
+    else:
+        assert usage[0]["contract_valid"] is False
