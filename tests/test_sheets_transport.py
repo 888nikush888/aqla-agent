@@ -371,6 +371,21 @@ def test_equal_content_advances_revision_and_rejects_intermediate_state(transpor
     assert google.tables[PREFIX + "Regeln"][1][-1] == 3
 
 
+def test_existing_migration_headers_are_batched_on_every_sync(transport):
+    google, client = transport
+    client.sync([rules(1)])
+    google.calls.clear()
+    assert client.sync([rules(1)])["accepted"]
+    reads = [kwargs for method, _, kwargs in google.calls if method == "GET"]
+    assert len(reads) == 5
+    header_reads = [kwargs["params"]["ranges"] for method, url, kwargs in google.calls
+                    if method == "GET" and url.endswith("/values:batchGet")
+                    and all(Google.coordinates(query)[2] == Google.coordinates(query)[4] == 1 for query in kwargs["params"]["ranges"])]
+    assert len(header_reads) == 2
+    assert {Google.coordinates(query)[0] for query in header_reads[0]} == {PREFIX + table for table in HEADERS}
+    assert body_ranges(google) == [(PREFIX + "Regeln", 2, 2)]
+
+
 def test_lost_metadata_reply_retries_without_duplicate_or_revision_regression(transport):
     google, client = transport
     client.sync([rules(1)])

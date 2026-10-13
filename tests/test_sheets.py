@@ -198,8 +198,13 @@ def test_durable_queue_survives_restart_and_ignores_stale_ack(tmp_path, sheets):
 
 
 @pytest.mark.asyncio
-async def test_trade_fills_fees_profit_and_statistics_are_actual_facts(setup, signal, sheets):
-    _, state, fake, _, trading = setup
+async def test_trade_fills_fees_profit_and_statistics_are_actual_facts(setup, signal, sheets, monkeypatch):
+    _, state, fake, exchange, trading = setup
+    original = exchange.info
+    async def quoted_fills(kind, **arguments):
+        result = await original(kind, **arguments)
+        return [{**row, "feeToken": "USDC"} for row in result] if kind == "userFillsByTime" else result
+    monkeypatch.setattr(exchange, "info", quoted_fills)
     source, interpretation = signal
     plan = await trading.preview(source.event_id, interpretation)
     trade = await trading.execute(plan["plan_id"])
@@ -224,6 +229,84 @@ async def test_trade_fills_fees_profit_and_statistics_are_actual_facts(setup, si
     assert len(client.read("Fills")["rows"]) == 3
     google.tables[PREFIX + "Trades"][1][4] = "forged"
     assert client.statistics()["unverified_rows_excluded"] == 1
+
+
+@pytest.fixture
+def completed_journal_trade(setup):
+    from test_monthly import trade
+
+    snapshot = setup[1].snapshot()
+    row = trade()
+    row["plan"].update(entry_price="101", quantity="2", entry_limit="101", stop_loss="90",
+        take_profits=["105", "110"], risk_usdc="22", source_refs=[], account=snapshot["account"],
+        network=snapshot["network"], policy={"risk_percent": "1"})
+    row.update(entry_vwap="101", filled_quantity="2", remaining_quantity="0", stop_price="90", reserved_risk="0", orders=[])
+    snapshot["trades"] = {row["trade_id"]: row}
+    return snapshot, row
+
+
+@pytest.mark.parametrize("damage", ["partial_exit", "manual", "mixed", "fee_currency", "entry_quantity", "entry_open", "open_partial"])
+def test_incomplete_journal_outcomes_never_count_as_known_wins(completed_journal_trade, sheets, damage):
+    snapshot, row = completed_journal_trade
+    if damage in ("partial_exit", "open_partial"):
+        row["fill_events"].pop(list(row["fill_events"])[-1])
+        row.pop("closed_at")
+        if damage == "open_partial":
+            row["status"] = "open"
+    elif damage == "manual":
+        row["manual_closure"] = {"pnl_complete": False}
+    elif damage == "mixed":
+        row["external_conflict"] = "Mixed position"
+    elif damage == "fee_currency":
+        next(iter(row["fill_events"].values()))["feeToken"] = None
+    elif damage == "entry_quantity":
+        row.pop("entry_fill_quantity_confirmed")
+    else:
+        row["order_observations"]["entry"]["status"] = "open"
+    exported = project(snapshot)["Trades:" + row["trade_id"]]
+    cells = dict(zip(HEADERS["Trades"], exported["values"], strict=True))
+    assert cells["Netto vor Funding USD"] == ""
+    assert isinstance(cells["PnL realisiert vor Gebühren/Funding"], float)
+    client = sheets[2]
+    client.sync([exported])
+    group = client.statistics()["groups"]["gesamt"]
+    assert group["wins"] == group["losses"] == group["break_even"] == 0
+    assert group["incomplete_pnl"] == (0 if damage == "open_partial" else 1)
+    assert group["win_rate_known_percent"] is None
+
+
+def test_complete_journal_outcome_does_not_require_funding(completed_journal_trade, sheets):
+    snapshot, row = completed_journal_trade
+    row.pop("funding_coverage")
+    row.pop("funding_events")
+    exported = project(snapshot)["Trades:" + row["trade_id"]]
+    cells = dict(zip(HEADERS["Trades"], exported["values"], strict=True))
+    assert cells["Netto vor Funding USD"] == 15.1
+    sheets[2].sync([exported])
+    group = sheets[2].statistics()["groups"]["gesamt"]
+    assert group["wins"] == 1 and group["incomplete_pnl"] == 0
+
+
+def test_restart_requeues_changed_financial_projection_with_stable_ids(setup, completed_journal_trade, sheets):
+    settings, state, *_ = setup
+    snapshot, row = completed_journal_trade
+    key = "Trades:" + row["trade_id"]
+    old = project(snapshot)[key]
+    next(iter(row["fill_events"].values()))["feeToken"] = None
+    state.update(lambda data: data.update(trades=snapshot["trades"], journal_pending={key: old["fingerprint"]}))
+    state.close()
+    settings.google_sheets = sheets[0]
+    with State(settings) as restarted:
+        current = next(record for record in restarted.journal_batch(500)["records"] if record["table"] == "Trades")
+        assert current["record_id"] == old["record_id"]
+        assert current["fingerprint"] != old["fingerprint"]
+        assert restarted.snapshot()["journal_pending"][key] == current["fingerprint"]
+        sheets[2].sync([old])
+        accepted = sheets[2].sync([current])["accepted"]
+        assert restarted.acknowledge_journal(accepted)["acknowledged"] == 1
+        assert key not in restarted.snapshot()["journal_pending"]
+        result = sheets[2].read("Trades")
+        assert result["total"] == 1 and result["rows"][0]["Netto vor Funding USD"] == ""
 
 
 @pytest.mark.asyncio

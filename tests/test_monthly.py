@@ -161,6 +161,41 @@ def test_berlin_month_boundaries_dst_spanning_trade_and_testnet_exclusion():
     assert next_job(data(), due_at("2026-10") - 1)["report"] is None
 
 
+@pytest.mark.parametrize("entry_offset,included", [(-1, True), (0, False)])
+def test_open_partial_entries_use_observed_time_at_berlin_month_end(entry_offset, included):
+    row = trade("partial-open")
+    end = month_bounds("2026-10")[1]
+    row.update(status="open", remaining_quantity="2")
+    row["order_observations"]["entry"]["status"] = "open"
+    for field in ("entry_accounting", "entry_fill_quantity_confirmed", "closed_at"):
+        row.pop(field)
+    fills = [{**fill, "time": end + entry_offset} for fill in row["fill_events"].values() if fill["kind"] == "entry"]
+    row["fill_events"] = {fill_identity(fill): fill for fill in fills}
+    before = copy.deepcopy(row)
+    report = monthly_report(data(row), "2026-10")
+    assert len(report["open_trades"]) == int(included)
+    assert report["rows"] == report["undated_closed_trades"] == []
+    assert report["summary"]["complete"] == report["summary"]["trades"] == 0
+    if included:
+        opened = report["open_trades"][0]
+        assert opened["entry_at"] == end - 1 and opened["complete"] is False
+        assert all(opened[field] is None for field in ("entry_notional", "margin_leverage", "initial_margin", "gross_pnl", "fees", "funding", "net_pnl", "roe_percent"))
+    assert row == before
+
+
+@pytest.mark.parametrize("fills", ["empty", "zero", "undated"])
+def test_monthly_open_entries_require_positive_dated_own_fills(fills):
+    row = trade("unfilled-open")
+    row.update(status="opening", remaining_quantity="0")
+    row["order_observations"]["entry"]["status"] = "open"
+    for field in ("entry_accounting", "entry_fill_quantity_confirmed", "closed_at"):
+        row.pop(field)
+    row["fill_events"] = {} if fills == "empty" else {identity: {**fill, **({"sz": "0"} if fills == "zero" else {"time": None})}
+        for identity, fill in row["fill_events"].items() if fill["kind"] == "entry"}
+    report = monthly_report(data(row), "2026-10")
+    assert report["open_trades"] == report["rows"] == report["undated_closed_trades"] == []
+
+
 @pytest.mark.parametrize("month", ["2026-13", "2026-0", "x", "2026-10-01", None, "1900-10"])
 def test_month_validation(month):
     with pytest.raises(AqlaError):

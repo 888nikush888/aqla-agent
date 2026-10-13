@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
+from aqla_agent.monthly import accounting_facts, accounting_issues
 from aqla_hyperliquid_mcp.models import AqlaError, Model, digest, now_ms
 
 from .parameters import parameter_values
@@ -138,9 +139,11 @@ def project(data):
         exits = [fill for fill in fills.values() if fill["kind"] != "entry"]
         gross = sum((Decimal(fill["sz"]) * (Decimal(fill["px"]) - entry) * (1 if plan["side"] == "long" else -1) for fill in exits), Decimal(0)) if entry is not None else None
         quote = plan["market"].get("quote_token", "USDC")
-        fees_known = all(fill.get("fee") is not None and fill.get("feeToken") in (None, quote) for fill in fills.values())
+        fees_known = bool(fills) and all(fill.get("fee") is not None and fill.get("feeToken") == quote for fill in fills.values())
         fees = sum((Decimal(fill["fee"]) for fill in fills.values()), Decimal(0)) if fees_known else None
         net = gross - fees if gross is not None and fees is not None else None
+        if accounting_issues(trade, {**trade, **accounting_facts(trade)}):
+            net = None
         add(record("Trades", identity, aliases.get(trade["chat_id"], trade["chat_id"]), plan["market"]["symbol"], plan["side"], trade["status"], timestamp(plan["created_at"]), number(plan["entry_price"]), number(entry), number(plan["quantity"]), number(trade["filled_quantity"]), number(trade["remaining_quantity"]), number(trade["stop_price"]), text(trade.get("targets", plan["take_profits"])), number(plan["risk_usdc"]), number(trade["reserved_risk"]), number(gross), number(fees), number(net), text(plan["source_refs"])))
         entry_order = {"kind": "entry", "cloid": trade["entry_cloid"], "quantity": plan["quantity"], "price": plan["entry_limit"]}
         for order in [entry_order, *trade["orders"], *trade.get("exit_orders", [])]:

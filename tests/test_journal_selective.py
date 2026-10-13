@@ -80,7 +80,12 @@ def test_history_override_with_noncanonical_map_key_matches_complete_oracle(jour
 
 @pytest.mark.asyncio
 async def test_trade_order_fill_operation_rank_mixed_ack_complete_state_oracle(setup, signal, monkeypatch):
-    _, state, fake, _, trading = setup
+    _, state, fake, exchange, trading = setup
+    original = exchange.info
+    async def quoted_fills(kind, **arguments):
+        result = await original(kind, **arguments)
+        return [{**row, "feeToken": "USDC"} for row in result] if kind == "userFillsByTime" else result
+    monkeypatch.setattr(exchange, "info", quoted_fills)
     state.journal_enabled = True
     source, interpretation = signal
     plan = await trading.preview(source.event_id, interpretation)

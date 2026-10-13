@@ -142,14 +142,18 @@ class SheetsClient:
                 if not create:
                     raise AqlaError("Google Sheets journal has not been initialized by the synchronizer yet")
                 requests.append({"createDeveloperMetadata": {"developerMetadata": {"metadataKey": self.scope_key, "metadataValue": self.scope, "visibility": "DOCUMENT", "location": {"spreadsheet": True}}}})
+        existing_tables = [table for table in HEADERS if create and table in self.allowed_tables
+                           and table in PRE_PRESENTATION_HEADERS and self.prefix + table in properties]
+        header_ranges = [f"'{self.prefix + table}'!A1:{column(min(len(HEADERS[table]) + 2, properties[self.prefix + table]['gridProperties']['columnCount']))}1"
+                         for table in existing_tables]
+        existing_headers = dict(zip(existing_tables, self.values(header_ranges) if header_ranges else [], strict=True))
         for table, headers in HEADERS.items():
             if table not in self.allowed_tables:
                 continue
             title = self.prefix + table
             if title in properties:
                 if create and table in PRE_PRESENTATION_HEADERS:
-                    width = min(len(headers) + 2, properties[title]["gridProperties"]["columnCount"])
-                    cells = self.values([f"'{title}'!A1:{column(width)}1"])
+                    cells = existing_headers[table]
                     previous = [PRE_PRESENTATION_HEADERS[table]]
                     if table in PRE_RANK_HEADERS:
                         previous.append(PRE_RANK_HEADERS[table])
@@ -157,7 +161,7 @@ class SheetsClient:
                         previous.append(LEGACY_HEADERS[table])
                     if table in ("Trades", "Orders", "Fills", "Vorgänge"):
                         previous.append([*LEGACY_HEADERS[table], *TARGET_COLUMNS])
-                    old = next((headers for headers in previous if cells and cells[0] and cells[0][0] == [*headers, *META_HEADERS]), None)
+                    old = next((headers for headers in previous if cells and cells[0] == [*headers, *META_HEADERS]), None)
                     if old is not None and len(old) < len(headers):
                         identity = properties[title]["sheetId"]
                         start = len(old)

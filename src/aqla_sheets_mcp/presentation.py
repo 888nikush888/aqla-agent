@@ -545,9 +545,13 @@ def publish(client, snapshot, *, clock=None):
         charts = _chart_requests(raw, snapshot, ids)
         intact = _format_matches(client, raw, snapshot, ids, values)
         if manifest.confirmed and manifest.fingerprint == snapshot.fingerprint and not changed and not structure and not charts and not growth and intact:
+            if snapshot.revision > manifest.revision:
+                manifest = manifest.model_copy(update={"revision": snapshot.revision, "attempted_at": clock})
+                _store(client, manifest, metadata_id)
+                _guard(client, manifest)
             return {"status": "unchanged", "fingerprint": snapshot.fingerprint, "revision": snapshot.revision,
                     "url": f"https://docs.google.com/spreadsheets/d/{client.settings.spreadsheet_id}/edit#gid={ids['Dashboard']}"}
-        pending = PresentationManifest(binding=snapshot.scope_binding, fingerprint=snapshot.fingerprint, revision=snapshot.revision,
+        pending = PresentationManifest(binding=snapshot.scope_binding, fingerprint=snapshot.fingerprint, revision=max(snapshot.revision, manifest.revision),
             sheet_ids=ids, extents=extents, attempted_at=clock, options={"currency": snapshot.available_currencies, "period": snapshot.available_periods})
         _store(client, pending, metadata_id)
         raw, metadata_id = _guard(client, pending)

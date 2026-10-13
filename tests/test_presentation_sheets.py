@@ -553,6 +553,42 @@ def test_foreign_scope_stale_revision_nonempty_adoption_and_injected_snapshot_re
         selection(client)
 
 
+@pytest.mark.parametrize("lost_reply", [False, True])
+def test_identical_presentation_advances_revision_without_cell_writes(workbook, lost_reply):
+    google, client, source = workbook
+    source["sequence"] = 12
+    first = build_presentation(source, clock=CLOCK)
+    publish(client, first, clock=0)
+    source["sequence"] = 20
+    unchanged = build_presentation(source, clock=CLOCK)
+    if lost_reply:
+        google.lose_post = google.post_count + 1
+    google.calls.clear()
+    if lost_reply:
+        with pytest.raises(AqlaError, match="remain pending"):
+            publish(client, unchanged, clock=60)
+    else:
+        assert publish(client, unchanged, clock=60)["status"] == "unchanged"
+    metadata = next(row for row in google.metadata if row["metadataKey"] == "aqla.presentation.v1")
+    assert json.loads(metadata["metadataValue"])["revision"] == 20
+    assert len(writes(google)) == 1
+    assert "updateDeveloperMetadata" in writes(google)[0][1]["json"]["requests"][0]
+    restarted = SheetsClient(client.settings, session=google, scope=client.scope)
+    google.calls.clear()
+    assert publish(restarted, unchanged, clock=61)["status"] == "throttled"
+    assert writes(google) == []
+    source["sequence"] = 15
+    source["source_names"]["-1001"] = "Stale source label"
+    google.calls.clear()
+    with pytest.raises(AqlaError, match="Stale"):
+        publish(client, build_presentation(source, clock=CLOCK), clock=120)
+    assert writes(google) == []
+    google.tables["Journal"][1][9] = 999
+    assert publish(client, first, clock=180)["status"] == "published"
+    assert google.tables["Journal"][1][9] == 15.1
+    assert json.loads(metadata["metadataValue"])["revision"] == 20
+
+
 def test_legacy_header_upgrade_keeps_ids_old_digest_and_revision_until_verified_refresh():
     google = PresentationGoogle()
     client = SheetsClient(SimpleNamespace(spreadsheet_id="legacy", tab_namespace="mainnet"), session=google)

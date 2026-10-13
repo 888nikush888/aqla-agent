@@ -176,13 +176,11 @@ def accounting_facts(trade):
     return result
 
 
-def report_row(data, trade):
-    plan = trade["plan"]
-    facts = {**trade, **accounting_facts(trade)}
+def accounting_issues(trade, facts):
+    """Own lifecycle completeness, independent of fees and funding coverage."""
     metric = facts.get("entry_accounting", {})
     fills = list(trade.get("fill_events", {}).values())
     exits = [row for row in fills if row["kind"] != "entry"]
-    currency = plan["market"].get("quote_token", "USDC")
     issues = []
     if not metric:
         issues.append("Entry-Fills oder endgültiger Margin-Hebel nicht vollständig belegt")
@@ -199,6 +197,19 @@ def report_row(data, trade):
     exited = sum((Decimal(row["sz"]) for row in exits), Decimal(0))
     if not entered or entered != exited or not facts.get("closed_at"):
         issues.append("Vollständige eigene Exit-Fills fehlen")
+    return issues
+
+
+def report_row(data, trade):
+    plan = trade["plan"]
+    facts = {**trade, **accounting_facts(trade)}
+    metric = facts.get("entry_accounting", {})
+    fills = list(trade.get("fill_events", {}).values())
+    exits = [row for row in fills if row["kind"] != "entry"]
+    currency = plan["market"].get("quote_token", "USDC")
+    issues = accounting_issues(trade, facts)
+    entered = Decimal(metric.get("entry_quantity", "0"))
+    exited = sum((Decimal(row["sz"]) for row in exits), Decimal(0))
     fee_evidence = trade.get("report_fee_evidence", {})
     fees_known = bool(fills) and all((fee_evidence.get(fill_identity(row), row)).get("fee") is not None
                                    and (fee_evidence.get(fill_identity(row), row)).get("feeToken") == currency for row in fills)
@@ -239,8 +250,10 @@ def monthly_report(data, month):
         if trade["plan"]["network"] != "mainnet":
             continue
         row = report_row(data, trade)
-        if row["entry_at"] is not None and row["entry_at"] < end and (row["closed_at"] is None and trade["status"] not in CLOSED or row["closed_at"] is not None and row["closed_at"] >= end):
-            open_row = {**row, "closed_at": None, "gross_pnl": None, "fees": None, "funding": None, "net_pnl": None, "roe_percent": None,
+        entry_at = row["entry_at"] or min((fill["time"] for fill in trade.get("fill_events", {}).values()
+            if fill["kind"] == "entry" and isinstance(fill.get("time"), int) and Decimal(fill["sz"]) > 0), default=None)
+        if entry_at is not None and entry_at < end and (row["closed_at"] is None and trade["status"] not in CLOSED or row["closed_at"] is not None and row["closed_at"] >= end):
+            open_row = {**row, "entry_at": entry_at, "closed_at": None, "gross_pnl": None, "fees": None, "funding": None, "net_pnl": None, "roe_percent": None,
                         "complete": False, "issues": ["Am Monatsende offen; kein Ergebnis in der Monatssumme"]}
             opened.append(open_row)
         elif trade["status"] in CLOSED:
