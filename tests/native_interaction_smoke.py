@@ -22,7 +22,8 @@ def main():
     os.environ['HERMES_HOME']=str(home)
     os.environ['HERMES_SKIP_CONFIG_MIGRATION']='1'
     os.environ['HERMES_SKIP_UPDATE_CHECK']='1'
-    sys.path[:0]=[str(Path(__file__).resolve().parents[1]/'src'),str(Path(args.hermes_source).resolve())]
+    source_paths=[str(Path(__file__).resolve().parents[1]/'src'),str(Path(args.hermes_source).resolve())]
+    sys.path[:0]=source_paths
     import yaml
     from gateway.platforms.base import SendResult
     from gateway.run_turn_runner import TurnRunner
@@ -63,7 +64,8 @@ def main():
     assert _routing_entries(routing_home) == {entry.session_id: entry.to_dict()}
     assert diagnose_session_history(routing_home) == {'files': 0, 'valid': 0, 'issues': []}
     cli = subprocess.run([sys.executable, '-m', 'aqla_agent.session_history', '--home', str(routing_home),
-                          '--hermes-source', args.hermes_source, '--diagnose'], capture_output=True, text=True, check=True)
+                          '--hermes-source', args.hermes_source, '--diagnose'], capture_output=True, text=True, check=True,
+                         env={**os.environ, 'PYTHONPATH': os.pathsep.join([*source_paths, os.environ.get('PYTHONPATH', '')])})
     assert json.loads(cli.stdout) == {'files': 0, 'valid': 0, 'issues': []}
     assert routing_file.read_bytes() == routing_only and not (routing_home / 'state.db').exists()
     routing_history = Conversations(routing_home / 'sessions/transcripts')
