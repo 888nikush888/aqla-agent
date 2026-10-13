@@ -5,6 +5,7 @@ from aqla_agent.decision_evaluation import (
     REQUIRED_SCENARIOS,
     EvaluationCheckpoint,
     calibration_profile,
+    calibration_question_results,
     case_packet,
     equal,
     evaluate,
@@ -14,6 +15,21 @@ from aqla_agent.decision_evaluation import (
 )
 from aqla_agent.decisions import DecisionFailure, DecisionResult
 from aqla_hyperliquid_mcp.models import Interpretation
+
+
+def test_calibration_separates_kind_labels_and_intent_polarities():
+    packet = case_packet({"id":"labels","messages":["BTC result report."]})
+    decisions = calibration_question_results(packet,{"kind":"report"},
+        {"values":{"kind":"report"},"probabilities":{"kind":0.94,"live_action":0.01},
+         "required_questions":["kind","live_action"]},None)
+    assert [row["family"] for row in decisions] == ["kind.report","live_action.false"]
+    thresholds, disabled = fit_thresholds([
+        {"raw_correct":True,"question_results":decisions},
+        {"raw_correct":False,"baseline_gate_passed":True,"question_results":[
+            {"family":"kind.incomplete","correct":False,"confidence":1,"prediction":"incomplete"}]},
+    ])
+    assert disabled == ["kind.incomplete"]
+    assert thresholds["kind.report"] == 0.94 and thresholds["live_action.false"] == 0.99
 
 
 def test_legacy_revision_identity_preserves_real_reply_anchor_without_rehashing():
@@ -221,6 +237,16 @@ def test_confidence_one_wrong_answer_disables_family_instead_of_accepting_equali
     thresholds, disabled = fit_thresholds([{"raw_correct": False, "baseline_gate_passed": True,
         "question_results": [{"family": "kind", "correct": False, "confidence": 1}]}])
     assert "kind" in disabled and "kind" not in thresholds
+
+
+def test_probability_buckets_tolerate_float_noise_but_never_round_errors_down():
+    thresholds, disabled = fit_thresholds([
+        {"raw_correct":True,"question_results":[{"family":"kind.report","correct":True,"confidence":0.99142251605}]},
+        {"raw_correct":False,"baseline_gate_passed":True,"question_results":[{"family":"kind.new_signal","correct":False,"confidence":0.99991111}]},
+    ])
+    assert thresholds["kind.report"]==0.9914 and 0.99142251575 >= thresholds["kind.report"]
+    assert thresholds["kind.new_signal"]==1 and 0.99991111 < thresholds["kind.new_signal"]
+    assert disabled==[]
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ from aqla_agent.decisions import (
     checked_answers,
     questions_for,
     replay_decision,
+    verification_questions,
 )
 from aqla_hyperliquid_mcp.models import Evidence, Interpretation, SourceEvent
 
@@ -127,7 +128,7 @@ def test_uncertain_new_trading_intent_requires_bounded_review(kind):
 def test_reduction_requires_one_original_quantity_and_matching_mathematics(quote, amount, accepted):
     from aqla_agent.decisions import validate_interpretation
     packet = packet_for("BTC: reduce " + quote)
-    result = Interpretation(kind="trade_update", source_refs=[packet["anchor_source_id"]], update_action="reduce",
+    result = Interpretation(kind="trade_update", symbol="BTC", source_refs=[packet["anchor_source_id"]], update_action="reduce",
         reduce_percent=amount, evidence=[Evidence(field="reduce_percent", source_id=packet["anchor_source_id"], quote=quote)])
     if accepted:
         validate_interpretation(packet, result)
@@ -392,6 +393,145 @@ def test_classification_proofs_cover_original_text_without_another_semantic_choi
     result=replay_decision(packet,CalibrationProfile(),[response_for(questions,kind="unrelated")],
                            model=DEFAULT_DECISION_MODEL,revision=DEFAULT_DECISION_MODEL)
     assert "".join(proof.quote for proof in result.interpretation.evidence)==text
+
+
+def test_calibrated_numeric_roles_have_separate_thresholds_and_disabled_families():
+    profile = CalibrationProfile(thresholds={"number_role.ignore": 0.85, "number_role.stop_loss": 0.995},
+                                 disabled_questions=["number_role.leverage"])
+    assert profile.threshold("role.original", "ignore") == 0.85
+    assert profile.threshold("role.original", "stop_loss") == 0.995
+    assert profile.question_disabled("role.original", "leverage")
+    assert not profile.question_disabled("role.original", "stop_loss")
+    assert CalibrationProfile(thresholds={"number_role":0.8}).threshold("role.original") == 0.8
+
+
+def test_calibrated_kind_and_intent_polarities_do_not_share_error_thresholds():
+    profile = CalibrationProfile(thresholds={"kind.new_signal":0.8,"kind.incomplete":0.995,
+        "live_action.true":0.85,"live_action.false":0.98},disabled_questions=["kind.ambiguous"])
+    assert profile.threshold("kind","new_signal") == 0.8
+    assert profile.threshold("kind","incomplete") == 0.995
+    assert profile.threshold("live_action",True) == 0.85
+    assert profile.threshold("live_action",False) == 0.98
+    assert profile.question_disabled("kind","ambiguous")
+    assert not profile.question_disabled("kind","new_signal")
+    assert CalibrationProfile(disabled_questions=["kind"]).question_disabled("kind","new_signal")
+
+
+def test_equivalent_symbol_occurrences_do_not_split_choice_confidence():
+    packet = packet_for("BTC LONG. BTC Entry 100. SL 90. BTC TP 110.")
+    spans = candidates(packet)
+    assert len([span for span in spans if span.kind == "symbol" and span.value == "BTC"]) == 3
+    options = questions_for(packet, spans)["symbol"]["criteria"]
+    matching = [key for key,value in options.items() if value.startswith("{") and json.loads(value).get("value") == "BTC"]
+    assert len(matching) == 1
+
+
+def test_symbol_options_preserve_asset_x_but_exclude_exact_leverage_prefixes():
+    packet = packet_for("OP SHORT X 15. Leverage X20.")
+    options = questions_for(packet,candidates(packet))["symbol"]["criteria"]
+    values = [json.loads(value)["value"] for value in options.values() if value.startswith("{")]
+    assert "OP" in values and "X" not in values and "X20" not in values
+    packet = packet_for("X LONG. Entry 100. SL 90. TP 110.")
+    options = questions_for(packet,candidates(packet))["symbol"]["criteria"]
+    assert any(value.startswith("{") and json.loads(value)["value"]=="X" for value in options.values())
+
+
+def test_equivalent_reply_symbols_use_current_or_nearest_original_quote():
+    root = SourceEvent(chat_id="channel",message_id=1,sent_at=1000,text="BTC LONG. Entry 100.")
+    parent = SourceEvent(chat_id="channel",message_id=2,sent_at=1001,reply_to_id=1,text="BTC still open.")
+    anchor = SourceEvent(chat_id="channel",message_id=3,sent_at=1002,reply_to_id=2,text="Move stop to entry now.")
+    packet = packet_for(messages=[root,parent,anchor])
+    packet["messages"] = [packet["messages"][2],packet["messages"][0],packet["messages"][1]]
+    options = questions_for(packet,candidates(packet))["symbol"]["criteria"]
+    matching = [json.loads(value) for value in options.values() if value.startswith("{") and json.loads(value)["value"]=="BTC"]
+    assert len(matching)==1 and matching[0]["source_id"]==parent.source_id
+
+
+def test_update_venue_absence_does_not_require_historical_footer_confidence():
+    parent = SourceEvent(chat_id="channel",message_id=1,sent_at=1000,text="BTC LONG. Exchange: Bybit. Entry 100.")
+    anchor = SourceEvent(chat_id="channel",message_id=2,sent_at=1001,reply_to_id=1,text="BTC: close now.")
+    packet = packet_for(messages=[parent,anchor])
+    spans=candidates(packet)
+    response=response_for(questions_for(packet,spans),kind="trade_update",overrides={"update_action":"close","side":"not_present"})
+    profile=CalibrationProfile(disabled_questions=["source_exchange"])
+    result=replay_decision(packet,profile,[response,response_for(verification_questions())],model=DEFAULT_DECISION_MODEL,revision=DEFAULT_DECISION_MODEL)
+    assert result.interpretation.source_exchange is None and "source_exchange" not in result.required_questions
+
+
+@pytest.mark.parametrize("quote,value", [("1/2",50),("1/4",25),("3/4",75),("2/4",50)])
+def test_exact_fractional_position_quantities_keep_original_quotes(quote,value):
+    packet=packet_for("BTC: close "+quote+" of the position now.")
+    span=next(s for s in candidates(packet) if s.notation=="position_fraction")
+    assert span.quote==quote and span.value==str(value)
+    interpretation=Interpretation(kind="trade_update",symbol="BTC",update_action="reduce",reduce_percent=value,
+        source_refs=[packet["anchor_source_id"]],evidence=[Evidence(field="reduce_percent",source_id=packet["anchor_source_id"],quote=quote)])
+    from aqla_agent.decisions import validate_interpretation
+    validate_interpretation(packet,interpretation)
+
+
+def test_dates_and_nonterminating_fractions_do_not_become_position_quantities():
+    packet=packet_for("BTC: report 4/1/2 and 1/2/2026. Also 1/3 is not silently rounded.")
+    assert not any(s.notation=="position_fraction" for s in candidates(packet))
+
+
+def test_two_current_management_actions_cannot_execute_as_one_partial_update():
+    packet=packet_for("BTC: close 25% and move the stop to break-even now.")
+    questions=questions_for(packet,candidates(packet))
+    response=response_for(questions,kind="trade_update",overrides={"update_action":"reduce","side":"not_present"})
+    response["answers"]["single_management_action"]["noul"]=0.01
+    with pytest.raises(DecisionFailure,match="management_actions_not_representable"):
+        replay_decision(packet,CalibrationProfile(),[response,response_for(verification_questions())],
+            model=DEFAULT_DECISION_MODEL,revision=DEFAULT_DECISION_MODEL)
+
+
+@pytest.mark.parametrize("text,quote,amount", [("BTC: exit at +70%.","70%",70),
+    ("Закройте BTC - 30%. Слабый актив.","30%",30),("BTC: выйдем на −20%.","20%",20)])
+def test_signed_pnl_cannot_be_used_as_a_positive_position_reduction(text,quote,amount):
+    from aqla_agent.decisions import validate_interpretation
+    packet=packet_for(text)
+    result=Interpretation(kind="trade_update",symbol="BTC",update_action="reduce",reduce_percent=amount,
+        source_refs=[packet["anchor_source_id"]],evidence=[Evidence(field="reduce_percent",source_id=packet["anchor_source_id"],quote=quote)])
+    with pytest.raises(DecisionFailure,match="pnl_percentage_is_not_reduction_quantity"):
+        validate_interpretation(packet,result)
+
+
+def test_update_without_market_needs_python_authoritative_setup_binding():
+    from aqla_agent.decisions import validate_interpretation
+    packet=packet_for("Close the position now.")
+    result=Interpretation(kind="trade_update",update_action="close",source_refs=[packet["anchor_source_id"]])
+    with pytest.raises(DecisionFailure,match="update_identity_missing"):
+        validate_interpretation(packet,result)
+    packet["anchor_setup_bound"]=True
+    validate_interpretation(packet,result)
+
+
+def test_explicit_order_form_mentions_keep_anchor_quotes_and_positions():
+    parent = SourceEvent(chat_id="channel",message_id=1,sent_at=1000,text="BTC LONG LIMIT 100.")
+    anchor = SourceEvent(chat_id="channel",message_id=2,sent_at=1001,reply_to_id=1,text="BTC SHORT. Вход: Рынок 110.")
+    packet = packet_for(messages=[parent,anchor])
+    question = questions_for(packet,candidates(packet))["entry"]
+    instruction = json.loads(question["instructions"])
+    mentions = instruction["original_order_form_mentions"]
+    assert [row["form"] for row in mentions] == ["market"]
+    assert all(anchor.text[row["start"]:row["end"]] == row["quote"] for row in mentions)
+    assert "proof.side" not in questions_for(packet,candidates(packet))
+
+
+def test_update_numbers_from_reply_parent_do_not_gate_current_changed_value():
+    parent = SourceEvent(chat_id="channel", message_id=1, sent_at=1000, text="BTC LONG. Entry 100. SL 90. TP 110.")
+    anchor = SourceEvent(chat_id="channel", message_id=2, sent_at=1001, reply_to_id=1, text="BTC: stop now to 95.")
+    packet = packet_for(messages=[parent,anchor])
+    spans = candidates(packet)
+    overrides = {"update_action":"move_stop", "side":"not_present"}
+    overrides.update({"role."+span.candidate_id:"stop_loss" for span in spans if span.kind=="number" and span.quote=="95"})
+    questions = questions_for(packet,spans)
+    response = response_for(questions,kind="trade_update",overrides=overrides)
+    profile = CalibrationProfile(thresholds={"number_role.ignore":1})
+    result = replay_decision(packet,profile,[response,response_for(verification_questions())],
+                             model=DEFAULT_DECISION_MODEL,revision=DEFAULT_DECISION_MODEL)
+    assert result.interpretation.stop_loss == 95
+    assert result.interpretation.entry_prices == []
+    assert len(result.interpretation.evidence) == 3
 
 
 @pytest.mark.parametrize("kind", ["incomplete", "ambiguous"])

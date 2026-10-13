@@ -282,6 +282,9 @@ async def test_fallback_cost_requires_observed_endpoint_and_cannot_block_interpr
         return "token"
 
     def call_llm(**kwargs):
+        assert kwargs["max_tokens"] == 8192
+        assert kwargs["extra_body"]["max_tokens"] == 8192
+        assert kwargs["reasoning_config"] == {"enabled":True,"effort":"medium"}
         kwargs["route_info"].update(provider="custom", model="fixture")
         capture[-1].record_auxiliary_usage("fixture", "source_interpretation", billing_provider="custom",
             billing_base_url="https://other.example/v1" if endpoint_changed else runtime["base_url"])

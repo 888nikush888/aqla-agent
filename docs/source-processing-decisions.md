@@ -11,7 +11,7 @@ source_processing:
   mode: shadow  # legacy, shadow, hybrid
   model: inception/mercury-decide:free
   key_env: OPENROUTER_API_KEY
-  calibration_file: calibration/decision-source-v5.json
+  calibration_file: calibration/decision-source-v9.json
   timeout_seconds: 5
   max_context_characters: 60000
 ```
@@ -44,6 +44,8 @@ Begründungen und Entscheidungscodes erzeugt Python aus festen Vorlagen. Die Kla
 
 Eine private `notification_outbox` friert Texte, Empfänger, Konto, Netzwerk und Meldungsversionen ein. Nur ihr nativer Worker sendet über den vorhandenen Hermes-Adapter. Erfolgreiche Teile bleiben gespeichert; erfolgreicher Gesamtversand und versioniertes Fakten-ACK werden gemeinsam geschrieben. Ein alter ACK entfernt keine neue Meldungsversion.
 
+Der Quellen-Fallback verwendet ein eigenes Budget: standardmäßig `fallback_max_tokens: 8192` und `fallback_reasoning_effort: medium`. Er übernimmt kein unbegrenztes `ultra`-Reasoning aus dem Betreiberchat. Das Budget gilt auch bei der nativen Weiterleitung von OpenCode Go zu OpenRouter; abgeschnittene oder ungültige Antworten erteilen keine Handelsfreigabe. Die Betreiberchat-Einstellungen bleiben unverändert.
+
 Bei einem unklaren Sendestand wird eine mögliche Dublette ausdrücklich gekennzeichnet. Fehlgeschlagene Sendungen verwenden Backoff und bis zu fünf automatische Versuche. Erschöpfte Jobs haben den Status `exhausted`; ein neu verbundener nativer Adapter kann sie wieder aufnehmen. Für eine gezielte administrative Wiederaufnahme steht der geschützte interne `integration`-Auftrag `delivery_retry` zur Verfügung. Bekannte erfolgreiche Teile werden nicht erneut gesendet. Für diesen Pfad wird keine zusätzliche Hermes-Final-Response-Ledger-Schleife angelegt.
 
 ## Offline-Vergleich und Kalibrierung
@@ -51,7 +53,7 @@ Bei einem unklaren Sendestand wird eine mögliche Dublette ausdrücklich gekennz
 Das Prüfprogramm besitzt keinerlei Bot-, MCP- oder Orderwerkzeuge:
 
 ```sh
-aqla-evaluate-decisions --dataset annotated-sources.json --output decision-report.json --sources QUELLEN_CHAT_ID --master hermes-home/skills/aqla-master/SKILL.md --write-profile calibration/decision-source-v5.json
+aqla-evaluate-decisions --dataset annotated-sources.json --output decision-report.json --sources QUELLEN_CHAT_ID --master hermes-home/skills/aqla-master/SKILL.md --write-profile calibration/decision-source-v9.json
 ```
 
 Es verwendet den OpenRouter-Key aus der Umgebung und kann API-Kosten verursachen. Jede Dataset-Zeile besitzt `id`, `chat_id`, `messages`, `expected`, `split` (`calibration` oder `holdout`) und `group_id` zur Trennung vollständiger Quellthreads. Replys können `reply_to_id` angeben. `language` nennt `de`, `en` oder `ru`; `tags` verwenden `reply`, `edit`, `percent`, `decimal`, `injection`, `multi_setup`, `report_with_action`. Für eine Aktivierungsfreigabe müssen `annotation_complete: true` und sämtliche kritischen Interpretationsfelder in `expected` vorliegen, auch mit explizitem `null` oder leeren Listen. Die synthetischen `tests/fixtures/context_cases.json` können ohne Aktivierungsprofil geprüft werden; deren Teilannotationen reichen nicht zur Produktionsfreigabe.
@@ -61,6 +63,16 @@ Für reale Replies und Edits akzeptiert `messages` vollständige `SourceEvent`-O
 Für eine Freigabe ist eine ausdrückliche `group_id` je Quellthread erforderlich. Dieselbe reale Originalnachricht einschließlich ihrer Edits darf auch bei unterschiedlichen Gruppen-IDs nicht in beiden Splits vorkommen; solche Datensätze werden vor dem ersten Modellaufruf abgewiesen.
 
 Der Sammelmodus erfasst unsichere Antworten zur Kalibrierung, erteilt aber niemals eine Ausführungsfreigabe. Anschließend laufen unveränderte Holdout-Antworten durch dieselbe vollständige Prüfung wie die Produktion. Schwellen entstehen ausschließlich aus Kalibrierungsantworten; eine falsche Antwort mit Konfidenz 1 sperrt die betreffende Frage statt sie an der Grenze zuzulassen. Rohgenauigkeit, akzeptierte Fälle, Rückstellungen und tatsächlich freigabefähige Quellenarten werden getrennt berichtet.
+
+Fragenversion `aqla-decisions-v9` kalibriert Nachrichtenarten, positive/negative Handelsabsicht und numerische Rollen getrennt nach vorhergesagtem Ergebnis. Ein falsches „unvollständig“ setzt damit nicht die Schwelle aller korrekten Einstiege hoch; die betreffende fehlerhafte Entscheidung bleibt gesperrt oder benötigt eine höhere Konfidenz. Frühere globale Schwellen und Sperren bleiben lesbar. Die Anforderungen an vollständige Belege, getrennte Testdaten, Quellenfreigaben und null kritische Fehlfreigaben gelten unverändert.
+
+Python erhält wiederholte Zahlen als getrennte Kandidaten, bündelt aber identische Symboloptionen über die tatsächliche Reply-Kette. Der aktuelle Anker hat Vorrang, anschließend die nächste tatsächliche Reply-Nachricht; unabhängige Setup-Bindungen bestimmt weiterhin Python. Ein Hebelpräfix wie `X 15` hinter einer Richtung wird nicht als zusätzlicher Markt angeboten. Ein tatsächlicher Markt `X` bleibt verfügbar. Belege für Richtung, verzögerten Einstieg und Update-Aktion bestehen aus dem vollständigen aktuellen Originaltext; dafür werden keine zusätzlichen Auswahlfragen gestellt. Alte Reply-Zahlen werden nicht als neue Update-Werte übernommen. Bei Updates ohne aktuelle Börsennennung entscheidet Python deren belegbare Abwesenheit. Eine allgemeine Börsenwerbung im Footer belegt keinen ausdrücklich zugewiesenen Handelsplatz.
+
+Wörtliche Orderform-Nennungen erhalten Textposition und Originalzitat als Verständnishilfe. Russische Marktformulierungen einschließlich „по маркету“ bleiben ausdrückliche Markt-Einstiege. Eine nicht genannte Orderform ist weiterhin zulässig und wird nicht erfunden. Gegenwärtige oder zukünftige Schließankündigungen werden von vergangenen Ergebnissen unterschieden; „in Einstand schließen“ ist eine Schließung, kein Stop-Nachziehen. Eine zusätzliche binäre Frage prüft, ob genau eine aktuelle Management-Aktion dargestellt werden kann. Zusammengesetzte Anweisungen und nicht darstellbare zukünftige Ausführungsbedingungen dürfen nicht als einzelne sofortige Aktion ausgeführt werden.
+
+Die binären Fragen besitzen getrennte positive und negative Kriterien gemäß dem [dokumentierten Decision-Vertrag](https://docs.inceptionlabs.ai/capabilities/decisions). Aufträge gehen weiterhin ausschließlich an OpenRouter. Python berechnet exakte Positionsbruchteile wie `1/2` und `3/4`; Originalzitate und Positionen bleiben erhalten, überlappende numerische Zuordnungen werden abgewiesen. Nicht endliche Prozentdarstellungen wie `1/3` werden nicht stillschweigend gerundet. Die Kalibrierung verwendet vier Dezimalstellen: korrekte Untergrenzen werden abgerundet, beobachtete Fehler strikt auf die nächste Grenze aufgerundet. Damit hängt eine Freigabe nicht von winzigen Anbieter-Rundungsunterschieden ab; beobachtete falsche Antworten werden weiterhin ausgeschlossen.
+
+Die Validierungspolitik `aqla-decisions-v9` sperrt PnL-Angaben wie „bei +70 % schließen“ oder negative Prozentangaben als Reduktionsmenge. Ein Update ohne belegten Markt benötigt eine von Python festgestellte Setup-Bindung; der Modellvorschlag kann sie nicht selbst erteilen. Diese Prüfungen gelten auch für die generative Ausnahmebehandlung. Die Originalkontext-Struktur behält unabhängig davon ihre bisherige Schema-Version. Entwicklungsauswertungen dürfen vorhandene Anbieterantworten nur nach identischem Kontext-Hash und identischem semantischen Fragenvertrag wiederverwenden; bereits beobachtete Fälle werden ausschließlich Kalibrierung, neue Testfälle bleiben getrennt.
 
 Offline-Kontexte können mit `revision_time_context` als semantischer Zeitpunktvergleich erstellt werden: nur bis zur Ankerrevision verfügbare Nachrichtenänderungen, anschließend die letzten 20 Nachrichten und tatsächlichen Reply-Vorfahren. Dies reproduziert keine verzögerte Telegram-Zustellung; spätere Edits dürfen nicht in frühere Testfälle gelangen.
 

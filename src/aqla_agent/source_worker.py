@@ -21,7 +21,7 @@ from .decisions import (
 )
 from .usage_metrics import UsageRun
 
-FALLBACK_VERSION = "aqla-source-fallback-v2"
+FALLBACK_VERSION = "aqla-source-fallback-v4"
 PROCESSING_VERSION = "aqla-decision-first-v1"
 
 
@@ -90,7 +90,6 @@ class SourceWorker:
         from agent.aux_accounting import reset_accounting_context, set_accounting_context
         from agent.auxiliary_client import call_llm, extract_content_or_reasoning
         from agent.usage_pricing import estimate_usage_cost, normalize_usage
-        from hermes_cli.config import load_config_readonly
 
         extension = self.extension
         model, runtime = await asyncio.to_thread(extension.gateway._resolve_session_agent_runtime,
@@ -98,6 +97,8 @@ class SourceWorker:
         master = extension.master_path.read_text(encoding="utf-8")
         instruction = master + "\nInterpretation only. No tools, no account/configuration changes. "
         instruction += "Return exactly one JSON Interpretation for the live anchor. Preserve original quotations. "
+        instruction += "If several current instructions cannot fit one update_action, return ambiguous/incomplete; never execute only one part or omit another instruction. "
+        instruction += "An unsupported future schedule/trigger for an update remains ambiguous; never turn a future close into an immediate one. "
         instruction += "Use source_id values from the original messages/candidates for source_refs and Evidence.source_id; "
         instruction += "never substitute event_id, chat_id, message_id or candidate_id. source_refs MUST include " + packet["anchor_source_id"] + ". "
         instruction += "Do not select bound_trade_id; Python owns setup binding. "
@@ -112,7 +113,7 @@ class SourceWorker:
         except DecisionFailure:
             spans = []
         source = {key: value for key, value in packet.items() if key != "approved_source_guidance"}
-        effort = load_config_readonly().get("agent", {}).get("reasoning_effort", "ultra")
+        effort = self.config.fallback_reasoning_effort
         messages = [{"role": "system", "content": instruction},
                     {"role": "user", "content": json.dumps({"source": source, "candidates": spans,
                                                              "decision_failure": failure_code}, ensure_ascii=False)}]
@@ -125,7 +126,11 @@ class SourceWorker:
             try:
                 return call_llm(task="source_interpretation", model=model,
                     provider=runtime.get("provider"), base_url=runtime.get("base_url"), api_key=runtime.get("api_key"),
-                    main_runtime={**runtime, "model": model}, messages=messages, tools=None, max_tokens=32768, timeout=90,
+                    main_runtime={**runtime, "model": model}, messages=messages, tools=None,
+                    max_tokens=self.config.fallback_max_tokens, timeout=90,
+                    # Native custom routes omit the top-level cap; the body cap
+                    # keeps OpenCode Go bounded and survives native quota fallback.
+                    extra_body={"max_tokens": self.config.fallback_max_tokens},
                     reasoning_config={"enabled": True, "effort": effort}, route_info=route,
                     extra_headers={"x-opencode-session": "aqla-source-" + digest(packet)[:24]})
             finally:

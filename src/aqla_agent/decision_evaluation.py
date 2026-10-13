@@ -20,6 +20,7 @@ from .decisions import (
     DecisionFailure,
     OpenRouterDecisionAdapter,
     build_packet,
+    calibration_family,
     candidates,
     replay_decision,
 )
@@ -193,6 +194,7 @@ def question_labels(packet, expected, actual=None):
     if expected.get("kind") not in ("incomplete", "ambiguous"):
         labels["live_action"] = {actionable}
     labels["single_entry_form"] = {expected.get("kind") not in ("ambiguous", "incomplete")}
+    labels["single_management_action"] = {expected.get("kind") not in ("ambiguous", "incomplete")}
     values_fields = {"leverage", "entry", "entry_timing", "entry_prices", "stop_loss", "take_profits",
                      "take_profit_unit", "update_action", "reduce_percent", "evidence"}
     setup_fields = {"symbol", "side", "source_exchange", "source_refs"}
@@ -216,14 +218,14 @@ def calibration_question_results(packet, expected, observation, result):
         if key not in probabilities or key not in labels:
             continue
         probability = probabilities[key]
-        if key in ("live_action", "single_entry_form") or key.startswith("verification."):
+        if key in ("live_action", "single_entry_form", "single_management_action") or key.startswith("verification."):
             prediction = probability >= 0.5
             confidence = probability if prediction else 1 - probability
         else:
             prediction, confidence = values.get(key), probability
-        rows.append({"question": key, "family": "number_role" if key.startswith("role.") else key,
+        rows.append({"question": key, "family": calibration_family(key, prediction),
                      "correct": prediction in labels[key], "confidence": confidence,
-                     "positive_only": key == "single_entry_form" or key.startswith("verification."),
+                     "positive_only": key in ("single_entry_form", "single_management_action") or key.startswith("verification."),
                      "prediction": prediction})
     return rows
 
@@ -246,9 +248,12 @@ def fit_thresholds(rows):
         if wrong and max(wrong) >= 1:
             disabled.append(family)
             continue
-        threshold = max(0.5, min(values["correct"], default=0.99))
+        # Do not bind permission to provider floating-point noise at the exact
+        # least-correct observation. Use four-decimal probability buckets:
+        # correct lower bounds round down; observed errors strictly round up.
+        threshold = max(0.5, math.floor(min(values["correct"], default=0.99) * 10000) / 10000)
         if wrong:
-            threshold = max(threshold, math.nextafter(max(wrong), 1.0))
+            threshold = max(threshold, (math.floor(max(wrong) * 10000) + 1) / 10000)
         thresholds[family] = threshold
     return thresholds, disabled
 

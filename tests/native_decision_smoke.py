@@ -70,6 +70,7 @@ def main():
         assert result.fallback and result.interpretation.kind == "report"
         assert len(requests) == 1 and len(requests[0]["messages"]) == 2
         assert not requests[0].get("tools")
+        assert requests[0].get("max_tokens",requests[0].get("max_completion_tokens")) == 8192
         schema = json.loads(requests[0]["messages"][0]["content"].split("Schema:\n", 1)[1])
         assert schema["properties"]["source_refs"]["items"]["enum"] == [source.source_id]
         assert schema["properties"]["source_refs"]["contains"] == {"const": source.source_id}
