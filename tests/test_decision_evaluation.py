@@ -426,6 +426,61 @@ def test_proven_strict_deferred_gate_labels_raw_unspecified_as_correct():
     assert question_labels(packet, expected)["entry"] == {"limit"}
 
 
+def test_proven_original_entry_range_labels_raw_unspecified_as_correct():
+    from aqla_agent.decision_evaluation import question_labels
+    packet = case_packet({"id": "range", "messages": ["BTC LONG. 100 - 105. SL 90."]})
+    source = packet["anchor_source_id"]
+    expected = {"entry": "range", "entry_prices": [100, 105], "evidence": [
+        {"field": "entry_prices.0", "source_id": source, "quote": "100"},
+        {"field": "entry_prices.1", "source_id": source, "quote": "105"}]}
+    assert question_labels(packet, expected)["entry"] == {"range", "unspecified"}
+    packet["messages"][0]["text"] = "BTC LONG. Entry 100. Reference 105. SL 90."
+    assert question_labels(packet, expected)["entry"] == {"range"}
+
+
+def evidence_fixture():
+    from aqla_hyperliquid_mcp.models import Evidence
+    return Interpretation(kind="report", source_refs=["first", "second"], evidence=[
+        Evidence(field="classification", source_id="first", quote="Original result"),
+        Evidence(field="source_exchange", source_id="second", quote="Bybit")])
+
+
+def test_evidence_order_is_not_semantic_but_every_exact_proof_is_retained():
+    from aqla_agent.decision_evaluation import annotation_mismatches, complete_fields
+    actual = evidence_fixture()
+    expected = complete_fields(actual)
+    expected["evidence"] = list(reversed(expected["evidence"]))
+    assert annotation_mismatches(actual, expected) == []
+    expected["source_refs"] = list(reversed(expected["source_refs"]))
+    assert annotation_mismatches(actual, expected) == ["source_refs"]
+
+
+@pytest.mark.parametrize("difference", ["quote", "field", "source_id", "missing", "extra", "duplicate"])
+def test_evidence_multiset_rejects_every_proof_or_multiplicity_change(difference):
+    from aqla_agent.decision_evaluation import annotation_mismatches, complete_fields
+    actual = evidence_fixture()
+    expected = complete_fields(actual)
+    if difference in ("quote", "field", "source_id"):
+        expected["evidence"][0][difference] = "changed"
+    elif difference == "missing":
+        expected["evidence"].pop()
+    elif difference == "extra":
+        expected["evidence"].append({"field": "side", "source_id": "first", "quote": "LONG"})
+    else:
+        expected["evidence"].append(expected["evidence"][0].copy())
+    assert annotation_mismatches(actual, expected) == ["evidence"]
+
+
+def test_numeric_arrays_keep_their_semantic_order_when_evidence_is_reordered():
+    from aqla_agent.decision_evaluation import annotation_mismatches, complete_fields
+    actual = Interpretation(kind="new_signal", source_refs=["first"], symbol="BTC", side="long", entry="range",
+        entry_prices=[100, 105], take_profits=[110, 120])
+    expected = complete_fields(actual)
+    expected["entry_prices"].reverse()
+    expected["take_profits"].reverse()
+    assert annotation_mismatches(actual, expected) == ["entry_prices", "take_profits"]
+
+
 @pytest.mark.asyncio
 async def test_swapped_same_value_occurrence_roles_are_a_critical_error_even_when_public_values_match():
     import json

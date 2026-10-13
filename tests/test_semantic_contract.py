@@ -6,7 +6,7 @@ import pytest
 from test_decisions import packet_for
 
 from aqla_agent.decisions import DecisionFailure, validate_interpretation
-from aqla_agent.semantic_contract import supported_action_failure, unsupported_structure
+from aqla_agent.semantic_contract import current_actions, supported_action_failure, unsupported_structure
 from aqla_agent.source_worker import SourceWorker
 from aqla_hyperliquid_mcp.models import Evidence, Interpretation, SourceEvent
 
@@ -67,6 +67,36 @@ async def test_native_generative_admission_rejects_all_three_partial_action_prob
     assert len(calls) == 1 and calls[0]["tools"] is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_current_update", [False, True])
+async def test_native_report_and_update_admission_agree_with_completed_russian_actions(with_current_update, monkeypatch, tmp_path):
+    text = "BTC: Закрыл половину, переставил стоп в бу и обновил тейки."
+    if with_current_update:
+        text += " Сейчас закрываем четверть."
+    packet = packet_for(text)
+    source = packet["anchor_source_id"]
+    interpretation = Interpretation(kind="trade_update" if with_current_update else "report", symbol="BTC" if with_current_update else None,
+        update_action="reduce" if with_current_update else None, reduce_percent=25 if with_current_update else None,
+        source_refs=[source], reason="Completed results with one new reduction" if with_current_update else "Completed results",
+        evidence=([Evidence(field="update_action", source_id=source, quote=text),
+                   Evidence(field="reduce_percent", source_id=source, quote="четверть")] if with_current_update else
+                  [Evidence(field="classification", source_id=source, quote=text)]))
+    master = tmp_path / "master.md"
+    master.write_text("Synthetic source interpretation rules", encoding="utf-8")
+    extension = SimpleNamespace(master_path=master, session_key="synthetic",
+        gateway=SimpleNamespace(_resolve_session_agent_runtime=lambda **_: ("synthetic", {"provider": "custom"})))
+    monkeypatch.setitem(sys.modules, "agent", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "agent.aux_accounting", SimpleNamespace(
+        set_accounting_context=lambda *_: None, reset_accounting_context=lambda _: None))
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", SimpleNamespace(
+        call_llm=lambda **_: {"content": interpretation.model_dump_json()},
+        extract_content_or_reasoning=lambda response, **_: response["content"]))
+    monkeypatch.setitem(sys.modules, "agent.usage_pricing", SimpleNamespace(normalize_usage=lambda *_: None,
+        estimate_usage_cost=lambda *_: None))
+    result = await SourceWorker(extension, {"mode": "hybrid"}).generative_fallback(packet, "source_not_calibrated", [])
+    assert result.interpretation.kind == interpretation.kind and unsupported_structure(packet) is None
+
+
 @pytest.mark.parametrize("text", [
     "BTC: reduce half and move stop to entry.",
     "BTC: Hälfte schließen und Stop auf Einstand setzen.",
@@ -117,6 +147,38 @@ def test_parent_mixed_entry_and_stop_history_do_not_veto_current_update():
     interpretation = Interpretation(kind="trade_update", symbol="BTC", update_action="reduce", reduce_percent=50,
         source_refs=[anchor.source_id], evidence=[Evidence(field="reduce_percent", source_id=anchor.source_id, quote="half")])
     validate_interpretation(packet, interpretation)
+
+
+def test_completed_russian_stop_and_target_actions_are_not_current_instructions():
+    text = "Закрыл половину, переставил стоп в бу и обновил тейки"
+    packet = packet_for(text)
+    assert current_actions(text) == [] and unsupported_structure(packet) is None
+    result = Interpretation(kind="report", source_refs=[packet["anchor_source_id"]], reason="Completed actions",
+        evidence=[Evidence(field="classification", source_id=packet["anchor_source_id"], quote=text)])
+    validate_interpretation(packet, result)
+
+
+@pytest.mark.parametrize("text,action", [
+    ("BTC: переставил стоп в бу и обновил тейки. Сейчас закрываем четверть.", "reduce"),
+    ("BTC: отменил заявку и сократил половину. Сейчас переставь стоп в бу.", "break_even"),
+    ("BTC: перевел стоп в бу и заменил тейки. Сейчас обнови тейки до 110.", "replace_targets"),
+    ("BTC: сократил позицию теперь закрываем четверть.", "reduce"),
+])
+def test_completed_past_verbs_do_not_hide_a_separate_new_current_action(text, action):
+    assert [recognized for recognized, _ in current_actions(text)] == [action]
+    result = Interpretation(kind="trade_update", symbol="BTC", update_action=action,
+        reduce_percent=25 if action == "reduce" else None,
+        take_profits=[110] if action == "replace_targets" else [], source_refs=["synthetic:1"])
+    assert supported_action_failure(text, result) is None and unsupported_structure(packet_for(text)) is None
+
+
+@pytest.mark.parametrize("text,action", [
+    ("BTC: переставь стоп в бу.", "break_even"), ("BTC: переставим стоп в бу.", "break_even"),
+    ("BTC: обнови тейки до 110.", "replace_targets"), ("BTC: обновим тейки до 110.", "replace_targets"),
+    ("BTC: отмени заявку на вход.", "cancel_entry"), ("BTC: сократи половину.", "reduce"),
+])
+def test_past_morphology_does_not_suppress_true_imperatives_or_current_future_announcements(text, action):
+    assert [recognized for recognized, _ in current_actions(text)] == [action]
 
 
 @pytest.mark.parametrize("text", [

@@ -587,9 +587,11 @@ def assemble(packet, spans, values, probabilities, profile, *, collect=False, re
         if required and not fields.get(required):
             raise DecisionFailure("update_value_missing")
     if kind == "new_signal" and fields.get("entry") == "unspecified":
-        from .semantic_contract import strict_deferred_price
+        from .semantic_contract import bounded_live_entry_range, strict_deferred_price
         anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
-        if (selected.get("entry0") and selected["entry0"].source_id == packet["anchor_source_id"]
+        if bounded_live_entry_range(packet, [selected.get("entry0"), selected.get("entry1")]):
+            fields["entry"] = "range"
+        elif (selected.get("entry0") and selected["entry0"].source_id == packet["anchor_source_id"]
                 and strict_deferred_price(anchor["text"], fields.get("entry_timing"), fields.get("entry_prices", []))):
             # An expressly strict deferred price gate is one price-bound entry,
             # unlike an ordinary reference price or a time-delayed market order.

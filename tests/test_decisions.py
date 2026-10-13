@@ -518,6 +518,29 @@ def test_time_delay_or_ordinary_reference_does_not_invent_price_bound_entry():
         replay_decision(packet, CalibrationProfile(), [response], model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
 
 
+@pytest.mark.parametrize("delimiter", ["-", "–", "—", "to", "bis", "до"])
+def test_exact_two_selected_live_prices_derive_range_without_changing_raw_choice(delimiter):
+    packet = packet_for("BTC LONG. 100 " + delimiter + " 105. SL 90. TP 110.")
+    spans = candidates(packet)
+    overrides = {"entry": "unspecified", **{"role." + span.candidate_id: "entry1" for span in spans if span.quote == "105"}}
+    response = response_for(questions_for(packet, spans), overrides=overrides)
+    observation = {}
+    result = replay_decision(packet, CalibrationProfile(), [response, response_for(verification_questions())],
+        model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL, observation=observation)
+    assert result.interpretation.entry == "range" and result.interpretation.entry_prices == [100, 105]
+    assert observation["values"]["entry"] == "unspecified" and observation["probabilities"]["entry"] == 1
+
+
+def test_two_prices_in_separate_mentions_do_not_prove_a_range():
+    packet = packet_for("BTC LONG. Entry 100. Reference 105. SL 90. TP 110.")
+    spans = candidates(packet)
+    response = response_for(questions_for(packet, spans), overrides={"entry": "unspecified",
+        **{"role." + span.candidate_id: "entry1" for span in spans if span.quote == "105"}})
+    result = replay_decision(packet, CalibrationProfile(), [response, response_for(verification_questions())],
+        model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+    assert result.interpretation.entry == "unspecified"
+
+
 def test_exact_same_live_tp_role_repetition_coalesces_without_merging_target_roles():
     packet = packet_for("BTC LONG. Entry 100. SL 90. TP1: 110. First target 110.")
     spans = candidates(packet)

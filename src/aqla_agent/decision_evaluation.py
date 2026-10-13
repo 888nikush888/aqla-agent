@@ -8,6 +8,7 @@ import math
 import os
 import tempfile
 import time
+from collections import Counter
 from decimal import Decimal
 from pathlib import Path
 
@@ -170,7 +171,16 @@ def case_packet(case):
 
 def annotation_mismatches(interpretation, expected):
     actual = complete_fields(interpretation)
-    return [key for key, wanted in expected.items() if not equal(actual.get(key), wanted)]
+    def equivalent(key, wanted):
+        produced = actual.get(key)
+        if key == "evidence" and isinstance(produced, list) and isinstance(wanted, list):
+            fields = {"field", "source_id", "quote"}
+            if all(isinstance(proof, dict) and set(proof) == fields
+                   and all(isinstance(proof[field], str) for field in fields) for proof in produced + wanted):
+                return Counter((proof["field"], proof["source_id"], proof["quote"]) for proof in produced) == Counter(
+                    (proof["field"], proof["source_id"], proof["quote"]) for proof in wanted)
+        return equal(produced, wanted)
+    return [key for key, wanted in expected.items() if not equivalent(key, wanted)]
 
 
 NUMERIC_ROLE_FIELDS = {"entry_prices.0": "entry0", "entry_prices.1": "entry1", "stop_loss": "stop_loss",
@@ -270,6 +280,12 @@ def question_labels(packet, expected, actual=None, candidate_occurrences=None):
         labels["proof." + field] = {s.candidate_id for s in spans if s.kind == "text" and any(
             p["source_id"] == s.source_id and p["quote"] == s.quote for p in quotes)} if quotes else {"not_present"}
     numeric_roles = annotated_numeric_roles(packet, expected, spans, candidate_occurrences)
+    if expected.get("entry") == "range":
+        from .semantic_contract import bounded_live_entry_range
+        entries = [[span for span in spans if role in numeric_roles.get(span.candidate_id, set())]
+                   for role in ("entry0", "entry1")]
+        if all(len(entry) == 1 for entry in entries) and bounded_live_entry_range(packet, [entry[0] for entry in entries]):
+            labels["entry"].add("unspecified")
     for identity, span in by_id.items():
         if span.kind != "number":
             continue
