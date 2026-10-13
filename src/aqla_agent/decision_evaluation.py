@@ -191,7 +191,14 @@ def covered_by_proof(packet, span, proof):
         return False
     # An occurrence must be inside the unchanged original quote, not merely
     # have an equal numeric value somewhere else in the same message.
-    originals = [row["text"] for row in packet["messages"] if row["source_id"] == span.source_id]
+    rows = [row for row in packet["messages"] if row["source_id"] == span.source_id]
+    latest = None
+    for row in rows:
+        stamp = row.get("edited_at") or row.get("sent_at") or 0
+        previous = (latest.get("edited_at") or latest.get("sent_at") or 0) if latest else -1
+        if latest is None or stamp > previous or row["event_id"] == packet["anchor_event_id"]:
+            latest = row
+    originals = [latest["text"]] if latest else []
     import re
     return any(occurrence.start() <= span.start and span.end <= occurrence.end()
                for original in originals for occurrence in re.finditer(re.escape(proof["quote"]), original))

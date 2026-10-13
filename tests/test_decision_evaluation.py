@@ -377,6 +377,19 @@ def test_exact_repeat_annotations_can_name_equivalent_mentions_of_one_field():
     assert all(labels["role." + span.candidate_id] == {"target_1"} for span in spans)
 
 
+def test_occurrence_annotation_cannot_use_a_quote_from_a_superseded_revision():
+    from aqla_agent.decision_evaluation import question_labels
+    from aqla_agent.decisions import candidates
+    original = {"chat_id": "channel", "message_id": 1, "sent_at": 1000, "text": "SL 7"}
+    edited = {**original, "edited_at": 2000, "text": "TP 7"}
+    packet = case_packet({"id": "edited-proof", "messages": [original, edited]})
+    span = next(span for span in candidates(packet) if span.kind == "number")
+    expected = {"stop_loss": 7, "evidence": [{"field": "stop_loss", "source_id": span.source_id, "quote": "SL 7"}]}
+    annotation = {"field": "stop_loss", "source_id": span.source_id, "start": span.start, "end": span.end, "quote": "7"}
+    with pytest.raises(ValueError, match="original position and Evidence"):
+        question_labels(packet, expected, candidate_occurrences=[annotation])
+
+
 @pytest.mark.asyncio
 async def test_changed_gold_cannot_resume_cached_observation_under_same_input(tmp_path):
     calls = []
