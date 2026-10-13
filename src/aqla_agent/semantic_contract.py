@@ -54,6 +54,24 @@ ENTRY_ZONE = pattern(WORD + r"(?:range|zone|диапазон|зона|bereich)" 
 STRICT_ENTRY_PRICE = pattern(WORD + r"(?:strictly|only|exclusively)\s+(?:\w+\s+){0,4}(?:specified|stated|given)\s+price\b|"
     + WORD + r"(?:строго|только|исключительно)\s+(?:по\s+)?(?:указанной|обозначенной|заданной)\s+цене\b|"
     + WORD + r"(?:nur|ausschließlich|ausschliesslich)\s+(?:zum?\s+)?(?:angegebenen|genannten)\s+preis\b")
+OPPORTUNITY = pattern(WORD + r"(?:opportunit\w*|chance\w*|gelegenheit\w*|m[öo]glich\w*|moeglich\w*|возможност\w*|шанс\w*)" + END)
+OPENING_OPPORTUNITY = pattern(WORD + r"(?:enter\w*|entry|open\w*|buy\w*|sell\w*|long|short|"
+    r"einstieg\w*|einsteigen|er[öo]ffn\w*|eroeffn\w*|открыти\w*|вход\w*|лонг\w*|шорт\w*)" + END)
+FUTURE_OPPORTUNITY = pattern(WORD + r"(?:will|would|could|might|may|expected|awaited|"
+    r"wird|w[üu]rde|würden|koennte|k[öo]nnte|erwartet\w*|"
+    r"предоставит|даст|создаст|обеспечит|может|ожидаем\w*)" + END)
+ENTRY_LABEL = pattern(WORD + r"(?:entry|einstieg|вход)\s*[:=@]")
+CURRENT_ENTRY = pattern(r"(?:^|[:,]\s*)\s*(?:(?:now|jetzt|сейчас)\s+)?"
+    r"(?:(?:i|we)\s+(?:am\s+|are\s+)?(?:enter(?:ing)?|buy(?:ing)?|sell(?:ing)?|open(?:ing)?)|"
+    r"(?:enter|buy|sell|einsteigen|kaufe[n]?|verkaufe[n]?|входим|вхожу|войти|покупаем|покупаю|открываем|открываю))" + END)
+FINANCIAL_FIELD = pattern(WORD + r"(?:entry|stop(?:[-\s]+loss)?|sl|tp\s*\d*|targets?|take[-\s]+profit|"
+    r"einstieg|stopploss|ziel\w*|вход|стоп(?:[-\s]*лосс)?|цел[ьи]|тейк\w*)\s*[:=@-]?")
+TRUNCATED_EXTRA_ENTRY = pattern(WORD + r"(?:(?:another|additional|second|also)\s+(?:\w+\s+){0,4}"
+    r"(?:entry|bid|limit|buy|entry\s+point)\s*(?:at|in|on|:)|"
+    r"(?:weitere\w*|zus[äa]tzlich\w*|auch|noch)\s+(?:\w+\s+){0,4}"
+    r"(?:einstieg\w*|limit\w*|nachkauf\w*)\s*(?:bei|zu|in|:)|"
+    r"(?:так\s*же|также|еще|дополнительно|дополнительн\w*|втор\w*)\s+(?:\w+\s+){0,4}"
+    r"(?:точк\w*|вход\w*|лимит\w*|покупк\w*|добор\w*)\s*(?:в|на|по|у|при|:))\s*$")
 
 
 def strict_deferred_price(text, entry_timing, entry_prices):
@@ -142,6 +160,47 @@ def current_structure_text(text):
     return ";".join(live)
 
 
+def future_entry_opportunity_failure(text):
+    """A forecasted qualitative opening opportunity is not a current entry order."""
+    # A sentence may end immediately after a price ("Entry: 100. Forecast").
+    # Keep decimal points intact while separating that independent instruction.
+    sentences = re.split(r";|\.(?!\d)(?=\s|$)", current_structure_text(text))
+    opportunities = [sentence for sentence in sentences if OPPORTUNITY.search(sentence)
+        and OPENING_OPPORTUNITY.search(sentence) and (FUTURE_OPPORTUNITY.search(sentence)
+            or FUTURE.search(sentence) or CONDITION.search(sentence))]
+    if not opportunities:
+        return None
+    for sentence in sentences:
+        # An independent current instruction or a concrete deferred price-bound
+        # order remains eligible. An opportunity's price/target is not an order.
+        if sentence in opportunities:
+            continue
+        if CURRENT_ENTRY.search(sentence):
+            return None
+        if re.search(r"\d", sentence) and (ENTRY_LABEL.search(sentence) or STRICT_ENTRY_PRICE.search(sentence)
+                or LIMIT.search(sentence) and ENTRY.search(sentence)):
+            return None
+        if CURRENT.search(sentence) and (ENTRY.search(sentence) or SETUP_HEADING.search(sentence)) and MARKET.search(sentence):
+            return None
+    return "future_entry_opportunity_requires_review"
+
+
+def incomplete_financial_instruction_failure(text):
+    """Only truncated original financial fields/extra entries veto an action."""
+    live = current_structure_text(text)
+    if TRUNCATED_EXTRA_ENTRY.search(live):
+        return "source_financial_instruction_incomplete"
+    for field in FINANCIAL_FIELD.finditer(live):
+        tail = live[field.end():].split(";", 1)[0]
+        # Numeric percent clarification directly attached to a financial field,
+        # with an unclosed original parenthesis. Ordinary prose parentheses and
+        # fully closed price-plus-percent notation are unaffected.
+        if re.search(r"^\s*[-+~]?\d+(?:[.,]\d+)*(?:\s*[-–]\s*\d+(?:[.,]\d+)*)?\s*"
+                     r"\(\s*[-+~]?\d+(?:[.,]\d+)*\s*%[^)]*$", tail):
+            return "source_financial_instruction_incomplete"
+    return None
+
+
 def tp_break_even_footer(sentence):
     """One conditional TP-triggered BE rule, in either original word order."""
     return (bool(CONDITION.search(sentence) and TP_LABEL.search(sentence))
@@ -200,6 +259,9 @@ def unsupported_structure(packet):
     is required for entry/stop structural checks, avoiding old status context.
     """
     text = next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    failure = incomplete_financial_instruction_failure(text) or future_entry_opportunity_failure(text)
+    if failure:
+        return failure
     if ENTRY.search(text) or re.search(r"\b(?:long|short|лонг|шорт)\b", text, re.I):
         failure = entry_structure_failure(text)
         if failure:
@@ -217,6 +279,13 @@ def supported_action_failure(text, interpretation):
         return management_structure_failure(text, ignore_tp_footers=bool(NEW_ENTRY.search(text) or SETUP_HEADING.search(text)))
     if interpretation.kind not in ("new_signal", "trade_update"):
         return None
+    failure = incomplete_financial_instruction_failure(text)
+    if failure:
+        return failure
+    if interpretation.kind == "new_signal":
+        failure = future_entry_opportunity_failure(text)
+        if failure:
+            return failure
     if interpretation.update_action in ("move_stop", "break_even") and STOP_CONDITION.search(current_structure_text(text)):
         return "conditional_stop_not_representable"
     if interpretation.kind == "new_signal":

@@ -10,6 +10,72 @@ from aqla_agent.semantic_contract import current_actions, supported_action_failu
 from aqla_agent.source_worker import SourceWorker
 from aqla_hyperliquid_mcp.models import Evidence, Interpretation, SourceEvent
 
+FUTURE_OPENING_TEXTS = [
+    "BTC LONG. An expected pullback will provide an opportunity to open a long position with potential growth 49.33%.",
+    "BTC LONG. Nach der erwarteten Korrektur könnte sich eine Gelegenheit für einen Long-Einstieg mit 49.33% Potenzial ergeben.",
+    "BTC LONG. Ожидаемая коррекция предоставит возможность для открытия лонг позиции с потенциалом роста 49.33%.",
+]
+INCOMPLETE_FINANCIAL_TEXTS = [
+    "BTC LONG. Entry 100. Target: 120 (25% additional entry at",
+    "BTC LONG. Einstieg 100. Ziel: 120 (25% weiterer Einstieg bei",
+    "BTC LONG. Вход 100. Цель: 120 (25% Так же есть точка в",
+]
+
+
+def unsafe_opening_probe(text, code):
+    packet = packet_for(text)
+    source = packet["anchor_source_id"]
+    fields = {"take_profits": ["49.33"], "take_profit_unit": "roe_percent"} if "49.33" in text else {"entry_prices": [100], "take_profits": [120]}
+    quotes = [("symbol", "BTC"), ("side", "LONG"), ("take_profits.0", "49.33%" if "49.33" in text else "120")]
+    if "49.33" not in text:
+        quotes.append(("entry_prices.0", "100"))
+    interpretation = Interpretation(kind="new_signal", symbol="BTC", side="long", source_refs=[source], **fields,
+        evidence=[Evidence(field=field, source_id=source, quote=quote) for field, quote in quotes])
+    return packet, interpretation, code
+
+
+@pytest.mark.parametrize("text,code", [(text, "future_entry_opportunity_requires_review") for text in FUTURE_OPENING_TEXTS]
+    + [(text, "source_financial_instruction_incomplete") for text in INCOMPLETE_FINANCIAL_TEXTS])
+def test_future_opportunity_and_truncated_financial_original_cannot_authorize_an_entry(text, code):
+    packet, interpretation, code = unsafe_opening_probe(text, code)
+    assert unsupported_structure(packet) == code
+    with pytest.raises(DecisionFailure, match=code):
+        validate_interpretation(packet, interpretation)
+    nonaction = Interpretation(kind="ambiguous" if "49.33" in text else "incomplete", source_refs=interpretation.source_refs,
+        reason="Needs source clarification", evidence=[Evidence(field="classification", source_id=packet["anchor_source_id"], quote=text)])
+    validate_interpretation(packet, nonaction)
+
+
+@pytest.mark.parametrize("text", [
+    "BTC LONG. Another entry at", "BTC LONG. Weiterer Einstieg bei", "BTC LONG. Также есть точка в",
+])
+def test_truncated_additional_entry_does_not_require_an_open_parenthesis_to_be_blocked(text):
+    assert unsupported_structure(packet_for(text)) == "source_financial_instruction_incomplete"
+
+
+@pytest.mark.parametrize("text", [
+    "BTC LONG. Entry: 100. The expected pullback will offer another opportunity to open a long position.",
+    "BTC LONG. Tomorrow enter a limit order at 100. A later correction could provide a long entry opportunity.",
+    "BTC LONG. Einstieg: 100. Eine Korrektur könnte eine Gelegenheit für einen Long-Einstieg bieten.",
+    "BTC LONG. Вход: 100. Коррекция предоставит возможность для открытия лонг позиции.",
+    "BTC LONG. An expected pullback will offer a long entry opportunity, but now buy BTC market.",
+    "BTC LONG. Ранее коррекция предоставит возможность для открытия лонг позиции; сейчас входим по рынку.",
+    "BTC LONG. Yesterday an expected correction could provide an opportunity to enter long. Entry: 100.",
+    "BTC LONG. Entry 100. Target: 120 (25%).",
+    "BTC LONG. Entry 100. (An ordinary unfinished prose note",
+])
+def test_actual_current_and_concrete_deferred_entries_are_not_forecast_or_truncation_vetoes(text):
+    assert unsupported_structure(packet_for(text)) is None
+
+
+@pytest.mark.parametrize("text", [
+    "Earlier an expected pullback would offer an opportunity to enter long.",
+    "Gestern hätte eine Korrektur eine Gelegenheit für einen Long-Einstieg geboten.",
+    "Ранее ожидаемая коррекция предоставит возможность для открытия лонг позиции.",
+])
+def test_past_only_opportunity_descriptions_do_not_become_a_current_veto(text):
+    assert unsupported_structure(packet_for(text)) is None
+
 
 @pytest.mark.parametrize("text", [
     "Earlier we agreed to close half and move stop to95 and cancel entry",
@@ -85,9 +151,11 @@ def test_exact_proofs_do_not_authorize_omitting_original_instruction(form):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("form", ["market", "range", "reduce"])
+@pytest.mark.parametrize("form", ["market", "range", "reduce", "future_opening", "truncated_opening"])
 async def test_native_generative_admission_rejects_all_three_partial_action_probes(form, monkeypatch, tmp_path):
-    packet, interpretation, code = unsupported_probe(form)
+    packet, interpretation, code = (unsafe_opening_probe(FUTURE_OPENING_TEXTS[0], "future_entry_opportunity_requires_review")
+        if form == "future_opening" else unsafe_opening_probe(INCOMPLETE_FINANCIAL_TEXTS[0], "source_financial_instruction_incomplete")
+        if form == "truncated_opening" else unsupported_probe(form))
     master = tmp_path / "master.md"
     master.write_text("Synthetic original-source interpretation rules", encoding="utf-8")
     runtime = {"provider": "custom", "base_url": "https://opencode.ai/zen/go/v1", "api_key": "synthetic"}

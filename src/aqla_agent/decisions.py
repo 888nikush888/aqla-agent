@@ -14,7 +14,7 @@ from pydantic import Field, model_validator
 from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, Model, digest
 from aqla_hyperliquid_mcp.rules import quoted_leverage_numbers, verify_evidence
 
-VERSION = "aqla-decisions-v11"
+VERSION = "aqla-decisions-v12"
 QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v3"
 # The original-context wire shape is unchanged. Keeping its independent schema
 # version permits exact-state, exact-question observations to be reused for
@@ -97,7 +97,8 @@ class DecisionFailure(AqlaError):
 ANSWER_FAILURES = {"answer_shape", "answer_type", "answer_options", "answer_probabilities", "answer_choice", "answer_probability"}
 DECISION_DEFERRALS = {"uncertain_decision", "uncertain_trading_intent_requires_review", "conflicting_live_intent",
     "conflicting_management_intent", "verification_failed", "source_not_calibrated", "source_decision_kind_not_calibrated",
-    "decision_calibration_model_changed", "entry_form_not_representable", "source_context_limit", "candidate_limit"}
+    "decision_calibration_model_changed", "entry_form_not_representable", "source_context_limit", "candidate_limit",
+    "future_entry_opportunity_requires_review", "source_financial_instruction_incomplete"}
 
 
 def mark_decision_failure(usage, code):

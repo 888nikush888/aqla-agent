@@ -401,6 +401,10 @@ def test_rejected_oversized_fresh_source_is_not_removed_from_the_efficiency_deno
     ("BTC close half position and move stop to entry.", "management_actions_not_representable"),
     ("BTC close tomorrow.", "scheduled_management_not_representable"),
     ("BTC long entry market 100. Stop after 1h candle close below 90.", "conditional_stop_not_representable"),
+    ("BTC LONG. An expected correction will provide an opportunity to open a long position with potential growth 49.33%.", "future_entry_opportunity_requires_review"),
+    ("BTC LONG. Ожидаемая коррекция предоставит возможность для открытия лонг позиции с потенциалом роста 49.33%.", "future_entry_opportunity_requires_review"),
+    ("BTC LONG. Entry 100. Target: 120 (25% additional entry at", "source_financial_instruction_incomplete"),
+    ("BTC LONG. Вход 100. Цель: 120 (25% Также есть точка в", "source_financial_instruction_incomplete"),
 ])
 async def test_proven_unsupported_original_uses_mercury_first_then_review_without_generative_retry(worker_boundary, provider_down, text, code):
     extension, server, state, fake, _, _ = worker_boundary
@@ -426,6 +430,45 @@ async def test_proven_unsupported_original_uses_mercury_first_then_review_withou
     assert saved["review_sources"] == {source.source_id: source.event_id}
     assert saved["failure_detail"]["phase"] == "validate" and not saved["failure_detail"]["retryable"]
     assert len(requests) == 1 and not fallbacks and not fake.actions and not state.snapshot()["operations"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,code", [
+    ("BTC LONG. An expected correction will provide an opportunity to open a long position with growth 49.33%.", "future_entry_opportunity_requires_review"),
+    ("BTC LONG. Entry 100. Target: 120 (25% additional entry at", "source_financial_instruction_incomplete"),
+])
+async def test_falsely_actionable_original_is_identically_vetoed_offline_and_by_native_worker(worker_boundary, text, code):
+    from aqla_agent.decisions import DEFAULT_DECISION_MODEL, replay_decision
+    extension, server, state, fake, _, _ = worker_boundary
+    source = SourceEvent(chat_id="channel", message_id=110, sent_at=now_ms(), text=text)
+    server.aqla_trading.ingest(source)
+    requests, responses, fallbacks = [], [], []
+
+    def upstream(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        overrides = {key: "target_1" for key, question in body["questions"].items() if key.startswith("role.")
+            and json.loads(question["instructions"])["occurrence"]["quote"] in ("120", "49.33%")}
+        response = response_for(body["questions"], overrides=overrides)
+        responses.append(response)
+        return httpx.Response(200, json=response)
+
+    async def forbidden(*args):
+        fallbacks.append(True)
+        raise AssertionError("A proved original veto cannot be repaired by a generative retry")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        worker = SourceWorker(extension, {"mode": "hybrid"}, fallback=forbidden,
+            adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision=DEFAULT_DECISION_MODEL))
+        await worker.tick()
+        await worker.tick()
+    with pytest.raises(DecisionFailure, match=code):
+        replay_decision(requests[0]["state"], CalibrationProfile(), responses,
+            model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL, collect=True)
+    saved = next(iter(state.snapshot()["source_jobs"].values()))
+    assert saved["status"] == "review" and saved["failure_code"] == code
+    assert len(requests) == 1 and not fallbacks and not fake.actions
+    assert not state.snapshot()["operations"] and not state.snapshot()["plans"]
 
 
 @pytest.mark.asyncio

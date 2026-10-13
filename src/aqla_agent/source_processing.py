@@ -416,7 +416,8 @@ class SourceProcessor:
         job.failure_history = job.failure_history[-15:]
         if job.status == "failed" and job.failure_code in ("source_context_limit", "candidate_limit", "entry_legs_not_representable",
                 "signal_contains_management_instruction", "management_actions_not_representable", "scheduled_management_not_representable",
-                "conditional_stop_not_representable", "additional_entry_legs_not_representable"):
+                "conditional_stop_not_representable", "additional_entry_legs_not_representable",
+                "future_entry_opportunity_requires_review", "source_financial_instruction_incomplete"):
             job.status, job.outcome = "review", job.failure_code
             event = self.state.snapshot()["events"][job.event_id]
             job.review_sources = {event["source_id"]: job.event_id}
