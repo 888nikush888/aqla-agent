@@ -145,6 +145,15 @@ def test_candle_confirmation_stop_cannot_become_a_plain_price_trigger(text):
     assert supported_action_failure(text, interpretation) == "conditional_stop_not_representable"
 
 
+def test_changed_candle_stop_update_is_also_unrepresentable_but_old_stop_does_not_change_close():
+    move = Interpretation(kind="trade_update", symbol="BTC", update_action="move_stop", stop_loss=90, source_refs=["synthetic:1"])
+    text = "BTC: Move stop. Stop Loss: H4 below 90."
+    assert supported_action_failure(text, move) == "conditional_stop_not_representable"
+    close = Interpretation(kind="trade_update", symbol="BTC", update_action="close", source_refs=["synthetic:1"])
+    text = "BTC: yesterday old Stop Loss: H4 below 90. Close the position now."
+    assert supported_action_failure(text, close) is None
+
+
 @pytest.mark.parametrize("text", [
     "BTC LONG. Enter $250K now, $200K bids at 95. SL 90.",
     "BTC LONG. Вход: по рынку 100; Усреднение: 95. Стоп 90.",

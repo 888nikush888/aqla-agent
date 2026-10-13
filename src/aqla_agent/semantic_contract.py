@@ -112,6 +112,8 @@ def entry_structure_failure(text):
 
 def management_structure_failure(text):
     actions = current_actions(text)
+    if STOP_CONDITION.search(text) and any(action in ("move_stop", "break_even") for action, _ in actions):
+        return "conditional_stop_not_representable"
     immediate_actions = current_actions(text, include_tp_footers=False)
     if immediate_actions:
         actions = immediate_actions
@@ -144,6 +146,8 @@ def supported_action_failure(text, interpretation):
     """Return a stable rejection code for explicitly unrepresentable instructions."""
     if interpretation.kind not in ("new_signal", "trade_update"):
         return None
+    if interpretation.update_action in ("move_stop", "break_even") and STOP_CONDITION.search(text):
+        return "conditional_stop_not_representable"
     if interpretation.kind == "new_signal":
         failure = entry_structure_failure(text)
         if failure:
