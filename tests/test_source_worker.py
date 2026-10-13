@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sqlite3
 import sys
@@ -224,7 +225,8 @@ async def test_calibrated_source_uses_decision_and_no_generative_model(worker_bo
     server.aqla_trading.ingest(source)
     profile = CalibrationProfile(validated=True, master_hash="master-v1", sources=["channel"],
         model_revision="inception/mercury-decide:free", dataset_hash="calibration", holdout_hash="holdout", holdout_cases=30, thresholds={"kind": 0.99},
-        source_evidence={"channel": {"calibration_groups": 3, "holdout_groups": 5, "accepted_accuracy": 1, "critical_errors": 0}},
+        source_evidence={"channel": {"calibration_groups": 3, "holdout_groups": 5, "accepted_accuracy": 1, "critical_errors": 0,
+            "kinds": {"report": {"calibration_correct_groups": 1, "holdout_correct_accepted_groups": 2}}}},
         source_permissions={"channel": ["report"]})
     profile_path = extension.master_path.parents[2] / "profile.json"
     profile_path.write_text(profile.model_dump_json())
@@ -263,10 +265,10 @@ async def test_missing_text_is_deterministic_and_uses_no_model(worker_boundary):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint_changed,price_failed,bound_trade", [(False, False, False), (True, False, False),
-                                                                    (False, True, False), (False, False, True)])
+@pytest.mark.parametrize("endpoint_changed,price_failed,bound_trade,route_switched", [(False, False, False, False), (True, False, False, False),
+                                                                    (False, True, False, False), (False, False, True, False), (False, False, False, True)])
 async def test_fallback_cost_requires_observed_endpoint_and_cannot_block_interpretation(
-        worker_boundary, monkeypatch, endpoint_changed, price_failed, bound_trade):
+        worker_boundary, monkeypatch, endpoint_changed, price_failed, bound_trade, route_switched):
     extension, server, _, fake, _, _ = worker_boundary
     source = SourceEvent(chat_id="channel", message_id=8, sent_at=now_ms(), text="Result report, no new orders.")
     server.aqla_trading.ingest(source)
@@ -286,8 +288,9 @@ async def test_fallback_cost_requires_observed_endpoint_and_cannot_block_interpr
         assert kwargs["extra_body"]["max_tokens"] == 8192
         assert kwargs["reasoning_config"] == {"enabled":True,"effort":"medium"}
         kwargs["route_info"].update(provider="custom", model="fixture")
-        capture[-1].record_auxiliary_usage("fixture", "source_interpretation", billing_provider="custom",
-            billing_base_url="https://other.example/v1" if endpoint_changed else runtime["base_url"])
+        capture[-1].record_auxiliary_usage("fixture", "source_interpretation", billing_provider="openrouter" if route_switched else "custom",
+            model="deepseek/fixture" if route_switched else "fixture",
+            billing_base_url="https://openrouter.ai/api/v1" if route_switched else "https://other.example/v1" if endpoint_changed else runtime["base_url"])
         interpretation = report(packet)
         if bound_trade:
             interpretation.bound_trade_id = "model-selected-binding"
@@ -311,9 +314,10 @@ async def test_fallback_cost_requires_observed_endpoint_and_cannot_block_interpr
     monkeypatch.setitem(sys.modules, "hermes_cli.config", SimpleNamespace(load_config_readonly=lambda: {}))
     measured = []
     if bound_trade:
-        with pytest.raises(DecisionFailure, match="fallback_unresolved"):
+        with pytest.raises(DecisionFailure, match="fallback_bound_trade_forbidden"):
             await SourceWorker(extension, {"mode": "hybrid"}).generative_fallback(packet, "synthetic_unclear", measured)
         assert measured and fake.actions == []
+        assert measured[0]["response_success"] and not measured[0]["interpretation_valid"]
         return
     result = await SourceWorker(extension, {"mode": "hybrid"}).generative_fallback(packet, "synthetic_unclear", measured)
     assert result.interpretation.kind == "report" and result.fallback
@@ -322,4 +326,163 @@ async def test_fallback_cost_requires_observed_endpoint_and_cannot_block_interpr
         assert measured[0]["cost_status"] == "unknown" and measured[0]["cost_usd"] is None
     else:
         assert measured[0]["cost_usd"] == 0.007 and measured[0]["pricing_version"] == "fixture-v1"
+    if route_switched:
+        assert prices[0]["provider"] == measured[0]["provider"] == "openrouter"
+        assert prices[0]["base_url"] == "https://openrouter.ai/api/v1"
+        assert measured[0]["model"] == "deepseek/fixture"
     assert runtime["api_key"] not in json.dumps(measured)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("oversized", ["original", "master", "questions"])
+async def test_full_outgoing_input_limit_blocks_both_models_without_truncating_evidence(worker_boundary, oversized):
+    extension, server, state, fake, _, _ = worker_boundary
+    text = "Original unchanged text. " * 500 if oversized == "original" else (
+        "BTC  " + " ".join(str(1000 + index) for index in range(45)) if oversized == "questions" else "Result report.")
+    if oversized == "master":
+        extension.master_path.write_text("Complete master instruction. " * 3500, encoding="utf-8")
+    source = SourceEvent(chat_id="channel", message_id=101, sent_at=now_ms(), text=text)
+    server.aqla_trading.ingest(source)
+    requests, fallbacks = [], []
+
+    def upstream(request):
+        requests.append(request)
+        raise AssertionError("Oversized input must never reach the decision API")
+
+    async def forbidden(*args):
+        fallbacks.append(args)
+        raise AssertionError("Oversized input must never reach generative fallback")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        worker = SourceWorker(extension, {"mode": "hybrid", "max_context_characters": 2000 if oversized == "original" else 60000}, fallback=forbidden,
+            adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="fixture/revision"))
+        await worker.tick()
+        await worker.tick()
+    job = next(iter(state.snapshot()["source_jobs"].values()))
+    assert job["status"] == "review" and job["failure_code"] == "source_context_limit"
+    assert not job["failure_detail"]["retryable"]
+    assert state.snapshot()["events"][source.event_id]["source"]["text"] == text
+    assert not requests and not fallbacks and not fake.actions
+
+
+def test_source_efficiency_excludes_cache_empty_status_and_counts_retries_as_one_revision():
+    from aqla_agent.usage_metrics import source_efficiency
+    def row(key, *, valid=False, fallback=False, cache=False, responses=True):
+        return {"origin": "source_python", "workflow": {"source_revision_hash": key, "interpretation_valid": valid, "cache_hit": cache},
+                "api_responses": [{"phase": "interpretation_fallback" if fallback else "decision", "response_success": valid,
+                                   "interpretation_valid": valid, "failed": not valid}] if responses else []}
+    measured = source_efficiency([row("a"), row("a", valid=True), row("b", valid=True, fallback=True),
+        row("cache", valid=True, cache=True), row("empty", valid=True, responses=False), row("status", responses=False)])
+    assert measured == {"fresh_source_revisions": 2, "valid_interpretations": 2, "fully_without_fallback": 1,
+        "without_fallback_share": 0.5, "fallback_used": 1, "api_response_failures": 1, "invalid_model_responses": 0}
+
+
+def test_received_invalid_model_response_is_not_a_provider_failure():
+    from aqla_agent.usage_metrics import source_efficiency
+    measured = source_efficiency([{"origin": "source_python", "workflow": {"source_revision_hash": "invalid", "interpretation_valid": False},
+        "api_responses": [{"phase": "interpretation_fallback", "response_success": True,
+                           "interpretation_valid": False, "failed": True}]}])
+    assert measured["api_response_failures"] == 0 and measured["invalid_model_responses"] == 1
+    assert measured["fresh_source_revisions"] == 1 and measured["valid_interpretations"] == 0
+
+
+def test_rejected_oversized_fresh_source_is_not_removed_from_the_efficiency_denominator():
+    from aqla_agent.usage_metrics import source_efficiency
+    measured = source_efficiency([{"origin": "source_python", "workflow": {"source_revision_hash": "oversized",
+        "source_work_type": "interpretation", "interpretation_valid": False}, "api_responses": []},
+        {"origin": "source_python", "workflow": {"source_revision_hash": "empty", "source_work_type": "empty"}, "api_responses": []}])
+    assert measured["fresh_source_revisions"] == 1 and measured["without_fallback_share"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_down", [False, True])
+@pytest.mark.parametrize("text,code", [
+    ("BTC entry half market 100 and half limit 95. Long. SL 90.", "entry_legs_not_representable"),
+    ("BTC close half position and move stop to entry.", "management_actions_not_representable"),
+    ("BTC close tomorrow.", "scheduled_management_not_representable"),
+    ("BTC long entry market 100. Stop after 1h candle close below 90.", "conditional_stop_not_representable"),
+])
+async def test_proven_unsupported_original_uses_mercury_first_then_review_without_generative_retry(worker_boundary, provider_down, text, code):
+    extension, server, state, fake, _, _ = worker_boundary
+    source = SourceEvent(chat_id="channel", message_id=102, sent_at=now_ms(), text=text)
+    server.aqla_trading.ingest(source)
+    requests, fallbacks = [], []
+
+    def upstream(request):
+        requests.append(request)
+        return httpx.Response(503) if provider_down else httpx.Response(200, json=response_for(json.loads(request.content)["questions"], kind="report"))
+
+    async def forbidden(*args):
+        fallbacks.append(args)
+        raise AssertionError("Generative model cannot override an original structural veto")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        worker = SourceWorker(extension, {"mode": "hybrid"}, fallback=forbidden,
+            adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="fixture/revision"))
+        await worker.tick()
+        await worker.tick()
+    saved = next(iter(state.snapshot()["source_jobs"].values()))
+    assert saved["status"] == "review" and saved["failure_code"] == code
+    assert saved["review_sources"] == {source.source_id: source.event_id}
+    assert saved["failure_detail"]["phase"] == "validate" and not saved["failure_detail"]["retryable"]
+    assert len(requests) == 1 and not fallbacks and not fake.actions and not state.snapshot()["operations"]
+
+
+@pytest.mark.asyncio
+async def test_recovered_model_provider_resumes_same_durable_source_job(worker_boundary, monkeypatch):
+    extension, server, state, fake, _, _ = worker_boundary
+    source = SourceEvent(chat_id="channel", message_id=103, sent_at=now_ms(), text="Result report.")
+    server.aqla_trading.ingest(source)
+    requests, attempts = [], []
+
+    def upstream(request):
+        requests.append(request)
+        return httpx.Response(503) if len(requests) == 1 else httpx.Response(200, json=response_for(json.loads(request.content)["questions"], kind="report"))
+
+    async def fallback(packet, code, usage):
+        attempts.append(code)
+        failed = len(attempts) == 1
+        usage.append({"phase": "interpretation_fallback", "response_success": not failed,
+                      "interpretation_valid": not failed, "failed": failed, "usage_available": False})
+        if failed:
+            raise httpx.ReadTimeout("SYNTHETIC_PROVIDER_SECRET")
+        return DecisionResult(interpretation=report(packet), model="fixture", fallback=True)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        worker = SourceWorker(extension, {"mode": "hybrid", "retry_backoff_seconds": 1}, fallback=fallback,
+            adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="fixture/revision"))
+        await worker.tick()
+        saved = next(iter(state.snapshot()["source_jobs"].values()))
+        assert saved["status"] == "retry_wait" and saved["failure_detail"]["code"] == "provider_timeout"
+        assert "SYNTHETIC_PROVIDER_SECRET" not in json.dumps(saved)
+        await worker.tick()
+        assert len(requests) == len(attempts) == 1
+        monkeypatch.setattr("aqla_agent.source_processing.now_ms", lambda: saved["next_retry_at"])
+        await worker.tick()
+    jobs = state.snapshot()["source_jobs"]
+    assert len(jobs) == 1 and jobs[saved["job_id"]]["status"] == "done"
+    assert jobs[saved["job_id"]]["attempt_count"] == 2
+    assert jobs[saved["job_id"]]["retry_deadline_at"] == saved["retry_deadline_at"]
+    assert state.snapshot()["events"][source.event_id]["status"] == "report"
+    assert len(requests) == len(attempts) == 2 and not fake.actions
+
+
+@pytest.mark.asyncio
+async def test_interrupted_model_work_is_never_measured_as_completed_interpretation(worker_boundary):
+    extension, server, state, fake, _, _ = worker_boundary
+    source = SourceEvent(chat_id="channel", message_id=104, sent_at=now_ms(), text="Result report.")
+    server.aqla_trading.ingest(source)
+
+    async def interrupted(packet, profile, **kwargs):
+        kwargs["usage"].append({"phase": "decision", "failed": False, "response_success": True})
+        raise asyncio.CancelledError
+
+    worker = SourceWorker(extension, {"mode": "hybrid"}, adapter=SimpleNamespace(interpret=interrupted))
+    with pytest.raises(asyncio.CancelledError):
+        await worker.tick()
+    with sqlite3.connect(extension.master_path.parents[2] / "cache/aqla-usage.sqlite3") as connection:
+        metrics = json.loads(connection.execute("SELECT metrics FROM runs").fetchone()[0])
+    assert metrics["interrupted"] is True and metrics["completed"] is False
+    assert not metrics["workflow"]["interpretation_valid"]
+    assert next(iter(state.snapshot()["source_jobs"].values()))["status"] == "prepared"
+    assert not fake.actions

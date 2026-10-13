@@ -10,6 +10,7 @@ from pathlib import Path
 from aqla_hyperliquid_mcp.models import AqlaError, Interpretation, digest
 
 from .decisions import (
+    QUESTION_CONTRACT_VERSION,
     VERSION,
     CalibrationProfile,
     DecisionFailure,
@@ -17,12 +18,15 @@ from .decisions import (
     OpenRouterDecisionAdapter,
     SourceProcessingConfig,
     candidates,
+    questions_for,
     validate_interpretation,
 )
+from .semantic_contract import unsupported_structure
+from .source_failure import SourceFailure, classify_failure
 from .usage_metrics import UsageRun
 
 FALLBACK_VERSION = "aqla-source-fallback-v4"
-PROCESSING_VERSION = "aqla-decision-first-v1"
+PROCESSING_VERSION = "aqla-decision-first-v2"
 
 
 def fallback_schema(packet):
@@ -77,7 +81,17 @@ class SourceWorker:
     async def bind(self):
         # The MCP can restart independently of the gateway, losing its in-memory owner.
         # Same-generation binding is idempotent and never recovers live sending parts.
-        await self.internal("source_configure", processing_mode=self.config.mode)
+        try:
+            profile = self.profile()
+        except DecisionFailure:
+            profile = CalibrationProfile()
+        await self.internal("source_configure", processing_mode=self.config.mode,
+            retry_max_attempts=getattr(self.config, "retry_max_attempts", 3),
+            retry_backoff_seconds=getattr(self.config, "retry_backoff_seconds", 15),
+            retry_max_age_seconds=getattr(self.config, "retry_max_age_seconds", 900),
+            decision_status={"provider": "openrouter", "model": self.config.model,
+                             "validated": profile.validated and profile.master_hash == self.extension.skill_hash(),
+                             "permissions": profile.source_permissions if profile.validated and profile.master_hash == self.extension.skill_hash() else {}})
         adapter = self.extension.binding[0] if self.extension.binding else None
         if self.config.mode == "hybrid" and adapter is not None and adapter is not self.bound_adapter:
             # A newly connected native transport may resume exhausted jobs; mere polling cannot.
@@ -85,16 +99,8 @@ class SourceWorker:
             self.bound_adapter = adapter
         self.bound_owner = self.extension.gateway_identity
 
-    async def generative_fallback(self, packet, failure_code, usage):
-        # The pinned native client owns provider resolution, quota fallback and wire reasoning.
-        from agent.aux_accounting import reset_accounting_context, set_accounting_context
-        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
-        from agent.usage_pricing import estimate_usage_cost, normalize_usage
-
-        extension = self.extension
-        model, runtime = await asyncio.to_thread(extension.gateway._resolve_session_agent_runtime,
-                                                 session_key=extension.session_key)
-        master = extension.master_path.read_text(encoding="utf-8")
+    def fallback_messages(self, packet, failure_code, spans):
+        master = packet.get("approved_source_guidance") or self.extension.master_path.read_text(encoding="utf-8")
         instruction = master + "\nInterpretation only. No tools, no account/configuration changes. "
         instruction += "Return exactly one JSON Interpretation for the live anchor. Preserve original quotations. "
         instruction += "If several current instructions cannot fit one update_action, return ambiguous/incomplete; never execute only one part or omit another instruction. "
@@ -108,15 +114,34 @@ class SourceWorker:
             instruction += "Resolve the listed open_questions, correct wrong fields and references, and return the complete Interpretation. "
             instruction += "An uncertain case stays incomplete/ambiguous; do not invent missing values."
         instruction += "\nSchema:\n" + json.dumps(fallback_schema(packet))
-        try:
-            spans = [span.model_dump(mode="json") for span in candidates(packet)]
-        except DecisionFailure:
-            spans = []
         source = {key: value for key, value in packet.items() if key != "approved_source_guidance"}
+        return [{"role": "system", "content": instruction},
+                {"role": "user", "content": json.dumps({"source": source, "candidates": [span.model_dump(mode="json") for span in spans],
+                                                          "decision_failure": failure_code}, ensure_ascii=False)}]
+
+    def check_input(self, body):
+        size = len(json.dumps(body, ensure_ascii=False))
+        if size > self.config.max_context_characters:
+            error = DecisionFailure("source_context_limit")
+            error.checked_input_characters = size
+            raise error
+        return size
+
+    async def generative_fallback(self, packet, failure_code, usage, *, spans=None):
+        # The pinned native client owns provider resolution, quota fallback and wire reasoning.
+        from agent.aux_accounting import reset_accounting_context, set_accounting_context
+        from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+
+        extension = self.extension
+        model, runtime = await asyncio.to_thread(extension.gateway._resolve_session_agent_runtime,
+                                                 session_key=extension.session_key)
+        spans = candidates(packet) if spans is None else spans
         effort = self.config.fallback_reasoning_effort
-        messages = [{"role": "system", "content": instruction},
-                    {"role": "user", "content": json.dumps({"source": source, "candidates": spans,
-                                                             "decision_failure": failure_code}, ensure_ascii=False)}]
+        messages = self.fallback_messages(packet, failure_code, spans)
+        self.check_input({"model": model, "messages": messages, "tools": None,
+                          "max_tokens": self.config.fallback_max_tokens,
+                          "reasoning": {"enabled": True, "effort": effort}})
         started = time.monotonic()
         route = {}
         captured = NativeUsageCapture()
@@ -139,25 +164,34 @@ class SourceWorker:
         try:
             response = await asyncio.to_thread(invoke)
             raw = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
-            measured = normalize_usage(raw, provider=route.get("provider", runtime.get("provider"))) if raw else None
             cost = {"cost_status": "unknown", "cost_usd": None}
             billing = captured.rows[0] if len(captured.rows) == 1 else {}
             endpoint = billing.get("billing_base_url")
-            confirmed_route = (billing.get("billing_provider") == runtime.get("provider") and endpoint
-                               and endpoint.rstrip("/") == (runtime.get("base_url") or "").rstrip("/"))
+            provider = billing.get("billing_provider")
+            confirmed_route = bool(endpoint and (provider == runtime.get("provider")
+                and endpoint.rstrip("/") == (runtime.get("base_url") or "").rstrip("/")
+                or provider == "openrouter" and endpoint.rstrip("/") == "https://openrouter.ai/api/v1"))
+            actual_provider = provider if confirmed_route else route.get("provider", runtime.get("provider"))
+            actual_model = billing.get("model") if confirmed_route and billing.get("model") else route.get("model", model)
+            try:
+                measured = normalize_usage(raw, provider=actual_provider) if raw else None
+            except (ValueError, TypeError, AttributeError):
+                measured = None
             if measured is not None and confirmed_route:
                 try:
-                    priced = await asyncio.to_thread(estimate_usage_cost, route.get("model", model), measured,
-                        provider=runtime.get("provider"), base_url=runtime.get("base_url"), api_key=runtime.get("api_key"))
+                    priced = await asyncio.to_thread(estimate_usage_cost, actual_model, measured,
+                        provider=actual_provider, base_url=endpoint, api_key=(os.environ.get("OPENROUTER_API_KEY")
+                            if actual_provider == "openrouter" else runtime.get("api_key")))
                     cost = {"cost_status": priced.status,
                             "cost_usd": float(priced.amount_usd) if priced.amount_usd is not None else None,
                             "cost_source": priced.source, "pricing_version": priced.pricing_version}
                 except Exception:
                     # Measurement must never invalidate a successful interpretation.
                     pass
-            usage.append({"phase": "interpretation_fallback", "provider": route.get("provider", runtime.get("provider")),
-                          "model": route.get("model", model), "duration_seconds": time.monotonic() - started,
-                          "failed": False, "usage_available": measured is not None,
+            usage.append({"phase": "interpretation_fallback", "provider": actual_provider,
+                          "model": actual_model, "duration_seconds": time.monotonic() - started,
+                          "failed": False, "response_success": True, "interpretation_valid": False,
+                          "usage_available": measured is not None,
                           **cost,
                           **({key: getattr(measured, key) for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")} if measured else {})})
             text = extract_content_or_reasoning(response, max_reasoning_chars=0).strip()
@@ -167,13 +201,15 @@ class SourceWorker:
             if interpretation.bound_trade_id is not None:
                 raise DecisionFailure("fallback_bound_trade_forbidden")
             validate_interpretation(packet, interpretation)
-            return DecisionResult(interpretation=interpretation, model=route.get("model", model), fallback=True, usage=usage.copy())
+            usage[-1]["interpretation_valid"] = True
+            return DecisionResult(interpretation=interpretation, model=actual_model, fallback=True, usage=usage.copy())
         except Exception as error:
             if not usage or usage[-1].get("phase") != "interpretation_fallback":
                 usage.append({"phase": "interpretation_fallback", "model": model, "failed": True,
+                              "response_success": False, "interpretation_valid": False,
                               "cost_status": "unknown", "cost_usd": None,
                               "usage_available": False, "duration_seconds": time.monotonic() - started})
-            raise DecisionFailure("fallback_unresolved") from error
+            raise SourceFailure(classify_failure(error, "interpretation_fallback")) from error
 
     async def tick(self):
         await self.bind()
@@ -189,7 +225,8 @@ class SourceWorker:
                 revision = await self.adapter.identity()
             except DecisionFailure:
                 pass
-        policy_version = digest([VERSION, PROCESSING_VERSION, FALLBACK_VERSION, self.config.model, revision, profile.model_dump(mode="json"), master_hash])
+        policy_version = digest([VERSION, QUESTION_CONTRACT_VERSION, PROCESSING_VERSION, FALLBACK_VERSION,
+                                 self.config.model_dump(mode="json"), revision, profile.model_dump(mode="json"), master_hash])
         selected = await self.internal("source_prepare", processing_version=policy_version)
         job = selected.get("job")
         if job is None:
@@ -198,7 +235,9 @@ class SourceWorker:
         measured.workflow.update(source_job_id=job["job_id"], source_revision_hash=digest(job["event_id"]),
                                  processing_mode=self.config.mode, processing_version=PROCESSING_VERSION,
                                  calibration_validated=profile.validated, cache_hit=False)
-        result, failure = None, None
+        result, failure, packet, spans = None, None, None, None
+        interrupted = False
+        phase = "prepare"
         try:
             packet = selected.get("packet")
             if packet is None:
@@ -218,6 +257,8 @@ class SourceWorker:
                 if packet is None:
                     raise DecisionFailure("source_packet_limit")
             packet["approved_source_guidance"] = self.extension.master_path.read_text(encoding="utf-8")
+            selected_anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+            measured.workflow["source_work_type"] = "cached" if job.get("result") is not None else "interpretation" if selected_anchor["text"].strip() else "empty"
             if job.get("result") is not None:
                 result = DecisionResult.model_validate(job["result"])
                 if job.get("policy_version") != policy_version or result.question_version != VERSION or result.collection_only:
@@ -239,15 +280,38 @@ class SourceWorker:
                             kind="incomplete", source_refs=[anchor["source_id"]], reason="Originaltext fehlt.",
                             reason_codes=["missing_source_text"]))
                     else:
-                        result = await self.interpret(packet, profile, master_hash, revision, usage)
+                        # Bound the COMPLETE outgoing bodies, including master,
+                        # questions/schema and prepared candidates, before either API.
+                        phase = "decision"
+                        self.check_input(packet)
+                        spans = candidates(packet)
+                        sizes = [self.check_input({"model": self.config.model, "state": packet,
+                                                   "questions": questions_for(packet, spans)}),
+                                 self.check_input(self.fallback_messages(packet, "decision_review_required", spans))]
+                        measured.workflow["checked_input_characters"] = max(sizes)
+                        result = await self.interpret(packet, profile, master_hash, revision, usage, spans=spans)
+                        veto = unsupported_structure(packet)
+                        if veto:
+                            raise SourceFailure({"phase": "validate", "code": veto, "exception_type": "DecisionFailure", "retryable": False})
                 except (AqlaError, ValueError) as error:
                     code = str(error) if isinstance(error, DecisionFailure) else "decision_invalid"
+                    if code in ("source_context_limit", "candidate_limit"):
+                        raise
+                    veto = unsupported_structure(packet)
+                    if veto:
+                        # A common original-only schema veto cannot be repaired
+                        # by another provider. Preserve a durable review, not a
+                        # generative attempt to discard part of the instruction.
+                        raise SourceFailure({"phase": "validate", "code": veto, "exception_type": "DecisionFailure", "retryable": False}) from None
                     if self.config.mode == "shadow":
                         raise DecisionFailure(code) from error
-                    result = await self.fallback(packet, code, usage)
+                    phase = "interpretation_fallback"
+                    self.check_input(self.fallback_messages(packet, code, spans or []))
+                    result = await self.fallback(packet, code, usage, spans=spans) if self.fallback == self.generative_fallback else await self.fallback(packet, code, usage)
                     measured.workflow["fallback_reason"] = code
                 if self.extension.skill_hash() != master_hash:
                     raise DecisionFailure("master_changed")
+                phase = "validate"
                 await self.internal("source_record", job_id=job["job_id"], decision_result=result.model_dump(mode="json"))
             measured.workflow.update(fallback=result.fallback, decision_success=not result.fallback,
                                      decision_attempted=any(item.get("phase") == "decision" for item in measured.api),
@@ -260,23 +324,30 @@ class SourceWorker:
                     current_profile = CalibrationProfile()
                 if self.extension.skill_hash() != master_hash or current_profile != profile:
                     raise DecisionFailure("source_policy_changed")
+                phase = "apply"
                 applied = await self.internal("source_apply", job_id=job["job_id"])
                 measured.workflow["source_job_status"] = applied.get("status")
             else:
                 measured.workflow["source_job_status"] = "shadow"
         except asyncio.CancelledError:
+            interrupted = True
             raise
         except Exception as error:
-            failure = str(error) if isinstance(error, DecisionFailure) else "source_processing_failed"
-            await self.internal("source_fail", job_id=job["job_id"], failure_code=failure)
+            if isinstance(getattr(error, "checked_input_characters", None), int):
+                measured.workflow["checked_input_characters"] = error.checked_input_characters
+            detail = error.detail if isinstance(error, SourceFailure) else classify_failure(error, phase)
+            failure = detail["code"]
+            await self.internal("source_fail", job_id=job["job_id"], failure_code=failure, failure_detail=detail)
         finally:
             measured.workflow["decision_attempted"] = any(item.get("phase") == "decision" for item in measured.api)
             measured.workflow["decision_reviewed"] = bool(packet.get("decision_review")) if packet is not None else False
             measured.workflow["source_job_failed"] = failure is not None
+            measured.workflow["interpretation_valid"] = result is not None and phase in ("validate", "apply") and failure is None and not interrupted
+            measured.workflow["failure_detail"] = detail if failure is not None else None
             await asyncio.to_thread(measured.persist, self.extension.master_path.parents[2],
-                                   {"failed": failure is not None, "completed": failure is None})
+                                   {"failed": failure is not None, "interrupted": interrupted, "completed": failure is None and not interrupted})
 
-    async def interpret(self, packet, profile, master_hash, revision, usage):
+    async def interpret(self, packet, profile, master_hash, revision, usage, *, spans=None):
         if len(json.dumps(packet, ensure_ascii=False)) > self.config.max_context_characters:
             raise DecisionFailure("source_context_limit")
         source = next(row["chat_id"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
@@ -288,8 +359,9 @@ class SourceWorker:
         model_profile = profile if permitted or self.config.mode == "shadow" else CalibrationProfile(
             model=self.config.model, model_revision=revision)
         try:
+            extra = {"spans": spans, "max_context_characters": self.config.max_context_characters} if isinstance(self.adapter, OpenRouterDecisionAdapter) else {}
             result = await self.adapter.interpret(packet, model_profile,
-                collect=self.config.mode == "shadow" or not permitted, usage=usage, observation=observation)
+                collect=self.config.mode == "shadow" or not permitted, usage=usage, observation=observation, **extra)
             if self.config.mode == "hybrid":
                 if not permitted:
                     raise DecisionFailure("source_not_calibrated")

@@ -139,7 +139,7 @@ async def test_mcp_incarnation_change_resumes_proved_unsubmitted_job(native_proc
     job = processor.prepare("same-gateway", "p")["job"]
     processor.record("same-gateway", job["job_id"], classification(source))
     state.update_metadata(("source_jobs",), lambda data: data["source_jobs"][job["job_id"]].update(status="applying"))
-    assert processor.prepare("same-gateway", "p")["job"] is None
+    assert processor.prepare("same-gateway", "p")["job"]["status"] == "interpreted"
     restarted = SourceProcessor(state, server.aqla_trading)
     restarted.configure("hybrid", "same-gateway")
     resumed = restarted.prepare("same-gateway", "p")["job"]
@@ -494,3 +494,217 @@ async def test_current_policy_is_required_for_cached_unsubmitted_results(native_
     with pytest.raises(Exception, match="policy changed"):
         await rpc(server, "source_apply", job_id=job["job_id"])
     assert not fake.actions and not state.snapshot()["plans"]
+
+
+@pytest.mark.asyncio
+async def test_paused_entry_rejection_completes_without_retry_or_failure_notification(native_processor, signal):
+    server, state, fake = native_processor
+    source, value = signal
+    state.update(lambda data: data.update(paused=True))
+    job = (await rpc(server, "source_prepare", processing_version="paused"))["job"]
+    await rpc(server, "source_record", job_id=job["job_id"], decision_result=DecisionResult(
+        model="fixture", interpretation=value, verified=True).model_dump(mode="json"))
+    applied = await rpc(server, "source_apply", job_id=job["job_id"])
+    assert applied["status"] == "done"
+    assert state.snapshot()["events"][source.event_id]["status"] == "rejected"
+    assert not state.snapshot()["source_jobs"][job["job_id"]]["failure_history"]
+    assert "source-job:" + job["job_id"] not in state.snapshot()["notifications"]
+    assert (await rpc(server, "source_prepare", processing_version="paused"))["job"] is None
+    assert not fake.actions and not state.snapshot()["operations"]
+
+
+@pytest.mark.asyncio
+async def test_unbound_update_finishes_as_durable_review_without_loop(native_processor):
+    server, state, fake = native_processor
+    source = SourceEvent(chat_id="channel", message_id=55, sent_at=now_ms(), text="BTC close now.")
+    server.aqla_trading.ingest(source)
+    value = Interpretation(kind="trade_update", symbol="BTC", update_action="close", source_refs=[source.source_id],
+        evidence=[Evidence(field=field, source_id=source.source_id, quote=quote) for field, quote in (
+            ("classification", source.text), ("symbol", "BTC"), ("update_action", "close now"))])
+    job = (await rpc(server, "source_prepare", processing_version="unbound"))["job"]
+    await rpc(server, "source_record", job_id=job["job_id"], decision_result=DecisionResult(
+        model="fixture", interpretation=value, verified=True).model_dump(mode="json"))
+    applied = await rpc(server, "source_apply", job_id=job["job_id"])
+    assert applied["status"] == "review" and applied["outcome"] == "update_binding_review"
+    assert (await rpc(server, "source_prepare", processing_version="unbound"))["job"] is None
+    assert state.snapshot()["source_jobs"][job["job_id"]]["failure_detail"]["phase"] == "apply"
+    assert not fake.actions and not state.snapshot()["operations"]
+
+
+@pytest.mark.asyncio
+async def test_old_policy_terminal_applying_reconciles_and_keeps_failure_history(native_processor):
+    server, state, fake = native_processor
+    processor = SourceProcessor(state, server.aqla_trading)
+    processor.configure("hybrid", "worker")
+    source = SourceEvent(chat_id="channel", message_id=57, sent_at=now_ms(), text="Result report.")
+    server.aqla_trading.ingest(source)
+    job = processor.prepare("worker", "old")["job"]
+    processor.record("worker", job["job_id"], classification(source))
+    state.update_metadata(("source_jobs",), lambda data: data["source_jobs"][job["job_id"]].update(status="applying"))
+    processor.fail("worker", job["job_id"], "prior_failure")
+    server.aqla_trading.ingest(source.model_copy(update={"edited_at": source.sent_at + 1, "text": "Changed report."}))
+    assert state.snapshot()["events"][source.event_id]["status"] == "superseded"
+    processor.prepare("worker", "new")
+    saved = state.snapshot()["source_jobs"][job["job_id"]]
+    assert saved["status"] == "done" and saved["outcome"] == "superseded"
+    assert saved["failure_history"][0]["code"] == "prior_failure"
+    assert not fake.actions
+
+
+@pytest.mark.asyncio
+async def test_unknown_financial_send_is_engine_owned_and_never_resubmitted(native_processor, signal):
+    server, state, fake = native_processor
+    source, value = signal
+    processor = SourceProcessor(state, server.aqla_trading)
+    processor.configure("hybrid", "worker")
+    job = processor.prepare("worker", "p")["job"]
+    processor.record("worker", job["job_id"], DecisionResult(model="fixture", interpretation=value, verified=True))
+    fake.lose_entry_response = True
+    await processor.apply("worker", job["job_id"])
+    operations = state.snapshot()["operations"]
+    assert any(row["phase"] == "unknown" for row in operations.values())
+    state.update_metadata(("source_jobs",), lambda data: data["source_jobs"][job["job_id"]].update(status="applying"))
+    counts = len(fake.actions)
+    assert processor.prepare("worker", "p")["job"] is None
+    assert state.snapshot()["source_jobs"][job["job_id"]]["status"] == "recovering"
+    restarted = SourceProcessor(state, server.aqla_trading)
+    restarted.configure("hybrid", "worker")
+    assert restarted.prepare("worker", "p")["job"] is None
+    assert state.snapshot()["operations"] == operations and len(fake.actions) == counts
+    assert state.snapshot()["events"][source.event_id]["status"] in ("executed", "needs_reconciliation")
+
+
+@pytest.mark.asyncio
+async def test_active_application_is_never_reconciled_by_polling(native_processor):
+    server, state, fake = native_processor
+    processor = SourceProcessor(state, server.aqla_trading)
+    processor.configure("hybrid", "worker")
+    source = SourceEvent(chat_id="channel", message_id=58, sent_at=now_ms(), text="Result report.")
+    server.aqla_trading.ingest(source)
+    job = processor.prepare("worker", "p")["job"]
+    processor.record("worker", job["job_id"], classification(source))
+    state.update_metadata(("source_jobs",), lambda data: data["source_jobs"][job["job_id"]].update(status="applying"))
+    processor.active_jobs.add(job["job_id"])
+    assert processor.prepare("worker", "p")["job"] is None
+    assert state.snapshot()["source_jobs"][job["job_id"]]["status"] == "applying"
+    assert not fake.actions
+
+
+@pytest.mark.asyncio
+async def test_temporary_provider_retry_is_persisted_bounded_and_original_deadline_owned(native_processor, monkeypatch):
+    server, state, fake = native_processor
+    processor = SourceProcessor(state, server.aqla_trading)
+    processor.configure("hybrid", "worker", retry_max_attempts=2, retry_backoff_seconds=1, retry_max_age_seconds=30)
+    source = SourceEvent(chat_id="channel", message_id=59, sent_at=now_ms(), text="Result report.")
+    server.aqla_trading.ingest(source)
+    job = processor.prepare("worker", "p")["job"]
+    detail = {"phase": "interpretation_fallback", "code": "provider_timeout", "exception_type": "TimeoutError", "retryable": True}
+    processor.fail("worker", job["job_id"], "provider_timeout", detail)
+    saved = state.snapshot()["source_jobs"][job["job_id"]]
+    assert saved["status"] == "retry_wait" and not state.snapshot()["notifications"]
+    assert processor.prepare("worker", "p")["job"] is None
+    monkeypatch.setattr("aqla_agent.source_processing.now_ms", lambda: saved["next_retry_at"])
+    restarted = SourceProcessor(state, server.aqla_trading)
+    restarted.configure("hybrid", "worker", retry_max_attempts=2, retry_backoff_seconds=1, retry_max_age_seconds=30)
+    resumed = restarted.prepare("worker", "p")["job"]
+    assert resumed["job_id"] == job["job_id"] and resumed["attempt_count"] == 2
+    assert resumed["retry_deadline_at"] == saved["retry_deadline_at"]
+    restarted.fail("worker", job["job_id"], "provider_timeout", detail)
+    assert state.snapshot()["source_jobs"][job["job_id"]]["status"] == "review"
+    assert restarted.prepare("worker", "p")["job"] is None
+    assert not fake.actions
+
+
+@pytest.mark.asyncio
+async def test_semantic_failure_is_not_a_provider_retry_and_diagnostics_remove_payloads(native_processor):
+    server, state, fake = native_processor
+    source = SourceEvent(chat_id="channel", message_id=60, sent_at=now_ms(), text="Result report.")
+    server.aqla_trading.ingest(source)
+    job = (await rpc(server, "source_prepare", processing_version="p"))["job"]
+    await rpc(server, "source_fail", job_id=job["job_id"], failure_code="management_actions_not_representable",
+        failure_detail={"phase": "validate", "retryable": True, "exception_type": "DecisionFailure",
+                        "field_paths": ["symbol", "api_key.secret"], "response": "SYNTHETIC_SECRET"})
+    saved = state.snapshot()["source_jobs"][job["job_id"]]
+    assert saved["status"] == "review" and not saved["failure_detail"]["retryable"]
+    assert saved["failure_detail"]["field_paths"] == ["symbol"]
+    assert "SYNTHETIC_SECRET" not in json.dumps(saved)
+    assert (await rpc(server, "source_prepare", processing_version="p"))["job"] is None
+    assert not fake.actions
+
+
+@pytest.mark.asyncio
+async def test_identical_later_edit_reuses_nonactionable_interpretation_but_true_change_invalidates(native_processor):
+    server, state, fake = native_processor
+    source = SourceEvent(chat_id="channel", message_id=61, sent_at=now_ms(), text="Result report.")
+    server.aqla_trading.ingest(source)
+    original = (await rpc(server, "source_prepare", processing_version="p"))["job"]
+    await rpc(server, "source_record", job_id=original["job_id"], decision_result=classification(source).model_dump(mode="json"))
+    await rpc(server, "source_apply", job_id=original["job_id"])
+    edited = source.model_copy(update={"edited_at": source.sent_at + 1})
+    server.aqla_trading.ingest(edited)
+    reused = (await rpc(server, "source_prepare", processing_version="p"))["job"]
+    assert reused["job_id"] != original["job_id"] and reused["cache_reused_from"] == original["job_id"]
+    assert reused["intent_revisions"] == {source.source_id: edited.event_id}
+    await rpc(server, "source_apply", job_id=reused["job_id"])
+    server.aqla_trading.ingest(edited.model_copy(update={"edited_at": source.sent_at + 2, "text": "Different result report."}))
+    changed = (await rpc(server, "source_prepare", processing_version="p"))["job"]
+    assert changed["result"] is None and changed["cache_reused_from"] is None
+    assert not fake.actions
+
+
+@pytest.mark.asyncio
+async def test_identical_unsubmitted_signal_edit_rebinds_evidence_and_executes_once(native_processor, signal):
+    server, state, fake = native_processor
+    source, interpretation = signal
+    original = (await rpc(server, "source_prepare", processing_version="p"))["job"]
+    await rpc(server, "source_record", job_id=original["job_id"], decision_result=DecisionResult(
+        model="fixture", interpretation=interpretation, verified=True).model_dump(mode="json"))
+    edited = source.model_copy(update={"edited_at": source.sent_at + 1})
+    server.aqla_trading.ingest(edited)
+    reused = (await rpc(server, "source_prepare", processing_version="p"))["job"]
+    assert reused["cache_reused_from"] == original["job_id"]
+    assert reused["intent_revisions"] == {source.source_id: edited.event_id}
+    assert reused["result"]["interpretation"]["evidence"] == interpretation.model_dump(mode="json")["evidence"]
+    await rpc(server, "source_apply", job_id=reused["job_id"])
+    count = len(fake.actions)
+    assert count > 0 and fake.position > 0
+    with pytest.raises(Exception, match="changed"):
+        await rpc(server, "source_apply", job_id=original["job_id"])
+    assert len(fake.actions) == count
+    server.aqla_trading.ingest(edited.model_copy(update={"edited_at": source.sent_at + 2}))
+    later = (await rpc(server, "source_prepare", processing_version="p"))["job"]
+    if later is not None:
+        assert later["result"] is None and later["cache_reused_from"] is None
+    assert len(fake.actions) == count
+
+
+@pytest.mark.asyncio
+async def test_configuration_change_invalidates_equivalent_edit_cache(native_processor):
+    server, state, fake = native_processor
+    source = SourceEvent(chat_id="channel", message_id=62, sent_at=now_ms(), text="Result report.")
+    server.aqla_trading.ingest(source)
+    original = (await rpc(server, "source_prepare", processing_version="p"))["job"]
+    await rpc(server, "source_record", job_id=original["job_id"], decision_result=classification(source).model_dump(mode="json"))
+    await rpc(server, "source_apply", job_id=original["job_id"])
+    state.update(lambda data: data.update(configuration_revision=data["configuration_revision"] + 1))
+    server.aqla_trading.ingest(source.model_copy(update={"edited_at": source.sent_at + 1}))
+    changed = (await rpc(server, "source_prepare", processing_version="p"))["job"]
+    assert changed["result"] is None and changed["cache_reused_from"] is None
+    assert not fake.actions
+
+
+@pytest.mark.asyncio
+async def test_provider_retry_expiry_never_refreshes_original_deadline(native_processor, monkeypatch):
+    server, state, fake = native_processor
+    processor = SourceProcessor(state, server.aqla_trading)
+    processor.configure("hybrid", "worker", retry_max_age_seconds=30)
+    source = SourceEvent(chat_id="channel", message_id=63, sent_at=now_ms(), text="Result report.")
+    server.aqla_trading.ingest(source)
+    job = processor.prepare("worker", "p")["job"]
+    processor.fail("worker", job["job_id"], "provider_timeout", {"phase": "decision", "retryable": True, "exception_type": "ReadTimeout"})
+    monkeypatch.setattr("aqla_agent.source_processing.now_ms", lambda: job["retry_deadline_at"])
+    assert processor.prepare("worker", "p")["job"] is None
+    saved = state.snapshot()["source_jobs"][job["job_id"]]
+    assert saved["status"] == "review" and saved["outcome"] == "provider_retry_exhausted"
+    assert saved["retry_deadline_at"] == job["retry_deadline_at"] and saved["attempt_count"] == 1
+    assert not fake.actions and not state.snapshot()["operations"]

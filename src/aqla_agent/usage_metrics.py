@@ -12,6 +12,34 @@ RUN = ContextVar("aqla_usage_run", default=None)
 LOG = logging.getLogger(__name__)
 
 
+def source_efficiency(rows):
+    """Group fresh original revisions; retries/cache/status cannot inflate shares."""
+    grouped, api_failures, invalid_responses = {}, 0, 0
+    for row in rows:
+        workflow, responses = row.get("workflow", {}), row.get("api_responses", [])
+        if row.get("origin") != "source_python" or workflow.get("cache_hit") or workflow.get("source_work_type") in ("cached", "empty", "status"):
+            continue
+        calls = [call for call in responses if call.get("phase") in ("decision", "decision_verification", "interpretation_fallback")]
+        if not calls and workflow.get("source_work_type") != "interpretation":
+            continue
+        key = workflow.get("source_revision_hash") or workflow.get("source_job_id")
+        if not key:
+            continue
+        selected = grouped.setdefault(key, {"valid": False, "fallback": False})
+        selected["valid"] |= workflow.get("interpretation_valid") is True
+        selected["fallback"] |= any(call.get("phase") == "interpretation_fallback" for call in calls)
+        api_failures += sum(call.get("response_success") is False or "response_success" not in call and call.get("failed") is True for call in calls)
+        invalid_responses += sum(call.get("response_success") is True and call.get("interpretation_valid") is False for call in calls)
+    valid = sum(item["valid"] for item in grouped.values())
+    decision_only = sum(item["valid"] and not item["fallback"] for item in grouped.values())
+    count = len(grouped)
+    return {"fresh_source_revisions": count, "valid_interpretations": valid,
+            "fully_without_fallback": decision_only,
+            "without_fallback_share": decision_only / count if count else None,
+            "fallback_used": sum(item["fallback"] for item in grouped.values()),
+            "api_response_failures": api_failures, "invalid_model_responses": invalid_responses}
+
+
 @dataclass
 class UsageRun:
     origin: str
