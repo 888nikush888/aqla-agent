@@ -14,7 +14,8 @@ from pydantic import Field, model_validator
 from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, Model, digest
 from aqla_hyperliquid_mcp.rules import quoted_leverage_numbers, verify_evidence
 
-VERSION = "aqla-decisions-v9"
+VERSION = "aqla-decisions-v10"
+QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v2"
 # The original-context wire shape is unchanged. Keeping its independent schema
 # version permits exact-state, exact-question observations to be reused for
 # development while decision/validation policy has its own version and cache key.
@@ -37,7 +38,7 @@ def calibration_family(question, prediction=None):
 
 
 NUMBERS = re.compile(r"(?<![\w.])(?:[xх×]\s*)?\d+(?:[.,]\d+)*(?:[\u00a0\u202f]\d{3}(?:[.,]\d+)?)?(?:[xх×])?(?!\w|[.,]\d)", re.I)
-SYMBOLS = re.compile(r"(?<!\w)\$?[A-Za-z][A-Za-z0-9]{0,19}(?:[/:-][A-Za-z0-9]{2,12})?(?!\w)")
+SYMBOLS = re.compile(r"(?<!\w)\$?(?:[A-Za-z][A-Za-z0-9]{0,19}|\d+[A-Za-z][A-Za-z0-9]{0,18})(?:[/:-][A-Za-z0-9]{2,12})?(?!\w)")
 EXCHANGES = re.compile(r"(?<!\w)(?:hyperliquid|aster|lighter|binance|bybit|mexc|bingx|bitget|bitunix|okx)(?!\w)", re.I)
 ENTRY_FORM_MARKERS = re.compile(
     r"(?<!\w)(?:market|markt|рынок|маркет(?:у|ом)?|limit|лимит(?:ный|ная|ка)?)\b"
@@ -62,6 +63,30 @@ def position_fractions(text):
         else:
             value = Decimal(25 if match.group("quarter") else 50)
         yield match, value
+
+
+def redundant_numeric_mention(packet, prior, span, role):
+    """Only explicit, repeated labels for one live field may share its value."""
+    if (span.source_id != packet["anchor_source_id"] or prior.source_id != span.source_id
+            or prior.end > span.start or prior.value != span.value
+            or ("%" in prior.quote) != ("%" in span.quote) or prior.notation != span.notation):
+        return False
+    original = next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    if re.search(r"(?:#|\b)[A-Z][A-Z0-9]{1,15}\s+(?:LONG|SHORT)\b", original[prior.end:span.start]):
+        return False
+    if role.startswith("target_"):
+        ordinal = int(role.split("_")[1])
+        words = {1: "first|erste(?:r|s)?|перв(?:ая|ый)", 2: "second|zweite(?:r|s)?|втор(?:ая|ой)",
+                 3: "third|dritte(?:r|s)?|трет(?:ья|ий)"}.get(ordinal, r"(?!)")
+        label = re.compile(r"(?:\b(?:tp|target|take[-\s]?profit|тейк|цел[ьи]|ziel)\s*" + str(ordinal)
+            + r"\b|\b(?:" + words + r")\s+(?:target|take[-\s]?profit|тейк|цел[ьи]|ziel))\s*[:=@-]?\s*$", re.I)
+    elif role == "stop_loss":
+        label = re.compile(r"\b(?:sl|stop(?:[-\s]+loss)?|стоп)\s*[:=@-]?\s*$", re.I)
+    elif role == "leverage":
+        label = re.compile(r"\b(?:leverage|hebel|плечо)\s*[:=@-]?\s*$", re.I)
+    else:
+        return False
+    return all(label.search(original[max(0, occurrence.start - 50):occurrence.start]) for occurrence in (prior, span))
 
 
 class DecisionFailure(AqlaError):
@@ -107,6 +132,7 @@ class CalibrationProfile(Model):
     disabled_questions: list[str] = Field(default_factory=list)
     source_evidence: dict[str, dict] = Field(default_factory=dict)
     source_permissions: dict[str, list[str]] = Field(default_factory=dict)
+    activation_diagnostics: dict = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def checked(self):
@@ -124,6 +150,11 @@ class CalibrationProfile(Model):
                         or proof.get("accepted_accuracy", 0) < 0.95 or proof.get("critical_errors", 1) != 0
                         or not permitted or not set(permitted) <= set(KINDS)):
                     raise ValueError("Every activated source needs independent held-out evidence and tested kinds")
+                for kind in permitted:
+                    kind_proof = proof.get("kinds", {}).get(kind, {})
+                    if (kind_proof.get("calibration_correct_groups", 0) < 1
+                            or kind_proof.get("holdout_correct_accepted_groups", 0) < 2):
+                        raise ValueError("Every activated source kind needs distinct correctly admitted held-out groups")
         return self
 
     def permits(self, source, master_hash=None, *, model=DEFAULT_DECISION_MODEL, model_revision=None):
@@ -153,6 +184,9 @@ class SourceProcessingConfig(Model):
     timeout_seconds: float = Field(default=5, gt=0, le=30)
     max_context_characters: int = Field(default=60000, ge=2000, le=100000)
     retry_seconds: int = Field(default=300, ge=30, le=3600)
+    retry_max_attempts: int = Field(default=3, ge=1, le=5, strict=True)
+    retry_backoff_seconds: int = Field(default=15, ge=1, le=300, strict=True)
+    retry_max_age_seconds: int = Field(default=900, ge=30, le=3600, strict=True)
     fallback_max_tokens: int = Field(default=8192, ge=2048, le=16384)
     fallback_reasoning_effort: Literal["low", "medium", "high"] = "medium"
 
@@ -224,8 +258,15 @@ def candidates(packet):
                 add(start, end, "number", str(value), "ordinal" if ordinal else "value")
         for match in SYMBOLS.finditer(text):
             raw = match.group()
+            bare = raw.lstrip("$")
+            if bare[0].isdigit() and re.fullmatch(r"\d+(?:[smhdwxх×]|[kmb])", bare, re.I):
+                # Durations, timeframe ordinals, multipliers and currency-size
+                # shorthand are numeric notation, not digit-prefixed assets.
+                continue
             # Broad lexical candidates; these patterns never assign a trading role.
-            if raw.startswith("$") or raw.isupper() or "/" in raw or ":" in raw or raw.lower() in ("btc", "eth", "sol", "gold", "xau"):
+            if (raw.startswith("$") or raw.isupper() or "/" in raw or ":" in raw
+                    or text[max(0, match.start() - 1):match.start()] == "#"
+                    or raw.lower() in ("btc", "eth", "sol", "gold", "xau")):
                 value = raw.lstrip("$").split("/")[0]
                 add(*match.span(), "symbol", value)
         for match in EXCHANGES.finditer(text):
@@ -499,6 +540,8 @@ def assemble(packet, spans, values, probabilities, profile, *, collect=False, re
         role = read(question)
         if role == "ignore":
             continue
+        if role in selected and redundant_numeric_mention(packet, selected[role], span, role):
+            continue
         occurrence = (span.source_id, span.start, span.end)
         if role in selected or occurrence in used_occurrences or any(
                 prior.source_id == span.source_id and prior.start < span.end and span.start < prior.end
@@ -544,6 +587,8 @@ def assemble(packet, spans, values, probabilities, profile, *, collect=False, re
 
 
 def validate_interpretation(packet, interpretation):
+    from .semantic_contract import supported_action_failure
+
     if packet["anchor_source_id"] not in interpretation.source_refs:
         raise DecisionFailure("live_anchor_missing")
     events = {row["event_id"]: {"event_id": row["event_id"], "source_id": row["source_id"],
@@ -551,6 +596,8 @@ def validate_interpretation(packet, interpretation):
               for row in packet["messages"]}
     verify_evidence(interpretation, events)
     anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    if interpretation.kind == "new_signal" and packet.get("anchor_setup_bound"):
+        raise DecisionFailure("bound_setup_cannot_reenter")
     if interpretation.kind == "trade_update" and not interpretation.symbol and not packet.get("anchor_setup_bound"):
         raise DecisionFailure("update_identity_missing")
     if interpretation.kind == "new_signal" and interpretation.entry == "unspecified" and ENTRY_FORM_MARKERS.search(anchor["text"]):
@@ -573,6 +620,9 @@ def validate_interpretation(packet, interpretation):
                 supported = True
         if not supported:
             raise DecisionFailure("reduction_quantity_proof_missing")
+    failure = supported_action_failure(anchor["text"], interpretation)
+    if failure:
+        raise DecisionFailure(failure)
     if interpretation.kind not in ("new_signal", "trade_update"):
         from .source_disposition import verify_percentage_classification
         if anchor["text"].strip() and (not interpretation.reason.strip() or not any(
@@ -601,17 +651,18 @@ def verification_questions():
         }.items()}
 
 
-def first_decision(packet, profile, response, *, model, revision, collect=False, observation=None):
+def first_decision(packet, profile, response, *, model, revision, collect=False, observation=None, spans=None):
     if not isinstance(response, dict) or response.get("model") != revision:
         raise DecisionFailure("decision_model_changed")
     if profile.model_revision and (profile.model != model or profile.model_revision != revision):
         raise DecisionFailure("decision_calibration_model_changed")
-    spans = candidates(packet)
+    spans = candidates(packet) if spans is None else spans
     questions = questions_for(packet, spans)
     values, probabilities = checked_answers(response, questions, profile)
     required = []
     if observation is not None:
-        observation.update(values=values, probabilities=probabilities, required_questions=required)
+        observation.update(values=values, probabilities=probabilities, required_questions=required,
+                           questions_hash=digest(questions), question_contract_version=QUESTION_CONTRACT_VERSION)
     try:
         interpretation = assemble(packet, spans, values, probabilities, profile, collect=collect, required_questions=required)
         validate_interpretation(packet, interpretation)
@@ -624,12 +675,12 @@ def first_decision(packet, profile, response, *, model, revision, collect=False,
     return interpretation, probabilities, required
 
 
-def replay_decision(packet, profile, responses, *, model, revision, collect=False, usage=None, observation=None):
+def replay_decision(packet, profile, responses, *, model, revision, collect=False, usage=None, observation=None, spans=None):
     """One production gate shared by HTTP execution and order-free calibration replay."""
     if not responses:
         raise DecisionFailure("decision_response_missing")
     interpretation, probabilities, required = first_decision(packet, profile, responses[0], model=model,
-        revision=revision, collect=collect, observation=observation)
+        revision=revision, collect=collect, observation=observation, spans=spans)
     actionable = interpretation.kind in ("new_signal", "trade_update")
     if actionable:
         if len(responses) != 2 or responses[1].get("model") != revision:
@@ -681,7 +732,11 @@ class OpenRouterDecisionAdapter:
     def pin_revision(self, revision):
         self.model_revision, self.pinned_revision = revision, True
 
-    async def evaluate(self, state, questions, *, usage=None, phase="decision", expected_revision=None):
+    async def evaluate(self, state, questions, *, usage=None, phase="decision", expected_revision=None,
+                       max_context_characters=None):
+        body = {"model": self.model, "state": state, "questions": questions}
+        if max_context_characters is not None and len(json.dumps(body, ensure_ascii=False)) > max_context_characters:
+            raise DecisionFailure("source_context_limit")
         if not self.api_key:
             raise DecisionFailure("decision_key_missing")
         revision = expected_revision or await self.identity()
@@ -692,7 +747,7 @@ class OpenRouterDecisionAdapter:
         try:
             response = await client.post(OPENROUTER_DECISIONS_URL,
                 headers={"Authorization": "Bearer " + self.api_key},
-                json={"model": self.model, "state": state, "questions": questions}, timeout=self.timeout)
+                json=body, timeout=self.timeout)
             response.raise_for_status()
             if len(response.content) > 2_000_000:
                 raise DecisionFailure("decision_response_limit")
@@ -701,6 +756,7 @@ class OpenRouterDecisionAdapter:
                 raise DecisionFailure("decision_model_changed")
             raw = value.get("usage")
             measured = {"phase": phase, "model": self.model, "model_revision": revision, "provider": "openrouter", "failed": False,
+                     "response_success": True, "request_hash": digest(body), "question_contract_version": QUESTION_CONTRACT_VERSION,
                      "duration_seconds": time.monotonic() - started, "usage_available": isinstance(raw, dict)}
             if isinstance(raw, dict):
                 for key in ("input_tokens", "output_tokens"):
@@ -726,24 +782,31 @@ class OpenRouterDecisionAdapter:
         finally:
             if usage is not None and not recorded:
                 usage.append({"phase": phase, "model": self.model, "provider": "openrouter", "failed": True,
+                              "response_success": False, "request_hash": digest(body),
                               "usage_available": False, "duration_seconds": time.monotonic() - started})
             if owned:
                 await client.aclose()
 
-    async def interpret(self, packet, profile, *, collect=False, usage=None, observation=None):
+    async def interpret(self, packet, profile, *, collect=False, usage=None, observation=None, spans=None,
+                        max_context_characters=None):
         usage = usage if usage is not None else []
-        revision = await self.identity()
-        spans = candidates(packet)
+        spans = candidates(packet) if spans is None else spans
         questions = questions_for(packet, spans)
-        response, _ = await self.evaluate(packet, questions, usage=usage, expected_revision=revision)
+        if max_context_characters is not None and len(json.dumps(
+                {"model": self.model, "state": packet, "questions": questions}, ensure_ascii=False)) > max_context_characters:
+            raise DecisionFailure("source_context_limit")
+        revision = await self.identity()
+        response, _ = await self.evaluate(packet, questions, usage=usage, expected_revision=revision,
+                                         max_context_characters=max_context_characters)
         responses = [response]
         if observation is not None:
             observation["responses"] = responses
         interpretation, _, _ = first_decision(packet, profile, response, model=self.model,
-            revision=revision, collect=collect, observation=observation)
+            revision=revision, collect=collect, observation=observation, spans=spans)
         if interpretation.kind in ("new_signal", "trade_update"):
             response, _ = await self.evaluate({"original": packet, "interpretation": interpretation.model_dump(mode="json")},
-                verification_questions(), usage=usage, phase="decision_verification", expected_revision=revision)
+                verification_questions(), usage=usage, phase="decision_verification", expected_revision=revision,
+                max_context_characters=max_context_characters)
             responses.append(response)
         return replay_decision(packet, profile, responses, model=self.model, revision=revision,
-                               collect=collect, usage=usage, observation=observation)
+                               collect=collect, usage=usage, observation=observation, spans=spans)

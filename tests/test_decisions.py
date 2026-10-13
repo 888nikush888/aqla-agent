@@ -270,7 +270,8 @@ async def test_decision_models_are_configurable_and_missing_prices_are_unknown()
     assert SourceProcessingConfig(model=model).model == model
     profile = CalibrationProfile(model=model, model_revision=revision, validated=True, sources=["channel"],
         master_hash="master", dataset_hash="train", holdout_hash="test", holdout_cases=30, thresholds={"kind": 0.99},
-        source_evidence={"channel": {"calibration_groups": 3, "holdout_groups": 5, "accepted_accuracy": 1, "critical_errors": 0}},
+        source_evidence={"channel": {"calibration_groups": 3, "holdout_groups": 5, "accepted_accuracy": 1, "critical_errors": 0,
+                                     "kinds": {"report": {"calibration_correct_groups": 1, "holdout_correct_accepted_groups": 2}}}},
         source_permissions={"channel": ["report"]})
     assert profile.permits("channel", "master", model=model, model_revision=revision)
     assert not profile.permits("channel", "master", model=DEFAULT_DECISION_MODEL, model_revision=revision)
@@ -403,6 +404,72 @@ def test_calibrated_numeric_roles_have_separate_thresholds_and_disabled_families
     assert profile.question_disabled("role.original", "leverage")
     assert not profile.question_disabled("role.original", "stop_loss")
     assert CalibrationProfile(thresholds={"number_role":0.8}).threshold("role.original") == 0.8
+
+
+@pytest.mark.parametrize("symbol", ["4STOCK", "1000BONK", "1000RATS"])
+def test_digit_prefixed_asset_candidates_preserve_original_positions(symbol):
+    packet = packet_for("#" + symbol + " LONG. Entry 100. SL 90. TP 110.")
+    spans = candidates(packet)
+    selected = next(span for span in spans if span.kind == "symbol" and span.value == symbol)
+    assert packet["messages"][0]["text"][selected.start:selected.end] == selected.quote == symbol
+    options = questions_for(packet, spans)["symbol"]["criteria"]
+    assert selected.candidate_id in options
+
+
+def test_timeframes_numeric_sizes_and_multipliers_are_not_new_digit_prefixed_symbols():
+    packet = packet_for("BTC LONG. 4H 15x 15X 30m $250K 1000 1/2/2026.")
+    values = {span.value for span in candidates(packet) if span.kind == "symbol"}
+    assert not values & {"4H", "15x", "15X", "30m", "250K", "1000"}
+
+
+@pytest.mark.asyncio
+async def test_complete_outgoing_decision_size_is_checked_before_catalog_or_provider():
+    requests = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: requests.append(request))) as client:
+        adapter = OpenRouterDecisionAdapter("synthetic", client=client)
+        with pytest.raises(DecisionFailure, match="source_context_limit"):
+            await adapter.interpret(packet_for(), CalibrationProfile(), max_context_characters=100)
+        with pytest.raises(DecisionFailure, match="source_context_limit"):
+            await adapter.evaluate({"original": "x" * 500}, verification_questions(), max_context_characters=100)
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_prepared_candidates_are_reused_without_changing_request(monkeypatch):
+    import aqla_agent.decisions as decision_module
+    packet = packet_for()
+    spans = candidates(packet)
+    requests = []
+
+    def upstream(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        return httpx.Response(200, json=response_for(body["questions"]))
+
+    monkeypatch.setattr(decision_module, "candidates", lambda _: pytest.fail("Prepared candidates must be reused"))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+        result = await OpenRouterDecisionAdapter("synthetic", client=client, model_revision=DEFAULT_DECISION_MODEL).interpret(
+            packet, CalibrationProfile(), spans=spans)
+    assert result.verified and len(requests) == 2
+
+
+@pytest.mark.parametrize("field,value", [("retry_max_attempts", 0), ("retry_max_attempts", 6),
+    ("retry_max_attempts", True), ("retry_backoff_seconds", 301), ("retry_max_age_seconds", 29),
+    ("retry_max_age_seconds", "900")])
+def test_new_retry_config_requires_bounded_integer_values(field, value):
+    with pytest.raises(ValidationError):
+        SourceProcessingConfig(**{field: value})
+
+
+def test_python_bound_setup_cannot_become_a_second_entry():
+    from aqla_agent.decisions import validate_interpretation
+    packet = packet_for("BTC LONG.")
+    packet["anchor_setup_bound"] = True
+    result = Interpretation(kind="new_signal", symbol="BTC", side="long", source_refs=[packet["anchor_source_id"]],
+        evidence=[Evidence(field="symbol", source_id=packet["anchor_source_id"], quote="BTC"),
+                  Evidence(field="side", source_id=packet["anchor_source_id"], quote="LONG")])
+    with pytest.raises(DecisionFailure, match="bound_setup_cannot_reenter"):
+        validate_interpretation(packet, result)
 
 
 def test_calibrated_kind_and_intent_polarities_do_not_share_error_thresholds():
