@@ -20,7 +20,7 @@ from aqla_agent.decisions import (
     replay_decision,
     verification_questions,
 )
-from aqla_hyperliquid_mcp.models import Evidence, Interpretation, SourceEvent
+from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent
 
 
 def packet_for(text="BTC long. Entry 100. SL 90. TP 110 / 120.", *, messages=None):
@@ -311,7 +311,7 @@ def test_reduction_requires_one_original_quantity_and_matching_mathematics(quote
     if accepted:
         validate_interpretation(packet, result)
     else:
-        with pytest.raises(DecisionFailure, match="reduction_quantity_proof_missing"):
+        with pytest.raises(AqlaError, match="Reduction percentage.*source evidence"):
             validate_interpretation(packet, result)
 
 

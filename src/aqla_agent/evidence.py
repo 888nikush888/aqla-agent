@@ -1,10 +1,29 @@
 """Internal read contracts; public venue information payloads remain unchanged."""
 from __future__ import annotations
 
+import re
 from contextlib import AbstractContextManager, nullcontext
+from decimal import Decimal
 from typing import NotRequired, TypedDict
 
 from aqla_hyperliquid_mcp.models import Market, digest
+
+POSITION_FRACTIONS = re.compile(r"(?<![\w/])(?:(?P<quarter>quarter|viertel|четверть)|"
+    r"(?P<half>half|hälfte|halbe(?:n|r|s)?|половин(?:а|у|ы|ой|ою))|"
+    r"(?P<ratio>[1-3]\s*/\s*[24]))(?![\w/])", re.I)
+
+
+def position_fractions(text):
+    """Exact mathematical quantities; the model still selects their semantic role."""
+    for match in POSITION_FRACTIONS.finditer(text):
+        if match.group("ratio"):
+            numerator, denominator = map(Decimal, match.group("ratio").split("/"))
+            if numerator >= denominator:
+                continue
+            value = 100 * numerator / denominator
+        else:
+            value = Decimal(25 if match.group("quarter") else 50)
+        yield match, value
 
 
 class FillObservation(TypedDict):

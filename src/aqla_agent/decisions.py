@@ -14,6 +14,8 @@ from pydantic import Field, model_validator
 from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, Model, digest
 from aqla_hyperliquid_mcp.rules import quoted_leverage_numbers, verify_evidence
 
+from .evidence import position_fractions
+
 VERSION = "aqla-decisions-v12"
 QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v3"
 # The original-context wire shape is unchanged. Keeping its independent schema
@@ -48,22 +50,6 @@ ENTRY_FORM_MARKERS = re.compile(
     r"|(?<!\w)(?:entry|einstieg|вход)\s+(?:range|zone|диапазон|зона)\b"
     r"|(?<!\w)по\s+(?:рынку|маркету)(?!\w)"
     r"|(?<!\w)(?:market|markt)[-\s]+(?:entry|einstieg)(?!\w)", re.I)
-POSITION_FRACTIONS = re.compile(r"(?<![\w/])(?:(?P<quarter>quarter|viertel|четверть)|"
-    r"(?P<half>half|hälfte|halbe(?:n|r|s)?|половин(?:а|у|ы|ой|ою))|"
-    r"(?P<ratio>[1-3]\s*/\s*[24]))(?![\w/])", re.I)
-
-
-def position_fractions(text):
-    """Exact mathematical quantities; the model still selects their semantic role."""
-    for match in POSITION_FRACTIONS.finditer(text):
-        if match.group("ratio"):
-            numerator, denominator = map(Decimal, match.group("ratio").split("/"))
-            if numerator >= denominator:
-                continue
-            value = 100 * numerator / denominator
-        else:
-            value = Decimal(25 if match.group("quarter") else 50)
-        yield match, value
 
 
 def redundant_numeric_mention(packet, prior, span, role):

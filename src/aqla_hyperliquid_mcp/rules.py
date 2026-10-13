@@ -176,6 +176,17 @@ def verify_evidence(signal: Interpretation, events: dict):
             errors.append(f"Price not supported by source evidence: {field}")
         elif not any(len(re.findall(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])", quote)) == 1 for quote in supported):
             errors.append(f"Numeric source evidence must isolate one number: {field}")
+    if signal.reduce_percent is not None:
+        from aqla_agent.evidence import position_fractions
+        supported = False
+        for quote in fields.get("reduce_percent", []):
+            quantities = [{value} for _, value in position_fractions(quote)]
+            quantities.extend(set(quoted_numbers(match.group())) for match in re.finditer(
+                r"(?<![\w.])\d+(?:[.,]\d+)*\s*%", quote))
+            if len(quantities) == 1 and signal.reduce_percent in quantities[0]:
+                supported = True
+        if not supported:
+            errors.append("Reduction percentage is not supported by source evidence: reduce_percent")
     if signal.leverage is not None and not any(
             signal.leverage in set(quoted_leverage_numbers(quote)) for quote in fields.get("leverage", [])):
         errors.append("Signal leverage is not supported by source evidence")
@@ -373,6 +384,11 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
                 quantity = quantity_grid(min(quantity, account.available_margin * margin_leverage(leverage, market) / limit), market)
         if quantity <= 0 or quantity < market.min_quantity or quantity * limit < market.min_notional:
             raise AqlaError("Insufficient risk/margin budget or exchange minimum notional")
+        if source_tp is not None and signal.take_profit_unit == "roe_percent":
+            final_leverage = str(margin_leverage(leverage, market))
+            if source_tp["margin_leverage"] != final_leverage:
+                targets = prices(entry, signal.side, market, "roe_percent", selected, final_leverage)
+                source_tp.update(margin_leverage=final_leverage, preview_prices=[str(value) for value in targets])
         tp_sizes = split_targets(quantity, len(targets), policy, market)
         if any(size < market.min_quantity or size * price < market.min_notional for size, price in zip(tp_sizes, targets, strict=True)):
             raise AqlaError("A TP leg is below the exchange notional minimum")

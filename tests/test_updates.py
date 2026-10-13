@@ -22,6 +22,8 @@ def update(trading, message_id, action, text, **fields):
     source = SourceEvent(chat_id="channel", message_id=message_id, sent_at=now_ms(), reply_to_id=1, text=text)
     trading.ingest(source)
     evidence = fields.pop("evidence", [])
+    if action == "reduce" and not evidence:
+        evidence = [Evidence(field="reduce_percent", source_id=source.source_id, quote=text)]
     interpretation = Interpretation(kind="trade_update", source_refs=[source.source_id], update_action=action, evidence=evidence, **fields)
     return source, interpretation
 
@@ -511,29 +513,18 @@ async def test_initial_protection_revision_preserves_pending_stop(setup, signal,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stop,allowed,accepted", [("80", False, False), ("80", True, False), ("89.95", True, True)])
-async def test_pending_stop_validates_full_planned_budget_before_binding(setup, signal, stop, allowed, accepted):
+@pytest.mark.parametrize("stop,allowed", [("80", False), ("80", True), ("89.95", True)])
+async def test_pending_stop_validates_full_planned_budget_before_binding(setup, signal, stop, allowed):
     _, state, fake, _, trading = setup
     state.update(lambda data: data["policy"].update(allow_stop_widening=allowed))
     trade = await waiting_gtc(setup, signal)
     source, interpretation = stop_update(trading, stop=stop)
     before = len(fake.actions)
-    if not accepted:
-        with pytest.raises(AqlaError, match="widening"):
-            await trading.update_trade(source.event_id, interpretation)
-        assert "update:" + source.event_id not in state.snapshot()["bindings"]
-        assert "pending_stop_update" not in state.snapshot()["trades"][trade["trade_id"]]
-    else:
-        assert (await trading.update_trade(source.event_id, interpretation))["result"]["pending_stop_update"]
-        fake.mid = "100"
-        fake.fill(trade["entry_cloid"], Decimal(trade["plan"]["quantity"]) / 2)
-        await trading.refresh_trade(trade["trade_id"])
-        current = state.snapshot()["trades"][trade["trade_id"]]
-        assert current["pending_stop_update"]["phase"] == "confirmed"
-        assert Decimal(current["stop_price"]) == Decimal(stop)
-        assert Decimal(current["remaining_quantity"]) == Decimal(trade["plan"]["quantity"]) / 2
-    if not accepted:
-        assert len(fake.actions) == before
+    with pytest.raises(AqlaError, match="widening"):
+        await trading.update_trade(source.event_id, interpretation)
+    assert "update:" + source.event_id not in state.snapshot()["bindings"]
+    assert "pending_stop_update" not in state.snapshot()["trades"][trade["trade_id"]]
+    assert len(fake.actions) == before
 
 
 @pytest.mark.asyncio
@@ -882,3 +873,85 @@ async def test_owned_close_limit_stays_inside_slippage_bound_on_each_side(setup,
     order = state.snapshot()["operations"]["rounded-close"]["wire_action"]["orders"][0]
     bound = Decimal(fake.mid) * (Decimal("0.997") if side == "long" else Decimal("1.003"))
     assert Decimal(order["p"]) >= bound if side == "long" else Decimal(order["p"]) <= bound
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quote,amount,accepted", [
+    ("25%", 100, False), (None, 25, False), ("25", 25, False), ("half", 25, False),
+    ("25%", 25, True), ("half", 50, True), ("Hälfte", 50, True), ("Halbe", 50, True),
+    ("половину", 50, True), ("quarter", 25, True), ("Viertel", 25, True), ("четверть", 25, True),
+    ("1/2", 50, True), ("1/4", 25, True), ("3/4", 75, True),
+])
+async def test_reduction_requires_matching_original_quantity_before_any_order(setup, signal, quote, amount, accepted):
+    _, state, fake, _, trading = setup
+    trade = await opened(setup, signal)
+    source = SourceEvent(chat_id="channel", message_id=2, reply_to_id=1, sent_at=now_ms(),
+        text="Close " + (quote or "25%") + " of the position now.")
+    trading.ingest(source)
+    interpretation = Interpretation(kind="trade_update", source_refs=[source.source_id], update_action="reduce",
+        reduce_percent=amount, evidence=[Evidence(field="reduce_percent", source_id=source.source_id, quote=quote)] if quote else [])
+    before = copy.deepcopy(fake.actions)
+    if accepted:
+        await trading.update_trade(source.event_id, interpretation)
+        expected = Decimal(trade["filled_quantity"]) * (100 - amount) / 100
+        assert abs(Decimal(str(fake.position))) == expected
+        assert state.snapshot()["trades"][trade["trade_id"]]["plan"] == trade["plan"]
+    else:
+        with pytest.raises(AqlaError, match="Reduction percentage.*source evidence"):
+            await trading.update_trade(source.event_id, interpretation)
+        assert fake.actions == before
+        assert "update:" + source.event_id not in state.snapshot()["bindings"]
+        assert abs(Decimal(str(fake.position))) == Decimal(trade["filled_quantity"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("reserve_bps", [10, 1000])
+async def test_stop_widening_preserves_cost_reserve_and_allows_reduced_own_quantity(setup, signal, side, reserve_bps):
+    _, state, fake, _, trading = setup
+    state.update(lambda data: data["policy"].update(allow_stop_widening=True, cost_reserve_bps=reserve_bps))
+    source, interpretation = signal
+    if side == "short":
+        source = source.model_copy(update={"edited_at": source.sent_at + 1, "text": "BTC verkaufen. SL 110. Ziele 90 und 80."})
+        trading.ingest(source)
+        interpretation = interpretation.model_copy(update={"side": "short", "stop_loss": Decimal(110), "take_profits": [Decimal(90), Decimal(80)], "evidence": [
+            Evidence(field=field, source_id=source.source_id, quote=quote) for field, quote in (
+                ("symbol", "BTC"), ("side", "verkaufen"), ("stop_loss", "110"), ("take_profits.0", "90"), ("take_profits.1", "80"))]})
+    plan = await trading.preview(source.event_id, interpretation)
+    trade = await trading.execute(plan["plan_id"])
+    entry, size, budget = Decimal(trade["entry_vwap"]), Decimal(trade["remaining_quantity"]), Decimal(trade["reserved_risk"])
+    stop = entry + (1 if side == "short" else -1) * budget / size
+    before = copy.deepcopy(fake.actions)
+    with pytest.raises(AqlaError, match="original loss budget"):
+        await trading.replace_stop(trade["trade_id"], stop, "widen-without-cost-reserve")
+    assert fake.actions == before and "widen-without-cost-reserve" not in state.snapshot()["operations"]
+    await trading.close_position(trade["trade_id"], Decimal(50), "reduce-own-risk")
+    await trading.refresh_trade(trade["trade_id"])
+    result = await trading.replace_stop(trade["trade_id"], stop, "widen-reduced-own-quantity")
+    assert result["replacement_confirmed"]
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    modeled_risk = Decimal(current["remaining_quantity"]) * (abs(entry - Decimal(current["stop_price"])) + entry * reserve_bps / 10000)
+    assert modeled_risk <= budget
+    assert current["plan"] == plan and current["reserved_risk"] == trade["reserved_risk"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reserve_bps", [10, 1000])
+async def test_pending_stop_widening_after_confirmed_partial_entry_keeps_cost_reserve(setup, signal, reserve_bps):
+    _, state, fake, _, trading = setup
+    state.update(lambda data: data["policy"].update(allow_stop_widening=True, cost_reserve_bps=reserve_bps,
+        sizing_mode="fixed_notional", fixed_notional_usdc="480"))
+    source, interpretation = signal
+    interpretation = interpretation.model_copy(update={"entry": "limit", "entry_prices": [Decimal(100)]})
+    plan = await trading.preview(source.event_id, interpretation)
+    fake.partial_limit_fraction = .5
+    trade = await trading.execute(plan["plan_id"])
+    assert Decimal(trade["filled_quantity"]) == Decimal(plan["quantity"]) / 2
+    source, interpretation = stop_update(trading, stop="80")
+    result = await trading.update_trade(source.event_id, interpretation)
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert result["result"]["phase"] == current["pending_stop_update"]["phase"] == "confirmed"
+    assert Decimal(current["stop_price"]) == 80
+    risk = Decimal(current["remaining_quantity"]) * (20 + Decimal(100) * reserve_bps / 10000)
+    assert risk <= Decimal(trade["reserved_risk"])
+    assert current["plan"] == plan and current["reserved_risk"] == trade["reserved_risk"]

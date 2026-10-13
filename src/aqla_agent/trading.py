@@ -1333,7 +1333,7 @@ class Trading:
         pending = trade.get("pending_stop_update")
         if pending and pending["phase"] in STOP_UPDATE_ACTIVE:
             budget = min(budget, Decimal(pending["original_budget"]))
-        if widening and size * abs(reference - stop) > budget:
+        if widening and size * (abs(reference - stop) + reference * plan.policy.cost_reserve_bps / 10000) > budget:
             raise AqlaError("Stop widening exceeds the original loss budget")
 
     @staticmethod

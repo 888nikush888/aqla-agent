@@ -3,7 +3,15 @@ from decimal import Decimal
 import pytest
 
 from aqla_agent.percent_targets import prices
-from aqla_hyperliquid_mcp.models import AccountSnapshot, AqlaError, Evidence, Interpretation, Market, Policy
+from aqla_hyperliquid_mcp.models import (
+    AccountSnapshot,
+    AqlaError,
+    BackupValues,
+    Evidence,
+    Interpretation,
+    Market,
+    Policy,
+)
 from aqla_hyperliquid_mcp.rules import make_plan, verify_evidence
 
 
@@ -21,6 +29,29 @@ def test_unlabelled_source_percentages_use_actual_deployed_margin(side, expected
     for target, requested in zip(final, [50, 100], strict=True):
         actual = (target - 101) / 101 * 20 * 100 * (1 if side == "long" else -1)
         assert abs(actual - requested) <= Decimal(".01") / 101 * 20 * 100
+
+
+@pytest.mark.parametrize("side,expected", [("long", "105"), ("short", "95")])
+@pytest.mark.parametrize("backup_stop", [False, True])
+def test_source_roe_targets_freeze_final_notional_tier_leverage(side, expected, backup_stop):
+    stamp = 1000
+    market = Market(symbol="BTC", native_symbol="BTCUSDT", asset_id=1, product="perp", size_decimals=3,
+        mid="100", max_leverage=20, price_tick=".01", quantity_step=".001", leverage_tiers=[
+            {"notional_floor": "0", "notional_cap": "100", "max_leverage": 20},
+            {"notional_floor": "100", "notional_cap": "100000", "max_leverage": 10}])
+    signal = Interpretation(kind="new_signal", source_refs=["source"], symbol="BTC", side=side,
+        leverage=20, entry="limit", entry_prices=[100], take_profits=[50], take_profit_unit="roe_percent",
+        stop_loss=None if backup_stop else 90 if side == "long" else 110)
+    backup = BackupValues(leverage=20, fallback_stop_loss_percent=40, fallback_stop_loss_unit="roe_percent") if backup_stop else None
+    plan = make_plan(signal, market, AccountSnapshot(equity="10000", available_margin="10000", observed_at=stamp),
+        Policy(leverage_mode="signal"), 1, stamp, ("testnet", "account"), stamp=stamp, backup=backup)
+    assert plan.quantity * plan.entry_limit >= 100
+    assert plan.effective_leverage == 10 and plan.source_tp["margin_leverage"] == "10"
+    assert plan.take_profits == [Decimal(expected)]
+    assert list(map(Decimal, plan.source_tp["preview_prices"])) == plan.take_profits
+    final = prices(100, side, plan.market, "roe_percent", plan.source_tp["values"], plan.source_tp["margin_leverage"])
+    assert final == plan.take_profits
+    assert (final[0] - 100) / 100 * plan.effective_leverage * 100 * (1 if side == "long" else -1) == 50
 
 
 def test_shortened_number_quote_cannot_turn_fifty_percent_into_price(setup, signal):
