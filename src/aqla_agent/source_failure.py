@@ -6,6 +6,8 @@ import re
 import httpx
 from pydantic import ValidationError
 
+from aqla_hyperliquid_mcp.models import AqlaError
+
 from .decisions import DecisionFailure
 
 FIELDS = {"kind", "source_refs", "symbol", "side", "entry", "entry_timing", "entry_prices",
@@ -38,6 +40,11 @@ def classify_failure(error, phase="validate"):
     exception_type = type(error).__name__
     if isinstance(error, DecisionFailure):
         code = safe_code(str(error))
+    elif isinstance(error, AqlaError) and phase in ("decision", "validate", "interpretation_fallback"):
+        # This internal exception denotes rejected domain/evidence validation,
+        # never a provider payload or a request that may be retried.
+        code = "fallback_domain_rejected" if phase == "interpretation_fallback" else "interpretation_domain_rejected"
+        return sanitize_detail({"phase": phase, "exception_type": exception_type, "retryable": False}, code)
     while cause is not None and id(cause) not in seen:
         seen.add(id(cause))
         name = type(cause).__name__

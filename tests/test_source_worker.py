@@ -16,7 +16,7 @@ from aqla_agent.decisions import (
     OpenRouterDecisionAdapter,
 )
 from aqla_agent.source_worker import SourceWorker
-from aqla_hyperliquid_mcp.models import Evidence, Interpretation, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, now_ms
 from aqla_hyperliquid_mcp.server import close_server, create_server
 
 
@@ -95,6 +95,39 @@ async def test_short_fallback_runs_once_and_empty_queue_uses_no_model(worker_bou
     assert len(metrics["api_responses"]) == 2
     assert "source_read_receipt" not in json.dumps(interpretations)
     assert fake.actions == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_domain_rejection_persists_safe_code_without_secret_or_retry(worker_boundary):
+    extension, server, state, fake, _, _ = worker_boundary
+    source = SourceEvent(chat_id="channel", message_id=901, sent_at=now_ms(), text="Result report.")
+    server.aqla_trading.ingest(source)
+    attempts = {"decision": 0, "fallback": 0}
+
+    async def decision(*args, **kwargs):
+        attempts["decision"] += 1
+        raise DecisionFailure("synthetic_unclear")
+
+    async def fallback(*args, **kwargs):
+        attempts["fallback"] += 1
+        raise AqlaError("geheimer_API_key_and_private_provider_payload")
+
+    worker = SourceWorker(extension, {"mode": "hybrid"}, adapter=SimpleNamespace(interpret=decision), fallback=fallback)
+    await worker.tick()
+    await worker.tick()
+    saved = next(iter(state.snapshot()["source_jobs"].values()))
+    assert saved["status"] == "failed" and saved["failure_code"] == "fallback_domain_rejected"
+    assert saved["failure_detail"] == {"phase": "interpretation_fallback", "code": "fallback_domain_rejected",
+        "exception_type": "AqlaError", "retryable": False, "field_paths": []}
+    assert saved["next_retry_at"] is None and saved["attempt_count"] == 1
+    assert len(saved["failure_history"]) == 1 and attempts == {"decision": 1, "fallback": 1}
+    assert "geheimer" not in json.dumps(state.snapshot())
+    with sqlite3.connect(extension.master_path.parents[2] / "cache/aqla-usage.sqlite3") as connection:
+        metrics = json.loads(connection.execute("SELECT metrics FROM runs").fetchone()[0])
+    assert metrics["failed"] is True and metrics["workflow"]["source_job_failed"] is True
+    assert metrics["workflow"]["failure_detail"] == saved["failure_detail"]
+    assert "geheimer" not in json.dumps(metrics)
+    assert not fake.actions and not state.snapshot()["operations"]
 
 
 @pytest.mark.asyncio
