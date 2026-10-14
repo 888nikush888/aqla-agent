@@ -13,7 +13,7 @@ from aqla_agent.presentation import PresentationScope, build_presentation
 from aqla_agent.reporting import Reporting
 from aqla_agent.router import Router
 from aqla_hyperliquid_mcp.models import AqlaError, now_ms
-from aqla_sheets_mcp.journal import HEADERS, project
+from aqla_sheets_mcp.journal import HEADERS, acknowledge, batch, project, record
 
 
 async def manual_trade(setup, signal, monkeypatch, *, mixed=False):
@@ -163,4 +163,22 @@ async def test_manual_accounting_cannot_outlive_changed_bound_evidence(setup, si
             row[root]['unexpected_change'] = 'changed'
     state.update(change)
     assert not verified_manual_accounting(state.snapshot()['trades'][identity])
+    await reporting.router.close()
+
+
+@pytest.mark.asyncio
+async def test_financial_correction_publishes_before_historical_backlog_and_preserves_audit_delivery(setup, signal, monkeypatch):
+    state, _, identity, reporting, _ = await manual_trade(setup, signal, monkeypatch)
+    await reporting.refresh(identity)
+    data = state.snapshot()
+    financial = project(data)['Trades:' + identity]
+    audit = record('Ereignisse', 'old-audit', 'now', 1, 'Trades', identity, 'before', 'after')
+    data['journal_history'] = {'old-audit': audit}
+    data['journal_pending'] = {'Ereignisse:old-audit': audit['fingerprint'], 'Trades:' + identity: financial['fingerprint']}
+    first = batch(data, 1)['records']
+    assert len(first) == 1 and first[0]['table'] == 'Trades'
+    acknowledge(data, {'Trades:' + identity: financial['fingerprint']})
+    second = batch(data, 1)['records']
+    assert len(second) == 1 and second[0]['table'] == 'Ereignisse'
+    assert second[0]['fingerprint'] == audit['fingerprint']
     await reporting.router.close()

@@ -253,7 +253,7 @@ def batch(data, limit=100):
     history = {record_key(row): row for row in data.get("journal_history", {}).values() if record_key(row) in pending}
     selected, fallback = [], []
     size = 0
-    for key in pending:
+    for key in sorted(pending, key=lambda key: key.partition(":")[0] not in ("Trades", "Fills")):
         current = _selected_record(data, key, fallback, history)
         if current is None:
             continue
