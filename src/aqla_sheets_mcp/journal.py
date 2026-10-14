@@ -136,7 +136,9 @@ def project(data):
             add(_signal_record(data, identity, event, aliases))
     for identity, trade in data["trades"].items():
         plan = trade["plan"]
-        fills = trade.get("fill_events", {})
+        from aqla_agent.manual_accounting import verified_manual_accounting
+        manual = verified_manual_accounting(trade)
+        fills = {**trade.get("fill_events", {}), **(manual["exit_allocations"] if manual else {})}
         entry = Decimal(trade["entry_vwap"]) if trade.get("entry_vwap") else None
         exits = [fill for fill in fills.values() if fill["kind"] != "entry"]
         gross = sum((Decimal(fill["sz"]) * (Decimal(fill["px"]) - entry) * (1 if plan["side"] == "long" else -1) for fill in exits), Decimal(0)) if entry is not None else None

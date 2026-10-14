@@ -191,11 +191,13 @@ def accounting_issues(trade, facts):
         issues.append("Endgültige Entry-Ausführungsmenge nicht vollständig belegt")
     if facts.get("accounting_conflict"):
         issues.append(facts["accounting_conflict"])
-    if trade.get("external_conflict") or trade.get("manual_closure"):
+    from .manual_accounting import verified_manual_accounting
+    manual = verified_manual_accounting(trade)
+    if (trade.get("external_conflict") or trade.get("manual_closure")) and not manual:
         issues.append("Manueller/gemischter Positionsverlauf")
     entered = Decimal(metric.get("entry_quantity", "0"))
     exited = sum((Decimal(row["sz"]) for row in exits), Decimal(0))
-    if not entered or entered != exited or not facts.get("closed_at"):
+    if not entered or (entered != exited and not manual) or not facts.get("closed_at"):
         issues.append("Vollständige eigene Exit-Fills fehlen")
     return issues
 
@@ -226,6 +228,10 @@ def report_row(data, trade):
         entry_price = Decimal(metric["entry_notional"]) / entered
         gross = sum((Decimal(row["sz"]) * (Decimal(row["px"]) - entry_price) for row in exits), Decimal(0)) * (1 if plan["side"] == "long" else -1)
     fees = sum((Decimal(fee_evidence.get(fill_identity(row), row)["fee"]) for row in fills), Decimal(0)) if fees_known else None
+    from .manual_accounting import verified_manual_accounting
+    manual = verified_manual_accounting(trade)
+    if manual:
+        gross, fees = Decimal(manual["gross_pnl"]), Decimal(manual["fees"])
     funding_rows = trade.get("funding_events", {}).values()
     funding = sum((Decimal(row["amount"]) for row in funding_rows), Decimal(0)) if funding_known else None
     complete = not issues
@@ -239,7 +245,8 @@ def report_row(data, trade):
             "currency": currency, **{key: metric.get(key) for key in ("entry_notional", "margin_leverage", "initial_margin")},
             "gross_pnl": str(gross) if gross is not None else None, "fees": str(fees) if fees is not None else None,
             "funding": str(funding) if funding is not None else None, "net_pnl": str(net) if net is not None else None,
-            "roe_percent": str(roe) if roe is not None else None, "complete": complete, "issues": issues}
+            "roe_percent": str(roe) if roe is not None else None, "complete": complete, "issues": issues,
+            **({"attribution_note": manual["note"], "exit_vwap": manual["exit_vwap"]} if manual else {})}
 
 
 def monthly_report(data, month):

@@ -138,7 +138,7 @@ def table_values(report):
             elif key == "complete":
                 value = "ja" if value else "nein"
             elif key == "issues":
-                value = "; ".join(value)
+                value = "; ".join([*value, *([row["attribution_note"]] if row.get("attribution_note") else [])])
             values.append(str(value) if value is not None else "")
         return values
     rows.extend(render(row) for row in report["rows"])

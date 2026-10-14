@@ -5,7 +5,7 @@ import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Literal, TypedDict
 
 from aqla_hyperliquid_mcp.models import AqlaError, Market, TradePlan, digest, now_ms
@@ -135,7 +135,9 @@ class Reporting:
             if engine is None:
                 raise AqlaError("Börsenkonto für Funding-Abgleich nicht verfügbar")
             engine.assert_plan_binding(engine.state.snapshot(), TradePlan.model_validate(trade["plan"]))
-            if trade.get("external_conflict") or trade.get("manual_closure"):
+            manual = isinstance(trade.get("manual_closure"), dict) and trade["manual_closure"].get("basis") in (
+                "proved_original_account_closure", "proved_account_flat_after_last_owned_fill")
+            if (trade.get("external_conflict") or trade.get("manual_closure")) and not manual:
                 raise EvidenceConflict("Funding bei manuellem/gemischtem Positionsverlauf nicht eindeutig zuordenbar")
             adapter = engine.exchange
             market = Market.model_validate(trade["plan"]["market"])
@@ -146,8 +148,36 @@ class Reporting:
             async def fetch(low, high):
                 return await market_fills(adapter, market, low, high)
             observed = await bounded_history(fetch, trade["plan"]["created_at"], end, limit=2000)
-            observed = {fill_identity(row): row for row in observed if row.get("coin") == market.symbol
-                        and trade["plan"]["created_at"] <= row["time"] <= end}
+            selected = {}
+            for row in observed:
+                if row.get("coin") != market.symbol or not trade["plan"]["created_at"] <= row["time"] <= end:
+                    continue
+                identity = fill_identity(row)
+                if manual and identity in selected and selected[identity] != row:
+                    raise EvidenceConflict("A historical manual fill identity has conflicting receipts")
+                selected[identity] = row
+            observed = selected
+            if manual:
+                from .manual_accounting import attribute_manual_closure
+                payments = await adapter.funding_payments(market, start, end)
+                try:
+                    attribution, assigned, fees = attribute_manual_closure(trade, observed, payments)
+                except (AqlaError, InvalidOperation, KeyError, ValueError, TypeError) as error:
+                    raise EvidenceConflict(str(error) if isinstance(error, AqlaError) else "Manual PnL attribution is unconfirmed") from None
+                coverage.update(complete=True, fill_fingerprint=digest(fills), payments_fingerprint=digest(assigned))
+                def save_manual(data):
+                    current = data["trades"][trade_id]
+                    from .manual_accounting import closure_fingerprint
+                    if (digest(current["fill_events"]) != attribution["fill_fingerprint"]
+                            or closure_fingerprint(current) != attribution["closure_fingerprint"]
+                            or digest(current["plan"]) != attribution["plan_fingerprint"]
+                            or digest(current.get("entry_accounting", {})) != attribution["entry_fingerprint"]):
+                        raise EvidenceConflict("Trade evidence changed during manual accounting")
+                    current.update(manual_accounting=attribution, funding_events=assigned, funding_coverage=coverage,
+                        report_fee_evidence=fees, reporting_checked_at=now_ms())
+                    current["manual_closure"]["pnl_complete"] = True
+                self.state.update(save_manual)
+                return {"complete": True, "reason": "complete"}
             if set(observed) - set(fills):
                 raise EvidenceConflict("Zusätzliche manuelle Fills im eigenen Positionsverlauf vorhanden")
             if set(fills) - set(observed):
@@ -203,7 +233,12 @@ class Reporting:
             if not isinstance(error, EvidenceConflict) and verified_coverage_matches(trade, start=start, end=end):
                 self.state.update(lambda data: data["trades"][trade_id].update(reporting_checked_at=now_ms(), reporting_last_error=coverage["reason"]))
                 return {"complete": False, "reason": "unavailable"}
-        self.state.update(lambda data: data["trades"][trade_id].update(funding_coverage=coverage, reporting_checked_at=now_ms()))
+        def incomplete(data):
+            current = data["trades"][trade_id]
+            current.update(funding_coverage=coverage, reporting_checked_at=now_ms())
+            if isinstance(current.get("manual_closure"), dict):
+                current["manual_closure"]["pnl_complete"] = False
+        self.state.update(incomplete)
         return {"complete": False, "reason": failure_reason}
 
     def _incomplete(self, trade_id: str, reason: str) -> None:

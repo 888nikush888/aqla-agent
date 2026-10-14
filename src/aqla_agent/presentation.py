@@ -242,12 +242,13 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
             source=data.get("source_names", {}).get(trade["chat_id"], "Kanal ohne Anzeigename"), symbol=row["symbol"], side=row["side"],
             status=trade["status"], cohort=cohort, entry_at=row["entry_at"] or entered, closed_at=row["closed_at"],
             entry_price=_price(entries),
-            exit_price=_price([fill for fill in fills.values() if fill["kind"] != "entry"]) if cohort == "realized" else None,
+            exit_price=_decimal(row["exit_vwap"]) if cohort == "realized" and row.get("exit_vwap") else _price([fill for fill in fills.values() if fill["kind"] != "entry"]) if cohort == "realized" else None,
             quantity=sum((Decimal(fill["sz"]) for fill in entries), Decimal(0)) if entries else None,
             net_pnl=_decimal(row["net_pnl"]) if cohort == "realized" else None,
             fees=_decimal(row["fees"]), funding=_decimal(row["funding"]), currency=currency, exchange=exchange, network=plan["network"],
             entry_execution=plan.get("entry_execution", "standard"), take_profit_execution=plan.get("take_profit_execution", "standard"),
-            execution_roles=roles, complete=row["complete"] and cohort == "realized", issues=row["issues"]))
+            execution_roles=roles, complete=row["complete"] and cohort == "realized",
+            issues=[*row["issues"], *([row["attribution_note"]] if cohort == "realized" and row.get("attribution_note") else [])]))
         selected_ids.add(trade["trade_id"])
     journal.sort(key=lambda row: (row.closed_at or row.entry_at or 0, row.trade_id))
     evaluated = [row for row in journal if row.cohort in ("realized", "undated")]

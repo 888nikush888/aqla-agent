@@ -8,6 +8,8 @@ Das Dashboard verwendet dieselben belegten Finanzfakten wie die Monatsberichte, 
 
 Die technischen Tabs werden ausgeblendet und behalten ihre Namen, Sheet-IDs, Datensätze und Metadaten. Der Mainnet-Monatsclient behält den technischen Präfix `aqla Mainnet `. Journal-IDs verweisen auf die zugehörigen technischen Tabs; die Monatsübersicht verlinkt veröffentlichte Berichte. Entry-/TP-Modi und die tatsächlich belegte Maker-/Taker-Rolle stehen getrennt von den unveränderten finanziellen Fillbelegen.
 
+Belegte manuelle Schließungen erscheinen nach dem historischen Finanzabgleich mit vollständigem Brutto-PnL, Gebühren und tatsächlichem Funding. Bei gemeinsam geschlossener fremder Exposure werden gemeinsame Kosten anhand der belegten eigenen Positionsmenge zugeordnet. Das sichtbare Journal erklärt die anteilige Berechnung unter „Hinweise“; technische Fillzeilen verwenden `manual_close_allocated` für anteilige Schließungen und behalten die tatsächliche native Order-ID und den Ausführungspreis. Originalfills und ihre unveränderten Belege bleiben im Ausführungszustand erhalten. Technische Tradezeilen zeigen weiterhin Netto vor Funding; das sichtbare Journal und Dashboard zeigen Netto einschließlich Funding.
+
 Nur der authentifizierte native Publisher darf die abgeleiteten Ansichten schreiben. Seine beiden internen Werkzeuge sind vom Modellzugriff ausgeschlossen. Er prüft Auswahl, Zustandsscope, Inhaltsfingerprint, Revision und Schreibbestätigung, veröffentlicht höchstens einmal je Minute und schreibt bei identischem Inhalt und intakter Struktur keine Zellen erneut. Nach einer verlorenen Antwort verwendet er dieselben Sheet- und Chart-IDs. Er leert ausschließlich früher von ihm belegte Bereiche der abgeleiteten Ansichten.
 
 ## Welche Daten erscheinen?
