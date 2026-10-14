@@ -227,6 +227,10 @@ class Trading:
                 if latest_sources(snapshot["events"], [row["source_id"]])[row["source_id"]]["event_id"] != event_id:
                     raise AqlaError("An actionable interpretation must use the latest anchor revision")
             verify_evidence(interpretation, snapshot["events"])
+            if interpretation.kind == "new_signal" and interpretation.entry in ("limit", "range"):
+                expected_prices = 2 if interpretation.entry == "range" else 1
+                if len(interpretation.entry_prices) != expected_prices:
+                    raise AqlaError("Source entry type/prices disagree; limit needs exactly one evidenced price, range exactly two. Re-read source_context and correct the interpretation without inventing bounds")
             supported_refs = {row["source_id"], *(proof.source_id for proof in interpretation.evidence)}
             if interpretation.kind == "trade_update":
                 supported_refs.update(ref for trade in snapshot["trades"].values()

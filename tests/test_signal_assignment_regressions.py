@@ -113,3 +113,24 @@ async def test_legacy_mcp_can_store_original_entry_receipt_without_reopening_its
         assert not state.snapshot()["plans"] and not state.snapshot()["operations"] and not fake.actions
     finally:
         await close_server(server)
+
+
+@pytest.mark.parametrize("entry,prices,valid", [("range", [100], False), ("limit", [100, 101], False),
+    ("range", [100, 101], True), ("limit", [100], True)])
+def test_source_entry_shape_is_repaired_before_exchange_target_selection(setup, entry, prices, valid):
+    _, state, fake, _, engine = setup
+    source = SourceEvent(chat_id="channel", message_id=704, sent_at=now_ms(), text="BTC LONG Entry 100 - 101 SL 90 TP 110")
+    engine.ingest(source)
+    value = Interpretation(kind="new_signal", source_refs=[source.source_id], symbol="BTC", side="long", entry=entry,
+        entry_prices=prices, stop_loss=90, take_profits=[110], evidence=[
+            Evidence(field=field, source_id=source.source_id, quote=quote) for field, quote in
+            [("symbol", "BTC"), ("side", "LONG"), ("stop_loss", "90"), ("take_profits.0", "110"),
+             *[(f"entry_prices.{i}", str(price)) for i, price in enumerate(prices)]]])
+    before = copy.deepcopy(state.snapshot())
+    if valid:
+        assert engine.record_interpretation(source.event_id, value)["status"] == "interpreted"
+    else:
+        with pytest.raises(AqlaError, match="Source entry type/prices disagree"):
+            engine.record_interpretation(source.event_id, value)
+        assert state.snapshot() == before
+    assert not state.snapshot()["plans"] and not state.snapshot()["trades"] and not fake.actions
