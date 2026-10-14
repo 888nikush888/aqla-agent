@@ -37,9 +37,10 @@ separate. Neither quantity comes from a fresh exchange inventory read.
 target; a later source edit is not silently treated as that original signal.
 
 Status summaries expose `execution_counts.known_own_open`, `pending_entries`
-and `unsettled_ownership`. The compatible `open_trade_count` remains a count of
-active work including pending entries and unresolved ownership. The Telegram
-status labels this distinction explicitly; it is not an exchange-wide count.
+and `unsettled_ownership`. `open_trade_count` counts only `known_own_open`;
+`active_trade_count` includes pending entries and unresolved ownership, while
+`conflicted_trade_count` identifies the conflict cases separately. The Telegram
+status labels this distinction explicitly; these are not exchange-wide counts.
 
 Full/decision/batch source reads, classification acknowledgments, source lookup
 and selected diagnostics expose the same projection without state mutation.

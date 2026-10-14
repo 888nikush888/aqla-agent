@@ -168,13 +168,16 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         if view == "summary":
             claims = authorize(context_auth, operator=True) if context_auth else None
             lease_id, binding = setup_context(claims)
+            counts = execution_counts(snapshot)
             return {"view": "summary", "paused": snapshot["paused"], "network": settings.network,
                     "setup": setup_gate.status(binding, lease_id, owner_id=settings.telegram_owner_id),
                     "source_queue": queue_overview(snapshot, limit=8), "notification_pending": len(snapshot["notifications"]),
                     "source_processing": processor.overview(),
-                    "open_trade_count": sum(row["status"] in OPEN for row in snapshot["trades"].values()),
-                    "open_trade_count_meaning": "active_work_including_pending_and_unsettled",
-                    "execution_counts": execution_counts(snapshot),
+                    "open_trade_count": counts["known_own_open"],
+                    "open_trade_count_meaning": "confirmed_own_positions_from_retained_receipts",
+                    "active_trade_count": sum(row["status"] in OPEN for row in snapshot["trades"].values()),
+                    "conflicted_trade_count": sum(row["status"] == "conflicted" for row in snapshot["trades"].values()),
+                    "execution_counts": counts,
                     "execution_accounts": {key: {name: value for name, value in row.items() if name != "limits"}
                                            for key, row in trading.accounts_ready(snapshot).items()},
                     "account_recovery": recovery_diagnostics(snapshot),
