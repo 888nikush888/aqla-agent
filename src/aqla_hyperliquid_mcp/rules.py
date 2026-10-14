@@ -161,8 +161,6 @@ def verify_evidence(signal: Interpretation, events: dict):
     if unsupported:
         errors.append("Unsupported source evidence fields: " + ", ".join(unsupported))
     if signal.kind == "new_signal":
-        if set(signal.source_refs) - {proof.source_id for proof in signal.evidence if proof.field in EVIDENCE_FIELDS}:
-            errors.append("New signal source_refs include context without setup evidence; re-read source_context and select only the original messages supporting this setup, not all context or receipt refs. Each selected source needs its own evidence; keep genuine setup origins")
         for field in ("symbol", "side"):
             if not fields.get(field):
                 errors.append(f"Missing contextual source evidence for {field}")

@@ -227,6 +227,9 @@ class Trading:
                 if latest_sources(snapshot["events"], [row["source_id"]])[row["source_id"]]["event_id"] != event_id:
                     raise AqlaError("An actionable interpretation must use the latest anchor revision")
             verify_evidence(interpretation, snapshot["events"])
+            if interpretation.kind == "new_signal" and set(interpretation.source_refs) - {
+                    row["source_id"], *(proof.source_id for proof in interpretation.evidence)}:
+                raise AqlaError("New signal source_refs include context without setup evidence; re-read source_context and select only the live instruction and original messages supporting this setup, not all context or receipt refs. Each additional source needs its own evidence; keep genuine setup origins")
             from .semantic_contract import supported_action_failure
             failure = supported_action_failure(row["source"].get("text", ""), interpretation)
             if failure:
