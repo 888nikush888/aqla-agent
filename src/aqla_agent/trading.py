@@ -2147,8 +2147,20 @@ class Trading:
                 self.begin_cleanup(trade_id, trade["status"])
                 trade = self.state.snapshot()["trades"][trade_id]
             if trade["status"] == "conflicted":
-                reports.append({"trade_id": trade_id, "market_conflict": True, "market": trade['plan']['market']['symbol']})
-                continue
+                from .conflict_review import commit_conflict, observe_conflict
+                try:
+                    review, evidence = await observe_conflict(self, trade_id)
+                    if not review["resolvable"]:
+                        reports.append({"trade_id": trade_id, "market_conflict": True, "market": trade['plan']['market']['symbol']})
+                        continue
+                    root = getattr(self.state, "root", self.state)
+                    root.update(lambda data, identity=trade_id, fact=review, proof=evidence: commit_conflict(self, data, identity, fact, proof))
+                    await self.resume_pending_stop(trade_id)
+                    reports.append({"trade_id": trade_id, "conflict_resolved": True})
+                    trade = self.state.snapshot()["trades"][trade_id]
+                except Exception:
+                    reports.append({"trade_id": trade_id, "error": "Conflict closure reconciliation is unavailable"})
+                    continue
             if trade["status"] in OPEN:
                 try:
                     if trade["status"] == "cleanup":

@@ -643,7 +643,7 @@ class Router:
             return review
 
     async def resolve_conflict(self, trade_id, fingerprint, commit_check):
-        from .conflict_review import observe_conflict
+        from .conflict_review import commit_conflict, observe_conflict
         engine = self.conflict_engine(trade_id)
         async with engine.lock:
             saved = self.state.snapshot().get("source_status", {}).get("ownership_reviews", {}).get(trade_id, {})
@@ -657,22 +657,10 @@ class Router:
             commit_check()
             def commit(data):
                 commit_check()
-                current = data["trades"][trade_id]
                 latest = data.get("source_status", {}).get("ownership_reviews", {}).get(trade_id, {})
                 if latest.get("fingerprint") != fingerprint or latest.get("expires_at", 0) <= now_ms():
                     raise AqlaError("Ownership review expired; read a fresh review")
-                if (current["status"] != "conflicted" or digest(current) != evidence["trade_hash"]
-                        or digest(engine.state.snapshot()["operations"]) != evidence["operations_hash"]):
-                    raise AqlaError("Trade changed during ownership review")
-                engine.assert_plan_binding(engine.state.snapshot(), TradePlan.model_validate(current["plan"]))
-                current.update(status="closed", remaining_quantity="0", reserved_risk="0", cleanup_complete=True,
-                    fill_events=evidence["fills"], closed_at=evidence["closed_at"],
-                    manual_closure={"confirmed_at": now_ms(), "review_fingerprint": fingerprint, "pnl_complete": False,
-                        "order_statuses": review["order_statuses"], "basis": "proved_original_account_closure"})
-                from .monthly import accounting_facts
-                current.update(accounting_facts(current))
-                data["notifications"].setdefault("ownership-resolved:" + fingerprint, {"trade_id": trade_id, "change": {"status": "closed"}, "observed_at": now_ms()})
-                return {"resolved": True, "trade_id": trade_id, "pnl_complete": False}
+                return commit_conflict(engine, data, trade_id, review, evidence)
             return self.state.update(commit)
 
     async def reconcile(self, operation_id):
