@@ -3,9 +3,38 @@ from decimal import Decimal
 
 import pytest
 
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence
+from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, now_ms
 from aqla_hyperliquid_mcp.rules import latest_sources, verify_evidence
 from aqla_hyperliquid_mcp.trades import Trading
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("original_age,expired", [(60, False), (14401, True)])
+async def test_proven_multi_message_setup_keeps_original_deadline_after_reply_and_edit(setup, monkeypatch, original_age, expired):
+    _, state, fake, _, trading = setup
+    state.update(lambda data: data["policy"].update(max_signal_age_seconds=14400))
+    parent = SourceEvent(chat_id="channel", message_id=10, sent_at=now_ms() - original_age * 1000,
+                         text="BTC kaufen")
+    reply = SourceEvent(chat_id="channel", message_id=11, reply_to_id=10, sent_at=now_ms(),
+                        edited_at=now_ms(), text="SL 90. Ziele 110 und 120.")
+    trading.ingest(parent)
+    trading.ingest(reply)
+    value = Interpretation(kind="new_signal", source_refs=[parent.source_id, reply.source_id], symbol="BTC", side="long",
+        stop_loss=90, take_profits=[110, 120], evidence=[
+            Evidence(field="symbol", source_id=parent.source_id, quote="BTC"),
+            Evidence(field="side", source_id=parent.source_id, quote="kaufen"),
+            *[Evidence(field=field, source_id=reply.source_id, quote=quote) for field, quote in
+              (("stop_loss", "90"), ("take_profits.0", "110"), ("take_profits.1", "120"))]])
+    verify_evidence(value, state.snapshot()["events"])
+    if expired:
+        with pytest.raises(AqlaError, match="Signal deadline expired"):
+            await trading.preview(reply.event_id, value)
+        assert not state.snapshot()["plans"]
+    else:
+        plan = await trading.preview(reply.event_id, value)
+        assert plan["source_refs"] == value.source_refs
+        assert plan["deadline_at"] == parent.sent_at + 14400 * 1000
+    assert not fake.actions
 
 
 @pytest.mark.asyncio

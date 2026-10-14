@@ -62,6 +62,43 @@ async def test_ranked_fallback_preserves_leg_profile_network_and_explicit_priori
 
 
 @pytest.mark.asyncio
+async def test_fresh_fallback_signal_cannot_inherit_unquoted_old_channel_context(routed, setup, signal, monkeypatch):
+    from aqla_hyperliquid_mcp.models import SymbolUnavailable
+
+    router, boundaries = routed
+    state = setup[1]
+    state.update(lambda data: data["ranking_policy"].update(enabled=True))
+    state.update(lambda data: data["source_ranks"]["channel"].update(tier="D"))
+    profile = TradingProfile(id="a", name="A", parameters=Parameters(
+        **{**state.snapshot()["profiles"]["a"]["parameters"], "max_signal_age_seconds": 14400}))
+    state.update(lambda data: route_control(data, "set_profile", expected_revision=data["configuration_revision"], profile=profile))
+    state.update(lambda data: data["pipelines"]["source-one"].update(targets=data["pipelines"]["source-one"]["targets"][:1]))
+    old = SourceEvent(chat_id="channel", message_id=999, sent_at=now_ms() - 20 * 86400 * 1000,
+                      historical=True, text="Old unrelated channel result")
+    router.ingest(old)
+    source, value = signal
+    reads = []
+    async def missing(*_):
+        reads.append("hyperliquid")
+        raise SymbolUnavailable("Fresh metadata confirms missing BTC market")
+    monkeypatch.setattr(router.engines["hyperliquid"].exchange, "market", missing)
+    before = state.snapshot()
+    with pytest.raises(AqlaError, match="source_refs include context without setup evidence") as failure:
+        await router.preview(source.event_id, value.model_copy(update={"source_refs": [old.source_id, source.source_id]}))
+    assert "deadline expired" not in str(failure.value)
+    assert state.snapshot() == before and not reads
+    result = await router.preview(source.event_id, value)
+    plan = result["targets"][0]["plan"]
+    assert plan["exchange"] == "aster" and plan["requested_exchange"] == "hyperliquid"
+    assert plan["source_refs"] == [source.source_id]
+    assert plan["deadline_at"] == source.sent_at + 14400 * 1000
+    assert plan["profile_id"] == "a" and plan["policy"]["max_signal_age_seconds"] == 14400
+    assert state.snapshot()["events"][old.event_id] == before["events"][old.event_id]
+    assert reads == ["hyperliquid"] and all(not boundary.actions for boundary in boundaries.values())
+    await router.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reason", ["Fresh price data unavailable", "Insufficient margin", "Timeout: result unknown"])
 async def test_ranked_non_listing_errors_never_fallback(routed, setup, signal, monkeypatch, reason):
     router, boundaries = routed

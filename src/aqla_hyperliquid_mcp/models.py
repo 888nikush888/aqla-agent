@@ -266,7 +266,8 @@ class SourceClassification(Model):
 
 class Interpretation(Model):
     kind: Literal["new_signal", "trade_update", "report", "unrelated", "incomplete", "ambiguous"]
-    source_refs: list[str] = Field(min_length=1, max_length=20)
+    source_refs: list[str] = Field(min_length=1, max_length=20,
+        description="Source IDs supporting this setup, not every message read in context or receipt. For new_signal every selected source must supply original evidence; keep genuine multi-message setup origins, whose earliest publication fixes the signal deadline.")
     symbol: str | None = Field(default=None, max_length=100)
     side: Literal["long", "short"] | None = None
     leverage: Annotated[Decimal, Field(ge=1, allow_inf_nan=False)] | None = Field(default=None,
