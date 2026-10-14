@@ -101,7 +101,12 @@ def main():
         event = MessageEvent(text='Status', source=source, message_id='4242')
         runner = SimpleNamespace(_delivery_adapter_for=lambda _: adapter, _should_send_voice_reply=lambda *_args, **_kwargs: False)
         completed = []
-        labels = ['[Daten](https://example.invalid/image.png)', 'MEDIA:/not-existing/synthetic.pdf', '<img src="https://example.invalid/x.png">', 'VIP_`[] 🚀 Ä \\', 'Ä🚀[]`\\{}' * 150]
+        fixture = home / 'cache' / 'synthetic-report.txt'
+        fixture.parent.mkdir(exist_ok=True)
+        fixture.write_text('Benign native formatter fixture', encoding='utf-8')
+        labels = ['[Daten](https://example.invalid/image.png)', 'MEDIA:/not-existing/synthetic.pdf',
+                  'MEDIA:' + fixture.as_posix(), '[[audio_as_voice]]', '[[as_document]]',
+                  '<img src="https://example.invalid/x.png">', 'VIP_`[] 🚀 Ä \\', 'Ä🚀[]`\\{}' * 150]
         for label in labels:
             data['source_names']['-100123'] = label
             view = telegram_view(data, {'hyperliquid': {'network':'testnet','configured':True,'enabled':True}})
@@ -113,6 +118,7 @@ def main():
             assert routed == response
             extracted = await adapter._extract_response_content(routed, event, 'synthetic-route', is_ephemeral_response=False)
             assert not extracted.images and not extracted.media_files and not extracted.local_files
+            assert not extracted.force_document_attachments
             assert extracted.text_content == response.strip()
             before = len(delivered)
             await adapter._send_final_text(event, 'synthetic-route', extracted.text_content, {}, False, 0, completed.append)

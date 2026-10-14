@@ -230,20 +230,13 @@ class Aster(VenueAdapter):
         return await self.fills(start, end, market=market)
 
     async def fills(self, start, end, *, market: Market | None = None):
+        from .funding import bounded_history
         result = []
         markets = (market,) if market is not None else tuple(self.market_cache.values())
         for market in markets:
-            async def window(low, high, budget, selected=market):
-                if budget <= 0:
-                    raise AqlaError("Aster fill history exceeded its bounded request budget")
-                rows = await self.read("userTrades", {"symbol": selected.native_symbol, "startTime": str(low), "endTime": str(high), "limit": "1000"}, private=True)
-                if len(rows) >= 1000:
-                    if low >= high:
-                        raise AqlaError("Aster fills are saturated within one millisecond")
-                    middle = (low + high) // 2
-                    return await window(low, middle, budget - 1) + await window(middle + 1, high, budget - 1)
-                return rows
-            for row in await window(start, end, 6):
+            async def fetch(low, high, selected=market):
+                return await self.read("userTrades", {"symbol": selected.native_symbol, "startTime": str(low), "endTime": str(high), "limit": "1000"}, private=True)
+            for row in await bounded_history(fetch, start, end, limit=1000):
                 if row.get("symbol") is not None and row["symbol"] != market.native_symbol:
                     raise AqlaError("Aster returned a fill from another native market")
                 result.append({"oid": int(row["orderId"]), "tid": row["id"], "coin": market.symbol, "sz": row["qty"], "px": row["price"],

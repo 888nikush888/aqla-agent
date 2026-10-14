@@ -64,10 +64,11 @@ class VenueAdapter:
         return await self.fills(start, end)
 
     async def account_snapshot(self, market):
+        started = now_ms()
         raw = await self.positions()
         row = next((item["position"] for item in raw["assetPositions"] if item["position"]["coin"] == market.symbol), None)
         return AccountSnapshot(equity=raw["marginSummary"]["accountValue"], available_margin=raw["withdrawable"],
-                               position_size=Decimal(row["szi"]) if row else Decimal(0))
+                               position_size=Decimal(row["szi"]) if row else Decimal(0), observed_at=started)
 
     def native_market(self, asset):
         row = next((market for market in self.market_cache.values() if market.asset_id == asset), None)

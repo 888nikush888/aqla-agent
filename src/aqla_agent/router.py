@@ -468,6 +468,13 @@ class Router:
     def stop_event_statuses(data) -> dict[str, Literal["needs_reconciliation", "updated", "superseded", "rejected"]]:
         phases: dict[str, list[StopUpdatePhase]] = {}
         for trade in data["trades"].values():
+            for operation, saved in trade.get("target_updates", {}).items():
+                if not operation.startswith("update:") or "completed" not in saved and "superseded" not in saved:
+                    continue
+                phase = ("superseded" if saved.get("superseded") else "closed_without_application" if saved.get("closed_without_application")
+                         else "rejected" if saved.get("rejected")
+                         else "confirmed" if saved.get("completed") else "unknown")
+                phases.setdefault(operation.removeprefix("update:"), []).append(phase)
             requests = dict(trade.get("stop_update_history", {}))
             if pending := trade.get("pending_stop_update"):
                 requests[pending["operation_id"]] = pending

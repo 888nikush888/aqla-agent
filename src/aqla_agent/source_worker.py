@@ -238,6 +238,7 @@ class SourceWorker:
                                  calibration_validated=profile.validated, cache_hit=False)
         result, failure, packet, spans = None, None, None, None
         interrupted = False
+        interpretation_recorded = False
         phase = "prepare"
         try:
             packet = selected.get("packet")
@@ -272,6 +273,7 @@ class SourceWorker:
                             if row["event_id"] == packet["anchor_event_id"]), result.interpretation.kind)):
                     raise DecisionFailure("cached_decision_not_calibrated")
                 measured.workflow["cache_hit"] = True
+                interpretation_recorded = True
             else:
                 usage = measured.api
                 try:
@@ -313,6 +315,7 @@ class SourceWorker:
                     raise DecisionFailure("master_changed")
                 phase = "validate"
                 await self.internal("source_record", job_id=job["job_id"], decision_result=result.model_dump(mode="json"))
+                interpretation_recorded = True
             measured.workflow.update(fallback=result.fallback, decision_success=not result.fallback,
                                      decision_attempted=any(item.get("phase") == "decision" for item in measured.api),
                                      decision_reviewed=bool(packet.get("decision_review")),
@@ -342,7 +345,7 @@ class SourceWorker:
             measured.workflow["decision_attempted"] = any(item.get("phase") == "decision" for item in measured.api)
             measured.workflow["decision_reviewed"] = bool(packet.get("decision_review")) if packet is not None else False
             measured.workflow["source_job_failed"] = failure is not None
-            measured.workflow["interpretation_valid"] = result is not None and phase in ("validate", "apply") and failure is None and not interrupted
+            measured.workflow["interpretation_valid"] = interpretation_recorded
             measured.workflow["failure_detail"] = detail if failure is not None else None
             await asyncio.to_thread(measured.persist, self.extension.master_path.parents[2],
                                    {"failed": failure is not None, "interrupted": interrupted, "completed": failure is None and not interrupted})

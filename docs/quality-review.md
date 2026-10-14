@@ -71,6 +71,20 @@ Beim tatsächlichen Debian-VPS-Start wurde zusätzlich eine außerhalb der Start
 - Checksum-gepinnter Gitleaks-Scanner über die Git-Historie, Verbot lokaler Secret-/Statepfade und pip-audit über gehashte, eingefrorene Aqla-/Telegram-/Sheets-Abhängigkeiten sowie die tatsächlich installierte separate Hermes-Laufzeit. GitHub-Actions sind auf Commit-SHAs gepinnt; Dependabot prüft deren Updates monatlich.
 - Paketbuild, Archivinhalt, SHA-256, getrennte Wheel-Installation und Offline-Deploymentvorbereitung. CI-Berichte und geprüfte Pakete liegen als GitHub-Artefakte vor.
 
+## Zusätzliche Vollprüfung vom 14.10.2026
+
+Sieben weitere Befunde sind durch gemeinsame Korrekturen und Regressionen abgesichert:
+
+- Aster-Fillhistorien verwenden begrenzte Sieben-Tage-Fenster einschließlich vorhandener Sättigungs- und Requestgrenzen. Ältere eigene Positionen bleiben verwaltbar.
+- Kontoantworten tragen den Beginn ihrer Abfrage als `observed_at`; langsamer Transport erneuert die Zehn-Sekunden-Frischegrenze nicht.
+- Backup-ROE verwendet den tatsächlichen nativen Margin-Hebel, auch bei Lighters gerundeten Marginfraktionen. Gespeicherte und finalisierte Altpreise werden nicht umgeschrieben.
+- Ein angenommener TP-Ersatz speichert die aktuelle Generation vor jeder Börsenänderung. Wiederanlauf verwendet dieselben Operations- und Orderidentitäten. Neuere Ziele verdrängen ältere ungesendete Generationen; unbekannte Vorgänge werden ausschließlich abgeglichen. Nur vor der ersten Operationspersistierung darf eine nachgewiesene eigene Teilreduktion die ungesendeten Mengen verkleinern.
+- TP-Wiederaufnahme erhält einen bestätigten SL bei vorübergehenden Fehlern, respektiert spätere Stop-Anweisungen und manuelle Konflikte und beendet nach vollständigem eigenem Exit die nicht mehr anwendbare Absicht. Quellenstatus folgt den gespeicherten Managementfakten; ein neuer Signalentry wird dadurch nicht erneut freigegeben.
+- Benachrichtigungen mit erhaltenen opaque Alt-Ereignissen rendern ohne erfundene Quellzuordnung. Dynamische Anhangsmarker werden vor der nativen Telegram-Auswertung sichtbar neutralisiert; bewusst erzeugte Betreiberanhänge bleiben möglich.
+- Interpretationsgültigkeit wird nach positivem `source_record` getrennt vom späteren Anwendungserfolg gemessen. Hybrid-/Decision-Verarbeitung bleibt im produktiven Legacy-Modus inaktiv.
+
+`tests/test_audit_recovery_fixes.py` prüft echte lokale Adapter, SQLite-Neustart, verlorene Antworten, Zielgenerationen, spätere Reduktion/Stop-Anweisung, manuelle Exposure, vollständigen SL-Exit und den öffentlichen Status-/Metrikpfad. Der native Nachrichtentest enthält nun einen tatsächlich vorhandenen harmlosen Anhangspfad und die nativen globalen Anhangsmarker.
+
 ## Grenzen
 
 Die Prüfung ist kein formaler Beweis aller Zustandsübergänge, kein vollständiges Audit der Hermes-Abhängigkeiten und kein Live-Trading-Test. Ein sauberer Advisory-Scan bedeutet, dass zum Scanzeitpunkt keine bekannten Advisories für die geprüften Versionen gemeldet wurden. Sprachliche Signalerkennung muss mit dem tatsächlich gewählten Modell über den beiliegenden Eval-Runner geprüft werden. VPS-Dienststart und echte Telegram-Zustellung sind getrennte Betriebsprüfungen.

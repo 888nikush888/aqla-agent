@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 
 from .execution_outcome import execution_counts, retry_view, trade_outcome
 from .execution_roles import observed_roles
+from .source_queue import is_source_row
 
 VENUES = {"hyperliquid": "Hyperliquid", "aster": "Aster", "lighter": "Lighter"}
 OPEN = {"waiting_entry", "entry_pending", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
@@ -58,8 +59,11 @@ def execution_lines(trade):
 
 def literal(value):
     text = re.sub(r"[\x00-\x1f\x7f]", " ", str(value)).strip()
+    # Native delivery scans valid MEDIA directives even inside inline code.
+    text = re.sub(r"(?i)MEDIA:", lambda match: match.group()[:-1] + "：", text)
+    text = text.replace("[[", "［［").replace("]]", "］］")
     # Protect dynamic labels from becoming links, HTML, emphasis or code fences.
-    if any(char in text for char in "*_`[]<>~|#\\") or "MEDIA:" in text.upper():
+    if any(char in text for char in "*_`[]<>~|#\\") or "MEDIA：" in text.upper():
         # The pinned native HTML-image extractor also scans inline code. Keep
         # dynamic angle brackets visible without leaving an executable HTML tag.
         return "`" + text.replace("`", "ˋ").replace("\\", "⧵").replace("<", "‹").replace(">", "›") + "`"
@@ -540,7 +544,8 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None, notif
             text = "🚨 **Schutzvorfall**\n\n**Börse:** " + VENUES.get(notice.get("exchange"), literal(notice.get("exchange", "nicht zugeordnet"))) + "\n**Entries:** gesperrt\n\n**Grund:** " + literal(ERRORS.get(notice.get("error"), notice.get("error", "Schutz nicht bestätigt")))
             messages.append({"notification_ids": ids, "severity": "urgent", "texts": split_blocks(text)})
             continue
-        chat = next((row[2]["chat_id"] if row[2] else row[3]["source"]["chat_id"] for row in items if row[2] or row[3]), None)
+        chat = next((row[2]["chat_id"] if row[2] else row[3]["source"]["chat_id"] for row in items
+                     if row[2] or row[3] and is_source_row(row[3])), None)
         blocks = ["**Quelle:** " + source_name(data, chat)]
         by_trade = {}
         for _, notice, trade, _ in items:

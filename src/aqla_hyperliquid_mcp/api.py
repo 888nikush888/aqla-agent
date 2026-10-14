@@ -188,6 +188,7 @@ class Hyperliquid:
     async def account_snapshot(self, market: Market):
         if self.settings.shared_account and market.product == "perp":
             return await self.account_inventory(market)
+        started = now_ms()
         if market.product == "spot":
             raw = await self.info("spotClearinghouseState", user=self.account)
             balance = next((row for row in raw["balances"] if row["coin"] == "USDC"), None)
@@ -196,7 +197,7 @@ class Hyperliquid:
             available = Decimal(balance["total"]) - Decimal(balance.get("hold", "0"))
             position = next((row for row in raw["balances"] if row["coin"] == market.base_token), None)
             size = Decimal(position["total"]) if position else Decimal(0)
-            return AccountSnapshot(equity=Decimal(balance["total"]), available_margin=available, position_size=size)
+            return AccountSnapshot(equity=Decimal(balance["total"]), available_margin=available, position_size=size, observed_at=started)
         abstraction = await self.info("userAbstraction", user=self.account)
         if abstraction not in ("disabled", None):
             raise AqlaError("Automatic sizing requires standard account abstraction; other modes remain available through the full MCP")
@@ -211,7 +212,7 @@ class Hyperliquid:
             if len(matching) > 1:
                 raise AqlaError("Account position observation is ambiguous")
             size = Decimal(matching[0]["szi"]) if matching else Decimal(0)
-        return AccountSnapshot(equity=raw["marginSummary"]["accountValue"], available_margin=raw["withdrawable"], position_size=size)
+        return AccountSnapshot(equity=raw["marginSummary"]["accountValue"], available_margin=raw["withdrawable"], position_size=size, observed_at=started)
 
     async def account_inventory(self, market: Market | None = None):
         """Complete bounded REST observation; entry calls never use a cached budget."""

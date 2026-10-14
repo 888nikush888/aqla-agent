@@ -1073,6 +1073,18 @@ class Trading:
         trade = self.state.snapshot()["trades"][trade_id]
         if trade["status"] == "closing":
             return
+        try:
+            targets_ready = await self.resume_target_update(trade_id)
+        except ExternalInterference:
+            raise
+        except Exception as error:
+            detail = str(error) if isinstance(error, AqlaError) else type(error).__name__
+            self._patch(trade_id, status="protecting", waiting_error="Pending target replacement needs review: " + detail)
+            return
+        if not targets_ready:
+            self._patch(trade_id, status="protecting")
+            return
+        trade = self.state.snapshot()["trades"][trade_id]
         if not any(order["kind"] == "tp" for order in trade["orders"]):
             sizes = split_targets(Decimal(trade["filled_quantity"]), len(plan.take_profits), plan.policy, plan.market)
             operation = "targets:" + trade_id + ":0"
@@ -1893,24 +1905,84 @@ class Trading:
         self.assert_plan_binding(self.state.snapshot(), plan)
         target_prices = self.validate_targets(trade, plan, prices)
         prior = self.state.snapshot()["operations"].get(operation_id)
-        if prior:
-            return prior
-        request = await self.management_stop_preflight(trade_id, operation_id)
-        if request:
-            self.state.update(lambda data: self.supersede_stop_for_management(data, trade_id, request,
-                "An authorized target update replaced this unsent stop request"))
         staged = trade.get("target_updates", {}).get(operation_id)
+        if prior and staged is None:
+            return prior
         if staged is None:
+            request = await self.management_stop_preflight(trade_id, operation_id)
+            if request:
+                self.state.update(lambda data: self.supersede_stop_for_management(data, trade_id, request,
+                    "An authorized target update replaced this unsent stop request"))
             staged = {"prices": [str(price) for price in target_prices],
                       "original_orders": [order for order in trade["orders"] if order["kind"] == "tp" and not order.get("retired")],
-                      "action": None, "source_tp": source_tp}
-            self.state.update(lambda state: state["trades"][trade_id].setdefault("target_updates", {}).__setitem__(operation_id, staged))
+                      "action": None, "source_tp": source_tp, "completed": False}
+            def accept(data):
+                row = data["trades"][trade_id]
+                previous = self.pending_target_identity(data, row)
+                if previous and previous != operation_id:
+                    old = row["target_updates"][previous]
+                    old["superseded"] = True
+                    operation = data["operations"].get(previous)
+                    if old.get("action") is not None and (operation is None or operation.get("outcome") == "not_sent"):
+                        unsent = {order["c"] for order in old["action"]["orders"]}
+                        for order in row["orders"]:
+                            if order["cloid"] in unsent:
+                                order["retired"] = True
+                        staged["original_orders"] = old["original_orders"]
+                row.setdefault("target_updates", {})[operation_id] = staged
+                row["pending_target_update"] = operation_id
+                row["management_revision"] += 1
+                staged["accepted_revision"] = row["management_revision"]
+            self.state.update(accept)
         elif staged["prices"] != [str(price) for price in target_prices]:
             raise AqlaError("Target update ID already identifies different prices")
-        if staged["action"] is not None:
-            result = await self.exchange.mutate(operation_id, staged["action"]) if staged["action"]["orders"] else {"no_unfilled_targets": True}
+        elif trade.get("pending_target_update") not in (None, operation_id):
+            return {"target_update_superseded": True}
+
+        def finish(result):
             self.record_maker_target_rejection(trade_id, plan, result)
+            if result.get("phase") in ("acknowledged", "reconciled", "rejected") or result.get("no_unfilled_targets"):
+                def complete(data):
+                    row = data["trades"][trade_id]
+                    saved = row["target_updates"][operation_id]
+                    if not saved.get("completed"):
+                        saved["completed"] = True
+                        saved["rejected"] = result.get("phase") == "rejected"
+                        if ("accepted_revision" not in saved and row.get("pending_target_update") in (None, operation_id)
+                                and not saved.get("superseded")):
+                            pending = row.get("pending_stop_update")
+                            if (pending and pending["phase"] in STOP_UPDATE_ACTIVE
+                                    and pending["management_revision"] == row["management_revision"]
+                                    and data["bindings"].get(pending["operation_id"]) == pending["source_binding"]):
+                                pending["management_revision"] += 1
+                            row["management_revision"] += 1
+                    if row.get("pending_target_update") == operation_id:
+                        row.pop("pending_target_update")
+                self.state.update(complete)
             return result
+
+        expected_action = staged["action"]
+        def guard(data):
+            row = data["trades"][trade_id]
+            self.assert_plan_binding(data, plan)
+            if (row["status"] not in ("open", "protecting")
+                    or row.get("pending_target_update") not in (None, operation_id)
+                    or row["target_updates"][operation_id].get("completed") or row["target_updates"][operation_id].get("superseded")):
+                raise AqlaError("Target replacement is no longer the active own management intent")
+            active = {order["cloid"] for order in row["orders"] if order["kind"] == "tp" and not order.get("retired")}
+            action = row["target_updates"][operation_id]["action"]
+            if action is None or action != expected_action or any(order["c"] not in active for order in action["orders"]):
+                raise AqlaError("Target replacement generation was superseded")
+            if sum(Decimal(order["s"]) for order in action["orders"]) > Decimal(row["remaining_quantity"]):
+                raise AqlaError("Saved target replacement exceeds proved own remaining quantity")
+
+        if prior:
+            return finish(prior)
+        if staged.get("completed"):
+            return {"no_unfilled_targets": True}
+        if staged["action"] is not None:
+            result = await self.exchange.mutate(operation_id, staged["action"], prepare_guard=guard) if staged["action"]["orders"] else {"no_unfilled_targets": True}
+            return finish(result)
         old_orders = staged["original_orders"]
         cancels = [{"asset": plan.market.asset_id, "cloid": order["cloid"]} for order in old_orders]
         if cancels:
@@ -1947,6 +2019,8 @@ class Trading:
 
         def record(data):
             row = data["trades"][trade_id]
+            if row.get("pending_target_update") not in (None, operation_id):
+                raise AqlaError("Target replacement generation was superseded before staging")
             if staged.get("source_tp") is not None:
                 row["source_tp_override"] = staged["source_tp"]
             for old in row["orders"]:
@@ -1958,10 +2032,62 @@ class Trading:
             row["target_updates"][operation_id]["action"] = {"type": "order", "orders": [order for _, order in new], "grouping": "na"}
 
         self.state.update(record)
-        result = await self.exchange.mutate(operation_id, {"type": "order", "orders": [order for _, order in new], "grouping": "na"}) if new else {"no_unfilled_targets": True}
-        self.record_maker_target_rejection(trade_id, plan, result)
-        self._patch(trade_id, management_revision=trade["management_revision"] + 1)
-        return result
+        expected_action = {"type": "order", "orders": [order for _, order in new], "grouping": "na"}
+        result = await self.exchange.mutate(operation_id, expected_action, prepare_guard=guard) if new else {"no_unfilled_targets": True}
+        return finish(result)
+
+    @staticmethod
+    def pending_target_identity(snapshot, trade):
+        identity = trade.get("pending_target_update")
+        if identity is None:
+            active = {order["cloid"] for order in trade["orders"] if order["kind"] == "tp" and not order.get("retired")}
+            legacy = [key for key, saved in trade.get("target_updates", {}).items()
+                if key not in snapshot["operations"] and not saved.get("completed") and not saved.get("superseded") and
+                (any(order["c"] in active for order in (saved.get("action") or {}).get("orders", []))
+                 or saved.get("action") is None and {order["cloid"] for order in saved["original_orders"]} == active)]
+            if not legacy:
+                return None
+            if len(legacy) != 1:
+                raise AqlaError("Legacy pending target generation is ambiguous; preserve own stop for review")
+            identity = legacy[0]
+        return identity
+
+    async def resume_target_update(self, trade_id):
+        snapshot = self.state.snapshot()
+        trade = snapshot["trades"][trade_id]
+        identity = self.pending_target_identity(snapshot, trade)
+        if identity is None:
+            return True
+        saved = trade["target_updates"][identity]
+        if trade["status"] in ("closed", "rejected", "cancelled"):
+            operation = snapshot["operations"].get(identity)
+            if operation and operation["phase"] in ("prepared", "sending", "unknown"):
+                return False
+            def terminal(data):
+                row = data["trades"][trade_id]
+                stage = row["target_updates"][identity]
+                stage["completed"] = True
+                stage["closed_without_application"] = operation is None
+                stage["rejected"] = operation is not None and operation["phase"] == "rejected"
+                if row.get("pending_target_update") == identity:
+                    row.pop("pending_target_update")
+            self.state.update(terminal)
+            return True
+        if (identity not in snapshot["operations"] and saved.get("action") is not None
+                and sum(Decimal(order["s"]) for order in saved["action"]["orders"]) > Decimal(trade["remaining_quantity"])):
+            def resize_unsent(data):
+                row = data["trades"][trade_id]
+                if identity in data["operations"]:
+                    raise AqlaError("Target operation was already prepared; reconcile its exact request")
+                stage = row["target_updates"][identity]
+                unsent = {order["c"] for order in stage["action"]["orders"]}
+                for order in row["orders"]:
+                    if order["cloid"] in unsent:
+                        order["retired"] = True
+                stage["action"] = None
+            self.state.update(resize_unsent)
+        result = await self.replace_targets(trade_id, list(map(Decimal, saved["prices"])), identity, source_tp=saved.get("source_tp"))
+        return result.get("phase") not in ("prepared", "sending", "unknown")
 
     def record_maker_target_rejection(self, trade_id, plan, result, *, rejected_cloids=()):
         if plan.take_profit_execution != "maker_only":
@@ -2021,5 +2147,11 @@ class Trading:
                     reports.append({"trade_id": trade_id, "market_conflict": True, "market": trade['plan']['market']['symbol']})
                 except Exception as error:
                     reports.append({"trade_id": trade_id, "error": str(error) if isinstance(error, AqlaError) else "Trade reconciliation is unavailable"})
+            if self.state.snapshot()["trades"][trade_id]["status"] in ("closed", "rejected", "cancelled"):
+                try:
+                    if not await self.resume_target_update(trade_id):
+                        reports.append({"trade_id": trade_id, "error": "Closed trade target operation still needs exact reconciliation"})
+                except Exception as error:
+                    reports.append({"trade_id": trade_id, "error": str(error) if isinstance(error, AqlaError) else "Terminal target intent review is unavailable"})
         self.recovery_checked = not any(row.get("error") for row in reports)
         return reports

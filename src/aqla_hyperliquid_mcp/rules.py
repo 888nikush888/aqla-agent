@@ -120,6 +120,7 @@ def backup_prices(reference, side, market, stop_percent=None, percentages=(), *,
             effective = Decimal(0)
         if market.product != "perp" or not effective.is_finite() or effective < 1 or effective != effective.to_integral_value():
             raise AqlaError("Backup ROE requires valid effective perpetual leverage")
+        effective = margin_leverage(effective, market)
         if stop_percent is not None and stop_unit == "roe_percent":
             stop_percent /= effective
         if take_profit_unit == "roe_percent":
