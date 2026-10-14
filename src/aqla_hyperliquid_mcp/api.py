@@ -152,6 +152,8 @@ class Hyperliquid:
 
     @staticmethod
     def canonical_symbol(symbol: str, product="perp"):
+        if product == "perp" and ":" not in symbol and symbol.upper().endswith(".P"):
+            symbol = symbol[:-2]
         if product == "perp" and symbol.upper().replace("/", "") in {"GOLD", "XAU", "XAUUSD", "XAUUSDT", "XAUUSDC"}:
             return "xyz:GOLD"
         return symbol

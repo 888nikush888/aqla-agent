@@ -184,7 +184,7 @@ class Lighter(VenueAdapter):
     async def market(self, symbol, product="perp"):
         if product != "perp":
             raise AqlaError("Automatic Lighter routing supports perpetuals only")
-        name = symbol.upper()
+        name = symbol.upper().removesuffix(".P")
         for suffix in ("/USDC", "USDC", "/USDT", "USDT"):
             if name.endswith(suffix):
                 name = name[:-len(suffix)]

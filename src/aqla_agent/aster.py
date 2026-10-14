@@ -106,7 +106,7 @@ class Aster(VenueAdapter):
         if product != "perp":
             raise AqlaError("Automatic Aster routing supports perpetuals only")
         meta = await self.read("exchangeInfo")
-        name = symbol.upper().replace("/", "")
+        name = symbol.upper().removesuffix(".P").replace("/", "")
         candidates = [row for row in meta["symbols"] if row.get("status") == "TRADING" and row.get("contractType") == "PERPETUAL"
                       and name in (row["symbol"], row["baseAsset"])]
         if len(candidates) != 1:

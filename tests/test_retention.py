@@ -157,11 +157,12 @@ def test_pending_exports_are_not_pruned_to_force_quantity_limit(setup, monkeypat
 async def test_retention_preserves_pending_stop_event_and_bound_source_revision(setup, signal, monkeypatch):
     settings, state, fake, _, trading = setup
     trade = await waiting_gtc(setup, signal)
-    dependency = SourceEvent(chat_id="channel", message_id=3, sent_at=now_ms(), text="Stop context")
+    dependency = SourceEvent(chat_id="channel", message_id=3, sent_at=now_ms(), text="BTC stop context")
     trading.ingest(dependency)
     trading.record_interpretation(dependency.event_id, Interpretation(kind="report", source_refs=[dependency.source_id]))
     source, interpretation = stop_update(trading)
     interpretation.source_refs.append(dependency.source_id)
+    interpretation.evidence.append(Evidence(field="symbol", source_id=dependency.source_id, quote="BTC"))
     await trading.update_trade(source.event_id, interpretation)
     pending = state.snapshot()["trades"][trade["trade_id"]]["pending_stop_update"]
     assert source.source_id not in trade["plan"]["source_refs"]

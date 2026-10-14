@@ -44,7 +44,7 @@ CONDITION = pattern(WORD + r"(?:if|when|once|after|until|falls|wenn|sobald|nachd
                     r"если|когда|после|при\s+(?:достижении|касании|пробое|tp\s*\d|тейк\w*|цел\w*))" + END)
 STOP_CONDITION = pattern(WORD + r"(?:stop(?:[-\s]+loss)?|sl|стоп(?:[-\s]*лосс)?)\s*[:=-]?\s*"
                          r"(?:\w+\s+){0,4}(?:h\d+|\d+\s*[hm]|hourly|daily|candle\w*|свеч\w*|часов\w*|kerz\w*)" + END)
-EXTRA_ENTRY = pattern(WORD + r"(?:bids?|averag(?:e|ing)|additional\s+(?:limit|entries|entry)|"
+EXTRA_ENTRY = pattern(WORD + r"(?:bids?|averag(?:e|ing)(?!\s+entry\s+price\b)|additional\s+(?:limit|entries|entry)|"
                       r"усреднен\w*|докуп\w*|nachkauf\w*|zusätzlich\w*\s+(?:limit|einstieg))" + END)
 TP_LABEL = pattern(WORD + r"(?:tp\s*\d|target\s*\d|тейк\w*|цел\w*|ziel\w*)" + END)
 NEW_ENTRY = pattern(WORD + r"(?:entry|einstieg|вход)\s*[:=@]|"
@@ -289,6 +289,10 @@ def supported_action_failure(text, interpretation):
     if failure:
         return failure
     if interpretation.kind == "new_signal":
+        if (re.search(r"\bentry\s+\d+\s*[✅✔]", text, re.I)
+                and re.search(r"\baverage\s+entry\s+price\s*[:=@]", text, re.I)
+                and not any(CURRENT_ENTRY.search(sentence.strip()) for sentence in SENTENCES.split(current_structure_text(text)))):
+            return "entry_execution_report_not_new_signal"
         failure = future_entry_opportunity_failure(text)
         if failure:
             return failure

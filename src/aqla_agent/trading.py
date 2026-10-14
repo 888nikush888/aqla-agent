@@ -227,9 +227,13 @@ class Trading:
                 if latest_sources(snapshot["events"], [row["source_id"]])[row["source_id"]]["event_id"] != event_id:
                     raise AqlaError("An actionable interpretation must use the latest anchor revision")
             verify_evidence(interpretation, snapshot["events"])
-            if interpretation.kind == "new_signal" and set(interpretation.source_refs) - {
-                    row["source_id"], *(proof.source_id for proof in interpretation.evidence)}:
-                raise AqlaError("New signal source_refs include context without setup evidence; re-read source_context and select only the live instruction and original messages supporting this setup, not all context or receipt refs. Each additional source needs its own evidence; keep genuine setup origins")
+            supported_refs = {row["source_id"], *(proof.source_id for proof in interpretation.evidence)}
+            if interpretation.kind == "trade_update":
+                supported_refs.update(ref for trade in snapshot["trades"].values()
+                    if trade["chat_id"] == row["source"]["chat_id"] and interpretation.bound_trade_id in (None, trade["trade_id"])
+                    for ref in trade["plan"]["source_refs"])
+            if interpretation.kind in ("new_signal", "trade_update") and set(interpretation.source_refs) - supported_refs:
+                raise AqlaError("Actionable source_refs include context without setup evidence; re-read source_context and select only the live instruction and original messages supporting this setup, not all context or receipt refs. Each additional source needs its own evidence or, for updates, an existing own setup binding; keep genuine setup origins")
             from .semantic_contract import supported_action_failure
             failure = supported_action_failure(row["source"].get("text", ""), interpretation)
             if failure:
@@ -238,6 +242,8 @@ class Trading:
                 raise AqlaError("New source TP percentages must use roe_percent under source-roe-v1")
             row.update(interpretation=interpretation.model_dump(mode="json"),
                        status=interpretation.kind if interpretation.kind not in ("new_signal", "trade_update") else "interpreted")
+            if interpretation.kind not in ("new_signal", "trade_update"):
+                row.pop("last_error", None)
             return result()
         return (self.state.update_if_changed if hasattr(self.state, "update_if_changed") else self.state.update)(commit)
 
@@ -1720,7 +1726,7 @@ class Trading:
             def same_symbol(trade):
                 named = Hyperliquid.canonical_symbol(signal.symbol) if trade["plan"].get("exchange", "hyperliquid") == "hyperliquid" else signal.symbol
                 if trade["plan"]["market"]["product"] == "perp" and ":" not in named:
-                    named = named.upper()
+                    named = named.upper().removesuffix(".P")
                     for suffix in ("/USDT", "/USDC", "USDT", "USDC"):
                         if named.endswith(suffix):
                             named = named[:-len(suffix)]
