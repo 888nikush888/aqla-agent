@@ -87,7 +87,9 @@ class Trading:
         self.recovery_checked = False
 
     def ingest(self, source: SourceEvent, *, native_forward=False):
-        snapshot = self.state.snapshot()
+        legacy_event_id = digest([source.source_id, source.edited_at, source.text, source.media])[:32]
+        snapshot = self.state.read("sources_live_after", "sources", "source_aliases", "events", "event_tombstones",
+            entries={"events": [source.event_id], "event_tombstones": [source.event_id, legacy_event_id]})
         if source.sent_at < snapshot.get("sources_live_after", 0):
             source = source.model_copy(update={"historical": True})
         trusted_forward = native_forward and self.exchange.settings.telegram_owner_id and source.chat_id == self.exchange.settings.telegram_owner_id
@@ -95,7 +97,6 @@ class Trading:
             raise AqlaError("Source is not subscribed")
         if source.event_id in snapshot["events"]:
             return snapshot["events"][source.event_id]
-        legacy_event_id = digest([source.source_id, source.edited_at, source.text, source.media])[:32]
         if legacy_event_id != source.event_id and legacy_event_id in snapshot.get("event_tombstones", {}):
             return {"event_id": legacy_event_id, "source_id": source.source_id, "status": "already_processed", "reason": "legacy contextual revision retained as processed"}
         if source.event_id in snapshot.get("event_tombstones", {}):
