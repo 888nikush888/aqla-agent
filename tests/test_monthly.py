@@ -394,6 +394,53 @@ def test_monthly_pages_reject_stale_financial_request_and_attempt_bindings(chang
         jobs.monthly_page(snapshot, selected["job"], "rows")
 
 
+@pytest.mark.parametrize("action", ["page", "blocked_page", "ack", "failure"])
+def test_bound_monthly_operation_builds_report_once_without_reusing_later_evidence(monkeypatch, action):
+    snapshot, clock = data(trade()), due_at("2026-10")
+    if action == "blocked_page":
+        snapshot["source_names"]["-1001"] = "😀" * 100_000
+    selected = next_job(snapshot, clock)
+    original, calls = jobs.monthly_report, []
+
+    def counted(current, month):
+        calls.append(month)
+        return original(current, month)
+
+    monkeypatch.setattr(jobs, "monthly_report", counted)
+    if action in ("page", "blocked_page"):
+        result = jobs.monthly_page(snapshot, selected["job"], "rows")
+        assert result["status"] == ("blocked" if action == "blocked_page" else "page")
+    elif action == "ack":
+        acknowledge_publication(snapshot, "2026-10", selected["report"]["fingerprint"], "url",
+                                selected["report"]["revision"], clock, job=selected["job"])
+    else:
+        jobs.fail_publication(snapshot, {"job": selected["job"], "error_code": "temporary"}, clock)
+    assert calls == ["2026-10"]
+    if action == "page":
+        snapshot["source_names"]["-1001"] = "Changed between pages"
+        with pytest.raises(AqlaError, match="stale monthly job"):
+            jobs.monthly_page(snapshot, selected["job"], "rows")
+        assert calls == ["2026-10", "2026-10"]
+
+
+@pytest.mark.parametrize("field", ["fingerprint", "revision", "request_generation", "attempt_count"])
+@pytest.mark.parametrize("action", ["page", "ack", "failure"])
+def test_bound_monthly_operations_reject_tampered_binding_without_mutation(field, action):
+    snapshot, clock = data(trade()), due_at("2026-10")
+    selected = next_job(snapshot, clock)
+    binding = {**selected["job"], field: "0" * 64 if field == "fingerprint" else selected["job"][field] + 1}
+    before = copy.deepcopy(snapshot)
+    with pytest.raises(AqlaError, match="stale monthly job"):
+        if action == "page":
+            jobs.monthly_page(snapshot, binding, "rows")
+        elif action == "ack":
+            acknowledge_publication(snapshot, "2026-10", selected["report"]["fingerprint"], "url",
+                                    selected["report"]["revision"], clock, job=binding)
+        else:
+            jobs.fail_publication(snapshot, {"job": binding, "error_code": "temporary"}, clock)
+    assert snapshot == before
+
+
 def test_monthly_single_row_above_native_page_budget_blocks_without_progress_loop():
     snapshot, clock = data(trade()), due_at("2026-10")
     snapshot["source_names"]["-1001"] = "😀" * 100_000

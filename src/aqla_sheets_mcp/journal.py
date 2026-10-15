@@ -112,17 +112,95 @@ def _signal_record(data, identity, event, aliases):
 
 def _selected_record(data, key, fallback, history):
     table, separator, identity = key.partition(":")
-    if separator and table in ("Signale", "Ereignisse"):
+    if separator:
         row = history.get(key)
         if row is not None:
             return row
+    if separator and table in ("Signale", "Ereignisse"):
         if table == "Signale" and identity in data["events"] and is_source_row(data["events"][identity]):
             aliases = {value: name for name, value in data.get("source_aliases", {}).items()}
             return _signal_record(data, identity, data["events"][identity], aliases)
         return None
-    if not fallback:
-        fallback.append(project(data))
-    return fallback[0].get(key)
+    if separator and table in ("Trades", "Orders", "Fills", "Vorgänge"):
+        return _financial_record(data, table, identity, fallback)
+    if "all" not in fallback:
+        fallback["all"] = project(data)
+    return fallback["all"].get(key)
+
+
+def _financial_record(data, table, identity, cache):
+    if table == "Vorgänge":
+        operation = data["operations"].get(identity)
+        return _target_record(data, _operation_record(identity, operation)) if operation is not None else None
+    if table == "Trades":
+        trade_id = identity
+    else:
+        index_key = ("owners", table)
+        if index_key not in cache:
+            owners = {}
+            for trade_id, trade in data["trades"].items():
+                if table == "Orders":
+                    for cloid in [trade["entry_cloid"], *(row["cloid"] for row in trade["orders"]),
+                                  *(row["cloid"] for row in trade.get("exit_orders", []))]:
+                        owners[cloid] = trade_id
+                else:
+                    from aqla_agent.manual_accounting import verified_manual_accounting
+                    manual = verified_manual_accounting(trade)
+                    for fill_id in {**trade.get("fill_events", {}), **(manual["exit_allocations"] if manual else {})}:
+                        owners[fill_id] = trade_id
+            cache[index_key] = owners
+        trade_id = cache[index_key].get(identity)
+    trade = data["trades"].get(trade_id)
+    if trade is None:
+        return None
+    cache_key = ("records", table, trade_id)
+    if cache_key not in cache:
+        if "aliases" not in cache:
+            cache["aliases"] = {value: name for name, value in data.get("source_aliases", {}).items()}
+        if table == "Orders" and "actions" not in cache:
+            cache["actions"] = _order_actions(data)
+        cache[cache_key] = {row["record_id"]: _target_record(data, row) for row in
+                            _trade_records(data, trade_id, trade, cache["aliases"], cache.get("actions", {}), (table,))}
+    return cache[cache_key].get(identity)
+
+
+def _order_actions(data):
+    return {order.get("c"): order for operation in data["operations"].values()
+            for order in operation["wire_action"].get("orders", []) if order.get("c")}
+
+
+def _trade_records(data, identity, trade, aliases, actions, tables=("Trades", "Orders", "Fills")):
+    plan = trade["plan"]
+    if "Trades" in tables or "Fills" in tables:
+        from aqla_agent.manual_accounting import verified_manual_accounting
+        manual = verified_manual_accounting(trade)
+        fills = {**trade.get("fill_events", {}), **(manual["exit_allocations"] if manual else {})}
+        fee_facts = {identity: trade.get("report_fee_evidence", {}).get(fill_identity(fill), fill) for identity, fill in fills.items()}
+    if "Trades" in tables:
+        entry = Decimal(trade["entry_vwap"]) if trade.get("entry_vwap") else None
+        exits = [fill for fill in fills.values() if fill["kind"] != "entry"]
+        gross = sum((Decimal(fill["sz"]) * (Decimal(fill["px"]) - entry) * (1 if plan["side"] == "long" else -1) for fill in exits), Decimal(0)) if entry is not None else None
+        quote = plan["market"].get("quote_token", "USDC")
+        fees_known = bool(fills) and all(fact.get("fee") is not None and fact.get("feeToken") == quote for fact in fee_facts.values())
+        fees = sum((Decimal(fact["fee"]) for fact in fee_facts.values()), Decimal(0)) if fees_known else None
+        net = gross - fees if gross is not None and fees is not None else None
+        if accounting_issues(trade, {**trade, **accounting_facts(trade)}):
+            net = None
+        yield record("Trades", identity, aliases.get(trade["chat_id"], trade["chat_id"]), plan["market"]["symbol"], plan["side"], trade["status"], timestamp(plan["created_at"]), number(plan["entry_price"]), number(entry), number(plan["quantity"]), number(trade["filled_quantity"]), number(trade["remaining_quantity"]), number(trade["stop_price"]), text(trade.get("targets", plan["take_profits"])), number(plan["risk_usdc"]), number(trade["reserved_risk"]), number(gross), number(fees), number(net), text(plan["source_refs"]))
+    if "Orders" in tables:
+        entry_order = {"kind": "entry", "cloid": trade["entry_cloid"], "quantity": plan["quantity"], "price": plan["entry_limit"]}
+        for order in [entry_order, *trade["orders"], *trade.get("exit_orders", [])]:
+            action = actions.get(order["cloid"], {})
+            observed = trade.get("order_observations", {}).get(order["cloid"], {})
+            yield record("Orders", order["cloid"], identity, order["kind"], order.get("index"), number(order.get("quantity", action.get("s"))), number(order.get("price", action.get("p"))), order.get("retired", False), observed.get("status", ""), str(observed["oid"]) if observed.get("oid") is not None else "", timestamp(observed.get("changed_at")))
+    if "Fills" in tables:
+        for fill_id, fill in fills.items():
+            fee = fee_facts[fill_id]
+            yield record("Fills", fill_id, identity, timestamp(fill.get("time")), fill.get("coin", plan["market"]["symbol"]), fill["kind"], fill.get("index"), str(fill["oid"]), number(fill["sz"]), number(fill["px"]), number(fee.get("fee")), fee.get("feeToken"))
+
+
+def _operation_record(identity, operation):
+    return record("Vorgänge", identity, timestamp(operation["created_at"]), operation["wire_action"].get("type", ""), operation["phase"], operation.get("outcome", ""), str(operation["nonce"]), timestamp(operation.get("expires_after")), text(operation["request"]), text(operation.get("result")))
 
 
 def project(data):
@@ -130,36 +208,15 @@ def project(data):
     def add(row):
         rows[record_key(row)] = row
     aliases = {value: name for name, value in data.get("source_aliases", {}).items()}
-    actions = {order.get("c"): order for operation in data["operations"].values() for order in operation["wire_action"].get("orders", []) if order.get("c")}
+    actions = _order_actions(data)
     for identity, event in data["events"].items():
         if is_source_row(event):
             add(_signal_record(data, identity, event, aliases))
     for identity, trade in data["trades"].items():
-        plan = trade["plan"]
-        from aqla_agent.manual_accounting import verified_manual_accounting
-        manual = verified_manual_accounting(trade)
-        fills = {**trade.get("fill_events", {}), **(manual["exit_allocations"] if manual else {})}
-        entry = Decimal(trade["entry_vwap"]) if trade.get("entry_vwap") else None
-        exits = [fill for fill in fills.values() if fill["kind"] != "entry"]
-        gross = sum((Decimal(fill["sz"]) * (Decimal(fill["px"]) - entry) * (1 if plan["side"] == "long" else -1) for fill in exits), Decimal(0)) if entry is not None else None
-        quote = plan["market"].get("quote_token", "USDC")
-        fee_facts = {identity: trade.get("report_fee_evidence", {}).get(fill_identity(fill), fill) for identity, fill in fills.items()}
-        fees_known = bool(fills) and all(fact.get("fee") is not None and fact.get("feeToken") == quote for fact in fee_facts.values())
-        fees = sum((Decimal(fact["fee"]) for fact in fee_facts.values()), Decimal(0)) if fees_known else None
-        net = gross - fees if gross is not None and fees is not None else None
-        if accounting_issues(trade, {**trade, **accounting_facts(trade)}):
-            net = None
-        add(record("Trades", identity, aliases.get(trade["chat_id"], trade["chat_id"]), plan["market"]["symbol"], plan["side"], trade["status"], timestamp(plan["created_at"]), number(plan["entry_price"]), number(entry), number(plan["quantity"]), number(trade["filled_quantity"]), number(trade["remaining_quantity"]), number(trade["stop_price"]), text(trade.get("targets", plan["take_profits"])), number(plan["risk_usdc"]), number(trade["reserved_risk"]), number(gross), number(fees), number(net), text(plan["source_refs"])))
-        entry_order = {"kind": "entry", "cloid": trade["entry_cloid"], "quantity": plan["quantity"], "price": plan["entry_limit"]}
-        for order in [entry_order, *trade["orders"], *trade.get("exit_orders", [])]:
-            action = actions.get(order["cloid"], {})
-            observed = trade.get("order_observations", {}).get(order["cloid"], {})
-            add(record("Orders", order["cloid"], identity, order["kind"], order.get("index"), number(order.get("quantity", action.get("s"))), number(order.get("price", action.get("p"))), order.get("retired", False), observed.get("status", ""), str(observed["oid"]) if observed.get("oid") is not None else "", timestamp(observed.get("changed_at"))))
-        for fill_id, fill in fills.items():
-            fee = fee_facts[fill_id]
-            add(record("Fills", fill_id, identity, timestamp(fill.get("time")), fill.get("coin", plan["market"]["symbol"]), fill["kind"], fill.get("index"), str(fill["oid"]), number(fill["sz"]), number(fill["px"]), number(fee.get("fee")), fee.get("feeToken")))
+        for row in _trade_records(data, identity, trade, aliases, actions):
+            add(row)
     for identity, operation in data["operations"].items():
-        add(record("Vorgänge", identity, timestamp(operation["created_at"]), operation["wire_action"].get("type", ""), operation["phase"], operation.get("outcome", ""), str(operation["nonce"]), timestamp(operation.get("expires_after")), text(operation["request"]), text(operation.get("result"))))
+        add(_operation_record(identity, operation))
     add(record("Regeln", "aktuell", data["network"], data["account"], data["policy_revision"], data["paused"], text(data["sources"]), text(data["policy"])))
     for values in parameter_values(data):
         add(record("Handelsparameter", *values))
@@ -184,41 +241,46 @@ def project(data):
                        event["old"], event["new"], number(event["metrics"].get("score")), number(event["metrics"].get("drawdown_r")), event["network"], event["revision"],
                        event.get("reason"), event.get("proof_total"), event.get("factor")))
     for row in rows.values():
-        table, identity = row["table"], row["record_id"]
-        if table not in ("Trades", "Orders", "Fills", "Vorgänge"):
-            continue
-        trade = data["trades"].get(identity if table == "Trades" else row["values"][1])
-        plan = trade["plan"] if trade else {}
-        operation = data["operations"].get(identity, {}) if table == "Vorgänge" else {}
-        venue = plan.get("exchange", operation.get("exchange", "hyperliquid"))
-        binding = data.get("venue_accounts", {}).get(venue, {})
-        start = HEADERS[table].index("Börse")
-        row["values"][start:start + 7] = [venue, plan.get("network", binding.get("network", data["network"])), plan.get("account", binding.get("account", data["account"])),
-                              plan.get("pipeline_id") or operation.get("pipeline_id") or "legacy", plan.get("profile_id") or operation.get("profile_id") or "standard",
-                              plan.get("profile_revision") or operation.get("profile_revision") or "", plan.get("market", {}).get("quote_token", "USDT" if venue == "aster" else "USDC")]
-        if table == "Trades":
-            backup = plan.get("backup_values") or {}
-            final = trade.get("backup_finalization") or {}
-            details_start = HEADERS[table].index("Quellenname")
-            row["values"][details_start:details_start + len(TRADE_DETAILS)] = [data.get("source_names", {}).get(trade["chat_id"], ""), plan.get("source_symbol") or plan["market"]["symbol"],
-                number(plan.get("signal_leverage_original", plan.get("signal_leverage"))), number(plan.get("signal_leverage")), number(plan.get("effective_leverage")),
-                text(plan.get("backup_fields", [])), number(final.get("reference_entry")), number(backup.get("fallback_stop_loss_percent")), text(backup.get("fallback_take_profit_percentages", []))]
-            rank = plan.get("rank_snapshot") or {}
-            base = plan.get("base_parameters") or {}
-            rank_start = HEADERS[table].index(RANK_DETAILS[0])
-            row["values"][rank_start:rank_start + len(RANK_DETAILS)] = [plan.get("account_key", venue + ":" + plan["network"]), plan.get("setup_id", ""), plan.get("requested_exchange", venue), plan.get("routing_leg_id", ""),
-                       plan.get("fallback_reason", ""), rank.get("tier", ""), number(rank.get("score")), rank.get("factor", ""),
-                       number(base.get("risk_percent")), number(plan["policy"]["risk_percent"]), number(trade.get("initial_sl_risk", {}).get("amount")),
-                       trade.get("source_tp_override", plan.get("source_tp", {})).get("unit", "price"),
-                       text({"original": plan.get("source_tp"), "final": trade.get("percent_finalization"), "updates": trade.get("percent_updates", {}), "current": trade.get("source_tp_override")} if plan.get("source_tp") or trade.get("percent_updates") else {})]
-            row["values"][-2:] = [plan.get("entry_execution", "standard"), plan.get("take_profit_execution", "standard")]
-        elif table == "Fills":
-            role = trade.get("fill_execution_roles", {}).get(identity, "unknown")
-            row["values"][-1] = role if role in ("maker", "taker", "unknown") else "unknown"
-        row["fingerprint"] = fingerprint(row["values"])
+        _target_record(data, row)
     for row in data.get("journal_history", {}).values():
         add(row)
     return rows
+
+
+def _target_record(data, row):
+    table, identity = row["table"], row["record_id"]
+    if table not in ("Trades", "Orders", "Fills", "Vorgänge"):
+        return row
+    trade = data["trades"].get(identity if table == "Trades" else row["values"][1])
+    plan = trade["plan"] if trade else {}
+    operation = data["operations"].get(identity, {}) if table == "Vorgänge" else {}
+    venue = plan.get("exchange", operation.get("exchange", "hyperliquid"))
+    binding = data.get("venue_accounts", {}).get(venue, {})
+    start = HEADERS[table].index("Börse")
+    row["values"][start:start + 7] = [venue, plan.get("network", binding.get("network", data["network"])), plan.get("account", binding.get("account", data["account"])),
+                          plan.get("pipeline_id") or operation.get("pipeline_id") or "legacy", plan.get("profile_id") or operation.get("profile_id") or "standard",
+                          plan.get("profile_revision") or operation.get("profile_revision") or "", plan.get("market", {}).get("quote_token", "USDT" if venue == "aster" else "USDC")]
+    if table == "Trades":
+        backup = plan.get("backup_values") or {}
+        final = trade.get("backup_finalization") or {}
+        details_start = HEADERS[table].index("Quellenname")
+        row["values"][details_start:details_start + len(TRADE_DETAILS)] = [data.get("source_names", {}).get(trade["chat_id"], ""), plan.get("source_symbol") or plan["market"]["symbol"],
+            number(plan.get("signal_leverage_original", plan.get("signal_leverage"))), number(plan.get("signal_leverage")), number(plan.get("effective_leverage")),
+            text(plan.get("backup_fields", [])), number(final.get("reference_entry")), number(backup.get("fallback_stop_loss_percent")), text(backup.get("fallback_take_profit_percentages", []))]
+        rank = plan.get("rank_snapshot") or {}
+        base = plan.get("base_parameters") or {}
+        rank_start = HEADERS[table].index(RANK_DETAILS[0])
+        row["values"][rank_start:rank_start + len(RANK_DETAILS)] = [plan.get("account_key", venue + ":" + plan["network"]), plan.get("setup_id", ""), plan.get("requested_exchange", venue), plan.get("routing_leg_id", ""),
+                   plan.get("fallback_reason", ""), rank.get("tier", ""), number(rank.get("score")), rank.get("factor", ""),
+                   number(base.get("risk_percent")), number(plan["policy"]["risk_percent"]), number(trade.get("initial_sl_risk", {}).get("amount")),
+                   trade.get("source_tp_override", plan.get("source_tp", {})).get("unit", "price"),
+                   text({"original": plan.get("source_tp"), "final": trade.get("percent_finalization"), "updates": trade.get("percent_updates", {}), "current": trade.get("source_tp_override")} if plan.get("source_tp") or trade.get("percent_updates") else {})]
+        row["values"][-2:] = [plan.get("entry_execution", "standard"), plan.get("take_profit_execution", "standard")]
+    elif table == "Fills":
+        role = trade.get("fill_execution_roles", {}).get(identity, "unknown")
+        row["values"][-1] = role if role in ("maker", "taker", "unknown") else "unknown"
+    row["fingerprint"] = fingerprint(row["values"])
+    return row
 
 
 def enqueue_changes(previous, proposed):
@@ -251,7 +313,7 @@ def seed(data):
 def batch(data, limit=100):
     pending = data.get("journal_pending", {})
     history = {record_key(row): row for row in data.get("journal_history", {}).values() if record_key(row) in pending}
-    selected, fallback = [], []
+    selected, fallback = [], {}
     size = 0
     for key in sorted(pending, key=lambda key: key.partition(":")[0] not in ("Trades", "Fills")):
         current = _selected_record(data, key, fallback, history)
@@ -267,7 +329,7 @@ def batch(data, limit=100):
 
 
 def acknowledge(data, accepted):
-    fallback = []
+    fallback = {}
     history = {record_key(row): row for row in data.get("journal_history", {}).values() if record_key(row) in accepted} if accepted else {}
     pending = data.get("journal_pending", {})
     count = 0

@@ -3,6 +3,7 @@ from decimal import Decimal
 
 import httpx
 import pytest
+from oracles import journal_02765ac as journal_oracle
 from test_conflict_auto import foreign_fill, native_entry
 from test_operator_recovery import conflicted, terminal_orders
 
@@ -72,6 +73,10 @@ async def test_manual_pnl_is_evidence_bound_and_reaches_trade_fill_and_visible_j
     assert native['allocation']['account_amount'] == payments[0]['amount']
     assert native['signed_size'] == payments[0]['signed_size']
     projected = project(snapshot)
+    assert projected == journal_oracle.project(snapshot)
+    snapshot['journal_pending'] = {key: row['fingerprint'] for key, row in projected.items()
+                                   if row['table'] in ('Trades', 'Orders', 'Fills', 'Vorgänge')}
+    assert batch(snapshot, 500) == journal_oracle.batch(snapshot, 500)
     row = dict(zip(HEADERS['Trades'], projected['Trades:' + identity]['values'], strict=True))
     assert row['PnL realisiert vor Gebühren/Funding'] == float(own * 10)
     assert row['Gebühren USD'] == float(fees)
@@ -162,7 +167,13 @@ async def test_manual_accounting_cannot_outlive_changed_bound_evidence(setup, si
         else:
             row[root]['unexpected_change'] = 'changed'
     state.update(change)
-    assert not verified_manual_accounting(state.snapshot()['trades'][identity])
+    snapshot = state.snapshot()
+    assert not verified_manual_accounting(snapshot['trades'][identity])
+    projected = project(snapshot)
+    assert projected == journal_oracle.project(snapshot)
+    snapshot['journal_pending'] = {key: row['fingerprint'] for key, row in projected.items()
+                                   if row['table'] in ('Trades', 'Orders', 'Fills', 'Vorgänge')}
+    assert batch(snapshot, 500) == journal_oracle.batch(snapshot, 500)
     await reporting.router.close()
 
 

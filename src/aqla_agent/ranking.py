@@ -152,11 +152,15 @@ def outcome_index(data) -> OutcomeIndex:
     return index
 
 
-def outcomes(data):
+def outcomes(data, *, selected_ids=None, report_rows=None):
     from .monthly import report_row
+    if selected_ids is not None and not selected_ids:
+        return {}, {}
     index = outcome_index(data)
     result, excluded = {}, {}
     for (source, family), trades in index.families.items():
+        if selected_ids is not None and not any(trade["trade_id"] in selected_ids for trade in trades):
+            continue
         values, reasons, timestamps = [], [], []
         # An unfilled leg may still open later. Finalize the family only when no
         # original target remains pending, planned or actively waiting for entry.
@@ -168,7 +172,9 @@ def outcomes(data):
             if trade["status"] not in ("closed", "cancelled", "rejected"):
                 reasons.append("Trade noch offen")
                 continue
-            row = report_row(data, trade)
+            row = report_rows.get(id(trade)) if report_rows is not None else None
+            if row is None:
+                row = report_row(data, trade)
             initial = trade.get("initial_sl_risk")
             if not initial:
                 # Conservative legacy reconstruction: only a source-backed absolute SL.

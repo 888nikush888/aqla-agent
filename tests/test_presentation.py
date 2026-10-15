@@ -217,3 +217,67 @@ def test_unfilled_cancelled_and_pending_trades_have_no_realized_zero_or_open_pos
     assert len(snapshot.journal) == 2 and all(row.cohort == "unfilled" for row in snapshot.journal)
     assert snapshot.open_trades == 0 and snapshot.evaluated_trades == 0
     assert snapshot.net_pnl.value is None and snapshot.net_pnl.status == "empty"
+
+
+def test_scoped_outcomes_reuse_only_current_build_rows_and_keep_cross_currency_family(monkeypatch):
+    from oracles.ranking_ed233a2 import outcomes as original_outcomes
+
+    from aqla_agent import monthly, presentation
+
+    selected, sibling, unrelated = trade("selected"), trade("sibling", currency="USDT"), trade("unrelated", currency="USDT")
+    source = state_data(selected, sibling, unrelated)
+    for row in (selected, sibling):
+        row["plan"].update(setup_id="shared-family", source_refs=["shared-source"])
+    expected_r = Decimal(next(row["net_r"] for row in original_outcomes(source)[0]["-1001"]
+                             if row["setup_id"] == "shared-family"))
+    calls, original = [], monthly.report_row
+
+    def counted(data, row):
+        calls.append(row["trade_id"])
+        return original(data, row)
+
+    monkeypatch.setattr(monthly, "report_row", counted)
+    monkeypatch.setattr(presentation, "report_row", counted)
+    result = build_presentation(source, clock=CLOCK)
+    assert calls == ["selected", "sibling"]
+    assert result.channels[0].scope_setups == 1
+    assert result.channels[0].net_r == expected_r
+    coverage = sibling.pop("funding_coverage")
+    calls.clear()
+    changed = build_presentation(source, clock=CLOCK)
+    assert calls == ["selected", "sibling"]
+    assert changed.channels[0].net_r is None and changed.channels[0].excluded_setups == 1
+    assert result.channels[0].net_r == expected_r
+    sibling["funding_coverage"] = coverage
+    pending = copy.deepcopy(sibling)
+    pending.update(trade_id="pending", status="waiting_entry", fill_events={}, filled_quantity="0")
+    source["trades"]["pending"] = pending
+    waiting = build_presentation(source, clock=CLOCK)
+    assert waiting.channels[0].net_r is None and waiting.channels[0].excluded_setups == 1
+    assert original_outcomes(source)[1]["-1001"][0]["trade_ids"] == ["selected", "sibling"]
+
+
+def test_empty_scope_skips_unrelated_financial_outcomes(monkeypatch):
+    from aqla_agent import monthly
+
+    source = state_data(*(trade(str(index), currency="USDT") for index in range(100)))
+    monkeypatch.setattr(monthly, "report_row", lambda *_: pytest.fail("Unselected family accounting was evaluated"))
+    result = build_presentation(source, clock=CLOCK)
+    assert not result.journal and not result.channels
+
+
+def test_rank_history_is_scanned_once_with_original_valid_time_semantics():
+    class OneScan(dict):
+        def values(self):
+            assert not getattr(self, "scanned", False), "Rank history was rescanned per source"
+            self.scanned = True
+            return super().values()
+
+    source = state_data()
+    source["source_ranks"] = {identity: {"tier": "F"} for identity in ("one", "two", "empty")}
+    source["ranking_history"] = OneScan({
+        "old": {"source_id": "one", "time": CLOCK - 1}, "new": {"source_id": "one", "time": CLOCK},
+        "invalid": {"source_id": "one", "time": "later"}, "missing": {"source_id": "two"},
+        "negative": {"source_id": "two", "time": -10}, "zero": {"source_id": "two", "time": 0}})
+    result = build_presentation(source, clock=CLOCK)
+    assert {row.source_id: row.last_change for row in result.channels} == {"one": CLOCK, "two": 0, "empty": None}

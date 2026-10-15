@@ -104,3 +104,15 @@ def test_full_proof_history_window_and_rank_bindings_match_original_evaluation(m
     assert len(rank["evidence"]) > 50 and rank["metrics"]["count"] == 50
     assert len(rank["evaluated"]) == len(rank["evidence"])
     assert actual["ranking_revision"] == 7
+
+
+@pytest.mark.parametrize("aliased,ranked", [(False, False), (True, False), (False, True), (True, True)])
+def test_selected_families_match_filtered_frozen_oracle_with_all_pending_siblings(aliased, ranked):
+    snapshot = ranking_snapshot(aliased=aliased, ranked=ranked)
+    selected = {"filled-0", "filled-10", "filled-11", "filled-14", "filled-17", "filled-23", "missing-fills-27"}
+    before = copy.deepcopy(snapshot)
+    expected = tuple({source: retained for source, rows in section.items()
+                      if (retained := [row for row in rows if selected.intersection(row["trade_ids"])])}
+                     for section in original_outcomes(snapshot))
+    assert ranking.outcomes(snapshot, selected_ids=selected) == expected
+    assert snapshot == before

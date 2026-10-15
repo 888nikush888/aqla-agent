@@ -1,10 +1,130 @@
 import copy
 
 import pytest
+from oracles import journal_02765ac as financial_oracle
 from oracles import journal_85aa9d7 as oracle
 
 from aqla_hyperliquid_mcp.models import SourceEvent
 from aqla_sheets_mcp import journal
+
+
+@pytest.fixture
+def financial_data(setup, monkeypatch):
+    from test_monthly import trade
+
+    snapshot = setup[1].snapshot()
+    monkeypatch.setattr(journal, "now_ms", lambda: 1_800_000_000_000)
+    monkeypatch.setattr(financial_oracle, "now_ms", lambda: 1_800_000_000_000)
+    row = trade()
+    row["plan"].update(entry_price="101", quantity="2", entry_limit="101", stop_loss="90", take_profits=["105", "110"],
+        risk_usdc="22", source_refs=[], account=snapshot["account"], network=snapshot["network"], policy={"risk_percent": "1"})
+    row.update(entry_vwap="101", filled_quantity="2", remaining_quantity="0", stop_price="90", reserved_risk="0",
+        orders=[{"kind": "tp", "cloid": "target", "index": 1}],
+        exit_orders=[{"kind": "close", "cloid": "exit", "quantity": "1", "price": "110", "retired": True}])
+    row["fill_execution_roles"] = {identity: "maker" for identity in row["fill_events"]}
+    snapshot["trades"] = {row["trade_id"]: row}
+    snapshot["operations"] = {"operation": {"created_at": 1_800_000_000_000, "phase": "confirmed", "nonce": 7,
+        "wire_action": {"type": "order", "orders": [{"c": "target", "p": "105", "s": ".5"}]},
+        "request": {"type": "synthetic"}, "result": {"status": "ok"}}}
+    return snapshot
+
+
+@pytest.mark.parametrize("table", ["Trades", "Orders", "Fills", "Vorgänge"])
+@pytest.mark.parametrize("damage", [None, "missing_fee", "fee_currency", "partial_exit"])
+def test_financial_selected_batch_and_ack_match_frozen_projection_without_source_scan(financial_data, monkeypatch, table, damage):
+    class NoSourceScan(dict):
+        def items(self):
+            pytest.fail("Targeted finance projected unrelated source history")
+
+        def values(self):
+            pytest.fail("Targeted finance scanned unrelated source history")
+
+    row = financial_data["trades"]["trade"]
+    if damage == "missing_fee":
+        next(iter(row["fill_events"].values()))["fee"] = None
+    elif damage == "fee_currency":
+        next(iter(row["fill_events"].values()))["feeToken"] = "other"
+    elif damage == "partial_exit":
+        row["fill_events"].pop(list(row["fill_events"])[-1])
+    records = financial_oracle.project(financial_data)
+    assert journal.project(financial_data) == records
+    financial_data["journal_pending"] = {key: row["fingerprint"] for key, row in records.items() if row["table"] == table}
+    expected_batch = financial_oracle.batch(financial_data, 100)
+    expected = copy.deepcopy(financial_data)
+    accepted = {journal.record_key(row): row["fingerprint"] for row in expected_batch["records"]}
+    expected_ack = financial_oracle.acknowledge(expected, accepted)
+    financial_data["events"] = NoSourceScan(financial_data["events"])
+    monkeypatch.setattr(journal, "project", lambda *_: pytest.fail("Targeted finance used full projection"))
+    assert journal.batch(financial_data, 100) == expected_batch
+    assert journal.acknowledge(financial_data, accepted) == expected_ack
+    assert financial_data == expected
+
+
+@pytest.mark.parametrize("table", ["Trades", "Orders", "Fills", "Vorgänge"])
+def test_financial_history_overrides_and_two_fingerprint_guards_match_frozen_oracle(financial_data, monkeypatch, table):
+    records = financial_oracle.project(financial_data)
+    key, original = next((key, row) for key, row in records.items() if row["table"] == table)
+    override = copy.deepcopy(original)
+    override["values"][1] = "historical override"
+    override["fingerprint"] = journal.fingerprint(override["values"])
+    financial_data["journal_history"] = {"noncanonical-key": override}
+    financial_data["journal_pending"] = {key: override["fingerprint"]}
+    expected_batch = financial_oracle.batch(financial_data, 100)
+    monkeypatch.setattr(journal, "project", lambda *_: pytest.fail("Financial override used full projection"))
+    assert journal.batch(financial_data, 100) == expected_batch
+    for accepted_version, pending_version in ((original["fingerprint"], override["fingerprint"]),
+            (override["fingerprint"], "new pending generation"), (override["fingerprint"], override["fingerprint"])):
+        actual, expected = copy.deepcopy(financial_data), copy.deepcopy(financial_data)
+        actual["journal_pending"][key] = expected["journal_pending"][key] = pending_version
+        accepted = {key: accepted_version}
+        assert journal.acknowledge(actual, accepted) == financial_oracle.acknowledge(expected, accepted)
+        assert actual == expected
+
+
+@pytest.mark.parametrize("table", ["Orders", "Fills"])
+def test_financial_owner_collisions_and_missing_records_keep_full_projection_semantics(financial_data, monkeypatch, table):
+    duplicate = copy.deepcopy(financial_data["trades"]["trade"])
+    duplicate["trade_id"] = "second"
+    duplicate["plan"]["profile_id"] = "other"
+    financial_data["trades"]["second"] = duplicate
+    records = financial_oracle.project(financial_data)
+    financial_data["journal_pending"] = {key: row["fingerprint"] for key, row in records.items() if row["table"] == table}
+    financial_data["journal_pending"][table + ":missing"] = "missing"
+    expected = financial_oracle.batch(financial_data, 100)
+    monkeypatch.setattr(journal, "project", lambda *_: pytest.fail("Financial owner lookup used full projection"))
+    assert journal.batch(financial_data, 100) == expected
+    assert all(row["values"][1] == "second" for row in expected["records"])
+
+
+@pytest.mark.parametrize("table", ["Trades", "Orders", "Fills"])
+def test_financial_batch_indexes_owners_once_and_projects_only_requested_trade_table(financial_data, monkeypatch, table):
+    class CountingTrades(dict):
+        scans = 0
+
+        def items(self):
+            self.scans += 1
+            return super().items()
+
+    other = copy.deepcopy(financial_data["trades"]["trade"])
+    other.update(trade_id="other", entry_cloid="other-entry", orders=[], exit_orders=[])
+    other["fill_events"] = {"other-" + identity: row for identity, row in other["fill_events"].items()}
+    financial_data["trades"]["other"] = other
+    records = financial_oracle.project(financial_data)
+    financial_data["journal_pending"] = {key: row["fingerprint"] for key, row in records.items()
+                                         if row["table"] == table and (row["record_id"] == "trade" if table == "Trades" else row["values"][1] == "trade")}
+    expected = financial_oracle.batch(financial_data, 100)
+    financial_data["trades"] = CountingTrades(financial_data["trades"])
+    generated, original = [], journal._trade_records
+
+    def counted(data, identity, trade, aliases, actions, tables):
+        generated.append((identity, tables))
+        return original(data, identity, trade, aliases, actions, tables)
+
+    monkeypatch.setattr(journal, "_trade_records", counted)
+    monkeypatch.setattr(journal, "project", lambda *_: pytest.fail("Targeted financial batch used full projection"))
+    assert journal.batch(financial_data, 100) == expected
+    assert generated == [("trade", (table,))]
+    assert financial_data["trades"].scans == (0 if table == "Trades" else 1)
 
 
 @pytest.fixture

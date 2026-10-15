@@ -368,10 +368,11 @@ def request_publication(data, month):
     return {"requested_month": month}
 
 
-def _bound_job(data, binding, *, allow_published=False):
+def _bound_job(data, binding, *, allow_published=False, report=None):
     binding = MonthlyJobBinding.model_validate(binding)
     stored = data.get("monthly_jobs", {}).get(binding.month)
-    report = monthly_report(data, binding.month)
+    if report is None or report["month"] != binding.month:
+        report = monthly_report(data, binding.month)
     if not stored:
         raise AqlaError("stale monthly job: request a current publication job")
     job = MonthlyJob.model_validate(stored)
@@ -380,15 +381,19 @@ def _bound_job(data, binding, *, allow_published=False):
             or (report["fingerprint"], report["revision"]) != (binding.fingerprint, binding.revision)
             or job.status not in ({"publishing", "published"} if allow_published else {"publishing"})):
         raise AqlaError("stale monthly job: financial evidence or publication attempt changed")
-    return job
+    return job, report
 
 
 def fail_publication(data, failure, clock=None):
     failure = MonthlyFailure.model_validate(failure)
-    job = _bound_job(data, failure.job)
+    job, _ = _bound_job(data, failure.job)
+    return _fail_publication(data, job, failure.error_code, clock)
+
+
+def _fail_publication(data, job, error_code, clock=None):
     clock = now_ms() if clock is None else clock
-    job.last_error = failure.error_code
-    if failure.error_code == "temporary":
+    job.last_error = error_code
+    if error_code == "temporary":
         job.status = "retry"
         job.next_retry_at = clock + min(60 * 2 ** min(job.attempt_count - 1, 6), 3600) * 1000
     else:
@@ -399,8 +404,7 @@ def fail_publication(data, failure, clock=None):
 
 def monthly_page(data, binding, section: MonthlySection, offset=0, limit=100):
     binding = MonthlyJobBinding.model_validate(binding)
-    _bound_job(data, binding)
-    report = monthly_report(data, binding.month)
+    bound, report = _bound_job(data, binding)
     if section not in ("rows", "open_trades", "undated_closed_trades") or type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
         raise AqlaError("Monthly internal page requires a known section, offset >= 0 and limit between 1 and 100")
     total = len(report[section])
@@ -417,7 +421,7 @@ def monthly_page(data, binding, section: MonthlySection, offset=0, limit=100):
             break
         rows = result.rows
     if not rows and offset < total:
-        fail_publication(data, MonthlyFailure(job=binding, error_code="budget"))
+        _fail_publication(data, bound, "budget")
         return MonthlyPage(status="blocked", job=binding, section=section, offset=offset, total=total,
                            error_code="budget").model_dump(mode="json")
     consumed = offset + len(rows)
@@ -429,7 +433,7 @@ def acknowledge_publication(data, month, fingerprint, url, revision, clock=None,
     report = monthly_report(data, month)
     if report["fingerprint"] != fingerprint or report["revision"] != revision:
         raise AqlaError("Monatsbelege wurden während der Veröffentlichung geändert; erneut abgleichen")
-    bound = _bound_job(data, job, allow_published=True) if job is not None else None
+    bound = _bound_job(data, job, allow_published=True, report=report)[0] if job is not None else None
     if bound is not None and (bound.month, bound.fingerprint, bound.revision) != (month, fingerprint, revision):
         raise AqlaError("stale monthly job: publication does not match the selected job")
     clock = now_ms() if clock is None else clock

@@ -24,9 +24,11 @@ Journal-ACK ist eine eigene geprüfte Teiltransaktion. Sie entfernt einen Pendin
 nur bei gleichzeitig passendem aktuellen und Pendingfingerprint. Historienzeilen
 werden nur über diesen bestätigten ACKpfad freigegeben. Sequenz-, Zeit- und
 Initialisierungswirkungen entsprechen dem Genericpfad, einschließlich leerer und
-stale ACKs. Für Signale/Historie werden nur benötigte Records projiziert; andere
-Tabellen verwenden zunächst den vollständigen Fallback. Historyoverrides und die
-vorhandene Pendingreihenfolge bleiben erhalten.
+stale ACKs. Signale, Historie und Finanzzeilen (Trades, Orders, Fills, Vorgänge)
+verwenden selektive Projektionen. Order-/Fillzuordnungen werden je Aufruf einmal
+indiziert; die unveränderten Finanzprojektoren erzeugen nur die benötigten
+Trade-/Tabellenzeilen. Andere Tabellen behalten den vollständigen Fallback.
+Historyoverrides und die vorhandene Pendingreihenfolge bleiben erhalten.
 
 Feste Monatsjoboperationen lesen aktuelle Finanzbelege unter demselben Lock. Sie
 stellen nur die geprüften Job-/Requestfunktionen bereit, keinen beliebigen Callback
@@ -35,6 +37,14 @@ auch der feste Monats-ACK diesen Pfad mit detached Publication-/Notificationwurz
 Versionierter Notification-ACK kopiert ausschließlich die Notificationwurzel.
 Notificationseiten und Readerstatus sind feste read-only-Projektionen unter Lock;
 nur ihre begrenzten berechneten Ergebnisse werden detached zurückgegeben.
+
+Monatsseiten und Monats-ACK verwenden ihren bereits unter demselben Lock geprüften
+Bericht innerhalb dieses Aufrufs erneut. Es gibt keinen Cache über Aufrufe hinweg;
+spätere Finanz-, Request- oder Versuchsänderungen werden weiterhin neu geprüft.
+Die Präsentation verwendet Accountingzeilen nur innerhalb desselben Builds erneut
+und wertet nur ausgewählte Setupfamilien aus. Dabei bleiben sämtliche Mitglieder
+und ausstehenden Schwesterlegs einer ausgewählten Familie einschließlich anderer
+Währungen und Börsen relevant. Rangänderungszeiten werden einmal je Build indiziert.
 
 `update_if_changed` vermeidet ausschließlich einen tatsächlichen JSONgleichen
 Generic-No-op. Typen, Einfügereihenfolge und explizite Revisionseffekte bleiben

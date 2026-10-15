@@ -210,7 +210,7 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
     current = datetime.fromtimestamp(clock / 1000, BERLIN).strftime("%Y-%m")
     period = current if scope.period == "current" else scope.period
     start, end = (None, None) if period == "all" else month_bounds(period)
-    journal, selected_ids = [], set()
+    journal, selected_ids, report_rows = [], set(), {}
     for trade in data.get("trades", {}).values():
         plan = trade["plan"]
         currency = plan["market"].get("quote_token", "USDC")
@@ -218,6 +218,7 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
         if plan["network"] != scope.network or currency != scope.currency or scope.exchange != "all" and exchange != scope.exchange:
             continue
         row = report_row(data, trade)
+        report_rows[id(trade)] = row
         cohort = _cohort(trade, row, start, end)
         if cohort is None:
             continue
@@ -268,9 +269,15 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
         if point.value is not None:
             running += point.value
         cumulative.append(PresentationPoint(label=point.label, value=running if point.value is not None else None))
-    complete, excluded = outcomes(data)
+    complete, excluded = outcomes(data, selected_ids=selected_ids, report_rows=report_rows)
     channels = []
     sources = set(data.get("source_ranks", {})) | {source_key(data, row.source_id) for row in journal}
+    last_changes = {}
+    if sources:
+        for row in data.get("ranking_history", {}).values():
+            identity, stamp = row.get("source_id"), row.get("time")
+            if isinstance(identity, str) and identity in sources and isinstance(stamp, int):
+                last_changes[identity] = max(last_changes.get(identity, stamp), stamp)
     for identity in sorted(sources):
         rank = data.get("source_ranks", {}).get(identity, {})
         stats = rank.get("metrics", {})
@@ -278,11 +285,10 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
                     and (start is None or start <= row["closed_at"]) and (end is None or row["closed_at"] < end)]
         rejected = [row for row in excluded.get(identity, []) if selected_ids.intersection(row["trade_ids"])]
         origin = rank.get("origin", "bootstrap" if rank.get("bootstrap") else "auto" if rank.get("evaluated") else "unknown")
-        changes = [row.get("time") for row in data.get("ranking_history", {}).values() if row.get("source_id") == identity and isinstance(row.get("time"), int)]
         channels.append(PresentationChannel(source_id=identity, source=data.get("source_names", {}).get(identity, "Kanal ohne Anzeigename"),
             rank=rank.get("tier", "F"), origin=origin if origin in ("manual", "auto", "bootstrap", "unknown") else "unknown",
             score=_decimal(stats.get("score")), proof=len(rank.get("evidence", [])), drawdown_r=_decimal(stats.get("drawdown_r")),
-            last_change=max(changes) if changes else None, net_r=sum((Decimal(row["net_r"]) for row in eligible), Decimal(0)) if eligible else None,
+            last_change=last_changes.get(identity), net_r=sum((Decimal(row["net_r"]) for row in eligible), Decimal(0)) if eligible else None,
             scope_setups=len(eligible), excluded_setups=len(rejected)))
     channels.sort(key=lambda row: (-TIERS.index(row.rank), -(row.score or Decimal(0)), row.source.casefold(), row.source_id))
     currencies = sorted({"USDT", "USDC", *(trade["plan"]["market"].get("quote_token", "USDC") for trade in data.get("trades", {}).values())})
