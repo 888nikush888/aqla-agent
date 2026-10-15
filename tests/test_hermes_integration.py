@@ -47,7 +47,7 @@ async def test_verified_sheets_publication_outlives_native_default_deadline(exte
     await ext.sync_presentation()
     assert [tool for _, tool, _ in calls] == ["presentation_selection_internal", "integration", "sync_presentation_internal"]
     assert calls[0][2] == calls[2][2] == {"timeout": 240}
-    assert calls[1][2] == {}
+    assert calls[1][2] == {"timeout": 120}
 
 
 def message(owner="12345", injection=False, plugin_id="aqla-events", text="normal user text"):

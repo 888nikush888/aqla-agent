@@ -113,6 +113,8 @@ def install_strict_profile():
     replace(GatewayAdapterLifecycleMixin, "_install_reconnected_adapter", install_reconnected_adapter)
     from .usage_metrics import install as install_usage_metrics
     install_usage_metrics(replace)
+    from .provider_cooldown import install as install_provider_cooldown
+    install_provider_cooldown(replace)
     original_clarify = TurnRunner._clarify_callback_sync
 
     def clarify_callback(self, questions):

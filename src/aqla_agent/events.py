@@ -177,7 +177,8 @@ class HermesExtension:
     async def mcp_call(self, server, tool, args):
         claim = self.turn_claim.get()
         # Verified Sheets publications span several HTTP calls and bounded read retries.
-        call_options = {"timeout": 240} if server == "sheets" and tool.endswith("_internal") else {}
+        call_options = {"timeout": 240} if server == "sheets" and tool.endswith("_internal") else (
+            {"timeout": 120} if server == self.server and tool == "integration" else {})
         def invoke():
             if claim and claim.read():
                 return self.ctx.call_mcp(server, tool, args, **call_options)

@@ -88,7 +88,7 @@ async def verify(home, mcp_python):
         from tools.interrupt import acting_for_tid, is_interrupted, set_interrupt
         asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
         await asyncio.to_thread(set_interrupt, True)
-        def probe(*_):
+        def probe(*_, **__):
             return {'ok': not is_interrupted(), 'result': {'background_mcp_usable': True}}
         ext.ctx.call_mcp = probe
         assert await ext.mcp_call('aqla', 'integration', {}) == {'background_mcp_usable': True}
@@ -128,10 +128,40 @@ async def verify(home, mcp_python):
             assert deadlines == [('sheets', 'sync_presentation_internal', 240.0)]
         finally:
             mcp_tool_handlers._make_tool_handler, ext.ctx = handler, previous_context
+        from agent.error_classifier import FailoverReason
+        from run_agent import AIAgent
+
+        from aqla_agent.provider_cooldown import install as install_provider_cooldown
+        undo_provider = []
+        def replace_provider(target, name, value):
+            undo_provider.append((target, name, getattr(target, name)))
+            setattr(target, name, value)
+        install_provider_cooldown(replace_provider)
+        settings = {'model': 'qa-model', 'provider': 'custom', 'base_url': 'http://127.0.0.1:9/primary/v1',
+            'api_key': 'local-test-only', 'api_mode': 'chat_completions', 'enabled_toolsets': ['skills'],
+            'fallback_model': [{'provider': 'custom', 'model': 'qa-backup', 'base_url': 'http://127.0.0.1:9/backup/v1', 'api_key': 'local-test-only'}],
+            'skip_memory': True, 'skip_context_files': True, 'skip_background_review': True, 'quiet_mode': True, 'save_trajectories': False}
+        import time
+        first, fresh = None, None
+        try:
+            first = AIAgent(**settings)
+            assert first._try_activate_fallback(reason=FailoverReason.rate_limit, reset_at=time.time() + 3600)
+            fresh = AIAgent(**settings)
+            fresh._restore_primary_runtime()
+            assert fresh.base_url.rstrip('/').endswith('/backup/v1') and fresh._fallback_activated
+            assert fresh._rate_limited_until > time.monotonic() + 3500
+        finally:
+            if first is not None:
+                first.close()
+            if fresh is not None:
+                fresh.close()
+            for target, name, original in reversed(undo_provider):
+                setattr(target, name, original)
         print(json.dumps({'native_transform_before_persistence': True, 'actual_mcp_read_and_versioned_ack': True,
             'quiet_without_new_event': True, 'exact_rendered_event_delivered': True, 'exchange_calls': 0,
             'stale_pooled_interrupt_cleared_for_background_only': True, 'active_operator_interrupt_preserved': True,
-            'native_sheets_deadline_covers_verified_publication': True}))
+            'native_sheets_deadline_covers_verified_publication': True,
+            'fresh_native_agent_respects_persisted_provider_reset': True}))
     finally:
         lifecycle._plugin_hooks, lifecycle.has_hook = old_hooks, old_has
 

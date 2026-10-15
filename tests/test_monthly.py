@@ -587,8 +587,9 @@ def test_monthly_failed_final_shrink_readback_keeps_owned_tail_on_retry(monkeypa
     monkeypatch.setattr(google, "request", edit_at_confirmation)
     first = client.publish_monthly(shrunk)
     assert edited
-    assert first == {"status": "blocked" if fault == "tail_edit" else "retry", "publication": None,
-                     "error_code": "integrity" if fault == "tail_edit" else "temporary"}
+    detects_edit = fault in ("tail_edit", "lost_final_readback")
+    assert first == {"status": "blocked" if detects_edit else "retry", "publication": None,
+                     "error_code": "integrity" if detects_edit else "temporary"}
     google.calls.clear()
     retry = client.publish_monthly(shrunk)
     assert retry == {"status": "blocked", "publication": None, "error_code": "integrity"}
@@ -647,7 +648,11 @@ def test_monthly_manifest_fault_retry_confirms_only_complete_generation(monkeypa
 
     monkeypatch.setattr(google, "request", faulty_request)
     first = client.publish_monthly(report)
-    assert failed and first == {"status": "retry", "publication": None, "error_code": "temporary"}
+    assert failed
+    if fault == "commit_read":
+        assert first["status"] == "published" and len(values_writes(google)) == 1
+    else:
+        assert first == {"status": "retry", "publication": None, "error_code": "temporary"}
     google.calls.clear()
     second = client.publish_monthly(report)
     assert second["status"] == "published"
