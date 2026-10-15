@@ -166,6 +166,8 @@ async def test_actual_sqlite_restart_retains_attempt_order_and_reservation_failu
         with pytest.raises(asyncio.CancelledError):
             await reporter.tick()
         assert starts == ["a", "b"]
+        assert not (await reporter.tick())["attempts"]
+        clock.wall += 60_000
         before = restarted.snapshot()
         def fail_write(*args):
             raise OSError("synthetic failed metadata persistence")
@@ -211,6 +213,75 @@ async def test_job_request_limit_leaves_capacity_for_later_jobs(plan_shape):
     assert all(attempt["reason"] == "job_request_limit" for attempt in result["attempts"])
     assert result["requests"] == len(calls) == 3
     assert monthly_report(snapshot, "2026-10") == monthly_report(original, "2026-10")
+
+
+@pytest.mark.asyncio
+async def test_default_job_completes_two_slow_reads_without_weakening_financial_proofs(plan_shape):
+    row = trade("crv")
+    row.pop("funding_coverage")
+    row.pop("funding_events")
+    snapshot, clock, calls = data(row), Clock(), []
+    original = copy.deepcopy(row["fill_events"])
+    def respond(request):
+        kind = json.loads(request.content)["type"]
+        calls.append(kind)
+        clock.now += 1.4
+        return httpx.Response(200, json=list(original.values()) if kind == "userFillsByTime" else [])
+    async with httpx.AsyncClient(base_url="https://synthetic.invalid", transport=httpx.MockTransport(respond)) as client:
+        state, router = setup_http(snapshot, client)
+        result = await Reporting(state, router, clock=clock, wall_clock=clock.millis).tick()
+    assert result["attempts"][0]["complete"] and result["requests"] == 2
+    assert calls == ["userFillsByTime", "userFunding"] and clock.now == 2.8
+    assert row["fill_events"] == original and row["funding_coverage"]["complete"]
+    assert monthly_report(snapshot, "2026-10")["summary"]["complete"] == 1
+
+
+@pytest.mark.asyncio
+async def test_incomplete_legacy_trade_and_transient_retry_survive_restart_then_clear(plan_shape):
+    row, clock, calls = trade("crv"), Clock(), []
+    row.update(funding_coverage={"complete": False, "reason": "old timeout"}, reporting_checked_at=clock.wall-60_000)
+    snapshot, failing = data(row), [True]
+    def respond(request):
+        kind = json.loads(request.content)["type"]
+        calls.append(kind)
+        return httpx.Response(503, json={}) if failing[0] else httpx.Response(200,
+            json=list(row["fill_events"].values()) if kind == "userFillsByTime" else [])
+    async with httpx.AsyncClient(base_url="https://synthetic.invalid", transport=httpx.MockTransport(respond)) as client:
+        state, router = setup_http(snapshot, client)
+        first = await Reporting(state, router, clock=clock, wall_clock=clock.millis).tick()
+        assert first["attempts"][0]["reason"] == "unavailable"
+        assert row["reporting_next_retry_at"] == clock.wall+60_000
+        assert row["reporting_failure_count"] == 1
+        failing[0] = False
+        restarted = Reporting(state, router, clock=clock, wall_clock=clock.millis)
+        clock.wall += 59_999
+        assert not (await restarted.tick())["attempts"] and len(calls) == 1
+        clock.wall += 1
+        assert (await restarted.tick())["attempts"][0]["complete"]
+        assert len(calls) == 3 and "reporting_failure_count" not in row
+        assert row["reporting_next_retry_at"] == clock.wall+3_600_000
+        assert row["reporting_last_attempt"]["reason"] == "complete"
+        assert "reporting_last_error" not in row and row["funding_coverage"]["complete"]
+
+
+@pytest.mark.asyncio
+async def test_transient_retry_backoff_caps_but_evidence_conflicts_keep_hourly_review():
+    row, clock = trade("crv"), Clock()
+    snapshot = data(row)
+    row["funding_coverage"] = {"complete": False}
+    reporter = Reporting(fake_state(snapshot), SimpleNamespace(), clock=clock, wall_clock=clock.millis)
+    reason = ["unavailable"]
+    async def failed(identity):
+        return {"complete": False, "reason": reason[0]}
+    reporter.refresh = failed
+    for delay in (60_000, 120_000, 240_000, 300_000, 300_000):
+        assert (await reporter.tick())["attempts"][0]["reason"] == "unavailable"
+        assert row["reporting_next_retry_at"] == clock.wall+delay
+        clock.wall += delay
+    reason[0] = "evidence_conflict"
+    assert (await reporter.tick())["attempts"][0]["reason"] == "evidence_conflict"
+    assert row["reporting_next_retry_at"] == clock.wall+3_600_000
+    assert "reporting_failure_count" not in row
 
 
 @pytest.mark.asyncio

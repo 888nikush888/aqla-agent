@@ -48,7 +48,7 @@ class Reporting:
                  job_requests=None, job_time_seconds=None, clock: Callable[[], float] = time.monotonic,
                  wall_clock: Callable[[], int] | None = None, wait_for: Callable[..., Awaitable[RefreshResult]] | None = None):
         job_requests = min(8, max_requests) if job_requests is None and type(max_requests) is int else job_requests
-        job_time_seconds = min(2.0, time_budget_seconds) if job_time_seconds is None and type(time_budget_seconds) in (int, float) else job_time_seconds
+        job_time_seconds = min(8.0, time_budget_seconds) if job_time_seconds is None and type(time_budget_seconds) in (int, float) else job_time_seconds
         if any(type(value) is not int or not 1 <= value <= 4096 for value in (max_jobs, max_requests, job_requests)):
             raise ValueError("Reporting job/request budgets must be integers in 1..4096")
         if any(type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 40 for value in (time_budget_seconds, job_time_seconds)):
@@ -122,7 +122,7 @@ class Reporting:
                     funding_coverage={"complete": False, "reason": "Historische Entry-/Exit-Belege nicht vollständig verfügbar"}))
                 return {"complete": False, "reason": "history_unavailable"}
         metrics = accounting_facts(trade)
-        if metrics:
+        if any(trade.get(key) != value for key, value in metrics.items()):
             self.state.update(lambda data: data["trades"][trade_id].update(metrics))
             trade = self.state.snapshot()["trades"][trade_id]
         entry = trade.get("entry_accounting", {})
@@ -260,7 +260,8 @@ class Reporting:
             snapshot = self.state.snapshot()
             candidates = [trade for trade in snapshot["trades"].values()
                           if trade["status"] in CLOSED and (trade.get("fill_events") or Decimal(trade.get("filled_quantity", "0")) > 0)
-                          and self.wall_clock() - trade.get("reporting_checked_at", 0) >= 3_600_000]
+                          and self.wall_clock() >= trade.get("reporting_next_retry_at", trade.get("reporting_checked_at", 0)
+                              + (3_600_000 if verified_coverage_matches(trade) else 60_000))]
             candidates.sort(key=lambda trade: (trade.get("reporting_attempt_sequence", 0), trade.get("reporting_checked_at", 0), trade["trade_id"]))
             result: ReportingTick = {"attempts": [], "requests": 0, "elapsed_seconds": 0.0, "stop_reason": "idle" if not candidates else "complete"}
             for trade in candidates:
@@ -275,7 +276,8 @@ class Reporting:
                 trade_id = trade["trade_id"]
                 def reserve(data, trade_id=trade_id):
                     sequence = max((row.get("reporting_attempt_sequence", 0) for row in data["trades"].values()), default=0) + 1
-                    data["trades"][trade_id].update(reporting_attempt_sequence=sequence, reporting_attempted_at=self.wall_clock())
+                    data["trades"][trade_id].update(reporting_attempt_sequence=sequence, reporting_attempted_at=self.wall_clock(),
+                                                   reporting_next_retry_at=self.wall_clock()+60_000)
                 self.state.update(reserve)
                 job_started = self.clock()
                 duration = min(self.job_time_seconds, max(0.0, tick.deadline - job_started))
@@ -293,7 +295,24 @@ class Reporting:
                     except Exception:
                         self._incomplete(trade_id, "Börsenbelege für Funding/Gebühren vorübergehend nicht vollständig verfügbar")
                         complete, reason = False, "unavailable"
-                result["attempts"].append({"trade_id": trade_id, "complete": complete, "reason": reason,
-                                           "requests": job.requests, "elapsed_seconds": max(0.0, self.clock() - job_started)})
+                attempt: ReportingAttempt = {"trade_id": trade_id, "complete": complete, "reason": reason,
+                    "requests": job.requests, "elapsed_seconds": max(0.0, self.clock() - job_started)}
+                def schedule(data, trade_id=trade_id, attempt=attempt):
+                    row = data["trades"][trade_id]
+                    # A failed read is not a completed hourly evidence check.
+                    transient = not attempt["complete"] and attempt["reason"] not in ("missing_lifecycle", "evidence_conflict")
+                    if transient:
+                        count = min(row.get("reporting_failure_count", 0)+1, 4)
+                        row["reporting_failure_count"] = count
+                        delay = min(60_000 * 2**(count-1), 300_000)
+                    else:
+                        row.pop("reporting_failure_count", None)
+                        delay = 3_600_000
+                    if attempt["complete"]:
+                        row.pop("reporting_last_error", None)
+                    row.update(reporting_checked_at=self.wall_clock(), reporting_next_retry_at=self.wall_clock()+delay,
+                               reporting_last_attempt=attempt)
+                self.state.update(schedule)
+                result["attempts"].append(attempt)
             result.update(requests=tick.requests, elapsed_seconds=max(0.0, self.clock() - started))
             return result
