@@ -510,7 +510,10 @@ async def test_policy_revocation_stops_unsent_legs_and_preserves_already_sent_op
     state = setup[1]
     processor = SourceProcessor(state, router)
     processor.configure("hybrid", "worker")
-    _, interpretation = signal
+    source, interpretation = signal
+    # Keep this policy-revision test independent of simulated price aging on slow disks.
+    for module in ("aqla_agent.entry", "aqla_hyperliquid_mcp.api", "conftest"):
+        monkeypatch.setattr(module+".now_ms", lambda: source.sent_at)
     async def unavailable(*args):
         raise TemporaryObservation("read_unavailable", "preview", "transport")
     monkeypatch.setattr(router.engines["aster"], "preview", unavailable)
