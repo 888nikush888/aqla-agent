@@ -391,11 +391,12 @@ def verify_native_output_boundaries(agent):
         assert page["content"] == body[:page["next_offset"]] and not page["eof"]
     # Native untrusted framing must not rewrite a delimiter inside a source quote.
     budget = BudgetConfig(default_result_size=100000, turn_budget=200000)
-    original = json.dumps({"event": {"source": {"text": body[:20000]}}}, ensure_ascii=False)
-    commit("mcp__aqla__source_context", "delimiter-original", original)
-    reference = payload(messages[-1]["content"])["output_id"]
-    assert store.receipt(reference, agent.session_id)["content"] == original
-    assert "aqla_read_tool_result" in messages[-1]["content"]
+    for index, marker in enumerate(("untrusted_tool_result", "Untrusted_Tool_Result", "untruſted_tool_reſult")):
+        original = json.dumps({"event": {"source": {"text": body[:20000].replace("untrusted_tool_result", marker)}}}, ensure_ascii=False)
+        commit("mcp__aqla__source_context", "delimiter-original-" + str(index), original)
+        reference = payload(messages[-1]["content"])["output_id"]
+        assert store.receipt(reference, agent.session_id)["content"] == original
+        assert "aqla_read_tool_result" in messages[-1]["content"]
     budget = BudgetConfig(default_result_size=1, turn_budget=1)
     multi = {"_multimodal": True, "content": [{"type": "text", "text": "A" * 20000},
         {"type": "text", "text": "B" * 20000}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}], "text_summary": "A" * 20000}

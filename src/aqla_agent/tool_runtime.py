@@ -1,5 +1,6 @@
 """Checked native tool adapters, retaining native dispatch and authority hooks."""
 import json
+import re
 from contextlib import nullcontext
 from contextvars import ContextVar
 
@@ -206,7 +207,7 @@ def install(replace):
             if len(json.dumps(content, ensure_ascii=True).encode()) <= cap:
                 return content
         source_read = tool_name in ("mcp__aqla__source_context", "mcp__aqla__source_context_batch")
-        safe_inline = not (source_read and isinstance(content, str) and "untrusted_tool_result" in content)
+        safe_inline = not (source_read and isinstance(content, str) and re.search("untrusted_tool_result", content, re.I))
         if not capture or not isinstance(content, str) or safe_inline and len(content) <= cutoff and len(content.encode("utf-8")) <= (65536 if source_read else 16000):
             return persist(content, tool_name, tool_use_id, env, config, threshold)
         try:
