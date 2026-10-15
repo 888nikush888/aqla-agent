@@ -10,7 +10,7 @@ from typing import Literal, NotRequired, TypedDict
 from aqla_hyperliquid_mcp.models import AqlaError, Market, SymbolUnavailable, TradePlan, digest, now_ms
 
 from .accounting import inventory_view
-from .observations import TemporaryObservation, diagnostic, retry_due, retry_marker
+from .observations import TemporaryObservation, diagnostic, read_observation, retry_due, retry_marker
 from .pipelines import ConfigurationChanged, VenueState, validate_ranking_binding
 from .trading import OPEN, PendingStopUpdate, StopUpdatePhase, Trading
 from .venues import VenueAdapter, adapter_settings, execution_settings
@@ -165,13 +165,13 @@ class Router:
             self.state.update(lambda data: source_rank(data, source.chat_id))
         return result
 
-    def context(self, event_id, *, decision=False):
-        result = self.source.context(event_id, compact_receipt=decision)
-        data = self.state.snapshot()
+    def context(self, event_id, *, decision=False, snapshot=None, index=None):
+        data = self.state.snapshot() if snapshot is None else snapshot
+        result = self.source.context(event_id, compact_receipt=decision, snapshot=data, index=index)
         result.update(profiles=data["profiles"], pipelines=data["pipelines"], configuration_revision=data["configuration_revision"],
                       venue_limits=data["venue_limits"], execution_targets=data["events"][event_id].get("targets", {}))
         from .ranking import snapshot_rank
-        result.update(source_rank=snapshot_rank(data, data["events"][event_id]["source"]["chat_id"]), execution_accounts=self.accounts_ready())
+        result.update(source_rank=snapshot_rank(data, data["events"][event_id]["source"]["chat_id"]), execution_accounts=self.accounts_ready(data))
         if decision:
             selected = self.selected_targets(data["events"][event_id], data)
             pipeline_ids = {target["pipeline_id"] for target in selected.values()}
@@ -300,11 +300,21 @@ class Router:
                 with engine.state.scope(target, preview_snapshot=preview_basis):
                     basis = engine.state.preview_snapshot()
                     deadline = min(item["source"]["sent_at"] for item in latest_sources(basis["events"], interpretation.source_refs).values()) + basis["policy"]["max_signal_age_seconds"] * 1000
+                async def preview_on(candidate, route):
+                    nonlocal deadline
+                    async with candidate.lock:
+                        with candidate.state.scope(route, preview_snapshot=preview_basis):
+                            basis = candidate.state.preview_snapshot()
+                            deadline = min(item["source"]["sent_at"] for item in latest_sources(basis["events"], interpretation.source_refs).values()) + basis["policy"]["max_signal_age_seconds"] * 1000
+                            if ranked:
+                                market = await read_observation(lambda: candidate.exchange.market(interpretation.symbol), "market")
+                                return await candidate.preview(event_id, interpretation, _market=market)
+                            return await candidate.preview(event_id, interpretation)
                 if ranked:
                     target = {**target, "requested_exchange": requested, "network": network, "rank_snapshot": rank,
                               "setup_id": digest([rank["source_id"], sorted(interpretation.source_refs)])[:32], "leg_id": identity}
                     try:
-                        await engine.exchange.market(interpretation.symbol)
+                        plan = await preview_on(engine, target)
                     except SymbolUnavailable as missing:
                         if requested != "hyperliquid":
                             raise
@@ -324,21 +334,19 @@ class Router:
                                 reasons.append(venue + ": explicit pipeline target already reserves this market")
                                 continue
                             try:
-                                await candidate.exchange.market(interpretation.symbol)
+                                route = {**target, "exchange": venue, "fallback_reason": str(missing), "skipped_replacements": reasons}
+                                plan = await preview_on(candidate, route)
                             except SymbolUnavailable:
                                 reasons.append(venue + ": market unavailable")
                                 continue
                             replacement = candidate
-                            target.update(exchange=venue, fallback_reason=str(missing), skipped_replacements=reasons)
+                            target = route
                             break
                         if replacement is None:
                             raise AqlaError("No replacement market/account in " + network + ": " + "; ".join(reasons)) from missing
                         engine = replacement
-                async with engine.lock:
-                    with engine.state.scope(target, preview_snapshot=preview_basis):
-                        basis = engine.state.preview_snapshot()
-                        deadline = min(item["source"]["sent_at"] for item in latest_sources(basis["events"], interpretation.source_refs).values()) + basis["policy"]["max_signal_age_seconds"] * 1000
-                        plan = await engine.preview(event_id, interpretation)
+                else:
+                    plan = await preview_on(engine, target)
                 row = {**target, "status": "planned", "plan_id": plan["plan_id"]}
                 if marker:
                     row["observation_retry"] = {**marker, "completed": True, "exhausted": True}

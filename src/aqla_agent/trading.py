@@ -152,14 +152,28 @@ class Trading:
             state.setdefault("event_tombstones", {})[row["event_id"]] = row["source_id"]
             del state["events"][row["event_id"]]
 
-    def context(self, event_id, *, compact_receipt=False):
-        snapshot = self.state.snapshot()
+    @staticmethod
+    def context_index(snapshot):
+        messages, parents, trades = {}, {}, {}
+        for row in snapshot["events"].values():
+            if is_source_row(row):
+                messages.setdefault(row["source"]["chat_id"], []).append(row)
+        for chat, rows in messages.items():
+            rows.sort(key=lambda item: (item["source"]["sent_at"], item["source"].get("edited_at") or 0))
+            parents[chat] = {row["source"]["message_id"]: row for row in rows}
+        for row in snapshot["trades"].values():
+            if row["status"] in OPEN:
+                trades.setdefault(row["chat_id"], []).append(row)
+        return messages, parents, trades
+
+    def context(self, event_id, *, compact_receipt=False, snapshot=None, index=None):
+        snapshot = self.state.snapshot() if snapshot is None else snapshot
         row = snapshot["events"].get(event_id)
         if not is_source_row(row):
             raise AqlaError("Unknown source event")
         source = row["source"]
-        messages = [item for item in snapshot["events"].values() if is_source_row(item) and item["source"]["chat_id"] == source["chat_id"]]
-        messages.sort(key=lambda item: (item["source"]["sent_at"], item["source"].get("edited_at") or 0))
+        channels, parents, own_trades = self.context_index(snapshot) if index is None else index
+        messages = channels.get(source["chat_id"], [])
         included = messages[-self.exchange.settings.max_context_messages:]
         if row not in included:
             included.insert(0, row)
@@ -167,13 +181,13 @@ class Trading:
         seen = set()
         while reply and reply not in seen:
             seen.add(reply)
-            parent = next((item for item in reversed(messages) if item["source"]["message_id"] == reply), None)
+            parent = parents.get(source["chat_id"], {}).get(reply)
             if parent is None:
                 break
             if parent not in included:
                 included.insert(0, parent)
             reply = parent["source"].get("reply_to_id")
-        trades = [trade for trade in snapshot["trades"].values() if trade["status"] in OPEN and trade["chat_id"] == source["chat_id"]]
+        trades = own_trades.get(source["chat_id"], [])
         result = {"event": row, "messages": included, "trades": trades, "policy": snapshot["policy"],
                 "classification_constraints": {"missing_text": not source.get("text", "").strip(),
                     "media": source.get("media", "text"), "empty_body_only_kind": "incomplete"},
@@ -252,7 +266,7 @@ class Trading:
             return result()
         return (self.state.update_if_changed if hasattr(self.state, "update_if_changed") else self.state.update)(commit)
 
-    async def preview(self, event_id, interpretation: Interpretation):
+    async def preview(self, event_id, interpretation: Interpretation, *, _market=None):
         row = self.record_interpretation(event_id, interpretation)
         if interpretation.kind != "new_signal":
             return row
@@ -274,7 +288,8 @@ class Trading:
             raise AqlaError("Maximum open trade count reached")
         if any(ref in snapshot["bindings"] for ref in interpretation.source_refs):
             raise AqlaError("This source already owns a trade; process its edit as an update")
-        market = await read_observation(lambda: self.exchange.market(interpretation.symbol, policy.product), "market")
+        # The router may resolve this once under the same account lock for fallback.
+        market = _market if _market is not None else await read_observation(lambda: self.exchange.market(interpretation.symbol, policy.product), "market")
         if any(trade["plan"]["market"]["quote_token"] != market.quote_token for trade in active):
             raise AqlaError("One account risk budget cannot mix settlement currencies without conversion")
         if any(trade["plan"]["market"]["asset_id"] == market.asset_id for trade in active):

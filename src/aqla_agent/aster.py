@@ -32,9 +32,11 @@ class Aster(VenueAdapter):
 
     async def price_snapshot(self, market):
         from .entry import PriceSnapshot
+        from .observations import parallel_reads
         started = now_ms()
-        contract = await self.read("ticker/price", {"symbol": market.native_symbol})
-        book = await self.read("ticker/bookTicker", {"symbol": market.native_symbol})
+        contract, book = await parallel_reads(
+            self.read("ticker/price", {"symbol": market.native_symbol}),
+            self.read("ticker/bookTicker", {"symbol": market.native_symbol}))
         if any(row.get("symbol") != market.native_symbol for row in (contract, book)):
             raise AqlaError("Aster price snapshot belongs to another market")
         bid, ask = Decimal(book["bidPrice"]), Decimal(book["askPrice"])

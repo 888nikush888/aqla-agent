@@ -56,12 +56,14 @@ class Hyperliquid:
 
     async def price_snapshot(self, market):
         from aqla_agent.entry import PriceSnapshot
+        from aqla_agent.observations import parallel_reads
         started = now_ms()
-        raw = await self.info("metaAndAssetCtxs", **({"dex": market.dex} if market.dex else {}))
+        raw, book = await parallel_reads(
+            self.info("metaAndAssetCtxs", **({"dex": market.dex} if market.dex else {})),
+            self.info("l2Book", coin=market.symbol))
         context = next((context for item, context in zip(raw[0]["universe"], raw[1], strict=True) if item["name"] == market.symbol), None)
         if context is None:
             raise AqlaError("Target market has no verified mark-price context")
-        book = await self.info("l2Book", coin=market.symbol)
         if book.get("coin") != market.symbol or not all(book.get("levels", [])):
             raise AqlaError("Target market has no executable order book")
         bid, ask = Decimal(book["levels"][0][0]["px"]), Decimal(book["levels"][1][0]["px"])

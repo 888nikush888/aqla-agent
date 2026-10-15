@@ -1,6 +1,8 @@
 """Private aggregate usage; never stores messages, arguments or credentials."""
+import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -52,13 +54,15 @@ class UsageRun:
     result_hashes: set = field(default_factory=set)
     classified_sources: set = field(default_factory=set)
     workflow: dict = field(default_factory=dict)
+    source_timings: dict = field(default_factory=dict)
+    trade_sources: dict = field(default_factory=dict, repr=False)
 
     def response(self, usage, model, provider, duration, *, phase="main", failed=False):
         self.api.append({"model": model, "provider": provider, "usage_available": usage is not None,
                          "duration_seconds": duration, "phase": phase, "failed": failed, **({key: getattr(usage, key) for key in
                          ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")} if usage else {})})
 
-    def tool(self, name, content, error):
+    def tool(self, name, content, error, duration=None):
         from .efficiency import signature
         key = signature([name, content])
         row = self.tools.setdefault(name, {"calls": 0, "output_characters": 0, "errors": 0, "repeated_results": 0})
@@ -67,6 +71,12 @@ class UsageRun:
         row["errors"] += int(bool(error))
         row["repeated_results"] += int(key in self.result_hashes)
         self.result_hashes.add(key)
+        if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
+            samples = row.setdefault("duration_seconds", [])
+            if len(samples) < 256:
+                samples.append(duration)
+        if not error and isinstance(content, str):
+            self.observe_source(name, content)
         if isinstance(content, str) and not error and name.endswith(("interpret_source", "interpret_source_batch")):
             try:
                 value = json.loads(content)
@@ -79,6 +89,58 @@ class UsageRun:
                         self.classified_sources.add(item["event_id"])
             except (ValueError, TypeError, AttributeError):
                 pass
+
+    def observe_source(self, name, content):
+        """Timing facts only. A tool reply is never proof of an exchange send/fill."""
+        if not name.endswith(("source_context", "source_context_batch", "interpret_source", "interpret_source_batch", "trade_preview", "trade_execute")):
+            return
+        try:
+            value = json.loads(content)
+            for _ in range(3):
+                if isinstance(value, dict) and set(value) == {"result"}:
+                    value = value["result"]
+                    value = json.loads(value) if isinstance(value, str) else value
+            if not isinstance(value, dict):
+                return
+            stamp = int(time.time()*1000)
+            def key(identity):
+                if not isinstance(identity, str) or not 1 <= len(identity) <= 256:
+                    return None
+                return hashlib.sha256(identity.encode()).hexdigest()
+            if name.endswith(("source_context", "source_context_batch")):
+                messages = value.get("messages", {})
+                if not isinstance(messages, dict):
+                    messages = {}
+                anchors = [value.get("event", {})] if "event" in value else [messages.get(item.get("anchor_event_id"), {}) for item in value.get("items", [value]) if isinstance(item, dict)]
+                if not anchors or not any(anchors):
+                    anchors = [messages.get(value.get("anchor_event_id"), {})]
+                for event in anchors[:8]:
+                    source = event.get("source", {})
+                    identity = key(event.get("event_id"))
+                    received = source.get("received_at")
+                    if identity and source.get("historical") is not True and type(received) is int and 0 <= received <= stamp:
+                        if len(self.source_timings) < 256 or identity in self.source_timings:
+                            self.source_timings.setdefault(identity, {"received_at": received, "turn_started_at": int(self.started*1000)})["context_reply_at"] = stamp
+            elif name.endswith(("interpret_source", "interpret_source_batch")):
+                for item in value.get("items", [value])[:8]:
+                    if (isinstance(item, dict) and item.get("status") in ("report", "unrelated", "incomplete", "ambiguous", "interpreted", "updated", "executed")
+                            and (identity := key(item.get("event_id"))) in self.source_timings):
+                        self.source_timings[identity]["interpretation_reply_at"] = stamp
+            elif name.endswith(("trade_preview", "trade_execute")):
+                for item in value.get("targets", [value])[:8]:
+                    if not isinstance(item, dict):
+                        continue
+                    plan = item.get("plan", item)
+                    if not isinstance(plan, dict):
+                        continue
+                    identities = [identity for event in plan.get("source_revisions", {}).values() if (identity := key(event)) in self.source_timings]
+                    trade = item.get("trade_id", plan.get("trade_id"))
+                    if identities and isinstance(trade, str) and len(self.trade_sources) < 256:
+                        self.trade_sources[trade] = identities
+                    for identity in identities or self.trade_sources.get(trade, []):
+                        self.source_timings[identity]["preview_reply_at" if name.endswith("trade_preview") else "execution_reply_at"] = stamp
+        except (ValueError, TypeError, AttributeError):
+            pass
 
     def persist(self, home, result):
         try:
@@ -98,6 +160,7 @@ class UsageRun:
                    "failed": bool(result.get("failed", False)), "interrupted": bool(result.get("interrupted", False)),
                    "completed": result.get("completed"), "compression_exhausted": bool(result.get("compression_exhausted", False))}
             row["workflow"] = self.workflow
+            row["source_timings"] = self.source_timings
             with sqlite3.connect(path, timeout=1) as connection:
                 connection.execute("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, started_at REAL NOT NULL, origin TEXT NOT NULL, metrics TEXT NOT NULL)")
                 connection.execute("INSERT INTO runs(started_at,origin,metrics) VALUES(?,?,?)", (self.started, self.origin, json.dumps(row, separators=(",", ":"))))

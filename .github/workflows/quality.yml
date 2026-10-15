@@ -40,7 +40,7 @@ jobs:
       - run: uv run --no-sync ruff check src tests hermes_plugin scripts
       - run: uv run --no-sync aqla-hyperliquid-mcp --check-coverage
       - name: Tests, including the local WebSocket server
-        run: uv run --no-sync pytest -q --junitxml=reports/tests.xml --cov=aqla_agent --cov=aqla_hyperliquid_mcp --cov=aqla_sheets_mcp --cov-branch --cov-fail-under=70 --cov-report=term-missing:skip-covered --cov-report=xml:reports/coverage.xml
+        run: uv run --no-sync pytest -q -n 2 --dist loadfile --durations=25 --junitxml=reports/tests.xml --cov=aqla_agent --cov=aqla_hyperliquid_mcp --cov=aqla_sheets_mcp --cov-branch --cov-fail-under=70 --cov-report=term-missing:skip-covered --cov-report=xml:reports/coverage.xml
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -122,6 +122,10 @@ jobs:
         run: .cache/hermes-venv/bin/python tests/native_skill_review_smoke.py --hermes-source .cache/hermes-source --destination .cache/skill-review-pipeline
       - name: Native queued turns, cancellation and adapter reconnect
         run: .cache/hermes-venv/bin/python tests/native_pipeline_smoke.py --hermes-source .cache/hermes-source --destination .cache/lifecycle-pipeline --mcp-python .venv/bin/python --mode lifecycle
+      - name: Native lossless paging, output budgets and compression recovery
+        run: |
+          PYTHONPATH=src .cache/hermes-venv/bin/python tests/native_tool_smoke.py --hermes-source .cache/hermes-source --home .cache/tool-output-home --mcp-python .venv/bin/python
+          .cache/hermes-venv/bin/python tests/native_token_efficiency_smoke.py --hermes-source .cache/hermes-source --home .cache/token-efficiency-home
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -132,7 +136,6 @@ jobs:
 
   package:
     name: Build and verify VPS package
-    needs: [tests, security, native-hermes]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

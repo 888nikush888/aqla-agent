@@ -343,8 +343,9 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         from aqla_agent.efficiency import decision_batch
         if len(set(event_ids)) != len(event_ids):
             raise AqlaError("Source context batch requires distinct event IDs")
-        contexts = [trading.context(identity, decision=True) for identity in event_ids]
         snapshot = state.snapshot()
+        index = trading.source.context_index(snapshot)
+        contexts = [trading.context(identity, decision=True, snapshot=snapshot, index=index) for identity in event_ids]
         entry_operations = EntryOperations(snapshot["operations"])
         return decision_batch([{**context, "execution_outcome": event_outcomes(snapshot, context["event"], entry_operations),
                                 "trades": [{**row, "execution_outcome": trade_outcome(row, entry_operations), "entry_diagnostic": diagnostic_view(row, entry_operations)} for row in context["trades"]]}

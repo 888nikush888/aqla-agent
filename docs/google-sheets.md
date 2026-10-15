@@ -109,8 +109,8 @@ Der schmale Index garantiert keinen global unveränderten historischen Bodybesta
 Gewinnwerte sind **realisierte Ergebnisse vor Funding**. USDC-Gebühren werden aus eigenen Fills berücksichtigt; bei fehlender Gebühreninformation oder fremder Gebührenwährung bleibt Netto unbestimmt. Trefferquoten nennen nur bekannte abgeschlossene Ergebnisse. Ungeschlossene Positionen erhalten keine erfundene Mark-to-Market-PnL. Funding und die volle Hermes-Gesprächshistorie werden nicht gespiegelt.
 
 Interne Journalbatches projizieren nur die tatsächlich angefragten Pendingrecords.
-Signale und Historie verwenden einen selektiven Pfad; andere Tabellen behalten
-zunächst den vollständigen Fallback. Ein ACK verlangt weiterhin den aktuellen und
+Signale, Historie sowie Trade-, Order-, Fill- und Vorgangszeilen verwenden einen
+selektiven Pfad; andere Tabellen behalten den vollständigen Fallback. Ein ACK verlangt weiterhin den aktuellen und
 den Pendingfingerprint gleichzeitig. Nur dann werden Outboxeintrag und passende
 Historie atomar freigegeben. Leere und stale ACKs benötigen keine Vollprojektion;
 ihre bisherige Sequenz-/Initialisierungswirkung bleibt erhalten. Der Writer und

@@ -102,7 +102,7 @@ def test_capture_binds_trusted_home_and_model_arguments_do_not_select_identity(t
     assert CAPTURE.get() is None
 
 
-@pytest.mark.parametrize("offset,limit", [(True, 1), (0, False), (-1, 1), (0, 4097), (0, 0)])
+@pytest.mark.parametrize("offset,limit", [(True, 1), (0, False), (-1, 1), (0, 16385), (0, 0)])
 def test_bad_page_inputs_are_not_guessed(tmp_path, offset, limit):
     store = OutputStore(tmp_path)
     identity = store.save("own", "s", "id")

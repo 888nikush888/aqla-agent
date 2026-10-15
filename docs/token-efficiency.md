@@ -6,11 +6,13 @@ The main model, reasoning effort, routing fallback and financial authority remai
 
 - `status(view="summary")`: current ready/blocked/recovery counts and at most eight IDs, notification count, pause/Setup, account readiness/recovery and journal state. Inventory is explicitly not refreshed. Full and compact views remain compatible.
 - `source_context(view="decision")`: lossless original source bodies keyed by event ID, one anchor reference, relevant profiles/pipelines, and owned trade decision facts. Full stored trades are linked through diagnostics.
-- `source_context_batch(event_ids)`: 1–8 distinct anchors, shared messages/trades/configurations, `message_ids`/`trade_ids`/`configuration_id` per item, and an independent receipt per anchor. Never truncates original text.
+- `source_context_batch(event_ids)`: 1–8 distinct anchors, shared messages/trades/configurations, `message_ids`/`trade_ids`/`configuration_id` per item, and an independent receipt per anchor. One detached snapshot and channel/reply index serve the entire batch. Never truncates original text.
 - `notifications_read(view="rendered"|"facts")`: existing complete rendered messages or original structured facts, not both. IDs, original versions, cursors and ACK semantics are unchanged. A summary-only overflow response explicitly exposes `details_required`; complete versioned details must be read before reporting/ACK.
 - `trade_diagnostics(sections=[...])`: plan, sources, orders, fills, accounting, operations, lifecycle or prices. Original/later source bodies occur once in `source_messages`; attribution refers to revision IDs. Missing originals remain unknown.
 - `journal_read(columns=[...], start=..., end=..., time_column=...)`: aware interval `[start,end)`, existing UTC column (first UTC column by default), filters and bounded scan cursor. Projection follows verification of the complete original row, including omitted fields. ID/verification remain visible; invalid rows have no original fingerprint. Statistics and monthly evidence remain preferred for aggregates.
 - `aqla_read_tool_result(output_id, sections=[...], record_ids=[...])`: selects named JSON sections or up to eight IDs in one section of the existing immutable session-owned output. Continue character paging with exactly the same selection. EOF means the selection is complete, not the omitted original. Original hash/ownership/expiry and the lossless reader remain available. No paths or arbitrary execution.
+
+Source context results stay inline up to 64 KiB when the native budget permits. Originals containing native untrusted delimiters use immutable output receipts so framing cannot rewrite a source quote. Reader pages accept up to 16,384 characters (default 4,096) within a 32 KiB escaped envelope, reduced further for smaller native budgets. Paging never archives its own pages recursively; `next_offset` always follows the actual returned content.
 
 ## Classifications
 
@@ -41,5 +43,7 @@ Runtime toggles under `plugins.entries.aqla-events.settings.token_efficiency`: `
 ## Measurement
 
 Private `hermes-home/cache/aqla-usage.sqlite3` keeps aggregate runs for 90 days: main/compression responses, provider-reported uncached/cache/output/reasoning tokens, availability, latency, tool call/error/repeated-result counts and non-actionable classification count. It contains no messages, tool arguments, credentials or source text. Reasoning is a subset of output and must not be added again. Failed/missing usage is explicit; auxiliary summary calls are included. Measurement failure cannot stop trading.
+
+Native tool durations and source-stage reply times are bounded to 256 samples per run. Source identities are SHA-256 digests; historical imports are excluded. Context/interpretation/preview/execution reply timestamps describe observations at the tool boundary, never proof of an order send or fill. No additional model calls are made for measurement.
 
 `scripts/benchmark_token_efficiency.py --output ...` compares actual MCP serialization using synthetic data. Results measure UTF-8 bytes, not provider token savings or a daily bill. Optional isolated native same-model replay uses a private key environment variable, no tools/real orders/session database and only seeded test cases. External RTK/Context Mode/LLMLingua are not installed in the trading profile; the native changes should be measured before adding another integration.
