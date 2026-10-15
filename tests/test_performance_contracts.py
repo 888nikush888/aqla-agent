@@ -4,13 +4,12 @@ import hashlib
 import json
 import sqlite3
 
-import httpx
 import pytest
 from test_pipelines import routed  # noqa: F401
 from test_token_efficiency import call, efficiency_server  # noqa: F401
 
 from aqla_agent.aster import Aster
-from aqla_agent.observations import TemporaryObservation, parallel_reads
+from aqla_agent.observations import TemporaryObservation
 from aqla_agent.source_disposition import verify_disposition
 from aqla_agent.tool_outputs import PAGE_BYTES, OutputStore, reader_text
 from aqla_agent.usage_metrics import UsageRun
@@ -93,17 +92,14 @@ def test_usage_stage_timings_are_opaque_and_do_not_claim_exchange_fills(tmp_path
 @pytest.mark.asyncio
 @pytest.mark.parametrize('venue', ['hyperliquid', 'aster'])
 @pytest.mark.parametrize('invalid', [None, 'identity', 'stale'])
-async def test_price_pair_overlaps_without_weakening_validation(monkeypatch, venue, invalid):
+async def test_price_identity_and_freshness_validation_stay_strict(monkeypatch, venue, invalid):
     for module in ('aqla_agent.entry', 'aqla_hyperliquid_mcp.api', 'aqla_agent.aster'):
         monkeypatch.setattr(module+'.now_ms', lambda: 10000)
     adapter = object.__new__(Hyperliquid if venue == 'hyperliquid' else Aster)
     market = Market(symbol='BTC', native_symbol='BTCUSDT', asset_id=1, product='perp', size_decimals=2, max_leverage=20, mid='100')
-    both, started = asyncio.Event(), []
+    started = []
     async def read(kind, *args, **kwargs):
         started.append(kind)
-        if len(started) == 2:
-            both.set()
-        await asyncio.wait_for(both.wait(), 1)
         stamp = 7999 if invalid == 'stale' else 10000
         if venue == 'hyperliquid':
             if kind == 'metaAndAssetCtxs':
@@ -120,33 +116,6 @@ async def test_price_pair_overlaps_without_weakening_validation(monkeypatch, ven
         quote = await adapter.price_snapshot(market)
         assert quote.market == 'BTC' and quote.mid == quote.stop_reference == 100
     assert len(started) == 2
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('cancel', [False, True])
-async def test_parallel_read_failure_settles_sibling_and_preserves_type(cancel):
-    started, settled = asyncio.Event(), asyncio.Event()
-    failure = httpx.ReadTimeout('synthetic timeout')
-    async def slow():
-        started.set()
-        try:
-            await asyncio.Future()
-        finally:
-            settled.set()
-    async def fail():
-        await started.wait()
-        if cancel:
-            await asyncio.Future()
-        raise failure
-    task = asyncio.create_task(parallel_reads(fail(), slow()))
-    if cancel:
-        await started.wait()
-        task.cancel()
-    with pytest.raises(asyncio.CancelledError if cancel else httpx.ReadTimeout) as raised:
-        await task
-    assert settled.is_set()
-    if not cancel:
-        assert raised.value is failure
 
 
 @pytest.mark.asyncio

@@ -1,23 +1,9 @@
 """Typed read failures and bounded, durable retry facts, never provider bodies."""
 from __future__ import annotations
 
-import asyncio
-
 import httpx
 
 from aqla_hyperliquid_mcp.models import AqlaError, now_ms
-
-
-async def parallel_reads(*calls):
-    tasks = [asyncio.create_task(call) for call in calls]
-    try:
-        return await asyncio.gather(*tasks)
-    except BaseException:
-        # Settle sibling reads before retrying; preserve the original typed error.
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
 
 
 class TemporaryObservation(AqlaError):
