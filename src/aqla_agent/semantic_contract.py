@@ -278,6 +278,19 @@ def unsupported_structure(packet):
 def supported_action_failure(text, interpretation):
     """Return a stable rejection code for explicitly unrepresentable instructions."""
     if interpretation.kind in ("report", "unrelated"):
+        if interpretation.kind == "report":
+            # Original document framing scopes examples and chapter headings, never live orders.
+            chapters = list(re.finditer(r"(?m)^\s*\d{1,2}:\d{2}(?::\d{2})?\s*[-–—]\s*[^\n]+", text))
+            if len(chapters) >= 3 and re.search(r"\b(?:video|chapters?|webinar|kapitel|видео|разбираем|обсуждаем)\b", text, re.I):
+                text = re.sub(r"(?m)^\s*\d{1,2}:\d{2}(?::\d{2})?\s*[-–—]\s*[^\n]+", "", text)
+            scope = re.search(r"(?:everything\s+above\s+(?:is|was)\s+(?:an?\s+)?example|"
+                r"alles\s+obige\s+(?:ist|war)\s+(?:ein\s+)?beispiel|"
+                r"вс[её]\s*,?\s*что\s+выше[^\n.!?]{0,100}\bпример\w*)", text, re.I)
+            if scope:
+                text = text[scope.end():]
+            if PAST_WORD.search(text):
+                text = ";".join(sentence for sentence in SENTENCES.split(text)
+                    if not (CONDITION.search(sentence) and OPPORTUNITY.search(sentence) and not CURRENT.search(sentence)))
         if ENTRY.search(text) or re.search(r"\b(?:long|short|лонг|шорт)\b", text, re.I):
             failure = entry_structure_failure(text)
             if failure:
