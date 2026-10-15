@@ -611,7 +611,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         if action == "source_overview":
             return {**processor.overview(), "delivery": outbox.overview()}
         if action == "source_notice":
-            processor.require_owner(processing_owner)
+            if processor.mode != "legacy":
+                processor.require_owner(processing_owner)
             from aqla_agent.recovery_notices import record_source_notice
             def notice(data):
                 record_source_notice(data, failure_code, processing_version, notice_sources or ())

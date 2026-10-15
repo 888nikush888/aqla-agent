@@ -33,6 +33,34 @@ def classification(source):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["legacy", "shadow", "hybrid"])
+async def test_source_notices_keep_internal_auth_without_requiring_a_legacy_worker(setup, mode):
+    settings, state, fake, exchange, _ = setup
+    server = create_server(settings, state=state, exchange=exchange)
+    try:
+        if mode != "legacy":
+            await rpc(server, "source_configure", processing_mode=mode)
+        args = {"action": "source_notice", "token": server.aqla_authority.key.decode(),
+                "failure_code": "reader_unavailable", "processing_version": "outage"}
+        before = state.snapshot()
+        with pytest.raises(Exception, match="Internal integration access denied"):
+            await server.call_tool("integration", {**args, "token": "untrusted"})
+        if mode != "legacy":
+            for owner in (None, "stale-worker"):
+                with pytest.raises(Exception, match="ownership changed"):
+                    await server.call_tool("integration", {**args, "processing_owner": owner})
+            args["processing_owner"] = "native-worker"
+        assert state.snapshot() == before
+        await server.call_tool("integration", args)
+        after = state.snapshot()
+        assert any(row.get("source_notice", {}).get("code") == "reader_unavailable" for row in after["notifications"].values())
+        assert all(after[key] == before[key] for key in ("trades", "plans", "operations", "events"))
+        assert not fake.actions
+    finally:
+        await close_server(server)
+
+
+@pytest.mark.asyncio
 async def test_persisted_classification_resumes_and_does_not_repeat(native_processor):
     server, state, fake = native_processor
     source = SourceEvent(chat_id="channel", message_id=3, sent_at=now_ms(), text="BTC result report, no new trade.")
