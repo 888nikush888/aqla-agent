@@ -511,7 +511,7 @@ class Router:
         reports = []
         diagnostics: dict[str, RecoveryDiagnostic] = {}
         missing_accounts = {row["plan"].get("account_key") or row["plan"].get("exchange", "hyperliquid") + ":" + row["plan"]["network"]
-                            for row in self.state.snapshot()["trades"].values()
+                            for row in self.state.read("trades")["trades"].values()
                             if row["status"] in OPEN and self.engine_for_plan(row["plan"]) is None}
         for key in sorted(missing_accounts):
             reports.append({"exchange": key.split(":", 1)[0], "account_key": key,
@@ -524,7 +524,7 @@ class Router:
                 rows = []
                 try:
                     rows = await asyncio.wait_for(self._recover_account(engine), timeout=self._recovery_timeout)
-                    view = engine.state.snapshot()
+                    view = engine.state.read("operations", "trades")
                     unresolved = any(row["phase"] in ("prepared", "sending", "unknown") for row in view["operations"].values())
                     unsettled = any(row["status"] in OPEN and (row["status"] not in ("open", "opening", "waiting_entry")
                         or row.get("quantity_evidence_pending")) for row in view["trades"].values())
@@ -591,10 +591,10 @@ class Router:
     async def _recover_account(self, engine):
         reports = []
         async with engine.lock:
-            for row in engine.state.snapshot()["trades"].values():
+            for row in engine.state.read("trades")["trades"].values():
                 market = Market.model_validate(row["plan"]["market"])
                 engine.exchange.market_cache[market.symbol] = market
-            for row in engine.state.snapshot()["trades"].values():
+            for row in engine.state.read("trades")["trades"].values():
                 if row["status"] not in OPEN or Decimal(row["filled_quantity"]) > 0:
                     continue
                 try:

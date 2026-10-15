@@ -2075,7 +2075,7 @@ class Trading:
         return identity
 
     async def resume_target_update(self, trade_id):
-        snapshot = self.state.snapshot()
+        snapshot = self.state.read("trades", "operations", entries={"trades": [trade_id]})
         trade = snapshot["trades"][trade_id]
         identity = self.pending_target_identity(snapshot, trade)
         if identity is None:
@@ -2131,7 +2131,7 @@ class Trading:
                 return await self._recover()
 
     async def _recover(self):
-        snapshot = self.state.snapshot()
+        snapshot = self.state.read("operations")
         reports = []
         for operation_id, row in snapshot["operations"].items():
             if row["phase"] in ("prepared", "sending", "unknown"):
@@ -2139,15 +2139,15 @@ class Trading:
                     reports.append(await self.exchange.reconcile(operation_id))
                 except Exception:
                     reports.append({"operation_id": operation_id, "error": "Exact operation reconciliation is unavailable"})
-        for trade_id, trade in self.state.snapshot()["trades"].items():
+        for trade_id, trade in self.state.read("trades")["trades"].items():
             try:
-                self.assert_plan_binding(self.state.snapshot(), TradePlan.model_validate(trade["plan"]))
+                self.assert_plan_binding(self.state.read("network"), TradePlan.model_validate(trade["plan"]))
             except AqlaError as error:
                 reports.append({"trade_id": trade_id, "error": str(error)})
                 continue
             if trade["status"] in ("closed", "rejected") and trade["orders"] and not trade.get("cleanup_complete"):
                 self.begin_cleanup(trade_id, trade["status"])
-                trade = self.state.snapshot()["trades"][trade_id]
+                trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
             if trade["status"] == "conflicted":
                 from .conflict_review import commit_conflict, observe_conflict
                 try:
@@ -2159,7 +2159,7 @@ class Trading:
                     root.update(lambda data, identity=trade_id, fact=review, proof=evidence: commit_conflict(self, data, identity, fact, proof))
                     await self.resume_pending_stop(trade_id)
                     reports.append({"trade_id": trade_id, "conflict_resolved": True})
-                    trade = self.state.snapshot()["trades"][trade_id]
+                    trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
                 except Exception:
                     reports.append({"trade_id": trade_id, "error": "Conflict closure reconciliation is unavailable"})
                     continue
@@ -2181,12 +2181,12 @@ class Trading:
                     reports.append({"trade_id": trade_id, "market_conflict": True, "market": trade['plan']['market']['symbol']})
                 except Exception as error:
                     reports.append({"trade_id": trade_id, "error": str(error) if isinstance(error, AqlaError) else "Trade reconciliation is unavailable"})
-            if self.state.snapshot()["trades"][trade_id]["status"] in ("closed", "rejected", "cancelled"):
+            if self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]["status"] in ("closed", "rejected", "cancelled"):
                 try:
                     if not await self.resume_target_update(trade_id):
                         reports.append({"trade_id": trade_id, "error": "Closed trade target operation still needs exact reconciliation"})
                 except Exception as error:
                     reports.append({"trade_id": trade_id, "error": str(error) if isinstance(error, AqlaError) else "Terminal target intent review is unavailable"})
         self.recovery_checked = (not any(row.get("error") for row in reports)
-                                 and not any(row.get("protection_observation_pending") for row in self.state.snapshot()["trades"].values() if row["status"] in OPEN))
+                                 and not any(row.get("protection_observation_pending") for row in self.state.read("trades")["trades"].values() if row["status"] in OPEN))
         return reports
