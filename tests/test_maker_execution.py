@@ -581,6 +581,7 @@ async def test_lighter_native_post_only_signer_parameter_and_trigger_safety(ligh
         native = signer.calls[-1][1]["orders"]
         assert [row["TimeInForce"] for row in native] == [2, 0]
         assert native[0]["Price"] == 999 and native[1]["ReduceOnly"] == 1
+        assert native[0]["OrderExpiry"] == native[1]["OrderExpiry"] > now_ms()
     else:
         native = [values for kind, values in signer.calls if kind == "order"]
         assert [row["time_in_force"] for row in native] == [2, 0]
@@ -611,27 +612,35 @@ async def test_lighter_role_uses_native_account_side_not_zero_fees(lighter, own_
 
 
 @pytest.mark.asyncio
-async def test_installed_lighter_native_signer_accepts_post_only_parent_and_reduce_only_target():
+@pytest.mark.parametrize("tif", ["Alo", "Gtc", "Ioc"])
+async def test_installed_lighter_native_signer_accepts_parent_and_reduce_only_target(lighter, tif):
     from lighter import SignerClient
     from lighter.signer_client import CreateOrderTxReq, create_api_key
 
-    from aqla_agent.lighter import Lighter
-
+    adapter, boundary, _, _ = lighter
+    market = await adapter.market("BTC")
     key, _, error = create_api_key()
     assert error is None
     signer = SignerClient(url="https://testnet.zklighter.elliot.ai", account_index=42, api_private_keys={4: key})
+    adapter.signer, adapter.grouped_order_type = signer, CreateOrderTxReq
     try:
-        tif = Lighter.limit_tif(signer, {"t": {"limit": {"tif": "Alo"}}})
-        assert tif == 2
-        parent = CreateOrderTxReq(MarketIndex=1, ClientOrderIndex=12345, BaseAmount=10000, Price=99900, IsAsk=0, Type=0, TimeInForce=tif, ReduceOnly=0, TriggerPrice=0, OrderExpiry=-1)
-        stop = CreateOrderTxReq(MarketIndex=1, ClientOrderIndex=0, BaseAmount=0, Price=85000, IsAsk=1, Type=2, TimeInForce=0, ReduceOnly=1, TriggerPrice=90000, OrderExpiry=-1)
-        grouped = signer.sign_create_grouped_orders(1, [parent, stop], nonce=1, api_key_index=4)
-        assert grouped[3] is None and grouped[1] and grouped[2]
-        target = signer.sign_create_order(market_index=1, client_order_index=12346, base_amount=10000,
-            price=110000, is_ask=True, order_type=signer.ORDER_TYPE_LIMIT, time_in_force=tif,
-            reduce_only=True, trigger_price=0, order_expiry=-1, nonce=2, api_key_index=4)
-        assert target[3] is None and target[1] and target[2]
-        body = json.loads(target[1])
-        assert body["TimeInForce"] == 2 and body["ReduceOnly"] == 1
+        parent = {"a": market.asset_id, "b": True, "p": "99.9", "s": "1", "r": False,
+            "t": {"limit": {"tif": tif}}, "c": adapter.cloid("native-parent")}
+        stop = {**parent, "b": False, "p": "85", "r": True,
+            "t": {"trigger": {"isMarket": True, "tpsl": "sl", "triggerPx": "90"}}, "c": adapter.cloid("native-stop")}
+        started = now_ms()
+        grouped, = await adapter.build_requests({"type": "order", "orders": [parent, stop], "grouping": "normalTpsl"}, None)
+        body = json.loads(grouped["tx_info"])
+        assert body["Orders"][0]["TimeInForce"] == {"Alo": 2, "Gtc": 1, "Ioc": 0}[tif]
+        expiry = body["Orders"][0]["OrderExpiry"]
+        assert expiry == 0 if tif == "Ioc" else started < expiry <= now_ms() + 28 * 24 * 60 * 60 * 1000
+        assert body["Orders"][1]["ReduceOnly"] == 1 and body["Orders"][1]["OrderExpiry"] > started
+        if tif != "Ioc":
+            assert expiry == body["Orders"][1]["OrderExpiry"]
+        target = {**parent, "b": False, "p": "110", "r": True, "c": adapter.cloid("native-target")}
+        signed, = await adapter.build_requests({"type": "order", "orders": [target], "grouping": "na"}, None)
+        body = json.loads(signed["tx_info"])
+        assert body["TimeInForce"] == {"Alo": 2, "Gtc": 1, "Ioc": 0}[tif] and body["ReduceOnly"] == 1
+        assert boundary.posts == []
     finally:
-        await signer.close()
+        await adapter.close()

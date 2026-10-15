@@ -251,6 +251,8 @@ class Lighter(VenueAdapter):
         requests = []
         if action["type"] == "order" and action.get("grouping") == "normalTpsl":
             orders = []
+            # The SDK expands -1 per leg, but resting OTO legs require identical expiries.
+            expiry = now_ms() + 28 * 24 * 60 * 60 * 1000
             for item in action["orders"]:
                 market = self.native_market(item["a"])
                 trigger = item["t"].get("trigger")
@@ -259,7 +261,7 @@ class Lighter(VenueAdapter):
                     IsAsk=int(not item["b"]), Type=sdk.ORDER_TYPE_STOP_LOSS if trigger else sdk.ORDER_TYPE_LIMIT,
                     TimeInForce=self.limit_tif(sdk, item),
                     ReduceOnly=int(item["r"]), TriggerPrice=integer_price(trigger["triggerPx"], market.price_tick) if trigger else 0,
-                    OrderExpiry=sdk.DEFAULT_28_DAY_ORDER_EXPIRY if trigger or item["t"]["limit"]["tif"] != "Ioc" else sdk.DEFAULT_IOC_EXPIRY))
+                    OrderExpiry=expiry if trigger or item["t"]["limit"]["tif"] != "Ioc" else sdk.DEFAULT_IOC_EXPIRY))
             nonce = await self.next_nonce()
             signed = sdk.sign_create_grouped_orders(sdk.GROUPING_TYPE_ONE_TRIGGERS_THE_OTHER, orders, nonce=nonce, api_key_index=self.settings.api_key_index)
             return [self.signed_request(signed, nonce)]
