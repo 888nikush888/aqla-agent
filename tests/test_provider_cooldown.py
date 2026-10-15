@@ -1,3 +1,4 @@
+import math
 import sqlite3
 import sys
 from types import SimpleNamespace
@@ -17,7 +18,7 @@ def runtime(tmp_path, monkeypatch):
     def arm(agent, reason, reset_at=None):
         if reason != "limited":
             return None
-        seconds = reset_at - clock.wall if reset_at else 60
+        seconds = math.ceil(reset_at - clock.wall) if reset_at else 60
         agent._rate_limited_until = clock.elapsed + seconds
         return seconds
     def restore(agent):
@@ -52,6 +53,18 @@ def test_new_agent_and_changed_monotonic_origin_keep_provider_reset(runtime):
     helpers.restore_primary_runtime(fresh)
     assert fresh.route=="fallback" and fresh._rate_limited_until==8902
     assert quota.reset_at(fresh)==10000
+
+
+def test_replaying_shared_reset_cannot_extend_it_through_native_rounding(runtime):
+    clock,native,helpers,agent=runtime
+    clock.wall=1000.2
+    native._arm_rate_limit_cooldown(agent(),"limited",reset_at=2000.7)
+    original=quota.reset_at(agent())
+    clock.wall,clock.elapsed=1100.35,2
+    helpers.restore_primary_runtime(agent())
+    assert quota.reset_at(agent())==original
+    native._arm_rate_limit_cooldown(agent(),"limited",reset_at=5000)
+    assert quota.reset_at(agent())>original
 
 
 def test_expired_quota_restores_primary_and_credential_or_model_change_is_independent(runtime):

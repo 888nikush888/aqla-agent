@@ -5,11 +5,13 @@ import os
 import sqlite3
 import time
 from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from aqla_hyperliquid_mcp.models import AqlaError, digest
 
 LOG = logging.getLogger(__name__)
+REPLAY = ContextVar("aqla_provider_cooldown_replay", default=False)
 
 
 def identity(agent):
@@ -70,15 +72,22 @@ def install(replace):
 
     def arm_shared(agent, reason, reset_at=None):
         seconds = arm(agent, reason, reset_at=reset_at)
-        remember(agent, seconds)
+        if not REPLAY.get():
+            remember(agent, seconds)
         return seconds
 
     def restore_shared(agent):
         until = reset_at(agent)
         if until:
             agent._rate_limited_until = max(getattr(agent, "_rate_limited_until", 0), time.monotonic() + until - time.time())
-            if not agent._fallback_activated and not agent._try_activate_fallback(reason=FailoverReason.rate_limit, reset_at=until):
-                raise AqlaError("Primary provider quota remains exhausted and no configured fallback is available")
+            if not agent._fallback_activated:
+                token = REPLAY.set(True)
+                try:
+                    activated = agent._try_activate_fallback(reason=FailoverReason.rate_limit, reset_at=until)
+                finally:
+                    REPLAY.reset(token)
+                if not activated:
+                    raise AqlaError("Primary provider quota remains exhausted and no configured fallback is available")
         return restore(agent)
 
     replace(fallback_cooldown, "_arm_rate_limit_cooldown", arm_shared)
