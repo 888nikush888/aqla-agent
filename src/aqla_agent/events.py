@@ -175,7 +175,22 @@ class HermesExtension:
         return await self.mcp_call(self.server, "integration", args)
 
     async def mcp_call(self, server, tool, args):
-        result = await asyncio.to_thread(self.ctx.call_mcp, server, tool, args)
+        claim = self.turn_claim.get()
+        def invoke():
+            if claim and claim.read():
+                return self.ctx.call_mcp(server, tool, args)
+            try:
+                from tools.interrupt import acting_for_tid, clear_current_thread_interrupt
+            except ImportError:
+                return self.ctx.call_mcp(server, tool, args)
+            # Fresh background work cannot inherit a stopped agent's pooled thread.
+            clear_current_thread_interrupt()
+            token = acting_for_tid.set(None)
+            try:
+                return self.ctx.call_mcp(server, tool, args)
+            finally:
+                acting_for_tid.reset(token)
+        result = await asyncio.to_thread(invoke)
         if not result.get("ok"):
             raise AqlaError("Native MCP integration call failed")
         if result.get("truncated"):
@@ -631,7 +646,8 @@ class HermesExtension:
                 return {"action": "block", "message": str(error)}
         if short in ("status", "setup_status"):
             setup = self.setup.claims() if origin and origin[0] == "operator" else None
-            return {"action": "modify", "args": {"context_auth": self.authority.sign(*origin, setup=setup) if origin and origin[0] == "operator" else ""}}
+            return {"action": "modify", "args": {"context_auth": self.authority.sign(*origin, setup=setup) if origin and origin[0] == "operator" else "",
+                **({"view": "summary"} if short == "status" and claim and claim.automatic else {})}}
         if short == "monthly_report" and origin and origin[0] == "operator" and claim.can_change() and not diagnostic:
             # The read tool stays read-only. The native owner-request hook asks the
             # internal publisher for an analysis tab, separately from model tools.

@@ -47,11 +47,14 @@ async def produce(home):
 
 
 async def verify(home, mcp_python):
+    from concurrent.futures import ThreadPoolExecutor
+
     from agent.turn_finalizer import apply_llm_output_transform
     from hermes_cli import lifecycle
     from model_tools import _emit_post_tool_call_hook
 
     from aqla_agent.events import HermesExtension
+    from aqla_hyperliquid_mcp.models import AqlaError
 
     subprocess.run([mcp_python, __file__, '--produce', '--home', str(home)], check=True, capture_output=True)
     wire = json.loads((home / 'wire.json').read_text(encoding='utf-8'))
@@ -82,8 +85,35 @@ async def verify(home, mcp_python):
             agent = SimpleNamespace(session_id='synthetic-native-event', model='synthetic', platform='telegram')
             text, changed, _ = apply_llm_output_transform(agent, 'A verbose invented status round', turn_id='event')
             assert text == expected and text != 'NO_REPLY' and changed
+        from tools.interrupt import acting_for_tid, is_interrupted, set_interrupt
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
+        await asyncio.to_thread(set_interrupt, True)
+        def probe(*_):
+            return {'ok': not is_interrupted(), 'result': {'background_mcp_usable': True}}
+        ext.ctx.call_mcp = probe
+        assert await ext.mcp_call('aqla', 'integration', {}) == {'background_mcp_usable': True}
+        await asyncio.to_thread(set_interrupt, True)
+        try:
+            with ext.claim_scope(('operator', 'still-active')):
+                try:
+                    await ext.mcp_call('aqla', 'integration', {})
+                except AqlaError:
+                    pass
+                else:
+                    raise AssertionError('Active operator interruption was cleared')
+        finally:
+            await asyncio.to_thread(set_interrupt, False)
+        acting = acting_for_tid.set(123456789)
+        set_interrupt(True, thread_id=123456789)
+        try:
+            assert await ext.mcp_call('aqla', 'integration', {}) == {'background_mcp_usable': True}
+            assert is_interrupted(), 'Parent operator interrupt must remain set'
+        finally:
+            acting_for_tid.reset(acting)
+            set_interrupt(False, thread_id=123456789)
         print(json.dumps({'native_transform_before_persistence': True, 'actual_mcp_read_and_versioned_ack': True,
-            'quiet_without_new_event': True, 'exact_rendered_event_delivered': True, 'exchange_calls': 0}))
+            'quiet_without_new_event': True, 'exact_rendered_event_delivered': True, 'exchange_calls': 0,
+            'stale_pooled_interrupt_cleared_for_background_only': True, 'active_operator_interrupt_preserved': True}))
     finally:
         lifecycle._plugin_hooks, lifecycle.has_hook = old_hooks, old_has
 

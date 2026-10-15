@@ -54,11 +54,13 @@ def test_operator_responses_and_unacknowledged_or_other_turn_notices_are_not_pub
     ext, _ = extension
     with ext.claim_scope(('operator', 'owner')):
         assert ext.transform_output(response_text='Requested status') is None
+        assert 'view' not in ext.before_tool('mcp__aqla__status', {'view': 'full'})['args']
         notice(ext)
         assert ext.source_reply(ext.turn_claim.get()) == 'NO_REPLY'
     with ext.claim_scope(('source', 'wake')):
         claim = ext.turn_claim.get()
         claim.automatic = True
+        assert ext.before_tool('mcp__aqla__status', {'view': 'full'})['args']['view'] == 'summary'
         notice(ext, processed=False)
         assert ext.transform_output(response_text='should not send') == 'NO_REPLY'
         notice(ext)
