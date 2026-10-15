@@ -111,9 +111,27 @@ async def verify(home, mcp_python):
         finally:
             acting_for_tid.reset(acting)
             set_interrupt(False, thread_id=123456789)
+        from hermes_cli.plugins import PluginContext
+        from tools import mcp_tool_handlers
+        handler, previous_context = mcp_tool_handlers._make_tool_handler, ext.ctx
+        deadlines = []
+        def delayed_handler(server, tool, timeout):
+            deadlines.append((server, tool, timeout))
+            return lambda _: json.dumps({'result': {'status': 'published'}}) if timeout >= 45 else json.dumps({'error': 'MCP call timed out'})
+        native_context = SimpleNamespace(plugin_id='aqla-events', manifest=SimpleNamespace(name='aqla-events'),
+            _mcp_allowlist=lambda _: ['sheets'], _mcp_envelope=PluginContext._mcp_envelope)
+        native_context.call_mcp = lambda *args, **kwargs: PluginContext.call_mcp(native_context, *args, **kwargs)
+        try:
+            mcp_tool_handlers._make_tool_handler = delayed_handler
+            ext.ctx = native_context
+            assert await ext.mcp_call('sheets', 'sync_presentation_internal', {}) == {'status': 'published'}
+            assert deadlines == [('sheets', 'sync_presentation_internal', 240.0)]
+        finally:
+            mcp_tool_handlers._make_tool_handler, ext.ctx = handler, previous_context
         print(json.dumps({'native_transform_before_persistence': True, 'actual_mcp_read_and_versioned_ack': True,
             'quiet_without_new_event': True, 'exact_rendered_event_delivered': True, 'exchange_calls': 0,
-            'stale_pooled_interrupt_cleared_for_background_only': True, 'active_operator_interrupt_preserved': True}))
+            'stale_pooled_interrupt_cleared_for_background_only': True, 'active_operator_interrupt_preserved': True,
+            'native_sheets_deadline_covers_verified_publication': True}))
     finally:
         lifecycle._plugin_hooks, lifecycle.has_hook = old_hooks, old_has
 

@@ -300,24 +300,25 @@ def test_cursor_lost_read_does_not_advance_client_position(transport, monkeypatc
     google, client = transport
     cursor = signal_cursor(google, client)
     original = google.request
-    lost = False
+    lost = 0
 
     def losing_request(method, url, **kwargs):
         nonlocal lost
         response = original(method, url, **kwargs)
-        if not lost and url.endswith("/values:batchGet") and any(
+        if lost < 3 and url.endswith("/values:batchGet") and any(
             Google.coordinates(query)[1] == 1 and Google.coordinates(query)[2] > 1
             and Google.coordinates(query)[3] > 1 for query in kwargs["params"]["ranges"]
         ):
-            lost = True
+            lost += 1
             raise OSError("Body read reply lost")
         return response
 
     monkeypatch.setattr(google, "request", losing_request)
+    monkeypatch.setattr(adapter.time, "sleep", lambda _: None)
     with pytest.raises(AqlaError, match="request failed"):
         client.read("Signale", filters={"Quelle": "channel"}, scan_cursor=cursor)
     retry = client.read("Signale", filters={"Quelle": "channel"}, scan_cursor=cursor)
-    assert lost
+    assert lost == 3
     assert [row["ID"] for row in retry["rows"]] == [f"signal-{index:04d}" for index in range(120, 125)]
     assert retry["scan_complete"] is True
     assert google.writes == 0

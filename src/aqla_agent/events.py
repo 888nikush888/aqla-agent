@@ -176,18 +176,20 @@ class HermesExtension:
 
     async def mcp_call(self, server, tool, args):
         claim = self.turn_claim.get()
+        # Verified Sheets publications span several HTTP calls and bounded read retries.
+        call_options = {"timeout": 240} if server == "sheets" and tool.endswith("_internal") else {}
         def invoke():
             if claim and claim.read():
-                return self.ctx.call_mcp(server, tool, args)
+                return self.ctx.call_mcp(server, tool, args, **call_options)
             try:
                 from tools.interrupt import acting_for_tid, clear_current_thread_interrupt
             except ImportError:
-                return self.ctx.call_mcp(server, tool, args)
+                return self.ctx.call_mcp(server, tool, args, **call_options)
             # Fresh background work cannot inherit a stopped agent's pooled thread.
             clear_current_thread_interrupt()
             token = acting_for_tid.set(None)
             try:
-                return self.ctx.call_mcp(server, tool, args)
+                return self.ctx.call_mcp(server, tool, args, **call_options)
             finally:
                 acting_for_tid.reset(token)
         result = await asyncio.to_thread(invoke)

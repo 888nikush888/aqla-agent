@@ -5,8 +5,11 @@ import base64
 import hashlib
 import json
 import math
+import random
 import threading
+import time
 from collections import defaultdict
+from email.utils import parsedate_to_datetime
 
 from aqla_hyperliquid_mcp.models import AqlaError
 
@@ -120,14 +123,36 @@ class SheetsClient:
         return self.session
 
     def request(self, method, suffix="", **kwargs):
-        try:
-            response = self._session().request(method, BASE + self.settings.spreadsheet_id + suffix, timeout=self.timeout, **kwargs)
-            response.raise_for_status()
-            return response.json()
-        except AqlaError:
-            raise
-        except Exception:
-            raise AqlaError("Google Sheets request failed; journal records remain pending") from None
+        for attempt in range(3):
+            response = None
+            try:
+                response = self._session().request(method, BASE + self.settings.spreadsheet_id + suffix, timeout=self.timeout, **kwargs)
+                response.raise_for_status()
+                return response.json()
+            except AqlaError:
+                raise
+            except Exception as error:
+                status = getattr(response, "status_code", None)
+                retry = method.upper() == "GET" and (status in (408, 429, 500, 502, 503, 504)
+                    or response is None and isinstance(error, OSError))
+                delay = 2 ** attempt + random.random()
+                hint = getattr(response, "headers", {}).get("Retry-After")
+                if hint:
+                    try:
+                        wait = float(hint)
+                    except (ValueError, TypeError):
+                        try:
+                            wait = parsedate_to_datetime(hint).timestamp() - time.time()
+                        except (ValueError, TypeError, OverflowError):
+                            wait = 0
+                    if math.isfinite(wait):
+                        delay = max(delay, wait)
+                # A lost write reply may already have applied a structural batch.
+                # Leave its retry to the ID/readback transaction, never replay it here.
+                if not retry or attempt == 2 or delay > 60:
+                    category = f"http_{status}" if isinstance(status, int) else "transport" if isinstance(error, OSError) else "invalid_response"
+                    raise AqlaError(f"Google Sheets request failed ({category}); journal records remain pending") from None
+                time.sleep(delay)
 
     def layout(self, *, create=True):
         raw = self.request("GET", params={"fields": "sheets.properties,developerMetadata"})

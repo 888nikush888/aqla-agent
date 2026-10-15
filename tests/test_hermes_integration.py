@@ -29,6 +29,27 @@ class Context:
         return task
 
 
+@pytest.mark.asyncio
+async def test_verified_sheets_publication_outlives_native_default_deadline(extension, tmp_path):
+    from aqla_hyperliquid_mcp.models import GoogleSheetsSettings
+
+    ext, ctx = extension
+    ext.settings.google_sheets = GoogleSheetsSettings(enabled=True, spreadsheet_id="ci-sheet-" + "0" * 30,
+        credentials_file=tmp_path / "google.secret")
+    calls = []
+    def delayed_publication(server, tool, args, **options):
+        calls.append((server, tool, options))
+        if server == "sheets" and options.get("timeout", 30) < 45:
+            return {"ok": False, "error": "MCP call timed out after 30.0s"}
+        result = {"selection": {}} if tool == "presentation_selection_internal" else {"revision": 1} if server == "aqla" else {"status": "published"}
+        return {"ok": True, "result": result}
+    ctx.call_mcp = delayed_publication
+    await ext.sync_presentation()
+    assert [tool for _, tool, _ in calls] == ["presentation_selection_internal", "integration", "sync_presentation_internal"]
+    assert calls[0][2] == calls[2][2] == {"timeout": 240}
+    assert calls[1][2] == {}
+
+
 def message(owner="12345", injection=False, plugin_id="aqla-events", text="normal user text"):
     return SimpleNamespace(source=SimpleNamespace(platform=SimpleNamespace(value="telegram"), chat_type="dm", chat_id="12345", user_id=owner, message_id="1"),
                            metadata={"hermes_plugin_injection": injection, "hermes_plugin_id": plugin_id}, message_id="1", text=text)
@@ -397,7 +418,7 @@ async def test_truncated_internal_result_is_never_parsed_or_acknowledged(extensi
     from aqla_hyperliquid_mcp.models import AqlaError
 
     ext, ctx = extension
-    ctx.call_mcp = lambda *_: {"ok": True, "result": '{"partial', "truncated": True}
+    ctx.call_mcp = lambda *_, **__: {"ok": True, "result": '{"partial', "truncated": True}
     with pytest.raises(AqlaError, match="truncated"):
         await ext.mcp_call("sheets", "sync_internal", {})
 
@@ -568,7 +589,7 @@ async def test_sheets_delivery_acknowledges_only_after_success_and_isolates_outa
     state.update(lambda data: data.update(paused=True))
     calls = []
     failing = True
-    def call_mcp(server, tool, args):
+    def call_mcp(server, tool, args, **options):
         calls.append((server, tool, args.get("action")))
         extension.authority.internal(args["token"])
         if server == "aqla":
