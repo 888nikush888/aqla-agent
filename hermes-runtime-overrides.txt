@@ -3,3 +3,5 @@
 PyJWT==2.15.1
 httpx2==2.13.1
 httpcore2==2.13.1
+# GHSA-84m7-p3x7-pcfv: bound stateful Streamable HTTP session retention.
+mcp==2.2.0

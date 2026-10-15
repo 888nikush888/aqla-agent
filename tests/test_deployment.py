@@ -81,7 +81,7 @@ def test_native_dependency_recipe_is_shared_and_security_versions_are_exact():
     recipe = hermes_dependency_command("uv", Path("source"), "python", override)
     assert recipe[recipe.index("--overrides") + 1] == str(override)
     contents = override.read_text()
-    assert {"PyJWT==2.15.1", "httpx2==2.13.1", "httpcore2==2.13.1"} <= set(contents.splitlines())
+    assert {"PyJWT==2.15.1", "httpx2==2.13.1", "httpcore2==2.13.1", "mcp==2.2.0"} <= set(contents.splitlines())
 
 
 @pytest.mark.parametrize("character", [chr(value) for value in range(32)] + [chr(127), "'", '"'])
