@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import threading
 import uuid
@@ -106,8 +107,8 @@ async def verify_reload_and_agent(home, mcp_python):
     from aqla_agent.events import EXTENSIONS, HermesExtension, intercept_native_setup
     from aqla_agent.install import prepare
     from aqla_hyperliquid_mcp.models import Settings, SourceEvent
-    from aqla_hyperliquid_mcp.state import State
 
+    mcp_python = str(Path(mcp_python).absolute())
     destination = home / ("profile-" + uuid.uuid4().hex)
     prepare(Path(__file__).resolve().parents[1], destination, "12345", "qa-model", "http://127.0.0.1/v1")
     native_home = destination / "hermes-home"
@@ -185,15 +186,23 @@ async def verify_reload_and_agent(home, mcp_python):
             assert len(active) == 2 and len(app.handlers[-100]) == 1
         fresh = next(row for row in EXTENSIONS if row.ctx._manager is manager)
         settings = Settings.load(destination / "config.yaml")
-        state = State(settings)
         stamp = int(datetime.fromisoformat("2026-10-11T17:39:00+02:00").timestamp() * 1000)
         body = "Retained source, no fill proof. " + "X" * 14900
         received = [SourceEvent(chat_id="-123", message_id=index + 1, sent_at=stamp + index * 1000,
             received_at=stamp + index * 1000, text=body) for index in range(5)]
-        state.update(lambda data: data["events"].update({event.event_id: {"event_id": event.event_id,
-            "source_id": event.source_id, "source": event.model_dump(mode="json"), "status": "executed", "interpretation": None} for event in received}))
-        before = state.snapshot()
-        state.close()
+        seed = '''import json,sys
+from aqla_hyperliquid_mcp.models import Settings,SourceEvent
+from aqla_hyperliquid_mcp.state import State
+state=State(Settings.load(sys.argv[1]))
+try:
+    events=[SourceEvent.model_validate(row) for row in json.load(sys.stdin)]
+    state.update(lambda data: data["events"].update({event.event_id:{"event_id":event.event_id,
+        "source_id":event.source_id,"source":event.model_dump(mode="json"),"status":"executed","interpretation":None} for event in events}))
+finally: state.close()
+'''
+        # The trading writer and its dependencies belong to the separate MCP runtime.
+        subprocess.run([mcp_python, "-c", seed, str(destination / "config.yaml")],
+            input=json.dumps([event.model_dump(mode="json") for event in received]), text=True, check=True)
         discover_mcp_tools()
         from aqla_hyperliquid_mcp.storage import read_snapshot
         before = read_snapshot(settings.state_path)
