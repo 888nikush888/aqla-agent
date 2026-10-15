@@ -16,6 +16,10 @@ class Context:
     def get_config(self, key, default=None):
         return self.configuration.get(key, default)
 
+    def call_mcp(self, server, tool, arguments, **_):
+        assert tool == "integration" and arguments["action"] == "source_notice"
+        return {"ok": True, "result": {"recorded": True}}
+
     def on_unload(self, callback):
         self.cleanups.append(callback)
 

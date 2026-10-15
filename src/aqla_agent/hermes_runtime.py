@@ -71,6 +71,12 @@ def install_strict_profile():
     async def run_agent(self, message, context_prompt, history, source, session_id, **kwargs):
         from .tool_outputs import capture_scope
         from .tool_runtime import GUIDANCE, owned_profile
+        extension = gateway_extension(self)
+        incoming = extension.turn_event.get() if extension else None
+        if incoming and (getattr(incoming, "metadata", None) or {}).get("hermes_plugin_injection") is True:
+            from .events import WAKE
+            context_prompt = (context_prompt or "") + "\n\n" + WAKE
+            kwargs["scheduled_heartbeat"] = True
         if owned_profile():
             context_prompt = (context_prompt or "") + "\n\n" + GUIDANCE
             with capture_scope(session_id, "context-history"):

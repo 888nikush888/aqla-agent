@@ -23,6 +23,8 @@ Ein definitiv ungefüllter IOC ist ein beendeter Versuch; ungeklärte Antworten
 werden anhand derselben Operations-/Orderidentitäten abgeglichen, nie blind wiederholt.
 
 Ein Preis-Snapshot enthält Bid/Ask, Mid, Triggerreferenz, Börsenzeit und Lesezeiten.
+
+Nach einem Fill wird das eigene Stop-Risiko gegen den unveränderlichen Plan und die unmittelbar vor dem Versand genehmigte Kontoequity geprüft. Kursänderungen anderer Positionen während einer wartenden Limitorder ändern dieses bereits genehmigte Einzeltrade-Budget nicht rückwirkend. Ohne gespeicherten Freigabebeleg bleibt die konservative Prüfung gegen die aktuelle Equity bestehen. Preisstruktur, tatsächliche Fillmenge, Stop, Positionswert und das aktuelle gemeinsame Kontorisikolimit werden weiterhin geprüft.
 Alle Belege müssen frisch sein (maximal zwei Sekunden). Hyperliquid nutzt den
 Mark-Preis für SL, Aster den im bestehenden Adapter gewählten `CONTRACT_PRICE`.
 Lighter nutzt ausdrücklich zeitgestempelte REST-Daten oder die öffentlichen

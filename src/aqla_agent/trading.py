@@ -1045,6 +1045,7 @@ class Trading:
         targets = [Decimal(price) for price in trade["targets"]]
         account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
         quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
+        accepted_equity = Decimal(trade.get("entry_equity_snapshot", {}).get("equity", str(account.equity)))
         safe = (stop < min(entry, quote.stop_reference) and all(price > entry for price in targets) if plan.side == "long"
                 else stop > max(entry, quote.stop_reference) and all(price < entry for price in targets))
         notional = entry * size
@@ -1057,10 +1058,11 @@ class Trading:
         target_sizes = split_targets(size, len(targets), plan.policy, plan.market)
         targets_feasible = all(amount >= plan.market.min_quantity and amount * price >= plan.market.min_notional for amount, price in zip(target_sizes, targets, strict=True))
         permitted = (safe and within_entry_band and targets_feasible and notional <= plan.policy.max_notional_usdc and risk <= plan.risk_usdc
-                     and risk <= account.equity * plan.policy.risk_percent / 100
+                     and risk <= accepted_equity * plan.policy.risk_percent / 100
                      and risk + other_risk <= account.equity * limits.max_total_risk_percent / 100)
         check = {"phase": "after_fill", "snapshot": quote.model_dump(mode="json"), "entry_vwap": str(entry),
-                 "notional": str(notional), "risk": str(risk), "permitted": bool(permitted)}
+                 "notional": str(notional), "risk": str(risk), "permitted": bool(permitted),
+                 "accepted_equity": str(accepted_equity), "observed_equity": str(account.equity)}
         self.state.update(lambda data: data["trades"][trade_id].setdefault("price_checks", []).append(check))
         if not permitted:
             raise AqlaError("Confirmed entry violates price structure, position value or SL risk limits")

@@ -22,7 +22,9 @@ Decision reads issue compact `sr2` receipts: bounded compressed claims signed wi
 
 ## Native runtime
 
-Wake scheduling admits at most one pending wake; new work is read from authoritative state at execution time. Unchanged work retries after 30, 60, 120, then 300 seconds. New work, progress or changed notification/reader/recovery signatures reset the interval. An accepted but unconsumed wake is retried after 300 seconds only when no native model turn is running. Reconnect/unload clears admission state. Gateway scheduling acceptance is never treated as completed work.
+Wake scheduling admits at most one pending wake; new work is read from authoritative state at execution time. Unchanged work retries after 30, 60, 120, then 300 seconds. Ready IDs remain actionable even when their signature and notification count are unchanged; bounded wake selections rotate through the retained backlog. New work, progress or changed notification/reader/recovery signatures reset the interval. An accepted but unconsumed wake is retried after 300 seconds only when no native model turn is running. Reconnect/unload clears admission state. Gateway scheduling acceptance is never treated as completed work.
+
+Automatic source wakes use the native quiet background-turn display settings, without progress or long-running pings. Their final output is transformed before persistence and delivery into the exact backend event texts read and acknowledged with matching notification versions during that turn. With no such event the result is `NO_REPLY`; free-form status rounds cannot reach Telegram. Operator replies remain unchanged. Reader status changes use durable backend notices; retry counts/deadlines do not repeat an unchanged outage. An internal snapshot failure during reader backoff cannot bypass its retry deadline or repeatedly disconnect the reader.
 
 Source turns use `aqla-source`, a fixed subset of the existing MCP tools. Operator tools/Sheets/skill mutation schemas are excluded; independent authorization hooks remain active. Operator turns retain their configured toolsets. Different toolset keys preserve native cache isolation.
 

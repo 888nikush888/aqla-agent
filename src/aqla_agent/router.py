@@ -431,6 +431,12 @@ class Router:
             candidates = {name: [row for row in rows if row["trade_id"] == interpretation.bound_trade_id]
                           for name, rows in candidates.items() if any(row["trade_id"] == interpretation.bound_trade_id for row in rows)}
         anchor = self.state.snapshot()["events"][event_id]["source"]
+        if not candidates and not interpretation.bound_trade_id and not any(row["status"] in OPEN
+                and row["chat_id"] == anchor["chat_id"] for row in self.state.snapshot()["trades"].values()):
+            reason = "No existing own position matches this source update"
+            self.state.update(lambda data: data["events"][event_id].update(status="rejected", update_targets=[],
+                last_error=reason, update_disposition="no_matching_own_position"))
+            return {"status": "rejected", "reason": reason, "targets": []}
         if anchor.get("reply_to_id"):
             parent = digest([anchor["chat_id"], anchor["reply_to_id"]])[:32]
             parents = {binding["trade_id"] for engine in self.engines.values() if (binding := engine.state.snapshot()["bindings"].get(parent))}
