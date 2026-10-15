@@ -257,11 +257,14 @@ async def test_backup_prices_work_with_lighter_native_integer_contract(lighter,s
 
 
 @pytest.mark.asyncio
-async def test_multi_target_backup_keeps_each_profile_and_shared_limits(routed,setup,signal):  # noqa: F811 -- fixture
+async def test_multi_target_backup_keeps_each_profile_and_shared_limits(routed,setup,signal,monkeypatch):  # noqa: F811 -- fixture
     router,boundaries=routed
     _,state,*_=setup
     configure(state,stop='2',targets=['2','3'])
     source,value=signal
+    # Profile semantics use a controlled exchange clock, independent of slow test disks.
+    for module in ('aqla_agent.entry', 'aqla_hyperliquid_mcp.api', 'conftest'):
+        monkeypatch.setattr(module+'.now_ms', lambda: source.sent_at)
     previews=await router.preview(source.event_id,missing(value,'stop_loss','take_profits'))
     plans=[row['plan'] for row in previews['targets']]
     assert {plan['policy']['risk_percent'] for plan in plans}=={'0.25','1'}
