@@ -535,7 +535,7 @@ async def test_paused_entry_rejection_completes_without_retry_or_failure_notific
 
 
 @pytest.mark.asyncio
-async def test_unbound_update_finishes_as_durable_review_without_loop(native_processor):
+async def test_update_without_own_position_finishes_rejected_without_loop(native_processor):
     server, state, fake = native_processor
     source = SourceEvent(chat_id="channel", message_id=55, sent_at=now_ms(), text="BTC close now.")
     server.aqla_trading.ingest(source)
@@ -546,10 +546,13 @@ async def test_unbound_update_finishes_as_durable_review_without_loop(native_pro
     await rpc(server, "source_record", job_id=job["job_id"], decision_result=DecisionResult(
         model="fixture", interpretation=value, verified=True).model_dump(mode="json"))
     applied = await rpc(server, "source_apply", job_id=job["job_id"])
-    assert applied["status"] == "review" and applied["outcome"] == "update_binding_review"
+    assert applied["status"] == "done"
     assert (await rpc(server, "source_prepare", processing_version="unbound"))["job"] is None
-    assert state.snapshot()["source_jobs"][job["job_id"]]["failure_detail"]["phase"] == "apply"
-    assert not fake.actions and not state.snapshot()["operations"]
+    snapshot = state.snapshot()
+    assert snapshot["events"][source.event_id]["status"] == "rejected"
+    assert snapshot["events"][source.event_id]["update_disposition"] == "no_matching_own_position"
+    assert not snapshot["source_jobs"][job["job_id"]]["failure_detail"]
+    assert not fake.actions and not snapshot["operations"]
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,3 @@
-import ast
 import asyncio
 import copy
 import hashlib
@@ -264,9 +263,8 @@ def test_frozen_b2_oracle_loads_from_gitless_archive_without_subprocess(tmp_path
         pytest.fail("Frozen oracle must not execute Git or another subprocess")
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     assert baseline_module(target).Reporting.__module__ == "reporting_b2_oracle"
-    tree = ast.parse(target.read_text(encoding="utf-8"))
-    functions = ast.Module(body=[node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))], type_ignores=[])
-    assert hashlib.sha256(ast.dump(functions).encode()).hexdigest() == "225fbfa7611d4a3f6ad72f740ac770f7cc643d6a362a8e22fe097caae517b96f"
+    # Canonical text is stable across Python AST versions and checkout line endings.
+    assert hashlib.sha256(target.read_text(encoding="utf-8").encode()).hexdigest() == "f6b3e2b043df2b6809946ba62ae093ef4600692fc8460ee437f6ffa95e50362f"
 
 
 @pytest.mark.asyncio

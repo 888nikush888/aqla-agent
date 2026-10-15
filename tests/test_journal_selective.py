@@ -154,7 +154,12 @@ async def test_trade_order_fill_operation_rank_mixed_ack_complete_state_oracle(s
     expected, actual = copy.deepcopy(data), copy.deepcopy(data)
     assert journal.acknowledge(actual, accepted) == oracle.acknowledge(expected, accepted)
     assert actual == expected and actual["journal_history"]
-    assert journal.batch(data, 500) == oracle.batch(data, 500)
+    expected_batch = oracle.batch(data, 500)
+    # Financial corrections precede the backlog; record bodies and ACK behavior stay unchanged.
+    records = expected_batch["records"]
+    expected_batch["records"] = [row for row in records if row["table"] in ("Trades", "Fills")] + [
+        row for row in records if row["table"] not in ("Trades", "Fills")]
+    assert journal.batch(data, 500) == expected_batch
 
 
 @pytest.mark.parametrize("kind", ["matched", "stale", "empty", "missing"])

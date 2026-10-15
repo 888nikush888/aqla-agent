@@ -278,11 +278,6 @@ class TelegramReader:
         if not self.settings.telegram_api_id or not self.settings.telegram_api_hash_file or not self.settings.telegram_session_file:
             raise SourceAccessError("reader_configuration_missing")
         try:
-            from telethon import TelegramClient, events
-            from telethon.sessions import StringSession
-        except ImportError:
-            raise SourceAccessError("reader_dependency_missing") from None
-        try:
             session = self.settings.telegram_session_file.read_text().strip()
         except FileNotFoundError:
             raise SourceAccessError("reader_session_missing") from None
@@ -296,6 +291,11 @@ class TelegramReader:
             raise SourceAccessError("reader_configuration_unreadable") from None
         if not api_hash:
             raise SourceAccessError("reader_configuration_missing")
+        try:
+            from telethon import TelegramClient, events
+            from telethon.sessions import StringSession
+        except ImportError:
+            raise SourceAccessError("reader_dependency_missing") from None
         try:
             session = StringSession(session)
         except (ValueError, TypeError):

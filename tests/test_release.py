@@ -115,9 +115,10 @@ def test_allowlist_directory_symlink_before_traversal(release_project, tmp_path,
     (release_project / "src/allowed.txt").unlink()
     (release_project / "src").rmdir()
     _symlink(release_project / "src", target, directory=True)
-    monkeypatch.setattr(release.os, "scandir", lambda *args: pytest.fail("Traversal before directory link validation"))
-    with pytest.raises(ValueError, match="Linked/reparse"):
-        build(release_project, tmp_path / "out.zip")
+    with monkeypatch.context() as blocked:
+        blocked.setattr(release.os, "scandir", lambda *args: pytest.fail("Traversal before directory link validation"))
+        with pytest.raises(ValueError, match="Linked/reparse"):
+            build(release_project, tmp_path / "out.zip")
     assert list(target.iterdir()) == []
 
 
