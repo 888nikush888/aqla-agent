@@ -345,6 +345,9 @@ class Trading:
             if _refresh_from is not None:
                 prior = state["plans"][_refresh_from]
                 original = TradePlan.model_validate(prior["plan"])
+                self.validate_configuration(state, original)
+                if plan.policy != original.policy:
+                    raise ConfigurationChanged("Configuration changed during budget refresh; create a fresh preview")
                 if (prior.get("refreshed_plan_id") or prior.get("refreshed_from_plan_id")
                         or original.trade_id in state["trades"]
                         or any(prefix + original.trade_id in state["operations"] for prefix in ("entry:", "leverage:"))):

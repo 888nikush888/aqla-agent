@@ -227,3 +227,26 @@ async def test_ranked_fallback_budget_refresh_preserves_venue_profile_and_reason
         assert result['plan'][field]==original[field]
     assert Decimal(result['plan']['quantity'])<Decimal(original['quantity'])
     await router.close()
+
+
+@pytest.mark.asyncio
+async def test_configuration_change_before_refresh_cannot_reuse_the_old_execution_request(setup,signal,monkeypatch):
+    from aqla_agent.pipelines import ConfigurationChanged
+    _,state,fake,exchange,engine=setup
+    source,value=signal
+    original=await engine.preview(source.event_id,value)
+    account,preview=exchange.account_snapshot,engine.preview
+    async def reduced(market):
+        return (await account(market)).model_copy(update={'equity':Decimal(5000)})
+    async def changed(*args,**kwargs):
+        if kwargs.get('_refresh_from'):
+            def configure(data):
+                data['policy']['risk_percent']='0.25'
+                data['policy_revision']+=1
+            state.update(configure)
+        return await preview(*args,**kwargs)
+    monkeypatch.setattr(exchange,'account_snapshot',reduced)
+    monkeypatch.setattr(engine,'preview',changed)
+    with pytest.raises(ConfigurationChanged):
+        await engine.execute(original['plan_id'])
+    assert not fake.actions and not state.snapshot()['trades'] and len(state.snapshot()['plans'])==1
