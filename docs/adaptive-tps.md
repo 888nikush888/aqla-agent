@@ -17,6 +17,23 @@ stattdessen 100 % an TP1. Alle Exit-Orders sind Reduce-only; der native SL wird
 vorab zusammen mit dem Entry angelegt. Mengenrundung gibt den Rest an das letzte
 Ziel, sodass keine Menge verloren geht. Börsenmindestgrößen gelten weiterhin.
 
+Bei neuen adaptiven Vorschauen wird die größte ausführbare Anzahl der ersten
+Signalziele gewählt: fünf, vier, drei, zwei oder ein Ziel. Jede gerundete Teilmenge
+muss die Mindestmenge und den Mindestpositionswert der Börse erfüllen. Die
+Gesamtmenge, das Risikobudget, der Stop und die Originalquelle bleiben unverändert.
+Reicht selbst ein Ziel nicht aus, wird weiterhin abgelehnt. Andere Verteilungen
+bleiben strikt. Die gewählte Anzahl wird im Plan eingefroren und gilt auch für
+Backup-/Prozentfinalisierung und spätere Zielupdates; Originalziele bleiben als
+Evidenz erhalten. Telegram nennt die tatsächlich genutzte Anzahl.
+
+Ändert sich Eigenkapital oder freie Margin zwischen Vorschau und erster
+Zulassung, darf die Ausführung einmal ohne neuen Modellaufruf eine kleinere
+Vorschau erstellen. Quelle, Ablaufzeit und Hebel bleiben gleich; Menge, Risiko
+und Positionswert dürfen die ursprünglichen Grenzen nicht überschreiten.
+Die alten Planbelege bleiben unverändert erhalten. Die Korrektur ist dauerhaft
+auf einen Versuch begrenzt und nur ohne Trade oder bereits gestartete eigene
+Entry-/Hebeloperation zulässig. Spätere Budgetänderungen blockieren weiterhin.
+
 `stop_management=tp_ladder` ersetzt die einzelne Einstandsregel:
 
 - Nach vollständig ausgeführtem TP1: Stop auf tatsächlichen Entry-VWAP.

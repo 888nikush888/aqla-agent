@@ -67,6 +67,22 @@ def split_targets(quantity: Decimal, count: int, policy: Policy, market: Market)
     return quantities
 
 
+def executable_targets(quantity, targets, policy, market):
+    targets = selected_targets(targets, policy)
+    counts = range(len(targets), 0, -1) if policy.take_profit_allocation == "adaptive" else (len(targets),)
+    for count in counts:
+        try:
+            sizes = split_targets(quantity, count, policy, market)
+        except AqlaError:
+            if policy.take_profit_allocation != "adaptive":
+                raise
+            continue
+        prices = targets[:count]
+        if all(size >= market.min_quantity and size * price >= market.min_notional for size, price in zip(sizes, prices, strict=True)):
+            return prices, sizes
+    raise AqlaError("A TP leg is below the exchange notional minimum")
+
+
 def quoted_numbers(quote):
     # General decimal notation only; no channel-specific syntax or field-role regex.
     normalized = quote.replace("\u00a0", " ").replace("\u202f", " ")
@@ -390,9 +406,10 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
             if source_tp["margin_leverage"] != final_leverage:
                 targets = prices(entry, signal.side, market, "roe_percent", selected, final_leverage)
                 source_tp.update(margin_leverage=final_leverage, preview_prices=[str(value) for value in targets])
-        tp_sizes = split_targets(quantity, len(targets), policy, market)
-        if any(size < market.min_quantity or size * price < market.min_notional for size, price in zip(tp_sizes, targets, strict=True)):
-            raise AqlaError("A TP leg is below the exchange notional minimum")
+        targets, tp_sizes = executable_targets(quantity, targets, policy, market)
+        if source_tp is not None:
+            source_tp["values"] = source_tp["values"][:len(targets)]
+            source_tp["preview_prices"] = source_tp["preview_prices"][:len(targets)]
         trade_id = digest([*binding, sorted(signal.source_refs)])[:32]
         values = dict(trade_id=trade_id, source_refs=signal.source_refs, policy_revision=revision, policy=policy,
                       signal_leverage=int(Decimal(signal.leverage).to_integral_value(rounding=ROUND_FLOOR)) if signal.leverage is not None else None,

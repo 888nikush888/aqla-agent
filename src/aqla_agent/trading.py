@@ -44,6 +44,12 @@ from .source_queue import is_source_row
 
 OPEN = {"waiting_entry", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
 UNFINISHED = {"pending", "interpreted", "needs_reconciliation"}
+
+
+class EntryBudgetChanged(AqlaError):
+    pass
+
+
 StopUpdatePhase = Literal["waiting_fill", "replacing", "unknown", "confirmed", "rejected", "superseded", "closed_without_application"]
 STOP_UPDATE_ACTIVE = {"waiting_fill", "replacing", "unknown"}
 
@@ -266,7 +272,7 @@ class Trading:
             return result()
         return (self.state.update_if_changed if hasattr(self.state, "update_if_changed") else self.state.update)(commit)
 
-    async def preview(self, event_id, interpretation: Interpretation, *, _market=None):
+    async def preview(self, event_id, interpretation: Interpretation, *, _market=None, _refresh_from=None):
         row = self.record_interpretation(event_id, interpretation)
         if interpretation.kind != "new_signal":
             return row
@@ -335,7 +341,23 @@ class Trading:
                 self.validate_configuration(state, plan)
             except ConfigurationChanged as error:
                 raise ConfigurationChanged("Configuration changed during preview; create a fresh preview: " + str(error)) from error
-            state["plans"][plan.plan_id] = {"event_id": event_id, "plan": plan.model_dump(mode="json")}
+            record = {"event_id": event_id, "plan": plan.model_dump(mode="json")}
+            if _refresh_from is not None:
+                prior = state["plans"][_refresh_from]
+                original = TradePlan.model_validate(prior["plan"])
+                if (prior.get("refreshed_plan_id") or prior.get("refreshed_from_plan_id")
+                        or original.trade_id in state["trades"]
+                        or any(prefix + original.trade_id in state["operations"] for prefix in ("entry:", "leverage:"))):
+                    raise AqlaError("Entry preparation or budget refresh already started; reconcile it")
+                if (plan.plan_id == _refresh_from or plan.trade_id != original.trade_id or plan.source_revisions != original.source_revisions
+                        or plan.deadline_at != original.deadline_at or plan.effective_leverage != original.effective_leverage
+                        or plan.quantity > original.quantity or plan.risk_usdc > original.risk_usdc
+                        or plan.quantity * plan.entry_limit > original.quantity * original.entry_limit):
+                    raise EntryBudgetChanged("Refreshed entry must stay within the original quantity, risk, notional and deadline")
+                # Link both immutable plans in the same transaction, including across crashes.
+                prior["refreshed_plan_id"] = plan.plan_id
+                record["refreshed_from_plan_id"] = _refresh_from
+            state["plans"][plan.plan_id] = record
         self.state.update(save)
         return plan.model_dump(mode="json")
 
@@ -408,7 +430,7 @@ class Trading:
             if (plan.risk_usdc + reserved > account.equity * limits.max_total_risk_percent / 100
                     or plan.risk_usdc > account.equity * plan.policy.risk_percent / 100
                     or plan.quantity * plan.entry_limit / margin_leverage(plan.effective_leverage, plan.market) > account.available_margin):
-                raise AqlaError("Current equity/margin no longer permits this exact plan")
+                raise EntryBudgetChanged("Current equity/margin no longer permits this exact plan")
 
     async def positions(self, market):
         if market.product == "spot":
@@ -452,6 +474,8 @@ class Trading:
                  "filled_quantity": "0", "remaining_quantity": "0", "entry_vwap": None,
                  "stop_price": str(plan.stop_loss), "tp_filled": ["0"] * len(plan.take_profits), "management_revision": 0,
                  "fill_events": {}, "exit_orders": [], "updates": {}, "targets": [str(price) for price in plan.take_profits]}
+        if saved.get("refreshed_from_plan_id"):
+            trade["admission_refresh_from"] = saved["refreshed_from_plan_id"]
         return trade
 
     async def execute(self, plan_id):
@@ -463,15 +487,19 @@ class Trading:
             try:
                 return await self.execute_locked(plan_id)
             except TemporaryObservation as error:
-                return self.retain_observation_retry(plan_id, error)
+                saved = self.state.snapshot()["plans"][plan_id]
+                return self.retain_observation_retry(saved.get("refreshed_plan_id", plan_id), error)
 
-    async def execute_locked(self, plan_id):
+    async def execute_locked(self, plan_id, *, refresh_budget=True):
         snapshot = self.state.snapshot()
         saved = snapshot["plans"].get(plan_id)
         if not saved:
             raise AqlaError("Unknown immutable plan")
         plan = TradePlan.model_validate(saved["plan"])
         self.assert_plan_binding(snapshot, plan)
+        if saved.get("refreshed_plan_id"):
+            return await self.execute_locked(saved["refreshed_plan_id"], refresh_budget=False)
+        refresh_budget = refresh_budget and not saved.get("refreshed_from_plan_id")
         if plan.trade_id in snapshot["trades"]:
             trade = snapshot["trades"][plan.trade_id]
             if trade.get("observation_retry"):
@@ -499,7 +527,17 @@ class Trading:
                 state["bindings"][ref] = {"trade_id": plan.trade_id, "kind": "entry"}
             state["events"][saved["event_id"]]["status"] = "executed"
 
-        self.state.update(admit)
+        try:
+            self.state.update(admit)
+        except EntryBudgetChanged:
+            current = self.state.snapshot()
+            if (not refresh_budget or plan.trade_id in current["trades"]
+                    or any(prefix + plan.trade_id in current["operations"] for prefix in ("entry:", "leverage:"))):
+                raise
+            signal = Interpretation.model_validate(current["events"][saved["event_id"]]["interpretation"])
+            fresh = await self.preview(saved["event_id"], signal, _refresh_from=plan_id)
+            fresh = TradePlan.model_validate(fresh)
+            return await self.execute_locked(fresh.plan_id, refresh_budget=False)
         if plan.entry_timing == "deferred":
             self.state.update(lambda data: data["notifications"].setdefault("entry-waiting:" + plan.trade_id,
                               {"trade_id": plan.trade_id, "change": {"status": "waiting_entry"}, "observed_at": now_ms()}))
@@ -1250,7 +1288,7 @@ class Trading:
                 return False
             stop, targets = backup_prices(reference, plan.side, plan.market,
                 plan.backup_values.fallback_stop_loss_percent if "stop_loss" in plan.backup_fields else None,
-                selected_targets(plan.backup_values.fallback_take_profit_percentages, plan.policy) if "take_profits" in plan.backup_fields else (),
+                selected_targets(plan.backup_values.fallback_take_profit_percentages, plan.policy)[:len(plan.take_profits)] if "take_profits" in plan.backup_fields else (),
                 stop_unit=plan.backup_values.fallback_stop_loss_unit,
                 take_profit_unit=plan.backup_values.fallback_take_profit_unit, leverage=plan.effective_leverage)
             stop = stop if stop is not None else Decimal(trade["stop_price"])
@@ -1865,10 +1903,13 @@ class Trading:
                     reference = (trade.get("entry_vwap") or str(plan.entry_price)) if signal.take_profit_unit == "roe_percent" else specification.get("reference_entry") or trade["entry_vwap"]
                     if reference is None:
                         raise AqlaError("Percentage TP update requires this trade's stored source reference")
-                    converted = prices(reference, plan.side, plan.market, signal.take_profit_unit, selected_targets(signal.take_profits, plan.policy), margin_leverage(plan.effective_leverage, plan.market) if signal.take_profit_unit == "roe_percent" else specification.get("signal_leverage"))
+                    selected = selected_targets(signal.take_profits, plan.policy)
+                    if plan.policy.take_profit_allocation == "adaptive":
+                        selected = selected[:len(plan.take_profits)]
+                    converted = prices(reference, plan.side, plan.market, signal.take_profit_unit, selected, margin_leverage(plan.effective_leverage, plan.market) if signal.take_profit_unit == "roe_percent" else specification.get("signal_leverage"))
                     original = signal.model_dump(mode="json")
                     update_targets = converted
-                    update_spec = {"unit": signal.take_profit_unit, "values": [str(value) for value in selected_targets(signal.take_profits, plan.policy)],
+                    update_spec = {"unit": signal.take_profit_unit, "values": [str(value) for value in selected],
                                    "reference_entry": str(reference), "signal_leverage": specification.get("signal_leverage")}
                     if signal.take_profit_unit == "roe_percent":
                         update_spec.update(margin_leverage=str(margin_leverage(plan.effective_leverage, plan.market)), reference_kind="fill_vwap", reference_entry=trade.get("entry_vwap"), rules_version="source-roe-v1")
@@ -1929,6 +1970,8 @@ class Trading:
     @staticmethod
     def validate_targets(trade, plan, prices):
         prices = selected_targets(prices, plan.policy)
+        if plan.policy.take_profit_allocation == "adaptive":
+            prices = prices[:len(plan.take_profits)]
         if not prices or len(prices) != len(plan.take_profits):
             raise AqlaError("Replace targets with the same target count")
         target_prices = [price_grid(price, plan.market, up=plan.side == "short") for price in prices]

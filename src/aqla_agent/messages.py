@@ -19,6 +19,9 @@ ERRORS = {
     "Signal deadline expired; it is never renewed": "Die Gültigkeitsfrist des Signals ist abgelaufen.",
     "Source market cannot be resolved uniquely; no substitute market is used": "Der Signalmarkt ist nicht eindeutig auflösbar.",
     "Entry price observation is stale or has an invalid timestamp": "Die aktuelle Preisbeobachtung ist nicht frisch oder zeitlich nicht bestätigt.",
+    "A TP leg is below the exchange notional minimum": "Mindestens eine TP-Order unterschreitet die Börsenmindestgröße.",
+    "Current equity/margin no longer permits this exact plan": "Aktuelles Eigenkapital oder freie Margin reicht für diesen unveränderten Plan nicht mehr aus.",
+    "Refreshed entry must stay within the original quantity, risk, notional and deadline": "Die Budgetkorrektur würde ursprüngliche Ausführungsgrenzen überschreiten; kein Orderversand.",
 }
 CHUNK_UNITS = 3000
 MAX_NOTIFICATIONS = 100
@@ -271,6 +274,8 @@ def trade_block(data, trade, notices):
         lines.append(f"**{label}:** {number(entry)} {quote} · **Hebel:** {number(plan.get('effective_leverage', plan.get('policy', {}).get('leverage')))}×")
         if filled and receipt_filled and planned and filled < planned:
             lines.append(f"**Gefüllt:** {number(filled / planned * 100, places=2)} % der geplanten Menge")
+        if trade.get("admission_refresh_from"):
+            lines.append("**Menge vor Versand:** an das aktuelle Kontobudget angepasst")
         lines.append(f"**SL:** {number(trade.get('stop_price', plan.get('stop_loss')))} {quote}" + (" · vorgesehen" if stage == "waiting_entry" else " · Bestätigung ausstehend" if stage in ("unknown", "protecting", "opening") else ""))
         targets = trade.get("targets", plan.get("take_profits", []))
         budgets = trade.get("target_budgets") or plan.get("tp_quantities", [])
@@ -278,6 +283,9 @@ def trade_block(data, trade, notices):
         legs = [f"TP{index + 1}: {number(price)} {quote}" + target_label(plan, index) + (f" · {number((decimal(budgets[index]) or Decimal(0)) / total * 100, places=2)} % Position" if total and index < len(budgets) else " · Anteil nicht bestätigt") for index, price in enumerate(targets)]
         if legs:
             lines.append("**Ziele · Positionsanteil**\n" + "\n".join(legs))
+            source_count = plan.get("source_take_profit_count")
+            if source_count and source_count > len(targets):
+                lines.append(f"**Adaptive TP-Auswahl:** {len(targets)} von {source_count} Signalzielen")
         raw, rounded, effective = plan.get("signal_leverage_original", plan.get("signal_leverage")), plan.get("signal_leverage"), plan.get("effective_leverage")
         if raw is not None and (decimal(raw) != decimal(rounded) or decimal(rounded) != decimal(effective)):
             lines.append(f"**Hebel angepasst:** Signal {number(raw)}× → abgerundet {number(rounded)}× → wirksam {number(effective)}×")
