@@ -177,7 +177,8 @@ async def test_committed_refresh_survives_interruption_before_dispatch_without_a
 
 
 @pytest.mark.asyncio
-async def test_refreshed_plan_is_rejected_before_save_if_it_enlarges_original_intent(setup,signal,monkeypatch):
+@pytest.mark.parametrize('damage',['quantity','market'])
+async def test_refreshed_plan_is_rejected_before_save_if_it_changes_original_intent(setup,signal,monkeypatch,damage):
     from aqla_agent import trading as module
     _,state,fake,exchange,engine=setup
     state.update(lambda data:data['policy'].update(max_notional_usdc='5000'))
@@ -188,12 +189,15 @@ async def test_refreshed_plan_is_rejected_before_save_if_it_enlarges_original_in
         return (await account(market)).model_copy(update={'equity':Decimal(5000)})
     def enlarged(*args,**kwargs):
         plan=make(*args,**kwargs)
-        plan.quantity=Decimal(original['quantity'])+1
-        plan.risk_usdc=Decimal(original['risk_usdc'])*2
+        if damage=='quantity':
+            plan.quantity=Decimal(original['quantity'])+1
+            plan.risk_usdc=Decimal(original['risk_usdc'])*2
+        else:
+            plan.market=plan.market.model_copy(update={'asset_id':plan.market.asset_id+1})
         return plan
     monkeypatch.setattr(exchange,'account_snapshot',reduced)
     monkeypatch.setattr(module,'make_plan',enlarged)
-    with pytest.raises(EntryBudgetChanged,match='original quantity'):
+    with pytest.raises(EntryBudgetChanged,match='original quantity' if damage=='quantity' else 'original market'):
         await engine.execute(original['plan_id'])
     assert len(state.snapshot()['plans'])==1 and not fake.actions and not state.snapshot()['trades']
 

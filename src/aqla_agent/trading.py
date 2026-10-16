@@ -349,6 +349,11 @@ class Trading:
                         or original.trade_id in state["trades"]
                         or any(prefix + original.trade_id in state["operations"] for prefix in ("entry:", "leverage:"))):
                     raise AqlaError("Entry preparation or budget refresh already started; reconcile it")
+                identity_fields = ("asset_id", "symbol", "product", "dex", "size_decimals", "price_tick", "quantity_step",
+                                   "quote_token", "collateral_token", "base_token", "native_symbol", "margin_leverage_scale")
+                if (any(getattr(plan.market, key) != getattr(original.market, key) for key in identity_fields)
+                        or len(plan.take_profits) > len(original.take_profits)):
+                    raise EntryBudgetChanged("Budget refresh cannot change the original market or add TP targets")
                 if (plan.plan_id == _refresh_from or plan.trade_id != original.trade_id or plan.source_revisions != original.source_revisions
                         or plan.deadline_at != original.deadline_at or plan.effective_leverage != original.effective_leverage
                         or plan.quantity > original.quantity or plan.risk_usdc > original.risk_usdc

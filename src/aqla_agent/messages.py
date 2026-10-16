@@ -22,6 +22,7 @@ ERRORS = {
     "A TP leg is below the exchange notional minimum": "Mindestens eine TP-Order unterschreitet die Börsenmindestgröße.",
     "Current equity/margin no longer permits this exact plan": "Aktuelles Eigenkapital oder freie Margin reicht für diesen unveränderten Plan nicht mehr aus.",
     "Refreshed entry must stay within the original quantity, risk, notional and deadline": "Die Budgetkorrektur würde ursprüngliche Ausführungsgrenzen überschreiten; kein Orderversand.",
+    "Budget refresh cannot change the original market or add TP targets": "Die Budgetkorrektur darf weder den ursprünglichen Markt ändern noch TP-Ziele hinzufügen.",
 }
 CHUNK_UNITS = 3000
 MAX_NOTIFICATIONS = 100
