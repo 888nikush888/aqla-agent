@@ -10,6 +10,20 @@ from aqla_agent.messages import MAX_NOTIFICATIONS, literal, number, split_blocks
 READY = {'hyperliquid': {'configured': True, 'enabled': True, 'network': 'testnet'}}
 
 
+@pytest.mark.parametrize('allocation',['adaptive','first_target'])
+def test_only_adaptive_mode_reports_adaptive_selection_and_backup_labels_use_active_targets(opened,allocation):
+    trade=next(iter(opened['trades'].values()))
+    trade['status']='protecting'
+    trade['plan']['policy']['take_profit_allocation']=allocation
+    trade['plan']['source_take_profit_count']=8
+    trade['targets']=trade['targets'][:1]
+    trade['plan']['backup_fields']=['take_profits']
+    trade['plan']['backup_values']={'fallback_take_profit_unit':'roe_percent','fallback_take_profit_percentages':['25','50']}
+    result=text(telegram_view(opened,READY))
+    assert ('Adaptive TP-Auswahl' in result)==(allocation=='adaptive')
+    assert 'TPs: 25 % ROE' in result and 'TPs: 25, 50 % ROE' not in result
+
+
 def exit_trade(reasons, times=None):
     mapping = {"stop_loss": "sl", "take_profit": "tp", "source_close": "close", "operator_close": "close"}
     fills = [{"kind": mapping[reason], "sz": "1", "px": str(90 + index * 10), "oid": index + 2,

@@ -284,7 +284,7 @@ def trade_block(data, trade, notices):
         if legs:
             lines.append("**Ziele · Positionsanteil**\n" + "\n".join(legs))
             source_count = plan.get("source_take_profit_count")
-            if source_count and source_count > len(targets):
+            if plan.get("policy", {}).get("take_profit_allocation") == "adaptive" and source_count and source_count > len(targets):
                 lines.append(f"**Adaptive TP-Auswahl:** {len(targets)} von {source_count} Signalzielen")
         raw, rounded, effective = plan.get("signal_leverage_original", plan.get("signal_leverage")), plan.get("signal_leverage"), plan.get("effective_leverage")
         if raw is not None and (decimal(raw) != decimal(rounded) or decimal(rounded) != decimal(effective)):
@@ -299,7 +299,7 @@ def trade_block(data, trade, notices):
                 if "stop_loss" in plan["backup_fields"] and backup.get("fallback_stop_loss_unit") == "roe_percent":
                     roe.append("SL: " + number(backup.get("fallback_stop_loss_percent")) + " % Marginverlust")
                 if "take_profits" in plan["backup_fields"] and backup.get("fallback_take_profit_unit") == "roe_percent":
-                    roe.append("TPs: " + ", ".join(number(value) for value in backup.get("fallback_take_profit_percentages", [])) + " % ROE")
+                    roe.append("TPs: " + ", ".join(number(value) for value in backup.get("fallback_take_profit_percentages", [])[:len(targets)]) + " % ROE")
                 if roe:
                     lines.append("**Backup-Ziele:** " + " · ".join(roe) + "\nBasis: ursprüngliche Positionsmargin vor Gebühren und Funding.")
     else:
