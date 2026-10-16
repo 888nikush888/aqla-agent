@@ -10,6 +10,7 @@ from .models import (
     AccountSnapshot,
     AqlaError,
     BackupValues,
+    ExchangeMinimum,
     Interpretation,
     Market,
     Policy,
@@ -63,7 +64,7 @@ def split_targets(quantity: Decimal, count: int, policy: Policy, market: Market)
     quantities = [quantity_grid(quantity * weight / 100, market) for weight in weights[:-1]]
     quantities.append(quantity - sum(quantities))
     if any(size <= 0 for size in quantities):
-        raise AqlaError("A TP leg rounds to zero; choose fewer targets or different weights")
+        raise ExchangeMinimum("A TP leg rounds to zero; choose fewer targets or different weights")
     return quantities
 
 
@@ -80,7 +81,7 @@ def executable_targets(quantity, targets, policy, market):
         prices = targets[:count]
         if all(size >= market.min_quantity and size * price >= market.min_notional for size, price in zip(sizes, prices, strict=True)):
             return prices, sizes
-    raise AqlaError("A TP leg is below the exchange notional minimum")
+    raise ExchangeMinimum("A TP leg is below the exchange notional minimum")
 
 
 def quoted_numbers(quote):

@@ -20,6 +20,7 @@ ERRORS = {
     "Source market cannot be resolved uniquely; no substitute market is used": "Der Signalmarkt ist nicht eindeutig auflösbar.",
     "Entry price observation is stale or has an invalid timestamp": "Die aktuelle Preisbeobachtung ist nicht frisch oder zeitlich nicht bestätigt.",
     "A TP leg is below the exchange notional minimum": "Mindestens eine TP-Order unterschreitet die Börsenmindestgröße.",
+    "A TP leg rounds to zero; choose fewer targets or different weights": "Mindestens eine TP-Order ist nach Börsenrundung zu klein.",
     "Current equity/margin no longer permits this exact plan": "Aktuelles Eigenkapital oder freie Margin reicht für diesen unveränderten Plan nicht mehr aus.",
     "Refreshed entry must stay within the original quantity, risk, notional and deadline": "Die Budgetkorrektur würde ursprüngliche Ausführungsgrenzen überschreiten; kein Orderversand.",
     "Budget refresh cannot change the original market or add TP targets": "Die Budgetkorrektur darf weder den ursprünglichen Markt ändern noch TP-Ziele hinzufügen.",
@@ -165,7 +166,7 @@ def context(data, plan):
             text += " · Startfreigabe"
     if plan.get("fallback_reason"):
         text += "\n**Börsenersatz:** " + VENUES.get(plan.get("requested_exchange"), literal(plan.get("requested_exchange"))) + " → " + VENUES[venue]
-        text += " · ursprünglicher Markt dort nicht gelistet"
+        text += " · " + literal(ERRORS.get(plan["fallback_reason"], plan["fallback_reason"]))
     return text
 
 

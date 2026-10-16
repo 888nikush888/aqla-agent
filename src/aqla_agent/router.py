@@ -7,7 +7,15 @@ import time
 from decimal import Decimal
 from typing import Literal, NotRequired, TypedDict
 
-from aqla_hyperliquid_mcp.models import AqlaError, Market, SymbolUnavailable, TradePlan, digest, now_ms
+from aqla_hyperliquid_mcp.models import (
+    AqlaError,
+    ExchangeMinimum,
+    Market,
+    SymbolUnavailable,
+    TradePlan,
+    digest,
+    now_ms,
+)
 
 from .accounting import inventory_view
 from .observations import TemporaryObservation, diagnostic, read_observation, retry_due, retry_marker
@@ -258,8 +266,10 @@ class Router:
             self.state.update(lambda data: data["events"][event_id].update(status="unrouted", last_error="No enabled pipeline matches this source"))
             return {"event_id": event_id, "targets": [], "error": "No enabled pipeline matches this source"}
         outputs = []
-        order = sorted(targets, key=lambda identity: (targets[identity]["exchange"] == "hyperliquid", identity)) if ranked else list(targets)
-        reserved = set()
+        order = sorted(targets, key=lambda identity: (targets[identity].get("requested_exchange", targets[identity]["exchange"]) == "hyperliquid", identity)) if ranked else list(targets)
+        reserved = {(saved["plan"]["exchange"] + ":" + saved["plan"]["network"], interpretation.symbol.upper())
+                    for target in targets.values() if target["status"] != "pending"
+                    and (saved := preview_basis["plans"].get(target.get("plan_id")))}
         for identity in order:
             target = targets[identity]
             if target["status"] != "pending":
@@ -291,7 +301,10 @@ class Router:
                 outputs.append(self.state.snapshot()["events"][event_id]["targets"][identity])
                 continue
             network = rank["network"] if rank else self.engines[target["exchange"]].exchange.settings.network if target["exchange"] in self.engines else "mainnet"
-            requested = target["exchange"]
+            requested = target.get("requested_exchange", target["exchange"])
+            target = {**target, "exchange": requested}
+            target.pop("fallback_reason", None)
+            target.pop("skipped_replacements", None)
             engine = self.engine_for(requested, network)
             try:
                 if engine is None:
@@ -315,8 +328,8 @@ class Router:
                               "setup_id": digest([rank["source_id"], sorted(interpretation.source_refs)])[:32], "leg_id": identity}
                     try:
                         plan = await preview_on(engine, target)
-                    except SymbolUnavailable as missing:
-                        if requested != "hyperliquid":
+                    except (SymbolUnavailable, ExchangeMinimum) as missing:
+                        if requested != "hyperliquid" or self.target_started(self.state.snapshot(), target):
                             raise
                         pipeline_target = next(row for row in preview_basis["pipelines"][target["pipeline_id"]]["targets"] if row["exchange"] == requested)
                         replacements = pipeline_target.get("fallback_exchanges")
@@ -334,16 +347,16 @@ class Router:
                                 reasons.append(venue + ": explicit pipeline target already reserves this market")
                                 continue
                             try:
-                                route = {**target, "exchange": venue, "fallback_reason": str(missing), "skipped_replacements": reasons}
-                                plan = await preview_on(candidate, route)
-                            except SymbolUnavailable:
-                                reasons.append(venue + ": market unavailable")
+                                target = {**target, "exchange": venue, "fallback_reason": str(missing), "skipped_replacements": reasons.copy()}
+                                engine = candidate
+                                plan = await preview_on(candidate, target)
+                            except (SymbolUnavailable, ExchangeMinimum) as error:
+                                reasons.append(venue + ": " + str(error))
                                 continue
                             replacement = candidate
-                            target = route
                             break
                         if replacement is None:
-                            raise AqlaError("No replacement market/account in " + network + ": " + "; ".join(reasons)) from missing
+                            raise AqlaError("No replacement market/account in " + network + ": " + str(missing) + "; " + "; ".join(reasons)) from missing
                         engine = replacement
                 else:
                     plan = await preview_on(engine, target)

@@ -546,3 +546,7 @@ class ExternalInterference(AqlaError):
 
 class SymbolUnavailable(AqlaError):
     """Confirmed absence/delisting, never a transport, collateral or ambiguity error."""
+
+
+class ExchangeMinimum(AqlaError):
+    """TP quantity/notional cannot fit this venue, without increasing entry size."""

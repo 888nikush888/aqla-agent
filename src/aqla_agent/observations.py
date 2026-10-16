@@ -44,7 +44,7 @@ def diagnostic(error, stage):
     if isinstance(error, TemporaryObservation):
         return error.diagnostic()
     name = type(error).__name__
-    safe_name = name if name in {"ValueError", "KeyError", "TypeError", "RuntimeError", "AttributeError", "OverflowError", "OSError", "TimeoutError", "ConnectionError", "CancelledError", "AqlaError", "ConfigurationChanged", "EntryBudgetChanged"} else "Exception"
+    safe_name = name if name in {"ValueError", "KeyError", "TypeError", "RuntimeError", "AttributeError", "OverflowError", "OSError", "TimeoutError", "ConnectionError", "CancelledError", "AqlaError", "ConfigurationChanged", "EntryBudgetChanged", "ExchangeMinimum", "SymbolUnavailable"} else "Exception"
     return {"code": "admission_rejected" if isinstance(error, AqlaError) else "unclassified_failure",
             "stage": stage, "category": "protection" if isinstance(error, AqlaError) else "unexpected", "retryable": False, "exception_type": safe_name}
 
