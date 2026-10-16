@@ -10,7 +10,7 @@ from test_pipelines import routed  # noqa: F401
 from aqla_agent.messages import context
 from aqla_agent.observations import TemporaryObservation
 from aqla_agent.router import Router
-from aqla_hyperliquid_mcp.models import AqlaError, ExchangeMinimum, SymbolUnavailable
+from aqla_hyperliquid_mcp.models import AqlaError, ExchangeMinimum, SymbolUnavailable, now_ms
 
 
 def ranked(state, *, replacements=None, explicit=False):
@@ -204,4 +204,30 @@ async def test_pending_target_with_started_operation_cannot_switch_venue(routed,
     target = (await router.preview(source.event_id, value))['targets'][0]
     assert target['status'] == 'rejected' and target['exchange'] == 'hyperliquid'
     assert target['error'] == 'Confirmed absent' and len(state.snapshot()['plans']) == 1
+    await router.close()
+
+
+@pytest.mark.asyncio
+async def test_edit_of_owned_source_cannot_open_a_replacement_when_primary_market_disappears(routed, setup, signal, monkeypatch):
+    router, boundaries = routed
+    state = setup[1]
+    ranked(state)
+    source, value = signal
+    first = (await router.preview(source.event_id, value))['targets'][0]
+    await router.execute(first['plan_id'])
+    before = state.snapshot()
+    actions = {k: len(b.actions) for k, b in boundaries.items()}
+    edited = source.model_copy(update={'edited_at': now_ms()})
+    router.ingest(edited)
+    async def missing(*args):
+        raise SymbolUnavailable('Confirmed absent')
+    async def forbidden(*args, **kwargs):
+        pytest.fail('An edit of an owned source must not create replacement exposure')
+    monkeypatch.setattr(router.engines['hyperliquid'].exchange, 'market', missing)
+    monkeypatch.setattr(router.engines['aster'], 'preview', forbidden)
+    target = (await router.preview(edited.event_id, value))['targets'][0]
+    assert target['status'] == 'rejected' and target['exchange'] == 'hyperliquid'
+    assert 'already owns a trade' in target['error']
+    assert state.snapshot()['trades'] == before['trades'] and state.snapshot()['operations'] == before['operations']
+    assert actions == {k: len(b.actions) for k, b in boundaries.items()}
     await router.close()

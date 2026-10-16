@@ -18,7 +18,7 @@ from aqla_hyperliquid_mcp.models import (
 )
 
 from .accounting import inventory_view
-from .observations import TemporaryObservation, diagnostic, read_observation, retry_due, retry_marker
+from .observations import TemporaryObservation, diagnostic, retry_due, retry_marker
 from .pipelines import ConfigurationChanged, VenueState, validate_ranking_binding
 from .trading import OPEN, PendingStopUpdate, StopUpdatePhase, Trading
 from .venues import VenueAdapter, adapter_settings, execution_settings
@@ -319,9 +319,6 @@ class Router:
                         with candidate.state.scope(route, preview_snapshot=preview_basis):
                             basis = candidate.state.preview_snapshot()
                             deadline = min(item["source"]["sent_at"] for item in latest_sources(basis["events"], interpretation.source_refs).values()) + basis["policy"]["max_signal_age_seconds"] * 1000
-                            if ranked:
-                                market = await read_observation(lambda: candidate.exchange.market(interpretation.symbol), "market")
-                                return await candidate.preview(event_id, interpretation, _market=market)
                             return await candidate.preview(event_id, interpretation)
                 if ranked:
                     target = {**target, "requested_exchange": requested, "network": network, "rank_snapshot": rank,
