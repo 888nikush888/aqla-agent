@@ -395,7 +395,8 @@ class Router:
         if engine is None:
             raise AqlaError("The plan's exchange account is unavailable; no fallback exchange")
         target = {"pipeline_id": plan.get("pipeline_id") or "legacy", "profile_id": plan.get("profile_id") or "standard",
-                  **({"rank_snapshot": plan["rank_snapshot"], "requested_exchange": plan.get("requested_exchange"), "setup_id": plan["setup_id"]} if plan.get("rank_snapshot") else {})}
+                  **({"rank_snapshot": plan["rank_snapshot"], "requested_exchange": plan.get("requested_exchange"), "setup_id": plan["setup_id"],
+                      "fallback_reason": plan.get("fallback_reason")} if plan.get("rank_snapshot") else {})}
         try:
             with engine.state.scope(target):
                 result = await engine.execute(plan_id)

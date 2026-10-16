@@ -6,6 +6,7 @@ import pytest
 from test_adaptive_tps import setup_signal
 from test_backup_and_names import configure as configure_backup
 from test_backup_and_names import missing
+from test_pipelines import routed  # noqa: F401
 
 from aqla_agent.observations import TemporaryObservation
 from aqla_agent.trading import EntryBudgetChanged, Trading
@@ -195,3 +196,30 @@ async def test_refreshed_plan_is_rejected_before_save_if_it_enlarges_original_in
     with pytest.raises(EntryBudgetChanged,match='original quantity'):
         await engine.execute(original['plan_id'])
     assert len(state.snapshot()['plans'])==1 and not fake.actions and not state.snapshot()['trades']
+
+
+@pytest.mark.asyncio
+async def test_ranked_fallback_budget_refresh_preserves_venue_profile_and_reason(routed,setup,signal,monkeypatch):  # noqa: F811
+    from aqla_hyperliquid_mcp.models import SymbolUnavailable
+    router,_=routed
+    state=setup[1]
+    state.update(lambda data:data['ranking_policy'].update(enabled=True))
+    state.update(lambda data:data['source_ranks']['channel'].update(tier='D'))
+    state.update(lambda data:data['pipelines']['source-one'].update(targets=data['pipelines']['source-one']['targets'][:1]))
+    async def missing_market(*args):
+        raise SymbolUnavailable('Confirmed unavailable market')
+    monkeypatch.setattr(router.engines['hyperliquid'].exchange,'market',missing_market)
+    source,value=signal
+    target=(await router.preview(source.event_id,value))['targets'][0]
+    original=target['plan']
+    engine=router.engine_for(original['exchange'],original['network'])
+    account=engine.exchange.account_snapshot
+    async def reduced(market):
+        return (await account(market)).model_copy(update={'equity':Decimal(5000)})
+    monkeypatch.setattr(engine.exchange,'account_snapshot',reduced)
+    result=await router.execute(target['plan_id'])
+    assert result['status']=='open', result
+    for field in ('exchange','requested_exchange','profile_id','pipeline_id','routing_leg_id','fallback_reason','rank_snapshot'):
+        assert result['plan'][field]==original[field]
+    assert Decimal(result['plan']['quantity'])<Decimal(original['quantity'])
+    await router.close()
