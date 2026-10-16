@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
 
 import httpx
@@ -33,13 +34,16 @@ class Aster(VenueAdapter):
     async def price_snapshot(self, market):
         from .entry import PriceSnapshot
         started = now_ms()
-        contract = await self.read("ticker/price", {"symbol": market.native_symbol})
+        contract = await self.read("ticker/price", {"symbol": market.native_symbol}, fresh=True)
         book = await self.read("ticker/bookTicker", {"symbol": market.native_symbol})
         if any(row.get("symbol") != market.native_symbol for row in (contract, book)):
             raise AqlaError("Aster price snapshot belongs to another market")
+        if type(contract.get("time")) is not int or not 0 <= contract["time"] <= now_ms():
+            from .observations import TemporaryObservation
+            raise TemporaryObservation("price_stale", "price")
         bid, ask = Decimal(book["bidPrice"]), Decimal(book["askPrice"])
         return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
-                             stop_reference=contract["price"], stop_reference_kind="contract", exchange_time=min(contract["time"], book["time"]),
+                             stop_reference=contract["price"], stop_reference_kind="contract", exchange_time=book["time"],
                              started_at=started, observed_at=now_ms()).fresh()
 
     async def funding_payments(self, market, start, end):
@@ -84,7 +88,7 @@ class Aster(VenueAdapter):
             raise AqlaError("Aster returned an unclassified exchange response")
         return result
 
-    async def read(self, path, params=None, *, private=False):
+    async def read(self, path, params=None, *, private=False, fresh=False):
         with observed_request(self.client, "GET", "/fapi/v3/" + path):
             if private:
                 result = await self.send(self.signed("GET", "/fapi/v3/" + path, params or {}))
@@ -92,6 +96,16 @@ class Aster(VenueAdapter):
                 response = await self.client.get("/fapi/v3/" + path, params=params, auth=observation_auth(self.client))
                 response.raise_for_status()
                 result = response.json()
+                if fresh:
+                    from .observations import TemporaryObservation
+                    # Ticker `time` is the last trade, not when this current-price response was served.
+                    try:
+                        served = int(parsedate_to_datetime(response.headers["date"]).timestamp() * 1000)
+                        valid = 0 <= now_ms() - served <= 2000 and int(response.headers.get("age", "0")) == 0
+                    except (KeyError, ValueError, TypeError, OverflowError):
+                        valid = False
+                    if not valid:
+                        raise TemporaryObservation("price_stale", "price")
         if self.rejected(result):
             raise AqlaError("Aster rejected the requested account/market observation")
         return result

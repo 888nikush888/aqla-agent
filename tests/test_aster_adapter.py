@@ -1,5 +1,6 @@
 import time
 from decimal import Decimal
+from email.utils import formatdate
 from types import SimpleNamespace
 from urllib.parse import parse_qs
 
@@ -84,7 +85,7 @@ class AsterBoundary:
                 result = self.orders[identity]
         else:
             raise AssertionError((request.method, request.url.path))
-        return httpx.Response(200, json=result)
+        return httpx.Response(200, json=result, headers={'Date': formatdate(time.time(), usegmt=True)})
 
     def fill(self, identity):
         row = self.orders[identity]
@@ -262,7 +263,7 @@ async def test_aster_last_sending_write_reobserves_and_protection_survives_pause
         if request.method == "GET" and path in ("price", "bookTicker"):
             data = response.json()
             data["time"] = clock[0]
-            return httpx.Response(200, json=data)
+            return httpx.Response(200, json=data, headers={'Date': formatdate(clock[0] / 1000, usegmt=True)})
         if request.method == "POST" and path == "order":
             parameters = {key: values[0] for key, values in parse_qs(request.content.decode()).items()}
             if parameters.get("reduceOnly") != "true":

@@ -28,7 +28,7 @@ async def test_mcp_profile_router_independent_native_entry_and_tp(setup, signal,
         elif request.url.path.endswith("orderBookDetails"):
             for row in payload["order_book_details"]:
                 row.update(best_bid="99.9", best_ask="100.1")
-        return httpx.Response(response.status_code, json=payload)
+        return httpx.Response(response.status_code, json=payload, headers=response.headers)
     monkeypatch.setattr(adapter.client, "_transport", httpx.MockTransport(fresh_spread))
     signer = lighter[2]
     monkeypatch.setattr(signer, "ORDER_TIME_IN_FORCE_POST_ONLY", 2, raising=False)

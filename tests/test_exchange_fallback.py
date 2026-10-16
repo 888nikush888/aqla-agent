@@ -36,7 +36,7 @@ async def test_legacy_pipeline_resolves_missing_hl_symbol_through_native_aster_p
             value.update(totalMarginBalance='50', availableBalance='50')
         if request.url.path.endswith('/exchangeInfo'):
             value['symbols'][0]['filters'][-1]['notional'] = '5'
-        return httpx.Response(response.status_code, json=value)
+        return httpx.Response(response.status_code, json=value, headers=response.headers)
     await adapter.client.aclose()
     adapter.client = httpx.AsyncClient(base_url='https://fapi.asterdex-testnet.com', transport=httpx.MockTransport(handle))
     router = Router(settings, state, primary, adapters={'aster': adapter})
