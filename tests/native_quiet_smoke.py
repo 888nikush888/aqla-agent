@@ -146,10 +146,12 @@ async def verify(home, mcp_python):
         try:
             first = AIAgent(**settings)
             assert first._try_activate_fallback(reason=FailoverReason.rate_limit, reset_at=time.time() + 3600)
+            assert first._pending_fallback_notice
             fresh = AIAgent(**settings)
             fresh._restore_primary_runtime()
             assert fresh.base_url.rstrip('/').endswith('/backup/v1') and fresh._fallback_activated
             assert fresh._rate_limited_until > time.monotonic() + 3500
+            assert not getattr(fresh, '_pending_fallback_notice', None)
         finally:
             if first is not None:
                 first.close()

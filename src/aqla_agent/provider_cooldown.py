@@ -64,11 +64,17 @@ def reset_at(agent):
 
 
 def install(replace):
-    from agent import agent_runtime_helpers, fallback_cooldown
+    from agent import agent_runtime_helpers, chat_completion_helpers, fallback_cooldown
     from agent.error_classifier import FailoverReason
 
     arm = fallback_cooldown._arm_rate_limit_cooldown
     restore = agent_runtime_helpers.restore_primary_runtime
+    notice = chat_completion_helpers._buffer_fallback_notice
+
+    def buffer_notice(agent, text):
+        # A new agent carrying the same persisted outage is not a new provider switch.
+        if not REPLAY.get():
+            return notice(agent, text)
 
     def arm_shared(agent, reason, reset_at=None):
         seconds = arm(agent, reason, reset_at=reset_at)
@@ -92,3 +98,4 @@ def install(replace):
 
     replace(fallback_cooldown, "_arm_rate_limit_cooldown", arm_shared)
     replace(agent_runtime_helpers, "restore_primary_runtime", restore_shared)
+    replace(chat_completion_helpers, "_buffer_fallback_notice", buffer_notice)

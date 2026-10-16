@@ -28,6 +28,12 @@ Die lokale Linuxprüfung verwendet vorhandene WSL-/systemd-Werkzeuge in einem is
 
 Beim Live-Start erkannte ungenutzte native Cron-/Housekeeping-Factory wurde im Aqla-Profil deaktiviert und als nativer Regressioncheck abgesichert. systemd Stop-Frist beträgt 90 Sekunden, `KillMode=mixed` erhält MCP-Kinder bis zur geordneten Gatewayabschaltung. Native Lazy-Installationen ändern die vom Installer geprüfte Laufzeit nicht mehr.
 
+Ein vom Anbieter bestätigtes Quotenende bleibt über neue Agenten und Neustarts
+erhalten. Der native Erstwechsel und neue Ausfälle bleiben sichtbar; die bloße
+Wiederaufnahme derselben gespeicherten Sperre wiederholt die Fallback-Warnung
+nicht. Die Anbietersperre, konfigurierte Ersatzroute und ursprüngliche
+Wiederherstellungsprüfung bleiben unverändert.
+
 ## Bewusst noch zu konfigurieren
 
 Der Decision-Pfad verwendet `inception/mercury-decide:free` über OpenRouter und den allgemeinen System-One-Adapter. Generative Verarbeitung bleibt bei OpenCode Go mit OpenRouter-Fallback. Die Servereinführung erfolgt im unabhängigen Shadow-Worker; Handelsfreigaben aus Decision Models benötigen eine Kalibrierung für die konkrete OpenRouter-Modellrevision. Der bestehende Handelszustand, Betreiber-Skills und Zugangsdaten werden beim Rollout erhalten.

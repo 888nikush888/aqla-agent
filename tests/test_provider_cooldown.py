@@ -28,17 +28,19 @@ def runtime(tmp_path, monkeypatch):
         return True
     native._arm_rate_limit_cooldown = arm
     helpers = SimpleNamespace(restore_primary_runtime=restore)
-    monkeypatch.setitem(sys.modules,"agent",SimpleNamespace(fallback_cooldown=native,agent_runtime_helpers=helpers))
+    notices = SimpleNamespace(_buffer_fallback_notice=lambda agent,text: agent.notices.append(text))
+    monkeypatch.setitem(sys.modules,"agent",SimpleNamespace(fallback_cooldown=native,agent_runtime_helpers=helpers,chat_completion_helpers=notices))
     monkeypatch.setitem(sys.modules,"agent.error_classifier",SimpleNamespace(FailoverReason=SimpleNamespace(rate_limit="limited")))
     quota.install(lambda target,name,fn: setattr(target,name,fn))
     def agent(key="synthetic-primary-key", model="fixture"):
         value=SimpleNamespace(_primary_runtime={"provider":"custom","model":model,"base_url":"https://synthetic.invalid","api_key":key},
-            _fallback_activated=False,_rate_limited_until=0,route="primary",fallback_available=True)
+            _fallback_activated=False,_rate_limited_until=0,route="primary",fallback_available=True,notices=[])
         def activate(**arguments):
             native._arm_rate_limit_cooldown(value,**arguments)
             if value.fallback_available:
                 value._fallback_activated=True
                 value.route="fallback"
+                notices._buffer_fallback_notice(value,"primary quota exhausted; same-model fallback active")
             return value.fallback_available
         value._try_activate_fallback=activate
         return value
@@ -106,3 +108,20 @@ def test_shorter_observation_cannot_erase_existing_provider_quota(runtime):
     native._arm_rate_limit_cooldown(agent(),"limited",reset_at=10000)
     native._arm_rate_limit_cooldown(agent(),"limited",reset_at=1100)
     assert quota.reset_at(agent())==10000
+
+
+def test_persisted_outage_replay_keeps_routing_without_repeating_switch_notices(runtime):
+    clock,_,helpers,agent=runtime
+    first=agent()
+    first._try_activate_fallback(reason="limited",reset_at=10000)
+    assert len(first.notices)==1
+    for _ in range(3):
+        fresh=agent()
+        helpers.restore_primary_runtime(fresh)
+        assert fresh.route=="fallback" and not fresh.notices
+    clock.wall=10001
+    recovered=agent()
+    helpers.restore_primary_runtime(recovered)
+    assert recovered.route=="primary"
+    recovered._try_activate_fallback(reason="limited",reset_at=20000)
+    assert len(recovered.notices)==1

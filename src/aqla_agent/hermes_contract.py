@@ -48,6 +48,7 @@ def check_native_contract() -> None:
     specifications = [
         ("agent.fallback_cooldown", "", "_arm_rate_limit_cooldown", "agent,reason,reset_at=", False),
         ("agent.agent_runtime_helpers", "", "restore_primary_runtime", "agent", False),
+        ("agent.chat_completion_helpers", "", "_buffer_fallback_notice", "agent,notice", False),
         ("gateway.run_turn", "GatewayTurnMixin", "_resolve_turn_toolsets", "self,user_config,source,platform_key", False),
         ("agent.turn_usage", "", "record_response_usage", "agent,response,@messages,@api_call_count,@api_duration,@compression_attempts,@max_compression_attempts", False),
         ("agent.turn_response_check", "", "record_response_usage", "agent,response,@messages,@api_call_count,@api_duration,@compression_attempts,@max_compression_attempts", False),
