@@ -215,7 +215,7 @@ def verify_setup_references(signal, anchor_source_id, own_setup_refs=()):
         if set(signal.source_refs) != {anchor_source_id}:
             raise AqlaError("Non-actional source_refs must contain only the current anchor; keep reply context separate from classification targets")
         return
-    supported = {anchor_source_id, *(proof.source_id for proof in signal.evidence)}
+    supported = {anchor_source_id, *(proof.source_id for proof in signal.evidence if proof.field != "classification")}
     own_setup_refs = set(own_setup_refs)
     if signal.kind == "trade_update":
         supported.update(own_setup_refs)
@@ -224,10 +224,10 @@ def verify_setup_references(signal, anchor_source_id, own_setup_refs=()):
                            for proof in signal.evidence):
             raise AqlaError("Changed update values for " + changed + " need evidence from the current anchor, not copied parent values. Keep parents for market identity or own setup binding; re-read and quote only the newly instructed value")
     if signal.kind in ("new_signal", "trade_update") and set(signal.source_refs) - supported:
-        raise AqlaError("Actionable source_refs include context without setup evidence; re-read source_context and select only the live instruction and original messages supporting this setup, not all context or receipt refs. Each additional source needs its own evidence or, for updates, an existing own setup binding; keep genuine setup origins")
+        raise AqlaError("Actionable source_refs include context without setup evidence; classification quotes alone do not contribute a setup field. Remove that parent reference and its classification proof; retain original field contributions and existing own setup bindings")
     if signal.kind == "trade_update" and any(proof.field == "symbol" and proof.source_id == anchor_source_id for proof in signal.evidence):
         for ref in set(signal.source_refs) - {anchor_source_id} - own_setup_refs:
-            if {proof.field for proof in signal.evidence if proof.source_id == ref} == {"symbol"}:
+            if {proof.field for proof in signal.evidence if proof.source_id == ref} - {"classification"} == {"symbol"}:
                 raise AqlaError("source_refs include a redundant parent symbol: the current update already evidences its market. Remove only that duplicate parent reference and its symbol proof; retain genuine parent contributions and existing own setup bindings")
 
 

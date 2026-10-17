@@ -369,6 +369,20 @@ def test_update_rejects_only_redundant_unbound_parent_identity():
     verify_setup_references(value, "current")
 
 
+def test_parent_classification_does_not_count_as_a_contributed_actionable_field():
+    from aqla_hyperliquid_mcp.models import AqlaError
+    from aqla_hyperliquid_mcp.rules import verify_setup_references
+    value = Interpretation(kind="trade_update", symbol="BTC", update_action="break_even", source_refs=["current", "parent"],
+        evidence=[Evidence(field="symbol", source_id="current", quote="BTC"),
+            Evidence(field="classification", source_id="parent", quote="BTC LONG")])
+    with pytest.raises(AqlaError, match="classification quotes alone"):
+        verify_setup_references(value, "current")
+    verify_setup_references(value, "current", ["parent"])
+    value.evidence[-1] = Evidence(field="symbol", source_id="parent", quote="BTC")
+    value.evidence[0].field = "update_action"
+    verify_setup_references(value, "current")
+
+
 def test_check_preserves_trusted_closed_parent_binding_without_exposing_a_position():
     parent, _, _ = material()
     source = SourceEvent(chat_id=parent.chat_id, message_id=2, reply_to_id=parent.message_id,
