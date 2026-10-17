@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--mcp-python", type=Path, required=True)
     parser.add_argument("--transport-failure", action="store_true")
     parser.add_argument("--numbered-integer-target", action="store_true")
+    parser.add_argument("--rate-limit-failure", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root / "scripts"))
@@ -64,9 +65,18 @@ def main():
                 return
             calls.append(body)
             assert body.get("reasoning_effort") == "high", {"model": body.get("model"), "keys": list(body), "messages_count": len(body.get("messages", []))}
-            failures = 2 if args.transport_failure else 0
+            failures = 2 if args.transport_failure or args.rate_limit_failure else 0
             index = len(calls) - 1 - failures
             if index < 0:
+                if args.rate_limit_failure:
+                    raw = json.dumps({"error": {"code": "rate_limit_exceeded", "type": "rate_limit_exceeded",
+                        "message": "rate limit exceeded, retry later"}}).encode()
+                    self.send_response(429)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
                 self.close_connection = True
                 self.connection.shutdown(socket.SHUT_RDWR)
                 self.connection.close()
@@ -118,8 +128,8 @@ def main():
         from aqla_hyperliquid_mcp.storage import read_snapshot
         retained = read_snapshot(home / "state.sqlite3")
         assert set(retained["events"]) == {source.event_id, unrelated.event_id}
-        assert waits == ([15, 30] if args.transport_failure else [])
-        assert len(calls) == len(result["request_attempts"]) == responses + (2 if args.transport_failure else 0)
+        assert waits == ([15, 30] if args.transport_failure or args.rate_limit_failure else [])
+        assert len(calls) == len(result["request_attempts"]) == responses + (2 if args.transport_failure or args.rate_limit_failure else 0)
         assert len(result["api_responses"]) == responses, {
             "calls": [{"model": b.get("model"), "effort": b.get("reasoning_effort"), "keys": list(b)} for b in calls],
             "requests": result["request_attempts"], "responses": result["api_responses"]}

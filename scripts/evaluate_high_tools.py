@@ -63,11 +63,15 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     from tools.registry import registry
 
     from aqla_agent.hermes_runtime import install_strict_profile
+    from aqla_agent.provider_cooldown import REPLAY
     from aqla_agent.tool_outputs import register_reader
     from aqla_agent.tool_runtime import GUIDANCE
     from aqla_agent.usage_metrics import RUN, UsageRun
 
     undo = install_strict_profile()
+    # This isolated evaluation owns its 15/30s recovery, rather than the gateway's
+    # persisted fallback cooldown. The provider still enforces every request.
+    cooldown_token = REPLAY.set(True)
     register_reader(SimpleNamespace(register_tool=registry.register))
     names = discover_mcp_tools()
     assert any(n.endswith("source_check_interpretation") for n in names)
@@ -87,6 +91,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     requests = []
     agent = None
     result = None
+    worker_error_type = None
     started = time.monotonic()
     try:
         agent = AIAgent(model=DEFAULT_MODEL, provider="custom", base_url=model_url,
@@ -140,20 +145,24 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
                 break
             # Only transport recovery may repeat a turn; a semantic failure never does.
             error = str(result.get("error", "")).lower()
-            if not any(s in error for s in ("connection", "timeout", "rate limit", "temporar", "503", "502", "empty stream")):
+            if not any(s in error for s in ("connection", "timeout", "rate limit", "rate_limit", "429", "temporar", "503", "502", "empty stream")):
                 break
             retry_sleep(15 * 2 ** attempt)
+    except Exception as error:
+        worker_error_type = type(error).__name__
+        result = {"completed": False, "error": "worker_exception"}
     finally:
         if agent is not None:
             agent.close()
         shutdown_mcp_servers()
         RUN.reset(token)
+        REPLAY.reset(cooldown_token)
         undo()
     checks_path = directory / "checks.private.json"
     checks = json.loads(checks_path.read_text(encoding="utf-8")) if checks_path.exists() else []
     return {"completed": bool(result is not None and result.get("completed") is True and not result.get("error")
                                and not result.get("failed") and not result.get("interrupted") and not result.get("partial")),
-            "native_exit_reason": result.get("turn_exit_reason") if result else None,
+            "native_exit_reason": result.get("turn_exit_reason") if result else None, "worker_error_type": worker_error_type,
             "served_model": result.get("served_model") if result else None, "checks": checks,
             "draft_count": len(checks), "duration_seconds": time.monotonic() - started,
             "api_responses": measured.api, "request_attempts": requests,
