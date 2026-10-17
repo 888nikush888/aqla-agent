@@ -209,6 +209,36 @@ def test_one_check_reports_independent_reference_and_intent_errors_together():
     assert source_assistance(context)["original_structure_vetoes"]["trade_update"] == "unbound_setup_edit_is_not_management"
 
 
+def test_update_rejects_only_redundant_unbound_parent_identity():
+    from aqla_hyperliquid_mcp.models import AqlaError
+    from aqla_hyperliquid_mcp.rules import verify_setup_references
+    value = Interpretation(kind="trade_update", symbol="BTC", update_action="break_even", source_refs=["current", "parent"],
+        evidence=[Evidence(field="symbol", source_id=ref, quote="BTC") for ref in ("current", "parent")])
+    with pytest.raises(AqlaError, match="redundant parent symbol"):
+        verify_setup_references(value, "current")
+    verify_setup_references(value, "current", iter(["parent"]))
+    # A short reply genuinely needs its parent's market; it is not redundant.
+    value.evidence = value.evidence[1:]
+    verify_setup_references(value, "current")
+    value.evidence.insert(0, Evidence(field="symbol", source_id="current", quote="BTC"))
+    value.evidence.append(Evidence(field="update_action", source_id="parent", quote="Stop to entry"))
+    verify_setup_references(value, "current")
+
+
+def test_check_preserves_trusted_closed_parent_binding_without_exposing_a_position():
+    parent, _, _ = material()
+    source = SourceEvent(chat_id=parent.chat_id, message_id=2, reply_to_id=parent.message_id,
+        sent_at=now_ms(), text="BTC stop to entry.")
+    rows = [{"event_id": s.event_id, "source_id": s.source_id, "source": s.model_dump(mode="json")} for s in (parent, source)]
+    context = {"event": rows[-1], "messages": rows, "trades": []}
+    value = Interpretation(kind="trade_update", symbol="BTC", update_action="break_even",
+        source_refs=[source.source_id, parent.source_id], evidence=[
+            Evidence(field="symbol", source_id=s.source_id, quote="BTC") for s in (parent, source)])
+    assert not check_interpretation(context, value)["valid"]
+    context["bound_source_refs"] = [parent.source_id]
+    assert check_interpretation(context, value)["valid"] and context["trades"] == []
+
+
 def test_large_original_keeps_binding_and_contract_when_candidate_limit_is_exceeded():
     source, context, _ = material("BTC LONG. " + "Target 110. " * 300)
     context["bound_source_refs"] = [source.source_id]

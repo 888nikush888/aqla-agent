@@ -138,7 +138,7 @@ def check_interpretation(context, interpretation: Interpretation):
     try:
         if context.get("source_read_error"):
             raise DecisionFailure("source_context_changed_reread_required")
-        validate_interpretation(packet, result)
+        validate_interpretation(packet, result, own_setup_refs=context.get("bound_source_refs", ()))
         if result.kind == "new_signal" and result.entry in ("market", "limit"):
             from .semantic_contract import LIMIT, MARKET, source_price_boundary_failure, strict_deferred_price
             text = next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])

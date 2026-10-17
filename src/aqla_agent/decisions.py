@@ -23,7 +23,7 @@ from aqla_hyperliquid_mcp.rules import (
 
 from .evidence import position_fractions
 
-VERSION = "aqla-decisions-v18"
+VERSION = "aqla-decisions-v19"
 QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v8"
 # The original-context wire shape is unchanged. Keeping its independent schema
 # version permits exact-state, exact-question observations to be reused for
@@ -661,7 +661,7 @@ def assemble(packet, spans, values, probabilities, profile, *, collect=False, re
     return interpretation
 
 
-def validate_interpretation(packet, interpretation):
+def validate_interpretation(packet, interpretation, *, own_setup_refs=()):
     from .semantic_contract import supported_action_failure, unbound_setup_update_failure
 
     if packet["anchor_source_id"] not in interpretation.source_refs:
@@ -671,7 +671,7 @@ def validate_interpretation(packet, interpretation):
               for row in packet["messages"]}
     verify_evidence(interpretation, events)
     verify_setup_references(interpretation, packet["anchor_source_id"],
-                            (ref for trade in packet.get("trades", []) for ref in trade["source_refs"]))
+                            [*own_setup_refs, *(ref for trade in packet.get("trades", []) for ref in trade["source_refs"])])
     anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     if not anchor["text"].strip() and interpretation.kind != "incomplete":
         raise DecisionFailure("empty_source_requires_incomplete")
