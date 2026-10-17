@@ -21,6 +21,7 @@ from .models import (
 )
 
 UPDATE_VALUE_FIELDS = {"move_stop": "stop_loss", "replace_targets": "take_profits", "reduce": "reduce_percent"}
+SOURCE_NUMBERS = re.compile(r"(?<![\w.])(?:[xх×]\s*)?\d+(?:[.,]\d+)*(?:[\u00a0\u202f]\d{3}(?:[.,]\d+)?)?(?:[xх×])?(?!\w|[.,]\d)", re.I)
 
 
 def quantity_grid(value: Decimal, market: Market):
@@ -91,6 +92,41 @@ def number_is_ordinal(text, start, end):
         return False
     before = text[text.rfind("\n", 0, start) + 1:start].strip()
     return not before or bool(re.search(r"(?<!\w)(?:tp|target|take[-\s]?profit|тейк|цел[ьи]|ziel)\s*$", before, re.I))
+
+
+def _complete_numeric_span(original, start, end, tokens):
+    before, after = original[:start], original[end:]
+    return not (before[-1:].isdigit() or after[:1].isdigit() or re.search(r"\d[.,]$", before) or re.match(r"[.,]\d", after)
+                or any(low <= start and end <= high and (low, high) != (start, end) for low, high in tokens))
+
+
+def numeric_evidence_values(original, quote):
+    """Every original match must support one complete non-ordinal value."""
+    occurrences = list(re.finditer(re.escape(quote), original))
+    if not occurrences:
+        return None
+    tokens = [match.span() for match in SOURCE_NUMBERS.finditer(original)]
+    compatible = None
+    for occurrence in occurrences:
+        values = []
+        cropped = False
+        for number in SOURCE_NUMBERS.finditer(quote):
+            start, end = occurrence.start() + number.start(), occurrence.start() + number.end()
+            if not _complete_numeric_span(original, start, end, tokens):
+                cropped = True
+                break
+            if number_is_ordinal(original, start, end):
+                continue
+            alternatives = set(quoted_numbers(number.group()))
+            if not alternatives:
+                return None
+            values.append(alternatives)
+        if cropped:
+            continue  # A substring inside a larger decimal is not an occurrence of this value.
+        if len(values) != 1:
+            return None
+        compatible = values[0] if compatible is None else compatible & values[0]
+    return compatible or None
 
 
 def quoted_numbers(quote):
@@ -235,14 +271,9 @@ def verify_evidence(signal: Interpretation, events: dict):
         supported = [quote for quote in quotes if value in set(quoted_numbers(quote))]
         if not supported:
             errors.append(f"Price not supported by source evidence: {field}")
-        elif not any(len(re.findall(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])", quote)) == 1 for quote in supported):
-            errors.append(f"Numeric source evidence must isolate one number: {field}")
-        if any(number_is_ordinal(texts[proof.source_id], occurrence.start() + number.start(), occurrence.start() + number.end())
-               for proof in signal.evidence if proof.field == field and proof.quote in supported
-               for occurrence in re.finditer(re.escape(proof.quote), texts[proof.source_id])
-               for number in re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])", proof.quote)
-               if value in set(quoted_numbers(number.group()))):
-            errors.append(f"Numeric source evidence points to a numbering label: {field}")
+        elif not any(value in (numeric_evidence_values(texts[proof.source_id], proof.quote) or set())
+                     for proof in signal.evidence if proof.field == field and proof.quote in supported):
+            errors.append(f"Numeric source evidence must isolate one number: {field} (complete compatible original value; numbering labels are not prices)")
     if signal.reduce_percent is not None:
         from aqla_agent.evidence import position_fractions
         supported = False
@@ -287,8 +318,13 @@ def verify_evidence(signal: Interpretation, events: dict):
             if proof.field != field:
                 continue
             original = texts[proof.source_id]
+            tokens = [match.span() for match in SOURCE_NUMBERS.finditer(original)]
             for occurrence in re.finditer(re.escape(proof.quote), original):
-                for number in re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])", proof.quote):
+                for number in SOURCE_NUMBERS.finditer(proof.quote):
+                    if not _complete_numeric_span(original, occurrence.start() + number.start(), occurrence.start() + number.end(), tokens):
+                        continue
+                    if number_is_ordinal(original, occurrence.start() + number.start(), occurrence.start() + number.end()):
+                        continue
                     if value not in set(quoted_numbers(number.group())):
                         continue
                     tail = original[occurrence.start() + number.end():]

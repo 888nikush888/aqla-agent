@@ -34,6 +34,36 @@ def test_check_shortens_original_proofs_but_does_not_change_values_or_input():
     assert (context, original.model_dump(mode="json")) == before
 
 
+def test_repeated_integer_price_needs_context_and_a_unique_numbered_line_survives_formatting():
+    text = "BTC SHORT. Entry 2. Stop 3.\nTarget 1: 1.8\nTarget 2: 1.4\nTarget 3: 1\nRisk 1%"
+    source, context, _ = material(text)
+    value = Interpretation(kind="new_signal", source_refs=[source.source_id], symbol="BTC", side="short",
+        entry_prices=[2], stop_loss=3, take_profits=["1.8", "1.4", 1], evidence=[
+            Evidence(field=field, source_id=source.source_id, quote=quote) for field, quote in (
+                ("symbol", "BTC"), ("side", "SHORT"), ("entry_prices.0", "Entry 2"), ("stop_loss", "Stop 3"),
+                ("take_profits.0", "1.8"), ("take_profits.1", "1.4"), ("take_profits.2", "1"))])
+    result = check_interpretation(context, value)
+    assert not result["valid"] and result["errors"][0]["code"] == "source_numeric_proof_needs_context"
+    assert set(result["errors"][0]["field_paths"]) - {"evidence"} == {"take_profits.2"}
+    value.evidence[-1].quote = "Target 3: 1"
+    result = check_interpretation(context, value)
+    assert result["valid"] and result["interpretation"]["evidence"][-1]["quote"] == "Target 3: 1"
+
+
+@pytest.mark.parametrize("quote", ["1", "1.2", "Target 3: 1", "Target 3: 1.2"])
+def test_cropping_decimal_digits_cannot_manufacture_a_price_proof(quote):
+    from aqla_hyperliquid_mcp.rules import numeric_evidence_values
+    assert numeric_evidence_values("Target 3: 1.25", quote) is None
+
+
+@pytest.mark.parametrize("quote", ["Target 1: 1", "Target 3: 1", "Target 1: 1%"])
+def test_real_integer_equal_to_a_numbering_label_remains_a_value_when_context_is_kept(quote):
+    from decimal import Decimal
+
+    from aqla_hyperliquid_mcp.rules import numeric_evidence_values
+    assert numeric_evidence_values(quote, quote) == {Decimal(1)}
+
+
 @pytest.mark.parametrize("quote,text", [
     ("Target 1: 111", "BTC LONG. Target 1: 110"),
     ("Target 1: 110", "Target 1: 110; Target 1: 110"),

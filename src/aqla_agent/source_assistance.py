@@ -5,7 +5,7 @@ import json
 import re
 
 from aqla_hyperliquid_mcp.models import EVIDENCE_FIELDS, AqlaError, Interpretation, digest
-from aqla_hyperliquid_mcp.rules import number_is_ordinal, quoted_numbers
+from aqla_hyperliquid_mcp.rules import number_is_ordinal, numeric_evidence_values, quoted_numbers
 
 from .decisions import (
     DecisionFailure,
@@ -111,7 +111,8 @@ def precise_numeric_evidence(packet, interpretation):
     for proof in result.evidence:
         value = numeric.get(proof.field)
         original = originals.get(proof.source_id, "")
-        if value is None or proof.source_id not in result.source_refs or proof.quote not in original:
+        if (value is None or proof.source_id not in result.source_refs or proof.quote not in original
+                or value not in set(quoted_numbers(proof.quote))):
             continue
         occurrences = list(re.finditer(re.escape(proof.quote), original))
         if len(occurrences) != 1:
@@ -125,6 +126,8 @@ def precise_numeric_evidence(packet, interpretation):
                 continue
             if proof.quote[:number.start()].rstrip().endswith(("-", "−", "/")):
                 continue
+            if original.count(number.group()) != 1 or numeric_evidence_values(original, number.group()) != {value}:
+                continue  # Keep unique original context when a bare number would be ambiguous.
             # The source unit is checked again by verify_evidence after shortening.
             proof.quote = number.group()
     return result
@@ -155,10 +158,14 @@ def check_interpretation(context, interpretation: Interpretation):
                 raise DecisionFailure("source_limit_form_not_explicit_use_unspecified")
     except AqlaError as error:
         message = str(error)
+        numeric_context = "Numeric source evidence must isolate one number" in message
+        field_message = message.split("; use one exact original quote", 1)[0]
         detail = {"code": message if isinstance(error, DecisionFailure) else "source_evidence_invalid",
                        "field_paths": REPAIR_FIELDS.get(message, sorted(field for field in set(EVIDENCE_FIELDS) | set(Interpretation.model_fields)
-                                       if re.search(r"(?<![\w.])" + re.escape(field) + r"(?![\w.])", message))),
+                                       if re.search(r"(?<![\w.])" + re.escape(field) + r"(?![\w.])", field_message))),
                        "message": message, **({"repair": REPAIR_GUIDANCE[message]} if message in REPAIR_GUIDANCE else {})}
+        if numeric_context:
+            detail.update(code="source_numeric_proof_needs_context", repair="Use a longer UNIQUE exact original span, including the target label and its value if needed. Verified numbering labels are context, not prices. Do not resubmit a bare repeated number or crop digits from a decimal. Preserve the actual source value and unit.")
         if not any(row["message"] == message for row in errors):
             errors.append(detail)
     return {"event_id": packet["anchor_event_id"], "anchor_source_id": packet["anchor_source_id"],
