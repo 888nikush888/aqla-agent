@@ -284,16 +284,37 @@ def test_unaccepted_full_setup_edit_is_not_a_management_instruction():
 
 
 @pytest.mark.parametrize("stop", ["Stop to 90", "Stopp auf 90", "Стоп на 90"])
-def test_initial_numeric_stop_field_does_not_turn_full_setup_into_management(stop):
-    source, context, value = material(f"BTC LONG X30\nTarget 1: 110\nTarget 2: 120\n{stop}")
+@pytest.mark.parametrize("has_targets", [False, True])
+def test_initial_numeric_stop_field_does_not_turn_full_setup_into_management(stop, has_targets):
+    targets = "Target 1: 110\nTarget 2: 120\n" if has_targets else ""
+    source, context, value = material(f"BTC LONG X30\n{targets}{stop}")
     value.entry_prices = []
-    value.evidence = [p for p in value.evidence if not p.field.startswith("entry_prices")]
+    if not has_targets:
+        value.take_profits = []
+    value.evidence = [p for p in value.evidence if not p.field.startswith("entry_prices")
+        and (has_targets or not p.field.startswith("take_profits"))]
     value.evidence[2].quote = "90"
     assert check_interpretation(context, value)["valid"]
     update = Interpretation(kind="trade_update", symbol="BTC", update_action="move_stop", stop_loss=90,
         source_refs=[source.source_id], evidence=[Evidence(field=f, source_id=source.source_id, quote=q)
             for f, q in (("symbol", "BTC"), ("stop_loss", "90"))])
     assert not check_interpretation(context, update)["valid"]
+
+
+@pytest.mark.parametrize("announcement,stop,direction", [
+    ("По BTC целюсь в шорт.", "Стоп на 90", "шорт"),
+    ("BTC: aiming for a short.", "Stop to 90", "short"),
+    ("BTC: peile einen Short an.", "Stopp auf 90", "Short"),
+])
+def test_aimed_new_setup_initial_stop_needs_no_targets_or_entry_price(announcement, stop, direction):
+    source, context, _ = material(announcement + "\n" + stop)
+    value = Interpretation(kind="new_signal", symbol="BTC", side="short", stop_loss=90, source_refs=[source.source_id],
+        evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f, q in (
+            ("symbol", "BTC"), ("side", direction), ("stop_loss", "90"))])
+    assert "new_signal" not in source_assistance(context)["original_structure_vetoes"]
+    assert check_interpretation(context, value)["valid"]
+    value.kind, value.update_action = "trade_update", "move_stop"
+    assert not check_interpretation(context, value)["valid"]
 
 
 def test_unbound_update_cannot_keep_a_neighbour_market_after_removing_its_proof():

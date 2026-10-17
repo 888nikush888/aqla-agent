@@ -264,10 +264,15 @@ def test_parent_mixed_entry_and_stop_history_do_not_veto_current_update():
 
 
 @pytest.mark.parametrize("instruction", ["Move stop to 90", "Стоп в бу", "Переносим стоп на 90"])
-def test_real_management_inside_setup_is_not_an_initial_static_stop(instruction):
-    text = f"BTC LONG\nTarget 1: 110\n{instruction}"
+@pytest.mark.parametrize("has_targets", [False, True])
+def test_real_management_inside_setup_is_not_an_initial_static_stop(instruction, has_targets):
+    text = "BTC LONG\n" + ("Target 1: 110\n" if has_targets else "") + instruction
     assert current_actions(text)
     assert supported_action_failure(text, Interpretation(kind="new_signal", symbol="BTC", side="long", source_refs=["synthetic"])) == "signal_contains_management_instruction"
+
+
+def test_past_entry_label_does_not_hide_a_separate_current_stop():
+    assert current_actions("Yesterday BTC Entry: 100. Stop to 95.") == [("move_stop", "stop to 95")]
 
 
 def test_completed_russian_stop_and_target_actions_are_not_current_instructions():

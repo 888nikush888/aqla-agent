@@ -266,6 +266,10 @@ class SourceClassification(Model):
 
 
 class Interpretation(Model):
+    """Use only declared fields. Python owns risk and margin policy; source risk_percent,
+    margin_mode and deposit allocations are not Interpretation parameters.
+    """
+
     kind: Literal["new_signal", "trade_update", "report", "unrelated", "incomplete", "ambiguous"]
     source_refs: list[str] = Field(min_length=1, max_length=20,
         description="For report/unrelated/incomplete/ambiguous use ONLY the selected anchor source_id. For an actionable setup include the live instruction; each additional source must supply original evidence or, for trade_update, belong to an existing own binding. Do not copy every context/receipt ref. Keep genuine setup origins, whose earliest publication fixes the deadline.")

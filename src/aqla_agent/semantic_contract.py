@@ -52,7 +52,8 @@ EXTRA_ENTRY = pattern(WORD + r"(?:bids?|averag(?:e|ing)(?!\s+entry\s+price\b)|ad
                       r"усреднен\w*|докуп\w*|nachkauf\w*|zusätzlich\w*\s+(?:limit|einstieg))" + END)
 TP_LABEL = pattern(WORD + r"(?:tp\s*\d|target\s*\d|тейк\w*|цел\w*|ziel\w*)" + END)
 NEW_ENTRY = pattern(WORD + r"(?:entry|einstieg|вход)\s*[:=@]|"
-                    + WORD + r"(?:enter|buy|sell|einsteigen|входим|войти)" + END)
+                    + WORD + r"(?:enter|buy|sell|einsteigen|входим|войти|целюсь\s+в\s+(?:лонг|шорт)|"
+                    r"aim(?:ing)?\s+(?:for\s+)?(?:a\s+)?(?:long|short)|peil(?:e|en)\s+(?:einen?\s+)?(?:long|short))" + END)
 SETUP_HEADING = pattern(r"(?:^|\n)\s*[#$]?[a-z0-9]+\s+(?:long|short|лонг|шорт)" + END)
 DISCRETE_ENTRIES = pattern(WORD + r"(?:limit\s+(?:orders|entries|bids)|(?:orders|entries|bids)\s+at|лимитк(?:и|ами)|лимитны\w*\s+(?:заявк\w*|ордер\w*)|einstiegsorders|limitorders)" + END)
 ENTRY_ZONE = pattern(WORD + r"(?:range|zone|диапазон|зона|bereich)" + END)
@@ -178,7 +179,8 @@ def current_actions(text, *, include_tp_footers=True):
     """Recognize explicit current actions with their original clause boundaries."""
     actions = []
     normalized = text.casefold().replace("ё", "е")
-    initial_setup = bool(SETUP_HEADING.search(normalized) and TP_LABEL.search(normalized))
+    live = current_structure_text(text)
+    initial_setup = bool(SETUP_HEADING.search(normalized) or NEW_ENTRY.search(live) or CURRENT_ENTRY.search(live))
     if not include_tp_footers:
         normalized = ";".join(sentence for sentence in re.split(r"[;!?\n]|(?<!\d)\.(?!\d)", normalized)
                               if not tp_break_even_footer(sentence))
