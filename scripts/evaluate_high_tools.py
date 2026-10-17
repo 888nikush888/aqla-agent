@@ -128,7 +128,9 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
             "Python alone owns age, ownership, risk and execution permission. No trade, operator action or live write is available. "
             "Read source_context(view=decision), read the provided interpretation contract, and use source_check_interpretation. "
             "Check verification.intent, verification.values and verification.setup against the entire original. "
-            "When valid=true, finish briefly; your LAST checked interpretation is the evaluated result. "
+            "valid=true only confirms automated checks. Before finishing, independently recheck the full original against "
+            "verification.intent, verification.values, verification.setup and the kind criteria. Correct a semantic mistake "
+            "even if no tool error was returned; your LAST checked interpretation is the evaluated result. "
             "Do not stop with an unchecked answer. Correct specific tool errors, at most three drafts. "
             "Never use another model. Expected answers are unavailable to you.")
         for attempt in range(3):

@@ -93,6 +93,9 @@ def source_assistance(context):
                         "Check the complete anchor, including new management instructions in reports. "
                         "Non-actionable results need only kind, source_refs, classification evidence, reason and reason_codes; "
                         "omit all unused trading fields. Correct at most three drafts per processing turn. "
+                        "valid only means the automated checks passed: before saving, independently recheck the complete "
+                        "original against verification.intent, verification.values, verification.setup and the kind criteria; "
+                        "correct a semantic mistake even when the tool found no structural error. "
                         "A valid semantic check is not execution permission; historical sources remain non-executable."}
 
 
