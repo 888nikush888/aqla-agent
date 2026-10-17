@@ -30,6 +30,15 @@ REPAIR_GUIDANCE = {
     "source_limit_form_not_explicit_use_unspecified": "One reference price does not invent a limit order. Use unspecified unless the original names a limit, a directional price boundary or a supported strict deferred price.",
     "signal_contains_management_instruction": "Re-read the entire original: current management belongs to trade_update, several current actions require review. Do not stuff update_action into new_signal or execute only part. Explicitly framed examples/past results do not authorize an entry.",
 }
+REPAIR_FIELDS = {
+    "source_example_requires_report_review": ["kind"],
+    "classification_omits_management_instruction": ["kind", "update_action"],
+    "source_leverage_interval_requires_review": ["kind", "leverage"],
+    "source_price_boundary_requires_limit": ["entry", "entry_prices.0"],
+    "source_market_form_not_explicit_use_unspecified": ["entry"],
+    "source_limit_form_not_explicit_use_unspecified": ["entry"],
+    "signal_contains_management_instruction": ["kind", "update_action"],
+}
 
 
 def context_packet(context):
@@ -116,8 +125,8 @@ def check_interpretation(context, interpretation: Interpretation):
     except AqlaError as error:
         message = str(error)
         errors.append({"code": message if isinstance(error, DecisionFailure) else "source_evidence_invalid",
-                       "field_paths": [field for field in EVIDENCE_FIELDS
-                                       if re.search(r"(?<![\w.])" + re.escape(field) + r"(?![\w.])", message)],
+                       "field_paths": REPAIR_FIELDS.get(message, sorted(field for field in set(EVIDENCE_FIELDS) | set(Interpretation.model_fields)
+                                       if re.search(r"(?<![\w.])" + re.escape(field) + r"(?![\w.])", message))),
                        "message": message, **({"repair": REPAIR_GUIDANCE[message]} if message in REPAIR_GUIDANCE else {})})
     return {"event_id": packet["anchor_event_id"], "source_version": digest(packet), "valid": not errors,
             "interpretation": result.model_dump(mode="json"), "errors": errors,
