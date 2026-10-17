@@ -4,9 +4,27 @@ from decimal import Decimal
 
 from aqla_hyperliquid_mcp.models import AqlaError
 
-SOURCE_TP_PERCENT = re.compile(r"(?:\btps?\b|take.?profits?|targets?|ziele?|тейк|цел[ьи])\s*[:=;\-]?\s*"
-    r"(?P<value>\d+(?:[.,]\d+)?)\s*%", re.I)
+SOURCE_TP_PREFIX = r"(?:\btps?(?=\b|\d)|take.?profits?|targets?|ziele?|тейк|цел[ьи])(?:\s*\d+\s*[:=])?\s*[:=;\-]?\s*"
+SOURCE_TP_PERCENT = re.compile(SOURCE_TP_PREFIX + r"(?P<value>\d+(?:[.,]\d+)?)\s*%", re.I)
 PERCENT_VALUE = r"\d+(?:[.,]\d+)?\s*%"
+INTERVAL_LINK = r"(?:[-–—]|\bto\b|\bbis\b|\bдо\b)"
+PERCENT_INTERVAL_BODY = r"(?P<lower>\d+(?:[.,]\d+)?)\s*%?\s*" + INTERVAL_LINK + r"\s*(?P<upper>\d+(?:[.,]\d+)?)\s*%"
+PERCENT_INTERVAL = re.compile(r"(?<![\w.,])" + PERCENT_INTERVAL_BODY, re.I)
+SOURCE_TP_PERCENT_INTERVAL = re.compile(SOURCE_TP_PREFIX + PERCENT_INTERVAL_BODY, re.I)
+
+
+def percentage_intervals(text):
+    """Whole two-bound intervals, never a pair cropped from a longer TP list."""
+    for match in PERCENT_INTERVAL.finditer(text):
+        if (re.search(r"\d+(?:[.,]\d+)?\s*%?\s*" + INTERVAL_LINK + r"\s*$", text[:match.start()], re.I)
+                or re.match(r"\s*" + INTERVAL_LINK + r"\s*\d", text[match.end():], re.I)):
+            continue
+        yield match
+
+
+def explicit_percentage_target_interval(text):
+    intervals = {(m.span("lower"), m.span("upper")) for m in percentage_intervals(text)}
+    return any((m.span("lower"), m.span("upper")) in intervals for m in SOURCE_TP_PERCENT_INTERVAL.finditer(text))
 
 
 def explicit_percentage_targets(text):

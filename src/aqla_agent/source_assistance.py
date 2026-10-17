@@ -22,6 +22,7 @@ CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_ac
                    "source_exchange", "single_entry_form", "single_management_action")
 CONTEXT_CANDIDATE_LIMIT = 64
 REPAIR_GUIDANCE = {
+    "source_percentage_target_interval_not_representable": "The original specifies a TP interval, not an ordered list of exits. Recheck ambiguous; do not select an endpoint, invent several targets or erase the explicit target to use backup values. This is an interval problem, not missing percentage basis.",
     "entry_legs_not_representable": "Re-read contract.single_entry_form and the original separate orders. Renaming several discrete entry legs to range does not represent them. Use ambiguous when the source cannot fit one supported entry; omit unused trading fields and quote the conflicting original. Never pick one leg or repair this by changing its prices.",
     "source_percentage_targets_missing_or_changed": "The original explicitly lists percent-only TP targets. Under source-roe-v1 these are nominal ROE targets, not position allocations. Preserve every listed target in order with take_profit_unit=roe_percent and exact percent quotes. A separate deposit/margin percent is not a TP. Do not silently substitute backup targets.",
     "live_anchor_missing": "Use anchor_source_id in source_refs, not event_id/chat_id/message_id. Evidence.source_id uses the same original source IDs. Do not remove a correctly named symbol while correcting references.",
@@ -36,6 +37,7 @@ REPAIR_GUIDANCE = {
     "unbound_setup_edit_is_not_management": "Python reports no accepted own setup binding. An edit/publication alone is not execution. This anchor still presents a complete entry setup, not an explicit management instruction: recheck corrected new_signal, or ambiguous when all original entry legs cannot be represented.",
 }
 REPAIR_FIELDS = {
+    "source_percentage_target_interval_not_representable": ["kind", "take_profits", "take_profit_unit"],
     "entry_legs_not_representable": ["kind", "entry", "entry_prices"],
     "source_percentage_targets_missing_or_changed": ["take_profits", "take_profit_unit"],
     "live_anchor_missing": ["source_refs", "evidence"],
@@ -170,6 +172,8 @@ def check_interpretation(context, interpretation: Interpretation):
                        "message": message, **({"repair": REPAIR_GUIDANCE[message]} if message in REPAIR_GUIDANCE else {})}
         if numeric_context:
             detail.update(code="source_numeric_proof_needs_context", repair="Use a longer UNIQUE exact original span, including the target label and its value if needed. Verified numbering labels are context, not prices. Do not resubmit a bare repeated number or crop digits from a decimal. Preserve the actual source value and unit.")
+        if message.startswith("TP evidence selects a percentage-interval endpoint:"):
+            detail.update(code="source_percentage_interval_needs_role_review", repair="An interval endpoint is not one discrete TP. Re-read the original financial role: a narrative expected-move/potential range alone is not a TP instruction, so leave TP fields absent; an actual TP interval requires ambiguous. Never pick one bound or split a continuous range into invented exits. Use a unique original quote if a separate real target has the same number.")
         if message == "Evidence does not occur in its original source":
             originals = {row["source_id"]: row["text"] for row in packet["messages"]}
             detail.update(field_paths=[f"evidence.{i}" for i, proof in enumerate(result.evidence)

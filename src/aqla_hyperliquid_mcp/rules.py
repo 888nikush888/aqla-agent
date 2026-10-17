@@ -331,6 +331,11 @@ def verify_evidence(signal: Interpretation, events: dict):
                         continue
                     if value not in set(quoted_numbers(number.group())):
                         continue
+                    if field.startswith("take_profits."):
+                        from aqla_agent.percent_targets import percentage_intervals
+                        position = (occurrence.start() + number.start(), occurrence.start() + number.end())
+                        if any(position in (interval.span("lower"), interval.span("upper")) for interval in percentage_intervals(original)):
+                            raise AqlaError("TP evidence selects a percentage-interval endpoint: " + field)
                     tail = original[occurrence.start() + number.end():]
                     modes.append(bool(re.match(r"\s*%", tail)))
         if not modes or any(mode != percentage for mode in modes):

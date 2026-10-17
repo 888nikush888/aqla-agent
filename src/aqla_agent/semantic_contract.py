@@ -356,11 +356,13 @@ def unsupported_structure(packet):
 
 
 def source_percentage_target_failure(text, interpretation):
-    from .percent_targets import explicit_percentage_targets
+    from .percent_targets import explicit_percentage_target_interval, explicit_percentage_targets
     actionable = (interpretation.kind == "new_signal" and interpretation.symbol and interpretation.side
         or interpretation.kind == "trade_update" and interpretation.update_action == "replace_targets")
     if not actionable or HYPOTHETICAL.search(text) or PAST.search(text) or PAST_WORD.search(text):
         return None
+    if explicit_percentage_target_interval(text):
+        return "source_percentage_target_interval_not_representable"
     values = explicit_percentage_targets(text)
     if values and (interpretation.take_profit_unit != "roe_percent" or interpretation.take_profits != values):
         return "source_percentage_targets_missing_or_changed"

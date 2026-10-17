@@ -180,6 +180,57 @@ def test_empty_incomplete_needs_no_quote_and_foreign_quotes_get_a_precise_repair
         assert not check_interpretation(context, value)["valid"]
 
 
+@pytest.mark.parametrize("value,unit,quote", [(1,"price","1"),(1,"roe_percent","1"),(2,"roe_percent","2%")])
+def test_expected_move_interval_cannot_become_one_tp_endpoint(value, unit, quote, setup):
+    from aqla_agent.trading import Trading
+    from aqla_hyperliquid_mcp.models import AqlaError
+    source, context, _ = material("BTC LONG\nExpected local move: 1-2% and no more.")
+    draft = Interpretation(kind="new_signal", symbol="BTC", side="long", take_profits=[value], take_profit_unit=unit,
+        source_refs=[source.source_id], evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in (
+            ("symbol","BTC"),("side","LONG"),("take_profits.0",quote))])
+    checked = check_interpretation(context, draft)
+    assert not checked["valid"] and checked["errors"][0]["code"] == "source_percentage_interval_needs_role_review"
+    settings, state, fake, exchange, _ = setup
+    trading = Trading(exchange, state)
+    trading.ingest(source)
+    before = state.snapshot()
+    with pytest.raises(AqlaError, match="percentage-interval endpoint"):
+        trading.record_interpretation(source.event_id, draft)
+    assert state.snapshot() == before and not fake.actions
+    draft.take_profits, draft.take_profit_unit, draft.evidence = [], "price", draft.evidence[:2]
+    assert check_interpretation(context, draft)["valid"]
+
+
+@pytest.mark.parametrize("label", ["Targets:", "TP1:", "Цели:"])
+def test_actual_tp_interval_cannot_be_erased_for_backup_and_keeps_real_ambiguity(label):
+    source, context, draft = material("BTC LONG\n" + label + " 1%-2%")
+    draft.entry_prices, draft.stop_loss, draft.take_profits = [], None, []
+    draft.evidence = draft.evidence[:2]
+    checked = check_interpretation(context, draft)
+    assert not checked["valid"] and checked["errors"][0]["code"] == "source_percentage_target_interval_not_representable"
+    ambiguous = Interpretation(kind="ambiguous", source_refs=[source.source_id],
+        reason="Ambiguous ROE target percentage interval cannot be an ordered exit list", reason_codes=["other"],
+        evidence=[Evidence(field="classification", source_id=source.source_id, quote=source.text)])
+    assert check_interpretation(context, ambiguous)["valid"]
+
+
+@pytest.mark.parametrize("targets", ["Targets: 1% / 2% / 3%", "Targets: 1% - 2% - 3%", "TP1: 1%\nTP2: 2%\nTP3: 3%"])
+def test_discrete_percent_target_lists_are_not_cropped_into_an_interval(targets):
+    source, context, _ = material("BTC LONG\n" + targets)
+    draft = Interpretation(kind="new_signal", symbol="BTC", side="long", take_profits=[1,2,3], take_profit_unit="roe_percent",
+        source_refs=[source.source_id], evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in (
+            ("symbol","BTC"),("side","LONG"),("take_profits.0","1%"),("take_profits.1","2%"),("take_profits.2","3%"))])
+    assert check_interpretation(context, draft)["valid"]
+
+
+def test_separate_real_price_target_with_same_number_as_outlook_has_a_valid_unique_proof():
+    source, context, draft = material("BTC SHORT. Entry 2. Stop 3. Target 1: 1.\nExpected local move: 1-2%.")
+    draft.side, draft.entry_prices, draft.stop_loss, draft.take_profits = "short", [2], 3, [1]
+    draft.evidence = [Evidence(field=f, source_id=source.source_id, quote=q) for f,q in (
+        ("symbol","BTC"),("side","SHORT"),("entry_prices.0","2"),("stop_loss","3"),("take_profits.0","Target 1: 1"))]
+    assert check_interpretation(context, draft)["valid"]
+
+
 def test_discrete_entry_error_explains_why_renaming_to_range_is_not_a_correction():
     source, context, _ = material("BTC LONG\nEntry: limit orders at 100 and 95\nStop 90\nTarget 110")
     value = Interpretation(kind="new_signal", symbol="BTC", side="long", entry="range", entry_prices=[95,100],
