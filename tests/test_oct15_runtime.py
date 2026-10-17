@@ -136,9 +136,14 @@ async def test_source_update_without_own_position_is_terminal_instead_of_stallin
 
     from aqla_agent.router import Router
     from aqla_agent.source_queue import queue_overview
+    from aqla_hyperliquid_mcp.models import Evidence
     settings, state, fake, exchange, _ = setup
     router = Router(settings, state, exchange)
     source, value = update(router, 2, 'break_even', 'Stop auf Einstand')
+    parent, _ = signal
+    value.symbol = 'BTC'
+    value.source_refs.append(parent.source_id)
+    value.evidence.append(Evidence(field='symbol', source_id=parent.source_id, quote='BTC'))
     result = await router.update_trade(source.event_id, value)
     assert result['status'] == 'rejected'
     assert state.snapshot()['events'][source.event_id]['update_disposition'] == 'no_matching_own_position'

@@ -97,7 +97,8 @@ def decision_batch(contexts):
             assistance.pop("original_structure_vetoes")
         if "candidates" in assistance:
             spans = assistance.pop("candidates")
-            candidates.update({span["candidate_id"]: span for span in spans})
+            for span in spans:
+                candidates[span["candidate_id"]] = {key: value for key, value in span.items() if key != "candidate_id"}
             assistance["candidate_ids"] = [span["candidate_id"] for span in spans]
         if "contract" in assistance:
             contract = assistance.pop("contract")

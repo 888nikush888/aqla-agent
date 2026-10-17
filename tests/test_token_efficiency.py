@@ -105,6 +105,10 @@ async def test_decision_context_and_batch_keep_originals_quotes_replies_and_rece
     assert {row["anchor_event_id"] for row in batch["items"]} == {source.event_id for source in sources}
     for source, item in zip(sources, batch["items"], strict=True):
         assert batch["messages"][source.event_id]["source"]["text"] == source.text
+        for identity in item["interpretation_assistance"]["candidate_ids"]:
+            span = batch["interpretation_candidates"][identity]
+            original = next(row["source"]["text"] for row in batch["messages"].values() if row["source_id"] == span["source_id"])
+            assert original[span["start"]:span["end"]] == span["quote"]
         interpretation = Interpretation.model_validate({key: value for key, value in report_item(source, item["source_read_receipt"]).items()
                                                         if key not in ("event_id", "source_read_receipt")})
         verify_disposition(state.snapshot(), source.event_id, interpretation, item["source_read_receipt"], efficiency_server.aqla_authority.key)
