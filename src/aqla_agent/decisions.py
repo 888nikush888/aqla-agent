@@ -13,6 +13,7 @@ from pydantic import Field, model_validator
 
 from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, Model, digest
 from aqla_hyperliquid_mcp.rules import (
+    number_is_ordinal,
     quoted_leverage_numbers,
     verify_entry_shape,
     verify_evidence,
@@ -22,7 +23,7 @@ from aqla_hyperliquid_mcp.rules import (
 
 from .evidence import position_fractions
 
-VERSION = "aqla-decisions-v16"
+VERSION = "aqla-decisions-v17"
 QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v7"
 # The original-context wire shape is unchanged. Keeping its independent schema
 # version permits exact-state, exact-question observations to be reused for
@@ -277,10 +278,7 @@ def candidates(packet):
             if percent:
                 end += percent.end()
             # Preserve EVERY interpretation of an ambiguous decimal separator.
-            before = text[text.rfind("\n", 0, start) + 1:start].strip()
-            after = text[end:end + 2]
-            ordinal = (before.lower() in ("", "tp", "target", "☑️ target") and
-                       re.fullmatch(r"\d{1,2}", text[start:end]) and (after.startswith(")") or after.startswith(":")))
+            ordinal = number_is_ordinal(text, start, end)
             for value in sorted(set(quoted_leverage_numbers(text[start:end]))):
                 add(start, end, "number", str(value), "ordinal" if ordinal else "value")
         for match in SYMBOLS.finditer(text):

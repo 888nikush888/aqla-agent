@@ -62,6 +62,23 @@ def test_percent_and_comma_spelling_survive_and_never_convert_to_prices():
     assert not check_interpretation(context, value)["valid"]
 
 
+@pytest.mark.parametrize("label", ["Target 1:", "TP 1:", "1)", "Ziel 1:", "Цель 1:"])
+@pytest.mark.parametrize("quote_only_number", [False, True])
+def test_numbered_label_never_becomes_a_price_even_when_submitted_already_shortened(label, quote_only_number):
+    from aqla_hyperliquid_mcp.models import AqlaError
+    from aqla_hyperliquid_mcp.rules import verify_evidence
+    source, context, value = material(f"BTC LONG. Entry 100. Stop 90.\n{label} 110.")
+    value.take_profits = [1]
+    value.evidence = value.evidence[:4] + [Evidence(field="take_profits.0", source_id=source.source_id,
+        quote="1" if quote_only_number else label + " 110")]
+    result = check_interpretation(context, value)
+    assert not result["valid"]
+    assert result["interpretation"]["evidence"][-1]["quote"] == value.evidence[-1].quote
+    with pytest.raises(AqlaError, match="numbering label"):
+        verify_evidence(value, {source.event_id: context["event"]})
+    assert not any(c["kind"] == "number" and c["value"] == "1" for c in source_assistance(context)["candidates"])
+
+
 def test_assistance_reuses_original_contract_and_excludes_ordinals():
     source, context, _ = material()
     aid = source_assistance(context)

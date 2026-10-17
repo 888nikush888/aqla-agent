@@ -84,6 +84,13 @@ def executable_targets(quantity, targets, policy, market):
     raise ExchangeMinimum("A TP leg is below the exchange notional minimum")
 
 
+def number_is_ordinal(text, start, end):
+    if not re.fullmatch(r"\d{1,2}", text[start:end]) or text[end:end + 1] not in (":", ")"):
+        return False
+    before = text[text.rfind("\n", 0, start) + 1:start].strip()
+    return not before or bool(re.search(r"(?<!\w)(?:tp|target|take[-\s]?profit|тейк|цел[ьи]|ziel)\s*$", before, re.I))
+
+
 def quoted_numbers(quote):
     # General decimal notation only; no channel-specific syntax or field-role regex.
     normalized = quote.replace("\u00a0", " ").replace("\u202f", " ")
@@ -219,6 +226,12 @@ def verify_evidence(signal: Interpretation, events: dict):
             errors.append(f"Price not supported by source evidence: {field}")
         elif not any(len(re.findall(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])", quote)) == 1 for quote in supported):
             errors.append(f"Numeric source evidence must isolate one number: {field}")
+        if any(number_is_ordinal(texts[proof.source_id], occurrence.start() + number.start(), occurrence.start() + number.end())
+               for proof in signal.evidence if proof.field == field and proof.quote in supported
+               for occurrence in re.finditer(re.escape(proof.quote), texts[proof.source_id])
+               for number in re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])", proof.quote)
+               if value in set(quoted_numbers(number.group()))):
+            errors.append(f"Numeric source evidence points to a numbering label: {field}")
     if signal.reduce_percent is not None:
         from aqla_agent.evidence import position_fractions
         supported = False

@@ -291,7 +291,8 @@ def main():
               "order_requests": 0, "failures": [{"case_id": row["case_id"], "run": row["run"], "fields": row["mismatch_fields"]} for row in rows if not row["passed"]]}
     write_private_json(args.output / "report.json", report)
     print(json.dumps({k: v for k, v in report.items() if k != "failures"}), flush=True)
+    return 0 if report["all_passed"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

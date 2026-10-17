@@ -5,7 +5,7 @@ import json
 import re
 
 from aqla_hyperliquid_mcp.models import EVIDENCE_FIELDS, AqlaError, Interpretation, digest
-from aqla_hyperliquid_mcp.rules import quoted_numbers
+from aqla_hyperliquid_mcp.rules import number_is_ordinal, quoted_numbers
 
 from .decisions import (
     DecisionFailure,
@@ -115,6 +115,9 @@ def precise_numeric_evidence(packet, interpretation):
         matching = [number for number in numbers if set(quoted_numbers(number.group())) == {value}]
         if len(matching) == 1:
             number = matching[0]
+            offset = occurrences[0].start()
+            if number_is_ordinal(original, offset + number.start(), offset + number.end()):
+                continue
             if proof.quote[:number.start()].rstrip().endswith(("-", "−", "/")):
                 continue
             # The source unit is checked again by verify_evidence after shortening.
