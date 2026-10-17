@@ -20,6 +20,8 @@ from .models import (
     now_ms,
 )
 
+UPDATE_VALUE_FIELDS = {"move_stop": "stop_loss", "replace_targets": "take_profits", "reduce": "reduce_percent"}
+
 
 def quantity_grid(value: Decimal, market: Market):
     if market.quantity_step is not None:
@@ -177,6 +179,10 @@ def verify_setup_references(signal, anchor_source_id, own_setup_refs=()):
     own_setup_refs = set(own_setup_refs)
     if signal.kind == "trade_update":
         supported.update(own_setup_refs)
+        changed = UPDATE_VALUE_FIELDS.get(signal.update_action)
+        if changed and any(proof.source_id != anchor_source_id and (proof.field == changed or proof.field.startswith(changed + "."))
+                           for proof in signal.evidence):
+            raise AqlaError("Changed update values for " + changed + " need evidence from the current anchor, not copied parent values. Keep parents for market identity or own setup binding; re-read and quote only the newly instructed value")
     if signal.kind in ("new_signal", "trade_update") and set(signal.source_refs) - supported:
         raise AqlaError("Actionable source_refs include context without setup evidence; re-read source_context and select only the live instruction and original messages supporting this setup, not all context or receipt refs. Each additional source needs its own evidence or, for updates, an existing own setup binding; keep genuine setup origins")
     if signal.kind == "trade_update" and any(proof.field == "symbol" and proof.source_id == anchor_source_id for proof in signal.evidence):
@@ -197,7 +203,7 @@ def verify_update_shape(signal):
         return
     if signal.update_action is None:
         raise AqlaError("Trade update requires update_action")
-    required = {"move_stop": "stop_loss", "replace_targets": "take_profits", "reduce": "reduce_percent"}.get(signal.update_action)
+    required = UPDATE_VALUE_FIELDS.get(signal.update_action)
     if required and not getattr(signal, required):
         raise AqlaError("Trade update " + signal.update_action + " requires " + required + " with original source evidence; updates never use backup values")
 

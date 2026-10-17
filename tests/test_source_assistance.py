@@ -285,6 +285,19 @@ def test_check_preserves_trusted_closed_parent_binding_without_exposing_a_positi
     assert check_interpretation(context, value)["valid"] and context["trades"] == []
 
 
+@pytest.mark.parametrize("action,field,values,quote", [("move_stop", "stop_loss", {"stop_loss": 95}, "95"),
+    ("replace_targets", "take_profits.0", {"take_profits": [110]}, "110"), ("reduce", "reduce_percent", {"reduce_percent": 50}, "50%")])
+def test_update_value_proof_must_be_current_even_when_parent_is_our_owned_setup(action, field, values, quote):
+    from aqla_hyperliquid_mcp.models import AqlaError
+    from aqla_hyperliquid_mcp.rules import verify_setup_references
+    value = Interpretation(kind="trade_update", symbol="BTC", source_refs=["current", "parent"], update_action=action,
+        **values, evidence=[Evidence(field=field, source_id="parent", quote=quote)])
+    with pytest.raises(AqlaError, match="current anchor, not copied parent"):
+        verify_setup_references(value, "current", ["parent"])
+    value.evidence[0].source_id = "current"
+    verify_setup_references(value, "current", ["parent"])
+
+
 def test_large_original_keeps_binding_and_contract_when_candidate_limit_is_exceeded():
     source, context, _ = material("BTC LONG. " + "Target 110. " * 300)
     context["bound_source_refs"] = [source.source_id]

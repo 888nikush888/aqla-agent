@@ -23,7 +23,7 @@ from aqla_hyperliquid_mcp.rules import (
 
 from .evidence import position_fractions
 
-VERSION = "aqla-decisions-v22"
+VERSION = "aqla-decisions-v23"
 QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v10"
 # The original-context wire shape is unchanged. Keeping its independent schema
 # version permits exact-state, exact-question observations to be reused for
