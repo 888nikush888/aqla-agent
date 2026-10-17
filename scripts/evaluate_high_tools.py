@@ -190,7 +190,7 @@ def main():
     parser.add_argument("--runs", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--case-id", action="append")
     parser.add_argument("--worker-fixture", type=Path)
-    parser.add_argument("--workers", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--workers", type=int, choices=(1, 2, 4), default=2)
     args = parser.parse_args()
     logging.disable(logging.CRITICAL)
     if args.worker_fixture:
@@ -211,7 +211,7 @@ def main():
                 "effort": "high", "model": DEFAULT_MODEL, "draft_limit": 3, "transport_attempt_limit": 3,
                 "request_timeout_seconds": 120, "transport_wait_seconds": [15, 30],
                 "context_mode": "all_retained_original_messages_no_cached_labels",
-                "runs": args.runs, "order_tools_available": False}
+                "runs": args.runs, "workers": args.workers, "order_tools_available": False}
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
     seal = args.output / "identity.json"
     if seal.exists():
