@@ -17,11 +17,12 @@ from .decisions import (
     verification_questions,
 )
 
-VERSION = "source-assistance-v1"
+VERSION = "source-assistance-v2"
 CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_action",
                    "source_exchange", "single_entry_form", "single_management_action")
 CONTEXT_CANDIDATE_LIMIT = 64
 REPAIR_GUIDANCE = {
+    "entry_legs_not_representable": "Re-read contract.single_entry_form and the original separate orders. Renaming several discrete entry legs to range does not represent them. Use ambiguous when the source cannot fit one supported entry; omit unused trading fields and quote the conflicting original. Never pick one leg or repair this by changing its prices.",
     "source_percentage_targets_missing_or_changed": "The original explicitly lists percent-only TP targets. Under source-roe-v1 these are nominal ROE targets, not position allocations. Preserve every listed target in order with take_profit_unit=roe_percent and exact percent quotes. A separate deposit/margin percent is not a TP. Do not silently substitute backup targets.",
     "live_anchor_missing": "Use anchor_source_id in source_refs, not event_id/chat_id/message_id. Evidence.source_id uses the same original source IDs. Do not remove a correctly named symbol while correcting references.",
     "update_identity_missing": "An unbound update needs both its symbol FIELD and literal symbol evidence from this anchor or its actual reply chain. Unlinked neighbours and matching prices cannot identify the market. Without original identity or Python's own binding, classify incomplete; never retain a guessed symbol after removing its proof.",
@@ -35,6 +36,7 @@ REPAIR_GUIDANCE = {
     "unbound_setup_edit_is_not_management": "Python reports no accepted own setup binding. An edit/publication alone is not execution. This anchor still presents a complete entry setup, not an explicit management instruction: recheck corrected new_signal, or ambiguous when all original entry legs cannot be represented.",
 }
 REPAIR_FIELDS = {
+    "entry_legs_not_representable": ["kind", "entry", "entry_prices"],
     "source_percentage_targets_missing_or_changed": ["take_profits", "take_profit_unit"],
     "live_anchor_missing": ["source_refs", "evidence"],
     "update_identity_missing": ["symbol", "source_refs"],
@@ -93,7 +95,9 @@ def source_assistance(context):
             "workflow": "Use source_check_interpretation before saving or planning. Copy original candidate quotes. "
                         "Only Python's anchor_setup_bound proves an accepted own setup; publication/edited_at never does. "
                         "Check the complete anchor, including new management instructions in reports. "
-                        "Non-actionable results need only kind, source_refs, classification evidence, reason and reason_codes; "
+                        "Non-actionable results need only kind, source_refs, classification evidence and reason; "
+                        "reason_codes are optional (use only declared values or omit them); "
+                        "for an empty original use incomplete with evidence=[] (there is no original quote); never borrow a context quote. "
                         "omit all unused trading fields. Correct at most three drafts per processing turn. "
                         "valid only means the automated checks passed: before saving, independently recheck the complete "
                         "original against verification.intent, verification.values, verification.setup and the kind criteria; "
@@ -166,6 +170,11 @@ def check_interpretation(context, interpretation: Interpretation):
                        "message": message, **({"repair": REPAIR_GUIDANCE[message]} if message in REPAIR_GUIDANCE else {})}
         if numeric_context:
             detail.update(code="source_numeric_proof_needs_context", repair="Use a longer UNIQUE exact original span, including the target label and its value if needed. Verified numbering labels are context, not prices. Do not resubmit a bare repeated number or crop digits from a decimal. Preserve the actual source value and unit.")
+        if message == "Evidence does not occur in its original source":
+            originals = {row["source_id"]: row["text"] for row in packet["messages"]}
+            detail.update(field_paths=[f"evidence.{i}" for i, proof in enumerate(result.evidence)
+                if proof.source_id not in result.source_refs or proof.quote not in originals.get(proof.source_id, "")],
+                repair="Each proof must quote that same source_id's exact original and the source must be in source_refs. An EMPTY anchor is incomplete with evidence=[]; remove borrowed quotes, not the incomplete classification. Never probe other kinds or invent a quote to satisfy evidence.")
         if message.startswith("Non-actional source_refs"):
             detail.update(code="classification_scope_requires_anchor_only", repair="Use ONLY anchor_source_id in source_refs and classification evidence. Remove parent/context refs and their proofs from this non-actional result; they remain readable through the reply chain. Do not add parent proofs merely to retain an extra classification target.")
         if not any(row["message"] == message for row in errors):

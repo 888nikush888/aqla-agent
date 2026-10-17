@@ -83,7 +83,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     record_tool = measured.tool
 
     def observe_tool(name, content, error, duration=None):
-        tool_events.append({"name": name, "error": bool(error)})
+        tool_events.append({"name": name, "error": bool(error), **({"error_detail": str(content)[:1500]} if error else {})})
         record_tool(name, content, error, duration)
 
     measured.tool = observe_tool

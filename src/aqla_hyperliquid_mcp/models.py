@@ -251,10 +251,10 @@ class SourceClassification(Model):
     source_refs: list[str] = Field(min_length=1, max_length=20,
         description="Only the selected anchor source_id is classified. Reply/parent context remains readable but is not an additional classification target.")
     evidence: list[Evidence] = Field(default_factory=list, max_length=60,
-        description="Include field=classification, current anchor source_id and an exact original quote; every item needs its own proof. Empty-text incomplete is the only quote exception.")
+        description="Nonempty originals require field=classification, current anchor source_id and an exact original quote. For an EMPTY original use kind=incomplete and evidence=[]; no quote exists. Never borrow a parent/neighbour quote to classify an empty anchor.")
     reason: str = Field(min_length=1, max_length=2000)
     reason_codes: list[ClassificationReason] = Field(default_factory=list, max_length=8,
-        description="Independent reasons for a non-actionable classification. percentage_basis alone cannot block a source % TP: source-roe-v1 defines it as nominal ROE on own initial margin. Other genuine ambiguity remains non-actionable.")
+        description="Optional independent reasons for a non-actionable classification; use declared codes or omit the list, with specifics in reason. percentage_basis alone cannot block a source % TP: source-roe-v1 defines it as nominal ROE on own initial margin. Other genuine ambiguity remains non-actionable.")
     source_read_receipt: str = Field(min_length=1, max_length=32768)
 
     @model_serializer(mode="wrap")
@@ -288,10 +288,11 @@ class Interpretation(Model):
         description="For trade_update emit only changed action fields: move_stop needs stop_loss; replace_targets needs take_profits; reduce needs reduce_percent. Leave unrelated prices/targets null or empty; do not restate the whole original setup.")
     reduce_percent: Positive | None = Field(default=None, le=100)
     bound_trade_id: str | None = None
-    evidence: list[Evidence] = Field(default_factory=list, max_length=60)
+    evidence: list[Evidence] = Field(default_factory=list, max_length=60,
+        description="Original evidence for each populated field. For non-actionable results: " + SourceClassification.model_fields["evidence"].description)
     reason: str = Field(default="", max_length=2000)
     reason_codes: list[ClassificationReason] = Field(default_factory=list, max_length=8,
-        description="For non-actionable classifications, independent blocking causes. percentage_basis alone is invalid for source % TPs under source-roe-v1; re-read and interpret with roe_percent, without bypassing any other uncertainty.")
+        description=SourceClassification.model_fields["reason_codes"].description)
 
     @model_serializer(mode="wrap")
     def compatible_entry_fields(self, handler):

@@ -165,6 +165,32 @@ def test_assistance_reuses_original_contract_and_excludes_ordinals():
     assert "mcp__aqla__source_check_interpretation" in SOURCE_TOOLS
 
 
+def test_empty_incomplete_needs_no_quote_and_foreign_quotes_get_a_precise_repair():
+    source, context, _ = material("")
+    value = Interpretation(kind="incomplete", source_refs=[source.source_id], reason="No original text",
+        evidence=[Evidence(field="classification", source_id="neighbour", quote="BTC profit")])
+    checked = check_interpretation(context, value)
+    assert not checked["valid"]
+    assert checked["errors"][0]["field_paths"] == ["evidence.0"]
+    assert "evidence=[]" in checked["errors"][0]["repair"]
+    value.evidence = []
+    assert check_interpretation(context, value)["valid"]
+    for kind in ("report", "unrelated", "new_signal", "trade_update", "ambiguous"):
+        value.kind = kind
+        assert not check_interpretation(context, value)["valid"]
+
+
+def test_discrete_entry_error_explains_why_renaming_to_range_is_not_a_correction():
+    source, context, _ = material("BTC LONG\nEntry: limit orders at 100 and 95\nStop 90\nTarget 110")
+    value = Interpretation(kind="new_signal", symbol="BTC", side="long", entry="range", entry_prices=[95,100],
+        source_refs=[source.source_id], evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in (
+            ("symbol","BTC"),("side","LONG"),("entry_prices.0","95"),("entry_prices.1","100"))])
+    checked = check_interpretation(context, value)
+    error = next(e for e in checked["errors"] if e["code"] == "entry_legs_not_representable")
+    assert not checked["valid"] and {"kind","entry","entry_prices"} <= set(error["field_paths"])
+    assert "single_entry_form" in error["repair"] and "ambiguous" in error["repair"]
+
+
 @pytest.mark.parametrize("text", ["BTC first target hit. Stop to entry.", "BTC Ziel erreicht. Stopp auf Einstand.",
                                   "BTC тейк. Стоп на точку входа."])
 def test_a_report_cannot_hide_one_current_management_instruction(text):

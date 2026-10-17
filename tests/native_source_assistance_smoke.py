@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--transport-failure", action="store_true")
     parser.add_argument("--numbered-integer-target", action="store_true")
     parser.add_argument("--rate-limit-failure", action="store_true")
+    parser.add_argument("--empty-original", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root / "scripts"))
@@ -30,6 +31,8 @@ def main():
     home.mkdir(parents=True, exist_ok=True)
     text = ("BTC SHORT. Entry 2. Stop 3.\nTarget 1: 1.8\nTarget 2: 1.4\nTarget 3: 1\nRisk 1%"
         if args.numbered_integer_target else "BTC LONG. Entry 100. Stop 90. Target 1: 110.")
+    if args.empty_original:
+        text = ""
     source = SourceEvent(chat_id="synthetic-source", message_id=1, sent_at=1000, text=text, historical=True)
     unrelated = SourceEvent(chat_id="synthetic-source", message_id=2, sent_at=900,
         text="ETH SHORT. Entry 200. Stop 210. Target 180.", historical=True)
@@ -44,9 +47,14 @@ def main():
                 Evidence(field=f, source_id=source.source_id, quote=q) for f, q in (
                     ("symbol", "BTC"), ("side", "SHORT"), ("entry_prices.0", "Entry 2"), ("stop_loss", "Stop 3"),
                     ("take_profits.0", "1.8"), ("take_profits.1", "1.4"), ("take_profits.2", "1"))])
+    if args.empty_original:
+        value = Interpretation(kind="incomplete", source_refs=[source.source_id], reason="Original text is unavailable",
+            evidence=[Evidence(field="classification", source_id=unrelated.source_id, quote=unrelated.text)])
     corrected = value.model_copy(deep=True)
     if args.numbered_integer_target:
         corrected.evidence[-1].quote = "Target 3: 1"
+    if args.empty_original:
+        corrected.evidence = []
     fixture = home / "fixture.private.json"
     write_private_json(fixture, {"packet": packet, "context_messages": [row, {"event_id": unrelated.event_id,
         "source_id": unrelated.source_id, "source": unrelated.model_dump(mode="json")}],
@@ -83,7 +91,7 @@ def main():
                 return
             sequence = [("source_context", {"event_id": source.event_id, "view": "decision"}),
                         ("source_check_interpretation", {"event_id": source.event_id, "interpretation": value.model_dump(mode="json")})]
-            if args.numbered_integer_target:
+            if args.numbered_integer_target or args.empty_original:
                 sequence.append(("source_check_interpretation", {"event_id": source.event_id, "interpretation": corrected.model_dump(mode="json")}))
             message = {"role": "assistant", "content": "Checked; no orders."}
             if index < len(sequence):
@@ -118,12 +126,17 @@ def main():
         result = native_worker(SimpleNamespace(worker_fixture=fixture, hermes_source=args.hermes_source.resolve(),
             mcp_python=args.mcp_python.absolute()), model_url=f"http://127.0.0.1:{model.server_port}/v1", model_key="synthetic-only", local_fixture=True,
             retry_sleep=waits.append)
-        expected_drafts = 2 if args.numbered_integer_target else 1
+        expected_drafts = 2 if args.numbered_integer_target or args.empty_original else 1
         responses = 2 + expected_drafts
         assert result["completed"] and result["draft_count"] == expected_drafts and result["checks"][-1]["valid"], result
         if args.numbered_integer_target:
             assert not result["checks"][0]["valid"] and result["checks"][0]["errors"][0]["code"] == "source_numeric_proof_needs_context"
-        assert result["checks"][-1]["interpretation"]["evidence"][-1]["quote"] == ("Target 3: 1" if args.numbered_integer_target else "110")
+        if args.empty_original:
+            assert result["checks"][0]["errors"][0]["field_paths"] == ["evidence.0"]
+            assert "evidence=[]" in result["checks"][0]["errors"][0]["repair"]
+            assert result["checks"][-1]["interpretation"]["evidence"] == []
+        else:
+            assert result["checks"][-1]["interpretation"]["evidence"][-1]["quote"] == ("Target 3: 1" if args.numbered_integer_target else "110")
         assert not result["forbidden_tools"] and result["order_requests"] == 0
         from aqla_hyperliquid_mcp.storage import read_snapshot
         retained = read_snapshot(home / "state.sqlite3")
@@ -133,7 +146,8 @@ def main():
         assert len(result["api_responses"]) == responses, {
             "calls": [{"model": b.get("model"), "effort": b.get("reasoning_effort"), "keys": list(b)} for b in calls],
             "requests": result["request_attempts"], "responses": result["api_responses"]}
-        print(json.dumps({"native_high_mcp_loop": True, "original_quote_shortened": not args.numbered_integer_target,
+        print(json.dumps({"native_high_mcp_loop": True, "original_quote_shortened": not (args.numbered_integer_target or args.empty_original),
+            "empty_original_quote_exception": args.empty_original,
             "integer_target_context_kept": args.numbered_integer_target, "model_calls": len(calls),
             "transport_backoff_verified": waits, "order_requests": 0}))
     finally:
