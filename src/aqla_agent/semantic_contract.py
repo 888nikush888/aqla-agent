@@ -129,6 +129,16 @@ def source_leverage_interval_failure(text, interpretation):
     return None
 
 
+def unbound_setup_update_failure(packet, interpretation):
+    if interpretation.kind != "trade_update" or packet.get("anchor_setup_bound"):
+        return None
+    text = next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    live = current_structure_text(text)
+    if (NEW_ENTRY.search(live) or SETUP_HEADING.search(live)) and not current_actions(text, include_tp_footers=False):
+        return "unbound_setup_edit_is_not_management"
+    return None
+
+
 def bounded_live_entry_range(packet, spans):
     """One original bounded price phrase, never two unrelated numeric mentions."""
     if len(spans) != 2 or any(span is None or span.source_id != packet["anchor_source_id"]

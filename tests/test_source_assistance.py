@@ -154,6 +154,52 @@ def test_symbol_alias_cannot_hide_the_source_leverage_interval():
     assert not check_interpretation(context, value)["valid"]
 
 
+def test_unaccepted_full_setup_edit_is_not_a_management_instruction():
+    source, context, _ = material()
+    value = Interpretation(kind="trade_update", symbol="BTC", side="long", update_action="move_stop", stop_loss=90,
+        source_refs=[source.source_id], evidence=[Evidence(field="stop_loss", source_id=source.source_id, quote="90")])
+    result = check_interpretation(context, value)
+    assert not result["valid"] and result["errors"][0]["code"] == "unbound_setup_edit_is_not_management"
+    context["bound_source_refs"] = [source.source_id]
+    assert check_interpretation(context, value)["valid"]
+
+
+def test_closed_owned_setup_still_proves_binding_but_does_not_become_an_open_position():
+    from aqla_agent.trading import Trading
+    source, context, _ = material()
+    index = Trading.context_index({"events": {source.event_id: context["event"]},
+        "trades": {"owned": {"chat_id": source.chat_id, "status": "closed", "plan": {"source_refs": [source.source_id]}}}})
+    assert not index[2] and index[3][source.chat_id] == {source.source_id}
+    context["bound_source_refs"] = list(index[3][source.chat_id])
+    assert source_assistance(context)["anchor_setup_bound"]
+
+
+@pytest.mark.parametrize("action", [None, "move_stop", "replace_targets", "reduce"])
+def test_check_does_not_accept_an_update_without_its_required_changed_value(action):
+    source, context, _ = material("BTC: change the stop.")
+    value = Interpretation(kind="trade_update", symbol="BTC", source_refs=[source.source_id], update_action=action)
+    assert not check_interpretation(context, value)["valid"]
+
+
+def test_one_check_reports_independent_reference_and_intent_errors_together():
+    source, context, _ = material()
+    value = Interpretation(kind="trade_update", symbol="BTC", update_action="move_stop", stop_loss=90,
+        source_refs=[source.event_id], evidence=[Evidence(field="stop_loss", source_id=source.source_id, quote="90")])
+    result = check_interpretation(context, value)
+    assert {e["code"] for e in result["errors"]} == {"unbound_setup_edit_is_not_management", "live_anchor_missing"}
+    assert result["anchor_source_id"] == source.source_id
+    assert result["interpretation"]["source_refs"] == [source.event_id]
+    assert source_assistance(context)["original_structure_vetoes"]["trade_update"] == "unbound_setup_edit_is_not_management"
+
+
+def test_large_original_keeps_binding_and_contract_when_candidate_limit_is_exceeded():
+    source, context, _ = material("BTC LONG. " + "Target 110. " * 300)
+    context["bound_source_refs"] = [source.source_id]
+    aid = source_assistance(context)
+    assert aid["anchor_setup_bound"] and aid["contract"]["kind"]
+    assert not aid["candidates_complete"] and aid["candidate_error"] == "candidate_limit"
+
+
 def test_explicit_example_framing_cannot_authorize_its_quoted_setup():
     text = "BTC LONG. Entry 100. Stop 90. Target 1: 110. Target 2: 120.\nEverything above is an example."
     source, context, value = material(text)

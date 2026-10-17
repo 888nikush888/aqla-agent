@@ -33,6 +33,7 @@ from aqla_hyperliquid_mcp.rules import (
     verify_entry_shape,
     verify_evidence,
     verify_setup_references,
+    verify_update_shape,
 )
 from aqla_hyperliquid_mcp.state import State
 
@@ -162,7 +163,7 @@ class Trading:
 
     @staticmethod
     def context_index(snapshot):
-        messages, parents, trades = {}, {}, {}
+        messages, parents, trades, bound = {}, {}, {}, {}
         for row in snapshot["events"].values():
             if is_source_row(row):
                 messages.setdefault(row["source"]["chat_id"], []).append(row)
@@ -170,9 +171,10 @@ class Trading:
             rows.sort(key=lambda item: (item["source"]["sent_at"], item["source"].get("edited_at") or 0))
             parents[chat] = {row["source"]["message_id"]: row for row in rows}
         for row in snapshot["trades"].values():
+            bound.setdefault(row["chat_id"], set()).update(row["plan"]["source_refs"])
             if row["status"] in OPEN:
                 trades.setdefault(row["chat_id"], []).append(row)
-        return messages, parents, trades
+        return messages, parents, trades, bound
 
     def context(self, event_id, *, compact_receipt=False, snapshot=None, index=None):
         snapshot = self.state.snapshot() if snapshot is None else snapshot
@@ -180,7 +182,7 @@ class Trading:
         if not is_source_row(row):
             raise AqlaError("Unknown source event")
         source = row["source"]
-        channels, parents, own_trades = self.context_index(snapshot) if index is None else index
+        channels, parents, own_trades, bound = self.context_index(snapshot) if index is None else index
         messages = channels.get(source["chat_id"], [])
         included = messages[-self.exchange.settings.max_context_messages:]
         if row not in included:
@@ -197,6 +199,7 @@ class Trading:
             reply = parent["source"].get("reply_to_id")
         trades = own_trades.get(source["chat_id"], [])
         result = {"event": row, "messages": included, "trades": trades, "policy": snapshot["policy"],
+                "bound_source_refs": sorted(bound.get(source["chat_id"], set()) & {item["source_id"] for item in included}),
                 "classification_constraints": {"missing_text": not source.get("text", "").strip(),
                     "media": source.get("media", "text"), "empty_body_only_kind": "incomplete"},
                 "source_names": snapshot.get("source_names", {}), "source_name": snapshot.get("source_names", {}).get(source["chat_id"]),
@@ -251,12 +254,16 @@ class Trading:
                     raise AqlaError("An actionable interpretation must use the latest anchor revision")
             verify_evidence(interpretation, snapshot["events"])
             verify_entry_shape(interpretation)
+            verify_update_shape(interpretation)
             own_refs = (ref for trade in snapshot["trades"].values()
                         if trade["chat_id"] == row["source"]["chat_id"] and interpretation.bound_trade_id in (None, trade["trade_id"])
                         for ref in trade["plan"]["source_refs"])
             verify_setup_references(interpretation, row["source_id"], own_refs)
-            from .semantic_contract import supported_action_failure
+            from .semantic_contract import supported_action_failure, unbound_setup_update_failure
             failure = supported_action_failure(row["source"].get("text", ""), interpretation)
+            if failure is None and interpretation.kind == "trade_update":
+                from .decisions import build_packet
+                failure = unbound_setup_update_failure(build_packet(self.context(event_id, snapshot=snapshot)), interpretation)
             if failure:
                 raise AqlaError(failure)
             if interpretation.take_profit_unit in ("course_percent", "roi_percent") and interpretation.take_profits:

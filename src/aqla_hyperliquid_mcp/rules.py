@@ -180,6 +180,16 @@ def verify_entry_shape(signal):
             raise AqlaError("Source entry type/prices disagree; limit needs exactly one evidenced price, range exactly two. Re-read source_context and correct the interpretation without inventing bounds")
 
 
+def verify_update_shape(signal):
+    if signal.kind != "trade_update":
+        return
+    if signal.update_action is None:
+        raise AqlaError("Trade update requires update_action")
+    required = {"move_stop": "stop_loss", "replace_targets": "take_profits", "reduce": "reduce_percent"}.get(signal.update_action)
+    if required and not getattr(signal, required):
+        raise AqlaError("Trade update " + signal.update_action + " requires " + required + " with original source evidence; updates never use backup values")
+
+
 def verify_evidence(signal: Interpretation, events: dict):
     texts = {ref: row["source"]["text"] for ref, row in latest_sources(events, signal.source_refs).items()}
     if any(ref not in texts for ref in signal.source_refs):

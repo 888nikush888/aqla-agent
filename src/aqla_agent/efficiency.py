@@ -75,12 +75,13 @@ def decision_context(context):
     result = {key: value for key, value in context.items() if key not in
               ("event", "messages", "trades", "source_names")}
     from .source_assistance import source_assistance
+    assistance = source_assistance(context)
     result.update(view="decision", anchor_event_id=anchor["event_id"], anchor_source_id=anchor["source_id"],
                   message_ids=list(messages), messages=messages, trades=trades,
                   percentage_rule="Absolute targets without %: price. Explicit source TP percentages: roe_percent on own initial margin before costs.",
                   source_name=context.get("source_name"),
                   projection={"source_bodies": "lossless", "stored_trade_details_omitted": True},
-                  interpretation_assistance=source_assistance(context))
+                  interpretation_assistance=assistance, anchor_setup_bound=assistance["anchor_setup_bound"])
     return result
 
 
@@ -97,6 +98,8 @@ def decision_batch(contexts):
             assistance["candidate_ids"] = [span["candidate_id"] for span in spans]
         if "contract" in assistance:
             contract = assistance.pop("contract")
+            for key in ("workflow", "candidate_roles_are_not_inferred"):
+                contract[key] = assistance.pop(key)
             identity = signature(contract)[:24]
             contracts[identity] = contract
             assistance["contract_id"] = identity
