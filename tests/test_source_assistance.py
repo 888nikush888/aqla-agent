@@ -276,6 +276,9 @@ def test_unbound_update_cannot_keep_a_neighbour_market_after_removing_its_proof(
         source_refs=[source.source_id], evidence=[Evidence(field="reduce_percent", source_id=source.source_id, quote="40%")])
     result = check_interpretation(context, value)
     assert not result["valid"] and result["errors"][0]["code"] == "update_identity_missing"
+    value.bound_trade_id = "model-guessed-trade"
+    assert not check_interpretation(context, value)["valid"]
+    value.bound_trade_id = None
     context["bound_source_refs"] = [source.source_id]
     assert check_interpretation(context, value)["valid"]
 

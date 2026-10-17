@@ -140,7 +140,8 @@ def unbound_setup_update_failure(packet, interpretation):
 
 
 def update_identity_failure(packet, interpretation):
-    if interpretation.kind != "trade_update" or packet.get("anchor_setup_bound"):
+    if (interpretation.kind != "trade_update" or packet.get("anchor_setup_bound")
+            or interpretation.bound_trade_id is not None):
         return None
     from .decisions import linked_candidate_refs
     linked = linked_candidate_refs(packet)
