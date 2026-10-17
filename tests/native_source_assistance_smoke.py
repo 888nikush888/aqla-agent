@@ -1,6 +1,7 @@
 """Actual native high tool loop, local scripted model and isolated production MCP."""
 import argparse
 import json
+import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +14,7 @@ def main():
     parser.add_argument("--hermes-source", type=Path, required=True)
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--mcp-python", type=Path, required=True)
+    parser.add_argument("--transport-failure", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root / "scripts"))
@@ -47,7 +49,13 @@ def main():
                 return
             calls.append(body)
             assert body.get("reasoning_effort") == "high", {"model": body.get("model"), "keys": list(body), "messages_count": len(body.get("messages", []))}
-            index = len(calls) - 1
+            failures = 2 if args.transport_failure else 0
+            index = len(calls) - 1 - failures
+            if index < 0:
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+                return
             sequence = [("source_context", {"event_id": source.event_id, "view": "decision"}),
                         ("source_check_interpretation", {"event_id": source.event_id, "interpretation": value.model_dump(mode="json")})]
             message = {"role": "assistant", "content": "Checked; no orders."}
@@ -79,15 +87,20 @@ def main():
     model = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=model.serve_forever, daemon=True).start()
     try:
+        waits = []
         result = native_worker(SimpleNamespace(worker_fixture=fixture, hermes_source=args.hermes_source.resolve(),
-            mcp_python=args.mcp_python.absolute()), model_url=f"http://127.0.0.1:{model.server_port}/v1", model_key="synthetic-only", local_fixture=True)
+            mcp_python=args.mcp_python.absolute()), model_url=f"http://127.0.0.1:{model.server_port}/v1", model_key="synthetic-only", local_fixture=True,
+            retry_sleep=waits.append)
         assert result["completed"] and result["draft_count"] == 1 and result["checks"][0]["valid"], result
         assert result["checks"][0]["interpretation"]["evidence"][-1]["quote"] == "110"
         assert not result["forbidden_tools"] and result["order_requests"] == 0
-        assert len(calls) == len(result["request_attempts"]) == len(result["api_responses"]) == 3, {
+        assert waits == ([15, 30] if args.transport_failure else [])
+        assert len(calls) == len(result["request_attempts"]) == 3 + (2 if args.transport_failure else 0)
+        assert len(result["api_responses"]) == 3, {
             "calls": [{"model": b.get("model"), "effort": b.get("reasoning_effort"), "keys": list(b)} for b in calls],
             "requests": result["request_attempts"], "responses": result["api_responses"]}
-        print(json.dumps({"native_high_mcp_loop": True, "original_quote_shortened": True, "model_calls": len(calls), "order_requests": 0}))
+        print(json.dumps({"native_high_mcp_loop": True, "original_quote_shortened": True, "model_calls": len(calls),
+            "transport_backoff_verified": waits, "order_requests": 0}))
     finally:
         model.shutdown()
 

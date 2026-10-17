@@ -119,7 +119,10 @@ def source_leverage_interval_failure(text, interpretation):
     for line in text.splitlines():
         for match in interval.finditer(line):
             labelled = bool(re.search(r"\b(?:leverage|hebel|плечо)\s*[:=@]?\s*$", line[:match.start()], re.I))
-            header = bool(interpretation.symbol and interpretation.symbol.casefold() in line.casefold()
+            symbol_in_line = bool(interpretation.symbol and interpretation.symbol.casefold() in line.casefold()
+                                  or any(proof.field == "symbol" and proof.quote.casefold() in line.casefold()
+                                         for proof in interpretation.evidence))
+            header = bool(symbol_in_line
                           and re.search(r"[xх×]", match.group(), re.I))
             if labelled or header:
                 return "source_leverage_interval_requires_review"

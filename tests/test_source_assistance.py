@@ -147,6 +147,13 @@ def test_limit_inflection_is_shared_with_source_contract():
     assert source_assistance(context)["order_form_mentions"][0]["form"] == "limit"
 
 
+def test_symbol_alias_cannot_hide_the_source_leverage_interval():
+    source, context, value = material("$BTC/USDT LONG (2-5x). Entry 100. Stop 90. Target 1: 110. Target 2: 120.")
+    value.symbol = "BTCUSDT.P"
+    value.evidence[0] = Evidence(field="symbol", source_id=source.source_id, quote="$BTC/USDT")
+    assert not check_interpretation(context, value)["valid"]
+
+
 def test_explicit_example_framing_cannot_authorize_its_quoted_setup():
     text = "BTC LONG. Entry 100. Stop 90. Target 1: 110. Target 2: 120.\nEverything above is an example."
     source, context, value = material(text)

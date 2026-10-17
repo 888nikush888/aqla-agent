@@ -33,7 +33,7 @@ def source_digest():
     return digest([(str(p.relative_to(ROOT)).replace("\\", "/"), hashlib.sha256(p.read_bytes()).hexdigest()) for p in files])
 
 
-def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fixture=False):
+def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fixture=False, retry_sleep=time.sleep):
     import yaml
 
     fixture_path = args.worker_fixture.resolve()
@@ -48,6 +48,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     assert local_fixture or model_url == DEFAULT_MODEL_URL
     config = {"model": {"default": DEFAULT_MODEL, "provider": "custom", "base_url": model_url},
               "agent": {"stream": False, "api_max_retries": 1, "auto_recovery_cycles": 0},
+              "providers": {"custom": {"models": {DEFAULT_MODEL: {"timeout_seconds": 120, "stale_timeout_seconds": 120}}}},
               "compression": {"enabled": False}, "plugins": {"enabled": []}, "fallback_providers": [],
               "display": {"tool_progress": "off"}, "tools": {"tool_search": {"enabled": False}},
               "mcp_servers": {"aqla": {"command": str(args.mcp_python),
@@ -96,6 +97,9 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
             quiet_mode=True, save_trajectories=False, session_db=None,
             request_overrides={"stream": False, "max_tokens": 32768})
         agent.client.max_retries = 0
+        # The evaluation owns its three attempts and 15/30s backoff; native's
+        # extra last-primary rung would otherwise add an unplanned fourth try.
+        agent._try_recover_primary_transport = lambda *_args, **_kwargs: False
 
         def guard(request):
             assert request.method == "POST" and request.url.host == allowed_host
@@ -136,7 +140,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
             error = str(result.get("error", "")).lower()
             if not any(s in error for s in ("connection", "timeout", "rate limit", "temporar", "503", "502", "empty stream")):
                 break
-            time.sleep(15 * 2 ** attempt)
+            retry_sleep(15 * 2 ** attempt)
     finally:
         if agent is not None:
             agent.close()
@@ -145,7 +149,10 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
         undo()
     checks_path = directory / "checks.private.json"
     checks = json.loads(checks_path.read_text(encoding="utf-8")) if checks_path.exists() else []
-    return {"completed": bool(result is not None and not result.get("error")), "checks": checks,
+    return {"completed": bool(result is not None and result.get("completed") is True and not result.get("error")
+                               and not result.get("failed") and not result.get("interrupted") and not result.get("partial")),
+            "native_exit_reason": result.get("turn_exit_reason") if result else None,
+            "served_model": result.get("served_model") if result else None, "checks": checks,
             "draft_count": len(checks), "duration_seconds": time.monotonic() - started,
             "api_responses": measured.api, "request_attempts": requests,
             "tool_events": tool_events,
@@ -202,6 +209,7 @@ def main():
     identity = {"version": "high-tools-native-v1", "source_sha256": source_digest(),
                 "dataset_sha256": digest(cases), "master_sha256": hashlib.sha256(master.encode()).hexdigest(),
                 "effort": "high", "model": DEFAULT_MODEL, "draft_limit": 3, "transport_attempt_limit": 3,
+                "request_timeout_seconds": 120, "transport_wait_seconds": [15, 30],
                 "runs": args.runs, "order_tools_available": False}
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
     seal = args.output / "identity.json"
