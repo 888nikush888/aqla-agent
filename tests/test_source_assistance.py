@@ -272,6 +272,20 @@ def test_separate_real_price_target_with_same_number_as_outlook_has_a_valid_uniq
     assert check_interpretation(context, draft)["valid"]
 
 
+@pytest.mark.parametrize("status", ["Entry 2 ✅", "All entries achieved", "All entries filled", "All entries executed"])
+def test_completed_entry_status_cannot_reopen_the_setup(status):
+    source, context, draft = material("BTC LONG\n" + status + "\nAverage Entry Price: 100")
+    draft.entry_prices, draft.stop_loss, draft.take_profits = [100], None, []
+    draft.evidence = [Evidence(field=f, source_id=source.source_id, quote=q) for f,q in (
+        ("symbol","BTC"),("side","LONG"),("entry_prices.0","100"))]
+    checked = check_interpretation(context, draft)
+    assert not checked["valid"]
+    assert checked["errors"][0]["code"] == "entry_execution_report_not_new_signal"
+    report = Interpretation(kind="report", source_refs=[source.source_id], reason="Completed entry status",
+        evidence=[Evidence(field="classification", source_id=source.source_id, quote=source.text)])
+    assert check_interpretation(context, report)["valid"]
+
+
 def test_discrete_entry_error_explains_why_renaming_to_range_is_not_a_correction():
     source, context, _ = material("BTC LONG\nEntry: limit orders at 100 and 95\nStop 90\nTarget 110")
     value = Interpretation(kind="new_signal", symbol="BTC", side="long", entry="range", entry_prices=[95,100],

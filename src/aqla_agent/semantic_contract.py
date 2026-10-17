@@ -409,7 +409,7 @@ def supported_action_failure(text, interpretation):
     if failure:
         return failure
     if interpretation.kind == "new_signal":
-        if (re.search(r"\bentry\s+\d+\s*[✅✔]", text, re.I)
+        if (re.search(r"\b(?:entry\s+\d+\s*[✅✔]|all\s+entries\s+(?:achieved|filled|executed))", text, re.I)
                 and re.search(r"\baverage\s+entry\s+price\s*[:=@]", text, re.I)
                 and not any(CURRENT_ENTRY.search(sentence.strip()) for sentence in SENTENCES.split(current_structure_text(text)))):
             return "entry_execution_report_not_new_signal"
