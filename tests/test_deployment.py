@@ -54,6 +54,11 @@ def test_cli_new_install_defaults_to_deepseek_flash_ultra(tmp_path, monkeypatch)
     assert config["model"]["base_url"] == "https://opencode.ai/zen/go/v1"
     assert config["agent"]["reasoning_effort"] == "ultra"
     assert config["model"]["api_key"] == "${HERMES_MODEL_API_KEY}"
+    assert config["fallback_providers"] == []
+    assert config["auxiliary"]["source_interpretation"]["fallback_chain"] == []
+    assert config["plugins"]["entries"]["aqla-events"]["settings"]["source_processing"] == {"mode": "legacy"}
+    assert "openrouter" not in yaml.safe_dump(config).lower()
+    assert "OPENROUTER" not in (target / "vps.env").read_text()
     assert (target / "src" / "aqla_sheets_mcp" / "parameters.py").is_file()
 
 

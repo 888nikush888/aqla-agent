@@ -76,10 +76,10 @@ def prepare(project: Path, destination: Path, owner: str,
     python = str(destination / ".venv" / "bin" / "python")
     hermes_config = {
         "model": {"default": model, "provider": "custom", "base_url": model_url, "api_key": "${HERMES_MODEL_API_KEY}"},
-        "fallback_providers": [{"provider": "openrouter", "model": "deepseek/deepseek-v4.1-flash",
-                                "base_url": "https://openrouter.ai/api/v1", "key_env": "OPENROUTER_API_KEY", "api_mode": "chat_completions"}],
+        "fallback_providers": [],
         "skills": {"auto_load": auto_load, "write_approval": True, "creation_nudge_interval": 100},
-        "auxiliary": {"background_review": {"enabled": True, "min_interval_seconds": 21600, "max_input_tokens": 256000}},
+        "auxiliary": {"background_review": {"enabled": True, "min_interval_seconds": 21600, "max_input_tokens": 256000},
+                      "source_interpretation": {"fallback_chain": []}},
         "compression": {"enabled": True, "threshold_tokens": 128000, "tail_mode": "lean", "protect_last_n": 20,
                         "proactive_prune_tokens": 48000, "proactive_prune_min_result_chars": 8000,
                         "proactive_prune_min_reclaim_tokens": 4096, "micro_compact": False},
@@ -95,13 +95,13 @@ def prepare(project: Path, destination: Path, owner: str,
                                    "tools": {"exclude": ["sync_internal", "publish_monthly_internal", "sync_presentation_internal", "presentation_selection_internal"]}}},
         "plugins": {"enabled": ["aqla-events"], "entries": {"aqla-events": {"allow_gateway_injection": True,
                     "mcp_allowlist": ["aqla", "sheets"], "settings": {"owner_id": owner, "config_path": str(destination / "config.yaml"), "mcp_server": "aqla", "master_path": str(home / "skills" / "aqla-master" / "SKILL.md"),
-                    "source_processing": {"mode": "legacy", "model": "inception/mercury-decide:free", "key_env": "OPENROUTER_API_KEY"}}}}},
+                    "source_processing": {"mode": "legacy"}}}}},
         "platforms": {"telegram": {"enabled": True, "unauthorized_dm_behavior": "ignore", "extra": {"allow_from": [owner], "group_allow_from": []}}},
     }
     (home / "config.yaml").write_text(yaml.safe_dump(hermes_config, sort_keys=False), encoding="utf-8")
     env = "\n".join([f"HERMES_HOME={home}", f"PYTHONPATH={destination / 'src'}",
                        f"TELEGRAM_ALLOWED_USERS={owner}", f"TELEGRAM_HOME_CHANNEL={owner}",
-                       "TELEGRAM_BOT_TOKEN=", "HERMES_MODEL_API_KEY=", "OPENROUTER_API_KEY=", ""])
+                       "TELEGRAM_BOT_TOKEN=", "HERMES_MODEL_API_KEY=", ""])
     env_path = destination / "vps.env"
     env_path.write_text(env, encoding="utf-8")
     os.chmod(env_path, 0o600)

@@ -1,5 +1,7 @@
 # VPS-Betriebsabnahme
 
+Aktueller Providerstand (17.10.2026): DeepSeek V4.1 Flash über den erneuerten OpenCode-Go-Zugang, ohne OpenRouter-Fallback. Allgemeine und Quellen-Fallbackliste sind leer; der OpenRouter-Key ist aus der aktiven Laufzeit entfernt. Eine persistierte Sperre der erneuerten Go-Route wird erst nach einer erfolgreichen direkten Modellantwort gezielt entfernt. Spätere echte Quotenfehler bleiben gesperrt; Handelszustand, Risiko, Quellenfristen und Skills werden dafür nicht geändert. Der unten dokumentierte frühere OpenRouter-/Decision-Pilot bleibt historische beziehungsweise optionale Einrichtung.
+
 Stand: 03.10.2026. Tatsächliche Installation auf Debian 13 x86_64, getrennt unter `/opt/aqla`; Quellpaket unter `/opt/aqla-source`. Vorher vorhandene ungenutzte Docker-/Containerd-Pakete und Caches wurden auf ausdrücklichen Nutzerauftrag entfernt. Debian, SSH, Netzwerk und Provider-Systemdienste bleiben erhalten.
 
 ## Vorbereitungspfade — Offlineabnahme 08.10.2026
