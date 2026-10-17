@@ -10,6 +10,7 @@ import zlib
 
 from aqla_hyperliquid_mcp.models import AqlaError, digest, now_ms
 
+from .percent_targets import SOURCE_TP_PERCENT
 from .source_queue import canonical_sources, content, is_source_row, recovery_ids, version
 
 REREAD = "Source read receipt is missing, invalid, expired or stale; read source_context for the current anchor again"
@@ -29,7 +30,7 @@ def verify_percentage_classification(interpretation, original):
     # stated classification cause, not whether the source constitutes a signal.
     reason = interpretation.reason.casefold()
     target = re.search(r"\btps?\b|take.?profits?|targets?|ziele?|тейк|цел[ьи]", reason)
-    source_target = re.search(r"(?:\btps?\b|take.?profits?|targets?|ziele?|тейк|цел[ьи])\s*[:=;\-]?\s*\d+(?:[.,]\d+)?\s*%", original, re.I)
+    source_target = SOURCE_TP_PERCENT.search(original)
     percentage = re.search(r"%|percent|prozent|процент", reason)
     basis = re.search(r"\bro[ei]\b|price movement|course|kurs|margin|equity|цены|ценов|марж|движени|доходност", reason)
     uncertain = re.search(r"ambig|unclear|unknown|unspecif|missing|not (?:clear|specified)|mehrdeutig|uneindeutig|unklar|unbekannt|nicht eindeutig|nicht .*belegbar|fehl|неяс|неоднознач|неизвест|непонят|не определ|не указан", reason)

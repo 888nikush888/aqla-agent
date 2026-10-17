@@ -1,7 +1,34 @@
 """Source percentages: new own-margin ROE and preserved legacy source semantics."""
+import re
 from decimal import Decimal
 
 from aqla_hyperliquid_mcp.models import AqlaError
+
+SOURCE_TP_PERCENT = re.compile(r"(?:\btps?\b|take.?profits?|targets?|ziele?|тейк|цел[ьи])\s*[:=;\-]?\s*"
+    r"(?P<value>\d+(?:[.,]\d+)?)\s*%", re.I)
+PERCENT_VALUE = r"\d+(?:[.,]\d+)?\s*%"
+
+
+def explicit_percentage_targets(text):
+    """Recognize only unqualified percent-only target lines, never allocations."""
+    from aqla_hyperliquid_mcp.rules import quoted_numbers
+    values = []
+    for line in text.splitlines():
+        match = SOURCE_TP_PERCENT.search(line)
+        if not match or re.search(r"\w", line[:match.start()]):
+            continue
+        if line[:match.start("value")].rstrip().endswith(("-", "−")):
+            continue
+        body = line[match.start("value"):].strip()
+        # Mixed price/portion explanations remain with semantic review.
+        if not re.fullmatch(PERCENT_VALUE + r"(?:\s*[/,;|]\s*" + PERCENT_VALUE + r")*[.!]?", body):
+            continue
+        for number in re.finditer(PERCENT_VALUE, body):
+            alternatives = set(quoted_numbers(number.group()))
+            if len(alternatives) != 1:
+                return []
+            values.append(alternatives.pop())
+    return values if values == sorted(set(values)) and all(value > 0 for value in values) else []
 
 
 def reference_entry(signal, policy):

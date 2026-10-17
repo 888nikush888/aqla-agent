@@ -335,6 +335,18 @@ def unsupported_structure(packet):
     return management_structure_failure(text, ignore_tp_footers=bool(NEW_ENTRY.search(text) or SETUP_HEADING.search(text)))
 
 
+def source_percentage_target_failure(text, interpretation):
+    from .percent_targets import explicit_percentage_targets
+    actionable = (interpretation.kind == "new_signal" and interpretation.symbol and interpretation.side
+        or interpretation.kind == "trade_update" and interpretation.update_action == "replace_targets")
+    if not actionable or HYPOTHETICAL.search(text) or PAST.search(text) or PAST_WORD.search(text):
+        return None
+    values = explicit_percentage_targets(text)
+    if values and (interpretation.take_profit_unit != "roe_percent" or interpretation.take_profits != values):
+        return "source_percentage_targets_missing_or_changed"
+    return None
+
+
 def supported_action_failure(text, interpretation):
     """Return a stable rejection code for explicitly unrepresentable instructions."""
     scope = re.search(r"(?:everything\s+above\s+(?:is|was)\s+(?:an?\s+)?example|"
@@ -369,6 +381,9 @@ def supported_action_failure(text, interpretation):
     if interpretation.kind not in ("new_signal", "trade_update"):
         return None
     failure = incomplete_financial_instruction_failure(text)
+    if failure:
+        return failure
+    failure = source_percentage_target_failure(text, interpretation)
     if failure:
         return failure
     if interpretation.kind == "new_signal":

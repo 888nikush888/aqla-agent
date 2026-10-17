@@ -22,6 +22,7 @@ CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_ac
                    "source_exchange", "single_entry_form", "single_management_action")
 CONTEXT_CANDIDATE_LIMIT = 64
 REPAIR_GUIDANCE = {
+    "source_percentage_targets_missing_or_changed": "The original explicitly lists percent-only TP targets. Under source-roe-v1 these are nominal ROE targets, not position allocations. Preserve every listed target in order with take_profit_unit=roe_percent and exact percent quotes. A separate deposit/margin percent is not a TP. Do not silently substitute backup targets.",
     "live_anchor_missing": "Use anchor_source_id in source_refs, not event_id/chat_id/message_id. Evidence.source_id uses the same original source IDs. Do not remove a correctly named symbol while correcting references.",
     "update_identity_missing": "Include the managed market in the symbol FIELD when the anchor names it; symbol evidence alone does not populate the field. Otherwise use a real reply/own binding, never guess a market.",
     "source_example_requires_report_review": "The original explicitly scopes the preceding setup as an example. Inspect any independent instruction AFTER that framing; examples alone are reports, never new orders.",
@@ -34,6 +35,7 @@ REPAIR_GUIDANCE = {
     "unbound_setup_edit_is_not_management": "Python reports no accepted own setup binding. An edit/publication alone is not execution. This anchor still presents a complete entry setup, not an explicit management instruction: recheck corrected new_signal, or ambiguous when all original entry legs cannot be represented.",
 }
 REPAIR_FIELDS = {
+    "source_percentage_targets_missing_or_changed": ["take_profits", "take_profit_unit"],
     "live_anchor_missing": ["source_refs", "evidence"],
     "update_identity_missing": ["symbol", "source_refs"],
     "source_example_requires_report_review": ["kind"],

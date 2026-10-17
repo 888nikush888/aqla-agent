@@ -62,6 +62,52 @@ def test_percent_and_comma_spelling_survive_and_never_convert_to_prices():
     assert not check_interpretation(context, value)["valid"]
 
 
+@pytest.mark.parametrize("targets,unit", [([], "price"), ([50], "roe_percent"), ([50, 100], "price")])
+def test_explicit_percent_targets_cannot_disappear_into_backup_or_allocations(targets, unit):
+    source, context, value = material("BTC LONG. Entry 100. Stop 90.\nЦели: 50% / 100%\nMargin: 2% of deposit")
+    assert "new_signal" not in source_assistance(context)["original_structure_vetoes"]
+    value.take_profits, value.take_profit_unit = targets, unit
+    value.evidence = value.evidence[:4] + [Evidence(field=f"take_profits.{i}", source_id=source.source_id, quote=f"{number}%")
+        for i, number in enumerate(targets)]
+    result = check_interpretation(context, value)
+    assert not result["valid"] and result["errors"][0]["code"] == "source_percentage_targets_missing_or_changed"
+    assert result["errors"][0]["field_paths"] == ["take_profits", "take_profit_unit"]
+    value.take_profits, value.take_profit_unit = [50, 100], "roe_percent"
+    value.evidence = value.evidence[:4] + [Evidence(field=f"take_profits.{i}", source_id=source.source_id, quote=f"{number}%")
+        for i, number in enumerate((50, 100))]
+    assert check_interpretation(context, value)["valid"]
+
+
+def test_percent_completeness_applies_only_to_new_target_updates_and_current_source_sections():
+    from aqla_agent.semantic_contract import source_percentage_target_failure
+    value = Interpretation(kind="trade_update", symbol="BTC", source_refs=["current"], update_action="replace_targets")
+    text = "Targets: 50% / 100%"
+    assert source_percentage_target_failure(text, value) == "source_percentage_targets_missing_or_changed"
+    value.take_profits, value.take_profit_unit = [50, 100], "roe_percent"
+    assert source_percentage_target_failure(text, value) is None
+    value.take_profits = []
+    assert source_percentage_target_failure("Earlier result.\n" + text, value) is None
+    value.update_action = "break_even"
+    assert source_percentage_target_failure(text, value) is None
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("🎯 Targets: 50% / 100%\nMargin: 2%", [50, 100]),
+    ("Ziele: 12,5% / 25%.", ["12.5", 25]),
+    ("Targets: 110 (50% position) / 120 (50% position)", []),
+    ("Targets: 50% of position at 110", []),
+    ("Old targets: 50% / 100%", []),
+    ("Margin: 50% / 100%", []),
+    ("Targets: 1.234% / 2000%", []),
+    ("Targets -50% / 100%", []),
+])
+def test_percent_target_recognizer_keeps_mixed_allocations_and_ambiguous_numbers_for_review(text, expected):
+    from decimal import Decimal
+
+    from aqla_agent.percent_targets import explicit_percentage_targets
+    assert explicit_percentage_targets(text) == [Decimal(str(value)) for value in expected]
+
+
 @pytest.mark.parametrize("label", ["Target 1:", "TP 1:", "1)", "Ziel 1:", "Цель 1:"])
 @pytest.mark.parametrize("quote_only_number", [False, True])
 def test_numbered_label_never_becomes_a_price_even_when_submitted_already_shortened(label, quote_only_number):

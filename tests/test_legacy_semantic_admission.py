@@ -27,6 +27,9 @@ def original(server, text, **fields):
 
 
 CASES = [
+    ("BTC LONG. Entry 100.\nTargets: 50% / 100%\nMargin: 2% of deposit",
+     {"kind": "new_signal", "symbol": "BTC", "side": "long", "entry_prices": [100],
+      "quotes": [("symbol", "BTC"), ("side", "LONG"), ("entry_prices.0", "100")]}, "source_percentage_targets_missing_or_changed"),
     ("BTC LONG. Entry half MARKET 100 and half LIMIT 95. SL 90. TP 110.",
      {"kind": "new_signal", "symbol": "BTC", "side": "long", "entry": "market", "entry_prices": [100], "stop_loss": 90,
       "take_profits": [110], "quotes": [("symbol", "BTC"), ("side", "LONG"), ("entry_prices.0", "100"),
