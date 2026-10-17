@@ -43,6 +43,12 @@ CASES = [
           ("stop_loss", "90"), ("take_profits.0", "110")]}, "source_financial_instruction_incomplete"),
     ("BTC reduce 50% and move stop to95.", {"kind": "report", "reason": "Result report", "reason_codes": ["result_report"]},
      "management_actions_not_representable"),
+    ("BTC target reached. Stop to entry.", {"kind": "report", "reason": "Result report", "reason_codes": ["result_report"]},
+     "classification_omits_management_instruction"),
+    ("BTC LONG. Entry now; second entry if 95. SL 90. TP 110.",
+     {"kind": "new_signal", "symbol": "BTC", "side": "long", "entry": "market", "entry_prices": [95], "stop_loss": 90,
+      "take_profits": [110], "quotes": [("symbol", "BTC"), ("side", "LONG"), ("entry_prices.0", "95"),
+          ("stop_loss", "90"), ("take_profits.0", "110")]}, "additional_entry_legs_not_representable"),
 ]
 
 

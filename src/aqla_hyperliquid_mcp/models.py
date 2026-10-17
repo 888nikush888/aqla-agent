@@ -271,8 +271,9 @@ class Interpretation(Model):
     symbol: str | None = Field(default=None, max_length=100)
     side: Literal["long", "short"] | None = None
     leverage: Annotated[Decimal, Field(ge=1, allow_inf_nan=False)] | None = Field(default=None,
-        description="Original evidenced signal leverage, including decimals. Python floors then caps it. Null only when absent; never round before quoting evidence.")
-    entry: Literal["market", "limit", "range", "unspecified"] = "unspecified"
+        description="Original evidenced signal leverage, including decimals. Python floors then caps it. Null only when absent; never round before quoting evidence. A source leverage interval such as 2-5x is ambiguous even with a fixed profile; never choose a bound or treat the interval as missing.")
+    entry: Literal["market", "limit", "range", "unspecified"] = Field(default="unspecified",
+        description="Original SOURCE order form, not Python's execution default. market requires an explicitly named MARKET/Рынок/по рынку order. A current-price announcement without a named form stays unspecified. limit requires an explicit limit or one directional price boundary (SHORT price+ / LONG price-); range has exactly two original bounds. Never infer a source form from one reference price.")
     entry_timing: Literal["standard", "deferred"] = Field(default="standard", description="Explicitly delayed/not-now entry intent requires entry_timing evidence and a source price; Python waits, never substitute an immediate GTC order.")
     source_exchange: str | None = Field(default=None, min_length=1, max_length=100, description="Evidenced exchange named by the source. Metadata only; the operator pipeline chooses the execution exchange.")
     entry_prices: list[Positive] = Field(default_factory=list, max_length=2,

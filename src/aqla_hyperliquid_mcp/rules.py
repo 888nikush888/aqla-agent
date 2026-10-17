@@ -165,6 +165,21 @@ def slippage_price(reference: Decimal, percent: Decimal, market: Market, buy: bo
     return result
 
 
+def verify_setup_references(signal, anchor_source_id, own_setup_refs=()):
+    supported = {anchor_source_id, *(proof.source_id for proof in signal.evidence)}
+    if signal.kind == "trade_update":
+        supported.update(own_setup_refs)
+    if signal.kind in ("new_signal", "trade_update") and set(signal.source_refs) - supported:
+        raise AqlaError("Actionable source_refs include context without setup evidence; re-read source_context and select only the live instruction and original messages supporting this setup, not all context or receipt refs. Each additional source needs its own evidence or, for updates, an existing own setup binding; keep genuine setup origins")
+
+
+def verify_entry_shape(signal):
+    if signal.kind == "new_signal" and signal.entry in ("limit", "range"):
+        expected_prices = 2 if signal.entry == "range" else 1
+        if len(signal.entry_prices) != expected_prices:
+            raise AqlaError("Source entry type/prices disagree; limit needs exactly one evidenced price, range exactly two. Re-read source_context and correct the interpretation without inventing bounds")
+
+
 def verify_evidence(signal: Interpretation, events: dict):
     texts = {ref: row["source"]["text"] for ref, row in latest_sources(events, signal.source_refs).items()}
     if any(ref not in texts for ref in signal.source_refs):

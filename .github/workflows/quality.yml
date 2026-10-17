@@ -104,6 +104,8 @@ jobs:
         run: .cache/hermes-venv/bin/python tests/native_hermes_smoke.py --hermes-source .cache/hermes-source --home .cache/native-home
       - name: Tool-free native decision fallback with a local model
         run: .cache/hermes-venv/bin/python tests/native_decision_smoke.py --hermes-source .cache/hermes-source --home .cache/decision-home
+      - name: Native high with source assistance and isolated MCP
+        run: .cache/hermes-venv/bin/python tests/native_source_assistance_smoke.py --hermes-source .cache/hermes-source --home .cache/source-assistance-home --mcp-python .venv/bin/python
       - name: Operator questions, planning and legacy history migration
         run: .cache/hermes-venv/bin/python tests/native_interaction_smoke.py --hermes-source .cache/hermes-source --home .cache/interaction-home
       - name: Native Telegram message formatting, splitting and persistence

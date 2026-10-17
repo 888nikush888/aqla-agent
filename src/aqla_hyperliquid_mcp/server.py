@@ -325,6 +325,12 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         result = {"source_read_receipt": receipt, "percentage_rule": "source-roe-v1: new TP percentages use roe_percent on own initial margin before fees/funding, effective margin leverage and final own entry VWAP", **result}
         return compact_view(result, "source_context", {"event_id": event_id}, offset, limit, view_version) if view == "compact" else result
 
+    @server.tool(annotations=read)
+    async def source_check_interpretation(event_id: str, interpretation: Interpretation) -> dict:
+        """Check a source draft against current originals without saving, planning or trading. Returns precise errors and safely shortened original numeric quotes. Submit the returned interpretation to existing tools only after valid=true; their authorization and validation still apply."""
+        from aqla_agent.source_assistance import check_interpretation
+        return check_interpretation(trading.context(event_id, decision=True), interpretation)
+
     @server.tool(annotations=write)
     async def interpret_source(event_id: str, interpretation: Interpretation, context_auth: str = "", source_read_receipt: str = "",
                                result_view: Literal["full", "ack"] = "full") -> dict:

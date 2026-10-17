@@ -30,7 +30,9 @@ from aqla_hyperliquid_mcp.rules import (
     selected_targets,
     slippage_price,
     split_targets,
+    verify_entry_shape,
     verify_evidence,
+    verify_setup_references,
 )
 from aqla_hyperliquid_mcp.state import State
 
@@ -248,17 +250,11 @@ class Trading:
                 if latest_sources(snapshot["events"], [row["source_id"]])[row["source_id"]]["event_id"] != event_id:
                     raise AqlaError("An actionable interpretation must use the latest anchor revision")
             verify_evidence(interpretation, snapshot["events"])
-            if interpretation.kind == "new_signal" and interpretation.entry in ("limit", "range"):
-                expected_prices = 2 if interpretation.entry == "range" else 1
-                if len(interpretation.entry_prices) != expected_prices:
-                    raise AqlaError("Source entry type/prices disagree; limit needs exactly one evidenced price, range exactly two. Re-read source_context and correct the interpretation without inventing bounds")
-            supported_refs = {row["source_id"], *(proof.source_id for proof in interpretation.evidence)}
-            if interpretation.kind == "trade_update":
-                supported_refs.update(ref for trade in snapshot["trades"].values()
-                    if trade["chat_id"] == row["source"]["chat_id"] and interpretation.bound_trade_id in (None, trade["trade_id"])
-                    for ref in trade["plan"]["source_refs"])
-            if interpretation.kind in ("new_signal", "trade_update") and set(interpretation.source_refs) - supported_refs:
-                raise AqlaError("Actionable source_refs include context without setup evidence; re-read source_context and select only the live instruction and original messages supporting this setup, not all context or receipt refs. Each additional source needs its own evidence or, for updates, an existing own setup binding; keep genuine setup origins")
+            verify_entry_shape(interpretation)
+            own_refs = (ref for trade in snapshot["trades"].values()
+                        if trade["chat_id"] == row["source"]["chat_id"] and interpretation.bound_trade_id in (None, trade["trade_id"])
+                        for ref in trade["plan"]["source_refs"])
+            verify_setup_references(interpretation, row["source_id"], own_refs)
             from .semantic_contract import supported_action_failure
             failure = supported_action_failure(row["source"].get("text", ""), interpretation)
             if failure:

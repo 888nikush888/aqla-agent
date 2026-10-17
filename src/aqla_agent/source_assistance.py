@@ -1,0 +1,124 @@
+"""Original-only assistance for the native source agent; no model or write access."""
+from __future__ import annotations
+
+import json
+import re
+
+from aqla_hyperliquid_mcp.models import EVIDENCE_FIELDS, AqlaError, Interpretation, digest
+from aqla_hyperliquid_mcp.rules import quoted_numbers
+
+from .decisions import (
+    DecisionFailure,
+    build_packet,
+    candidates,
+    linked_candidate_refs,
+    questions_for,
+    validate_interpretation,
+    verification_questions,
+)
+
+VERSION = "source-assistance-v1"
+CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_action",
+                   "source_exchange", "single_entry_form", "single_management_action")
+CONTEXT_CANDIDATE_LIMIT = 64
+REPAIR_GUIDANCE = {
+    "source_example_requires_report_review": "The original explicitly scopes the preceding setup as an example. Inspect any independent instruction AFTER that framing; examples alone are reports, never new orders.",
+    "classification_omits_management_instruction": "An unconditional stop instruction remains current management even when a parent setup prescribed a future TP/BE rule. Channel results are not proof of our fills or an already applied stop. Recheck trade_update and its market; Python owns eligibility.",
+    "source_leverage_interval_requires_review": "The source specifies a leverage interval, not one source value. Do not pick an endpoint or pretend the field is absent. Recheck ambiguous; a fixed execution profile does not change the original communication.",
+    "source_price_boundary_requires_limit": "One SHORT price+ / >=price or LONG price- / <=price is a single limit price. Preserve that one original value; do not invent a second endpoint or default to market.",
+    "source_market_form_not_explicit_use_unspecified": "Current-price wording is not an explicitly named market order. Use unspecified for the source form; Python separately decides any permitted execution default.",
+    "source_limit_form_not_explicit_use_unspecified": "One reference price does not invent a limit order. Use unspecified unless the original names a limit, a directional price boundary or a supported strict deferred price.",
+    "signal_contains_management_instruction": "Re-read the entire original: current management belongs to trade_update, several current actions require review. Do not stuff update_action into new_signal or execute only part. Explicitly framed examples/past results do not authorize an entry.",
+}
+
+
+def context_packet(context):
+    rows = context["messages"]
+    rows = rows.values() if isinstance(rows, dict) else rows
+    messages = {row["event_id"]: row for row in [*rows, context["event"]]}
+    return build_packet({**context, "messages": list(messages.values())})
+
+
+def source_assistance(context):
+    packet = context_packet(context)
+    version = digest(packet)
+    try:
+        spans = candidates(packet)
+        questions = questions_for(packet, spans)
+    except DecisionFailure as error:
+        return {"version": VERSION, "source_version": version, "error": str(error),
+                "originals_required": True}
+    contract = {key: questions[key] for key in CONTRACT_FIELDS}
+    for key in ("symbol", "source_exchange"):
+        contract[key] = {"instructions": contract[key]["instructions"]}
+    entry = json.loads(contract["entry"]["instructions"])
+    contract["entry"] = {**contract["entry"], "instructions": entry["question"]}
+    contract["verification"] = verification_questions()
+    return {"version": VERSION, "source_version": version, "contract": contract,
+            "anchor_setup_bound": packet["anchor_setup_bound"],
+            "linked_source_ids": sorted(linked_candidate_refs(packet)),
+            "order_form_mentions": entry["original_order_form_mentions"],
+            "candidates": [span.model_dump(mode="json") for span in spans
+                           if span.kind != "text" and span.notation != "ordinal"][:CONTEXT_CANDIDATE_LIMIT],
+            "candidates_complete": sum(span.kind != "text" and span.notation != "ordinal" for span in spans) <= CONTEXT_CANDIDATE_LIMIT,
+            "candidate_limit": CONTEXT_CANDIDATE_LIMIT,
+            "candidate_roles_are_not_inferred": True,
+            "workflow": "Use source_check_interpretation before saving or planning. Copy original candidate quotes. "
+                        "Check the complete anchor, including new management instructions in reports. "
+                        "Non-actionable results need only kind, source_refs, classification evidence, reason and reason_codes; "
+                        "omit all unused trading fields. Correct at most three drafts per processing turn. "
+                        "A valid semantic check is not execution permission; historical sources remain non-executable."}
+
+
+def precise_numeric_evidence(packet, interpretation):
+    """Only shorten an already original quote around one unambiguous matching value."""
+    result = interpretation.model_copy(deep=True)
+    originals = {row["source_id"]: row["text"] for row in packet["messages"]}
+    numeric = {"stop_loss": result.stop_loss}
+    numeric.update({f"entry_prices.{i}": value for i, value in enumerate(result.entry_prices)})
+    numeric.update({f"take_profits.{i}": value for i, value in enumerate(result.take_profits)})
+    for proof in result.evidence:
+        value = numeric.get(proof.field)
+        original = originals.get(proof.source_id, "")
+        if value is None or proof.source_id not in result.source_refs or proof.quote not in original:
+            continue
+        occurrences = list(re.finditer(re.escape(proof.quote), original))
+        if len(occurrences) != 1:
+            continue
+        numbers = list(re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])(?:\s*%)?", proof.quote))
+        matching = [number for number in numbers if set(quoted_numbers(number.group())) == {value}]
+        if len(matching) == 1:
+            number = matching[0]
+            if proof.quote[:number.start()].rstrip().endswith(("-", "−", "/")):
+                continue
+            # The source unit is checked again by verify_evidence after shortening.
+            proof.quote = number.group()
+    return result
+
+
+def check_interpretation(context, interpretation: Interpretation):
+    packet = context_packet(context)
+    result = precise_numeric_evidence(packet, interpretation)
+    errors = []
+    try:
+        if context.get("source_read_error"):
+            raise DecisionFailure("source_context_changed_reread_required")
+        validate_interpretation(packet, result)
+        if result.kind == "new_signal" and result.entry in ("market", "limit"):
+            from .semantic_contract import LIMIT, MARKET, source_price_boundary_failure, strict_deferred_price
+            text = next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+            if result.entry == "market" and not MARKET.search(text):
+                raise DecisionFailure("source_market_form_not_explicit_use_unspecified")
+            if (result.entry == "limit" and not LIMIT.search(text)
+                    and not source_price_boundary_failure(text, result.model_copy(update={"entry": "unspecified"}))
+                    and not strict_deferred_price(text, result.entry_timing, result.entry_prices)):
+                raise DecisionFailure("source_limit_form_not_explicit_use_unspecified")
+    except AqlaError as error:
+        message = str(error)
+        errors.append({"code": message if isinstance(error, DecisionFailure) else "source_evidence_invalid",
+                       "field_paths": [field for field in EVIDENCE_FIELDS
+                                       if re.search(r"(?<![\w.])" + re.escape(field) + r"(?![\w.])", message)],
+                       "message": message, **({"repair": REPAIR_GUIDANCE[message]} if message in REPAIR_GUIDANCE else {})})
+    return {"event_id": packet["anchor_event_id"], "source_version": digest(packet), "valid": not errors,
+            "interpretation": result.model_dump(mode="json"), "errors": errors,
+            "reread_required": bool(context.get("source_read_error")), "execution_authorized": False}

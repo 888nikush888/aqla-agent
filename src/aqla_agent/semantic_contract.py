@@ -8,6 +8,8 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
+from aqla_hyperliquid_mcp.rules import quoted_numbers
+
 
 def pattern(expression):
     return re.compile(expression, re.I)
@@ -16,7 +18,7 @@ def pattern(expression):
 WORD = r"(?<!\w)"
 END = r"(?!\w)"
 MARKET = pattern(WORD + r"(?:market|markt|рынок|маркет(?:у|ом)?|по\s+рынку)" + END)
-LIMIT = pattern(WORD + r"(?:limit|лимит(?:ный|ная|ные|ка|кой|ом)?)" + END)
+LIMIT = pattern(WORD + r"(?:limit|лимит(?:н(?:ый|ая|ые|ым|ую|ого|ой|ому|ом|ыми|ых)|к(?:а|и|ой|у|ами|ах)|ом)?)" + END)
 ENTRY = pattern(WORD + r"(?:entry|enter|buy|sell|einstieg|einsteigen|вход|входим|войти)" + END)
 PORTION = pattern(WORD + r"(?:half|quarter|hälfte|halbe\w*|viertel|половин\w*|четверть|[1-3]\s*/\s*[24]|\d+\s*%)" + END)
 PAST = pattern(WORD + r"(?:yesterday|previously|already|earlier|gestern|bereits|zuvor|вчера|ранее|уже)" + END)
@@ -45,6 +47,8 @@ CONDITION = pattern(WORD + r"(?:if|when|once|after|until|falls|wenn|sobald|nachd
 STOP_CONDITION = pattern(WORD + r"(?:stop(?:[-\s]+loss)?|sl|стоп(?:[-\s]*лосс)?)\s*[:=-]?\s*"
                          r"(?:\w+\s+){0,4}(?:h\d+|\d+\s*[hm]|hourly|daily|candle\w*|свеч\w*|часов\w*|kerz\w*)" + END)
 EXTRA_ENTRY = pattern(WORD + r"(?:bids?|averag(?:e|ing)(?!\s+entry\s+price\b)|additional\s+(?:limit|entries|entry)|"
+                      r"second\s+(?:entry|order|leg|tranche)|втор\w*\s+(?:набор|вход|добор|ордер)|"
+                      r"zweit\w*\s+(?:einstieg|order|tranche)|"
                       r"усреднен\w*|докуп\w*|nachkauf\w*|zusätzlich\w*\s+(?:limit|einstieg))" + END)
 TP_LABEL = pattern(WORD + r"(?:tp\s*\d|target\s*\d|тейк\w*|цел\w*|ziel\w*)" + END)
 NEW_ENTRY = pattern(WORD + r"(?:entry|einstieg|вход)\s*[:=@]|"
@@ -79,6 +83,49 @@ def strict_deferred_price(text, entry_timing, entry_prices):
     return entry_timing == "deferred" and len(entry_prices) == 1 and bool(STRICT_ENTRY_PRICE.search(text))
 
 
+def one_sided_live_entry_limit(packet, span, side):
+    """One directional price boundary is a limit, never an invented second bound."""
+    if span is None or span.source_id != packet["anchor_source_id"] or span.kind != "number" or "%" in span.quote:
+        return False
+    text = next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    return one_sided_entry_limit(text, span.start, span.end, side)
+
+
+def one_sided_entry_limit(text, start, end, side):
+    prefix = text[text.rfind("\n", 0, start) + 1:start]
+    if not (ENTRY.search(prefix) or ENTRY_ZONE.search(prefix)):
+        return False
+    suffix = text[end:]
+    return bool(side == "short" and (re.match(r"\s*\+(?!\d)", suffix) or re.search(r"(?:>=|≥)\s*$", prefix))
+                or side == "long" and (re.match(r"\s*[-−](?!\s*\d)", suffix) or re.search(r"(?:<=|≤)\s*$", prefix)))
+
+
+def source_price_boundary_failure(text, interpretation):
+    if interpretation.entry == "limit" or len(interpretation.entry_prices) != 1:
+        return None
+    from .decisions import NUMBERS
+    for match in NUMBERS.finditer(text):
+        if (set(quoted_numbers(match.group())) == {interpretation.entry_prices[0]}
+                and one_sided_entry_limit(text, match.start(), match.end(), interpretation.side)):
+            return "source_price_boundary_requires_limit"
+    return None
+
+
+def source_leverage_interval_failure(text, interpretation):
+    if interpretation.kind != "new_signal":
+        return None
+    atom = r"(?:[xх×]\s*)?\d+(?:[.,]\d+)?(?:\s*[xх×])?"
+    interval = re.compile(r"(?<![\w.])" + atom + r"\s*[-–—]\s*" + atom + r"(?!\w)", re.I)
+    for line in text.splitlines():
+        for match in interval.finditer(line):
+            labelled = bool(re.search(r"\b(?:leverage|hebel|плечо)\s*[:=@]?\s*$", line[:match.start()], re.I))
+            header = bool(interpretation.symbol and interpretation.symbol.casefold() in line.casefold()
+                          and re.search(r"[xх×]", match.group(), re.I))
+            if labelled or header:
+                return "source_leverage_interval_requires_review"
+    return None
+
+
 def bounded_live_entry_range(packet, spans):
     """One original bounded price phrase, never two unrelated numeric mentions."""
     if len(spans) != 2 or any(span is None or span.source_id != packet["anchor_source_id"]
@@ -91,7 +138,7 @@ def bounded_live_entry_range(packet, spans):
     return (not entry_structure_failure(text) and bool(re.fullmatch(
         r"\s*(?:[-–—]|to|bis|до)\s*", text[first.end:second.start], re.I)))
 VERB = r"(?:move|set|put|bring|raise|lower|trail|adjust|переносим|перенести|переводим|перевести|перестав\w*|двигаем|подтягиваем|ставим|ставлю|ставь|setz\w*|zieh\w*|verschieb\w*)"
-STOP = r"(?:the\s+)?(?:stop(?:[-\s]+loss)?|стоп\w*)"
+STOP = r"(?:the\s+)?(?:stopp?(?:[-\s]+loss)?|стоп\w*)"
 BREAK_EVEN = r"(?:break[-\s]?even|breakeven|entry|einstand|безубыт\w*|б[./\s]?у|вход\w*)"
 STOP_ACTION = pattern(WORD + VERB + r"\s+(?:\w+\s+){0,3}" + STOP + r"|" + WORD + STOP + r"\s+(?:now\s+|jetzt\s+)?(?:to|auf|в|на)\s+")
 BE_DESTINATION = pattern(BREAK_EVEN)
@@ -277,15 +324,19 @@ def unsupported_structure(packet):
 
 def supported_action_failure(text, interpretation):
     """Return a stable rejection code for explicitly unrepresentable instructions."""
+    scope = re.search(r"(?:everything\s+above\s+(?:is|was)\s+(?:an?\s+)?example|"
+        r"alles\s+obige\s+(?:ist|war)\s+(?:ein\s+)?beispiel|"
+        r"вс[её]\s*,?\s*что\s+выше[^\n.!?]{0,100}\bпример\w*)", text, re.I)
+    if scope and interpretation.kind in ("new_signal", "trade_update"):
+        tail = text[scope.end():]
+        if not NEW_ENTRY.search(tail) and not SETUP_HEADING.search(tail) and not current_actions(tail):
+            return "source_example_requires_report_review"
     if interpretation.kind in ("report", "unrelated"):
         if interpretation.kind == "report":
             # Original document framing scopes examples and chapter headings, never live orders.
             chapters = list(re.finditer(r"(?m)^\s*\d{1,2}:\d{2}(?::\d{2})?\s*[-–—]\s*[^\n]+", text))
             if len(chapters) >= 3 and re.search(r"\b(?:video|chapters?|webinar|kapitel|видео|разбираем|обсуждаем)\b", text, re.I):
                 text = re.sub(r"(?m)^\s*\d{1,2}:\d{2}(?::\d{2})?\s*[-–—]\s*[^\n]+", "", text)
-            scope = re.search(r"(?:everything\s+above\s+(?:is|was)\s+(?:an?\s+)?example|"
-                r"alles\s+obige\s+(?:ist|war)\s+(?:ein\s+)?beispiel|"
-                r"вс[её]\s*,?\s*что\s+выше[^\n.!?]{0,100}\bпример\w*)", text, re.I)
             if scope:
                 text = text[scope.end():]
             if PAST_WORD.search(text):
@@ -295,7 +346,13 @@ def supported_action_failure(text, interpretation):
             failure = entry_structure_failure(text)
             if failure:
                 return failure
-        return management_structure_failure(text, ignore_tp_footers=bool(NEW_ENTRY.search(text) or SETUP_HEADING.search(text)))
+        failure = management_structure_failure(text, ignore_tp_footers=bool(NEW_ENTRY.search(text) or SETUP_HEADING.search(text)))
+        if failure:
+            return failure
+        # Bare exit/close words also describe market analysis (e.g. a candle close).
+        if any(action in ("break_even", "move_stop") for action, _ in current_actions(text, include_tp_footers=False)):
+            return "classification_omits_management_instruction"
+        return None
     if interpretation.kind not in ("new_signal", "trade_update"):
         return None
     failure = incomplete_financial_instruction_failure(text)
@@ -313,6 +370,12 @@ def supported_action_failure(text, interpretation):
         return "conditional_stop_not_representable"
     if interpretation.kind == "new_signal":
         failure = entry_structure_failure(text)
+        if failure:
+            return failure
+        failure = source_leverage_interval_failure(text, interpretation)
+        if failure:
+            return failure
+        failure = source_price_boundary_failure(text, interpretation)
         if failure:
             return failure
         if current_actions(text, include_tp_footers=False):

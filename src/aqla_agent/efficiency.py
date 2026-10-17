@@ -11,7 +11,7 @@ from .execution_outcome import diagnostic_view, trade_outcome
 from .source_queue import is_source_row
 
 SOURCE_TOOLS = tuple("mcp__aqla__" + name for name in (
-    "status", "source_lookup", "source_context", "source_context_batch", "interpret_source", "interpret_source_batch",
+    "status", "source_lookup", "source_context", "source_context_batch", "source_check_interpretation", "interpret_source", "interpret_source_batch",
     "trade_preview", "trade_execute", "trade_update", "trade_diagnostics", "operation_status", "operation_reconcile",
     "notifications_read", "notifications_details", "notifications_ack", "ranking_status", "monthly_report")) + ("aqla_read_tool_result",)
 
@@ -74,20 +74,32 @@ def decision_context(context):
                        "detail": {"tool": "trade_diagnostics", "trade_id": row["trade_id"]}})
     result = {key: value for key, value in context.items() if key not in
               ("event", "messages", "trades", "source_names")}
+    from .source_assistance import source_assistance
     result.update(view="decision", anchor_event_id=anchor["event_id"], anchor_source_id=anchor["source_id"],
                   message_ids=list(messages), messages=messages, trades=trades,
                   percentage_rule="Absolute targets without %: price. Explicit source TP percentages: roe_percent on own initial margin before costs.",
                   source_name=context.get("source_name"),
-                  projection={"source_bodies": "lossless", "stored_trade_details_omitted": True})
+                  projection={"source_bodies": "lossless", "stored_trade_details_omitted": True},
+                  interpretation_assistance=source_assistance(context))
     return result
 
 
 def decision_batch(contexts):
     if not 1 <= len(contexts) <= 8:
         raise AqlaError("Source context batch requires 1–8 distinct event IDs")
-    messages, trades, configurations, items = {}, {}, {}, []
+    messages, trades, configurations, items, contracts, candidates = {}, {}, {}, [], {}, {}
     for context in contexts:
         result = decision_context(context)
+        assistance = result["interpretation_assistance"]
+        if "candidates" in assistance:
+            spans = assistance.pop("candidates")
+            candidates.update({span["candidate_id"]: span for span in spans})
+            assistance["candidate_ids"] = [span["candidate_id"] for span in spans]
+        if "contract" in assistance:
+            contract = assistance.pop("contract")
+            identity = signature(contract)[:24]
+            contracts[identity] = contract
+            assistance["contract_id"] = identity
         percentage_rule = result.pop("percentage_rule")
         source_messages = result.pop("messages")
         for identity, row in source_messages.items():
@@ -108,7 +120,8 @@ def decision_batch(contexts):
         items.append({**result, "message_ids": list(source_messages),
                       "trade_ids": trade_keys, "configuration_id": config_id})
     return {"view": "decision_batch", "items": items, "messages": messages, "trades": trades,
-            "configurations": configurations, "source_bodies": "lossless", "percentage_rule": percentage_rule}
+            "configurations": configurations, "interpretation_contracts": contracts, "interpretation_candidates": candidates,
+            "source_bodies": "lossless", "percentage_rule": percentage_rule}
 
 
 def classification_ack(row, changed):
