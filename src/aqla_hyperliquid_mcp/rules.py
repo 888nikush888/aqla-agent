@@ -211,6 +211,10 @@ def slippage_price(reference: Decimal, percent: Decimal, market: Market, buy: bo
 
 
 def verify_setup_references(signal, anchor_source_id, own_setup_refs=()):
+    if signal.kind not in ("new_signal", "trade_update"):
+        if set(signal.source_refs) != {anchor_source_id}:
+            raise AqlaError("Non-actional source_refs must contain only the current anchor; keep reply context separate from classification targets")
+        return
     supported = {anchor_source_id, *(proof.source_id for proof in signal.evidence)}
     own_setup_refs = set(own_setup_refs)
     if signal.kind == "trade_update":

@@ -166,6 +166,8 @@ def check_interpretation(context, interpretation: Interpretation):
                        "message": message, **({"repair": REPAIR_GUIDANCE[message]} if message in REPAIR_GUIDANCE else {})}
         if numeric_context:
             detail.update(code="source_numeric_proof_needs_context", repair="Use a longer UNIQUE exact original span, including the target label and its value if needed. Verified numbering labels are context, not prices. Do not resubmit a bare repeated number or crop digits from a decimal. Preserve the actual source value and unit.")
+        if message.startswith("Non-actional source_refs"):
+            detail.update(code="classification_scope_requires_anchor_only", repair="Use ONLY anchor_source_id in source_refs and classification evidence. Remove parent/context refs and their proofs from this non-actional result; they remain readable through the reply chain. Do not add parent proofs merely to retain an extra classification target.")
         if not any(row["message"] == message for row in errors):
             errors.append(detail)
     return {"event_id": packet["anchor_event_id"], "anchor_source_id": packet["anchor_source_id"],

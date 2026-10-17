@@ -103,6 +103,8 @@ def verify_disposition(snapshot, event_id, interpretation, token, key, *, stamp=
         raise AqlaError("Financial execution/recovery revision is immutable")
     if row["source_id"] not in interpretation.source_refs or not interpretation.reason.strip():
         raise AqlaError("Classification requires the current anchor reference and a reason")
+    from aqla_hyperliquid_mcp.rules import verify_setup_references
+    verify_setup_references(interpretation, row["source_id"])
     if not row["source"].get("text", "").strip() and interpretation.kind == "incomplete":
         return
     if not any(proof.field == "classification" and proof.source_id == row["source_id"]

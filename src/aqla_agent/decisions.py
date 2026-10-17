@@ -24,8 +24,8 @@ from aqla_hyperliquid_mcp.rules import (
 
 from .evidence import position_fractions
 
-VERSION = "aqla-decisions-v25"
-QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v12"
+VERSION = "aqla-decisions-v26"
+QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v13"
 # The original-context wire shape is unchanged. Keeping its independent schema
 # version permits exact-state, exact-question observations to be reused for
 # development while decision/validation policy has its own version and cache key.

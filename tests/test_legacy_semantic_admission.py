@@ -125,6 +125,29 @@ async def test_legacy_batch_preserves_partial_success_and_each_current_receipt(l
 
 
 @pytest.mark.asyncio
+async def test_single_and_batch_nonaction_writes_recheck_anchor_only_scope(legacy_server):
+    server, state, fake = legacy_server
+    parent = SourceEvent(chat_id="channel", message_id=910, sent_at=now_ms(), text="BTC LONG. Entry 100.")
+    source = SourceEvent(chat_id="channel", message_id=911, reply_to_id=910, sent_at=now_ms(), text="Yesterday the target was reached.")
+    for item in (parent, source):
+        server.aqla_trading.ingest(item)
+    value = Interpretation(kind="report", source_refs=[source.source_id, parent.source_id], reason="Completed report",
+        evidence=[Evidence(field="classification", source_id=source.source_id, quote=source.text)])
+    receipt = server.aqla_trading.context(source.event_id)["source_read_receipt"]
+    auth = server.aqla_authority.sign("source", "classification-scope")
+    with pytest.raises(ToolError, match="Non-actional source_refs"):
+        await server.call_tool("interpret_source", {"event_id": source.event_id, "interpretation": value.model_dump(mode="json"),
+            "source_read_receipt": receipt, "context_auth": auth})
+    item = value.model_dump(mode="json", include={"kind", "source_refs", "evidence", "reason", "reason_codes"})
+    response = await server.call_tool("interpret_source_batch", {"items": [{**item, "event_id": source.event_id,
+        "source_read_receipt": receipt}], "context_auth": auth})
+    result = response.structured_content or json.loads(response.content[0].text)
+    assert not result["items"][0]["ok"] and "Non-actional source_refs" in result["items"][0]["error"]
+    assert state.snapshot()["events"][source.event_id]["interpretation"] is None
+    assert not state.snapshot()["plans"] and not state.snapshot()["operations"] and not fake.actions
+
+
+@pytest.mark.asyncio
 async def test_actual_legacy_status_keeps_previous_decision_jobs_as_history(legacy_server):
     server, state, fake = legacy_server
     state.update_metadata(("source_jobs",), lambda data: data["source_jobs"].update({

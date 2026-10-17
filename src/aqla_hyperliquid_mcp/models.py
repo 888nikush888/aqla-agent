@@ -248,7 +248,8 @@ class SourceClassification(Model):
     """A non-actionable batch item cannot carry any trade instruction."""
     event_id: str = Field(min_length=1, max_length=256)
     kind: Literal["report", "unrelated", "incomplete", "ambiguous"]
-    source_refs: list[str] = Field(min_length=1, max_length=20)
+    source_refs: list[str] = Field(min_length=1, max_length=20,
+        description="Only the selected anchor source_id is classified. Reply/parent context remains readable but is not an additional classification target.")
     evidence: list[Evidence] = Field(default_factory=list, max_length=60,
         description="Include field=classification, current anchor source_id and an exact original quote; every item needs its own proof. Empty-text incomplete is the only quote exception.")
     reason: str = Field(min_length=1, max_length=2000)
@@ -267,7 +268,7 @@ class SourceClassification(Model):
 class Interpretation(Model):
     kind: Literal["new_signal", "trade_update", "report", "unrelated", "incomplete", "ambiguous"]
     source_refs: list[str] = Field(min_length=1, max_length=20,
-        description="Source IDs supporting this setup, not every message read in context or receipt. Include the live instruction; every additional source must supply original evidence or, for trade_update, belong to an existing own setup binding. Keep genuine multi-message setup origins, whose earliest publication fixes the signal deadline.")
+        description="For report/unrelated/incomplete/ambiguous use ONLY the selected anchor source_id. For an actionable setup include the live instruction; each additional source must supply original evidence or, for trade_update, belong to an existing own binding. Do not copy every context/receipt ref. Keep genuine setup origins, whose earliest publication fixes the deadline.")
     symbol: str | None = Field(default=None, max_length=100)
     side: Literal["long", "short"] | None = None
     leverage: Annotated[Decimal, Field(ge=1, allow_inf_nan=False)] | None = Field(default=None,

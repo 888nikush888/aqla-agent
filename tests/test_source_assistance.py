@@ -285,6 +285,20 @@ def test_one_check_reports_independent_reference_and_intent_errors_together():
     assert source_assistance(context)["original_structure_vetoes"]["trade_update"] == "unbound_setup_edit_is_not_management"
 
 
+def test_nonactional_classification_targets_only_the_current_message():
+    parent, _, _ = material("BTC LONG. Entry 100.")
+    source = SourceEvent(chat_id=parent.chat_id, message_id=2, reply_to_id=parent.message_id, sent_at=now_ms(),
+        text="Yesterday BTC reached its target.")
+    rows = [{"event_id": s.event_id, "source_id": s.source_id, "source": s.model_dump(mode="json")} for s in (parent, source)]
+    context = {"event": rows[-1], "messages": rows, "trades": []}
+    value = Interpretation(kind="report", source_refs=[source.source_id, parent.source_id], reason="Completed result",
+        evidence=[Evidence(field="classification", source_id=source.source_id, quote=source.text)])
+    result = check_interpretation(context, value)
+    assert not result["valid"] and result["errors"][0]["code"] == "classification_scope_requires_anchor_only"
+    value.source_refs = [source.source_id]
+    assert check_interpretation(context, value)["valid"]
+
+
 def test_update_rejects_only_redundant_unbound_parent_identity():
     from aqla_hyperliquid_mcp.models import AqlaError
     from aqla_hyperliquid_mcp.rules import verify_setup_references
