@@ -28,13 +28,17 @@ def main():
     home.mkdir(parents=True, exist_ok=True)
     source = SourceEvent(chat_id="synthetic-source", message_id=1, sent_at=1000,
         text="BTC LONG. Entry 100. Stop 90. Target 1: 110.", historical=True)
+    unrelated = SourceEvent(chat_id="synthetic-source", message_id=2, sent_at=900,
+        text="ETH SHORT. Entry 200. Stop 210. Target 180.", historical=True)
     row = {"event_id": source.event_id, "source_id": source.source_id, "source": source.model_dump(mode="json")}
     packet = build_packet({"event": row, "messages": [row], "trades": []})
     value = Interpretation(kind="new_signal", symbol="BTC", side="long", entry_prices=[100], stop_loss=90, take_profits=[110],
         source_refs=[source.source_id], evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f, q in (
             ("symbol", "BTC"), ("side", "LONG"), ("entry_prices.0", "Entry 100"), ("stop_loss", "Stop 90"), ("take_profits.0", "Target 1: 110"))])
     fixture = home / "fixture.private.json"
-    write_private_json(fixture, {"packet": packet, "master": "Synthetic historical interpretation, no orders.", "session_id": "native-smoke"})
+    write_private_json(fixture, {"packet": packet, "context_messages": [row, {"event_id": unrelated.event_id,
+        "source_id": unrelated.source_id, "source": unrelated.model_dump(mode="json")}],
+        "master": "Synthetic historical interpretation, no orders.", "session_id": "native-smoke"})
     calls = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -94,6 +98,9 @@ def main():
         assert result["completed"] and result["draft_count"] == 1 and result["checks"][0]["valid"], result
         assert result["checks"][0]["interpretation"]["evidence"][-1]["quote"] == "110"
         assert not result["forbidden_tools"] and result["order_requests"] == 0
+        from aqla_hyperliquid_mcp.storage import read_snapshot
+        retained = read_snapshot(home / "state.sqlite3")
+        assert set(retained["events"]) == {source.event_id, unrelated.event_id}
         assert waits == ([15, 30] if args.transport_failure else [])
         assert len(calls) == len(result["request_attempts"]) == 3 + (2 if args.transport_failure else 0)
         assert len(result["api_responses"]) == 3, {

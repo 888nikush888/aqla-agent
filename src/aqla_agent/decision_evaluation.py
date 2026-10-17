@@ -153,7 +153,7 @@ def complete_fields(interpretation):
     return {key: value(getattr(interpretation, key)) for key in type(interpretation).model_fields}
 
 
-def case_packet(case):
+def case_context(case):
     sources = [SourceEvent.model_validate({"received_at": text.get("edited_at") or text.get("sent_at"), **text}) if isinstance(text, dict) else SourceEvent(
         chat_id=case.get("chat_id", case["id"]), message_id=i + 1, sent_at=1000 + i, received_at=1000 + i,
         reply_to_id=case.get("reply_to_id") if i == len(case["messages"]) - 1 else None, text=text)
@@ -167,7 +167,11 @@ def case_packet(case):
         "messages": [{"event_id": identity, "source_id": s.source_id, "source": s.model_dump(mode="json")}
                      for s, identity in zip(sources, event_ids, strict=True)],
         "trades": case.get("trades", [])}
-    return build_packet(context)
+    return context
+
+
+def case_packet(case):
+    return build_packet(case_context(case))
 
 
 def annotation_mismatches(interpretation, expected):

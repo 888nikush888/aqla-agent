@@ -23,7 +23,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from aqla_agent.decision_evaluation import write_private_json  # noqa: E402
+from aqla_agent.decision_evaluation import case_context, write_private_json  # noqa: E402
 from aqla_agent.install import DEFAULT_MODEL, DEFAULT_MODEL_URL  # noqa: E402
 from aqla_hyperliquid_mcp.models import Interpretation, digest  # noqa: E402
 
@@ -206,10 +206,11 @@ def main():
     master = args.master.read_text(encoding="utf-8")
     manifest = payload.get("protocol", payload.get("manifest"))
     assert digest(cases) == manifest["dataset_sha256"]
-    identity = {"version": "high-tools-native-v1", "source_sha256": source_digest(),
+    identity = {"version": "high-tools-native-v2", "source_sha256": source_digest(),
                 "dataset_sha256": digest(cases), "master_sha256": hashlib.sha256(master.encode()).hexdigest(),
                 "effort": "high", "model": DEFAULT_MODEL, "draft_limit": 3, "transport_attempt_limit": 3,
                 "request_timeout_seconds": 120, "transport_wait_seconds": [15, 30],
+                "context_mode": "all_retained_original_messages_no_cached_labels",
                 "runs": args.runs, "order_tools_available": False}
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
     seal = args.output / "identity.json"
@@ -246,7 +247,8 @@ def main():
             if budget_used[0] >= 5:
                 return {"case_id": case["id"], "run": run, "passed": False, "first_draft_passed": False,
                         "mismatch_fields": ["quota_estimate_limit"], "order_requests": 0}
-        fixture = {"packet": case["packet"], "master": master, "session_id": digest([case["id"], run])[:24]}
+        fixture = {"packet": case["packet"], "context_messages": case_context(case)["messages"],
+                   "master": master, "session_id": digest([case["id"], run])[:24]}
         fixture_path = directory / "fixture.private.json"
         write_private_json(fixture_path, fixture)
         command = [sys.executable, "-B", str(Path(__file__).resolve()), "--hermes-source", str(args.hermes_source),

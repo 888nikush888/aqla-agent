@@ -1,7 +1,7 @@
 import importlib.util
 from pathlib import Path
 
-from aqla_agent.decision_evaluation import complete_fields
+from aqla_agent.decision_evaluation import case_context, case_packet, complete_fields
 from aqla_agent.source_replay import canonical_symbol, mismatches
 from aqla_hyperliquid_mcp.models import Interpretation
 
@@ -17,6 +17,14 @@ def test_replay_grader_does_not_hide_wrong_prices_or_false_entries():
     assert "kind" in mismatches(value, complete_fields(report))
     assert canonical_symbol("1000PEPEUSDT.P") != canonical_symbol("PEPE")
     assert canonical_symbol("BTCUSDC.P") == "BTC"
+
+
+def test_native_context_retains_unlinked_originals_while_semantic_candidates_stay_scoped():
+    case = {"id": "synthetic-context", "messages": ["ETH SHORT. Entry 200. Stop 210.", "BTC LONG. Entry 100. Stop 90."]}
+    context = case_context(case)
+    packet = case_packet(case)
+    assert len(context["messages"]) == 2 and len(packet["messages"]) == 1
+    assert context["messages"][-1]["source"]["text"] == packet["messages"][0]["text"]
 
 
 def test_only_final_valid_checked_native_result_can_pass():

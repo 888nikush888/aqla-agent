@@ -59,10 +59,10 @@ def serve_fixture(path):
     settings = Settings(network="testnet", account="0x" + "1" * 40,
                         state_path=directory / "state.sqlite3", sources=sorted({m["chat_id"] for m in packet["messages"]}))
     state = State(settings)
-    rows = {m["event_id"]: {"event_id": m["event_id"], "source_id": m["source_id"],
-            "source": {k: v for k, v in m.items() if k not in ("event_id", "source_id")},
-            "status": "pending" if m["event_id"] == packet["anchor_event_id"] else "context", "interpretation": None}
-            for m in packet["messages"]}
+    originals = fixture.get("context_messages") or [{"event_id": m["event_id"], "source_id": m["source_id"],
+                  "source": {k: v for k, v in m.items() if k not in ("event_id", "source_id")}} for m in packet["messages"]]
+    rows = {m["event_id"]: {**m, "status": "pending" if m["event_id"] == packet["anchor_event_id"] else "context",
+                           "interpretation": None} for m in originals}
     state.update(lambda data: data["events"].update(rows))
 
     def blocked(request):
