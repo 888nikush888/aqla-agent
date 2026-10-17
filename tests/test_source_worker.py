@@ -618,7 +618,11 @@ async def test_only_the_actual_model_route_must_fit_its_input_budget(worker_boun
     packet["approved_source_guidance"] = extension.master_path.read_text(encoding="utf-8")
     spans = candidates(packet)
     decision_size = len(json.dumps({"model": probe.config.model, "state": packet, "questions": questions_for(packet, spans)}, ensure_ascii=False))
-    fallback_size = len(json.dumps(probe.fallback_messages(packet, "decision_review_required", spans), ensure_ascii=False))
+    # An actual uncalibrated fallback includes the decision review; an unselected
+    # fallback's raw schema size must not be assumed larger than all questions.
+    reviewed = {**packet, "decision_review": {"failure_code": "source_not_calibrated",
+                "open_questions": probe.review_questions("source_not_calibrated")}}
+    fallback_size = len(json.dumps(probe.fallback_messages(reviewed, "decision_review_required", spans), ensure_ascii=False))
     limit = decision_size + 10
     assert decision_size < limit < fallback_size
     requests, fallbacks = [], []
