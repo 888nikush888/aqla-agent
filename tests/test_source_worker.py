@@ -601,7 +601,7 @@ async def test_original_signal_expiry_stops_retry_before_any_further_model_or_di
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("calibrated", [True, False])
-async def test_only_the_actual_model_route_must_fit_its_input_budget(worker_boundary, calibrated):
+async def test_only_the_actual_model_route_must_fit_its_input_budget(worker_boundary, calibrated, monkeypatch):
     from aqla_agent.decisions import build_packet, candidates, questions_for
     extension, server, state, fake, _, _ = worker_boundary
     source = SourceEvent(chat_id="channel", message_id=106, sent_at=now_ms(), text="Result report.")
@@ -611,6 +611,11 @@ async def test_only_the_actual_model_route_must_fit_its_input_budget(worker_boun
         thresholds={"kind": 0.99}, source_evidence={"channel": {"calibration_groups": 3, "holdout_groups": 5,
             "accepted_accuracy": 1, "critical_errors": 0, "kinds": {"report": {
                 "calibration_correct_groups": 1, "holdout_correct_accepted_groups": 2}}}}, source_permissions={"channel": ["report"]})
+    # Exercise a deliberately larger review without depending on production
+    # prompt lengths or assuming the generative schema is always larger.
+    original_review = SourceWorker.review_questions
+    monkeypatch.setattr(SourceWorker, "review_questions", staticmethod(
+        lambda code: [*original_review(code), "Detailed synthetic review context. " * 100]))
     path = extension.master_path.parents[2] / "route-profile.json"
     path.write_text(profile.model_dump_json())
     probe = SourceWorker(extension, {"mode": "hybrid"})
@@ -618,8 +623,6 @@ async def test_only_the_actual_model_route_must_fit_its_input_budget(worker_boun
     packet["approved_source_guidance"] = extension.master_path.read_text(encoding="utf-8")
     spans = candidates(packet)
     decision_size = len(json.dumps({"model": probe.config.model, "state": packet, "questions": questions_for(packet, spans)}, ensure_ascii=False))
-    # An actual uncalibrated fallback includes the decision review; an unselected
-    # fallback's raw schema size must not be assumed larger than all questions.
     reviewed = {**packet, "decision_review": {"failure_code": "source_not_calibrated",
                 "open_questions": probe.review_questions("source_not_calibrated")}}
     fallback_size = len(json.dumps(probe.fallback_messages(reviewed, "decision_review_required", spans), ensure_ascii=False))
