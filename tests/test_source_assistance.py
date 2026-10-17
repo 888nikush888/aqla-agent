@@ -184,7 +184,7 @@ def test_empty_incomplete_needs_no_quote_and_foreign_quotes_get_a_precise_repair
 def test_expected_move_interval_cannot_become_one_tp_endpoint(value, unit, quote, setup):
     from aqla_agent.trading import Trading
     from aqla_hyperliquid_mcp.models import AqlaError
-    source, context, _ = material("BTC LONG\nExpected local move: 1-2% and no more.")
+    source, context, _ = material("BTC LONG\nExpected local move: 1-2%.")
     draft = Interpretation(kind="new_signal", symbol="BTC", side="long", take_profits=[value], take_profit_unit=unit,
         source_refs=[source.source_id], evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in (
             ("symbol","BTC"),("side","LONG"),("take_profits.0",quote))])
@@ -212,6 +212,47 @@ def test_actual_tp_interval_cannot_be_erased_for_backup_and_keeps_real_ambiguity
         reason="Ambiguous ROE target percentage interval cannot be an ordered exit list", reason_codes=["other"],
         evidence=[Evidence(field="classification", source_id=source.source_id, quote=source.text)])
     assert check_interpretation(context, ambiguous)["valid"]
+
+
+@pytest.mark.parametrize("goal", [
+    "Locally only for 3-4% and no more.",
+    "Expected local move: 3-4% and no more.",
+    "Lokal nur für 3-4% und nicht mehr.",
+    "Локально, это на 3-4% и не больше.",
+    "Только на 3-4%.",
+    "Risk: 1-2%. Locally only for 3-4% and no more.",
+])
+def test_binding_profit_span_requires_ambiguity_and_cannot_use_backup(goal, setup):
+    from aqla_agent.trading import Trading
+    from aqla_hyperliquid_mcp.models import AqlaError
+    source, context, draft = material("BTC LONG\n" + goal)
+    draft.entry_prices, draft.stop_loss, draft.take_profits = [], None, []
+    draft.evidence = draft.evidence[:2]
+    checked = check_interpretation(context, draft)
+    assert not checked["valid"]
+    assert checked["errors"][0]["code"] == "source_percentage_target_interval_not_representable"
+    _, state, fake, exchange, _ = setup
+    trading = Trading(exchange, state)
+    trading.ingest(source)
+    before = state.snapshot()
+    with pytest.raises(AqlaError, match="source_percentage_target_interval_not_representable"):
+        trading.record_interpretation(source.event_id, draft)
+    assert state.snapshot() == before and not fake.actions
+    ambiguous = Interpretation(kind="ambiguous", source_refs=[source.source_id],
+        reason="Binding ROE profit interval cannot be executed as one exact exit list",
+        evidence=[Evidence(field="classification", source_id=source.source_id, quote=source.text)])
+    assert check_interpretation(context, ambiguous)["valid"]
+
+
+@pytest.mark.parametrize("metadata", [
+    "Risk: at most 3-4%.", "Margin: only 3-4%.", "Nur 3-4% Risiko.",
+    "Маржа: только 3-4% депозита.", "Риск не более 3-4%.",
+])
+def test_binding_risk_or_allocation_span_is_not_an_exit_instruction(metadata):
+    source, context, draft = material("BTC LONG\n" + metadata)
+    draft.entry_prices, draft.stop_loss, draft.take_profits = [], None, []
+    draft.evidence = draft.evidence[:2]
+    assert check_interpretation(context, draft)["valid"]
 
 
 @pytest.mark.parametrize("targets", ["Targets: 1% / 2% / 3%", "Targets: 1% - 2% - 3%", "TP1: 1%\nTP2: 2%\nTP3: 3%"])

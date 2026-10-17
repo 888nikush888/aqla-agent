@@ -22,9 +22,18 @@ def percentage_intervals(text):
         yield match
 
 
-def explicit_percentage_target_interval(text):
+def binding_percentage_target_interval(text):
     intervals = {(m.span("lower"), m.span("upper")) for m in percentage_intervals(text)}
-    return any((m.span("lower"), m.span("upper")) in intervals for m in SOURCE_TP_PERCENT_INTERVAL.finditer(text))
+    if any((m.span("lower"), m.span("upper")) in intervals for m in SOURCE_TP_PERCENT_INTERVAL.finditer(text)):
+        return True
+    from .semantic_contract import SENTENCES
+    for sentence in SENTENCES.split(text):
+        for match in percentage_intervals(sentence):
+            scope = sentence[max(0, match.start() - 60):match.end() + 60]
+            if (re.search(r"\b(?:only|max(?:imum)?|at most|no more|nur|maximal|höchstens|nicht mehr|только|не больше|не более)\b", scope, re.I)
+                    and not re.search(r"\b(?:risk\w*|rm|stop\w*|allocation\w*|margin\w*|equity|deposit\w*|capital|size|risiko\w*|kapital\w*|марж\w*|деп\w*|риск\w*|стоп\w*)\b", scope, re.I)):
+                return True
+    return False
 
 
 def explicit_percentage_targets(text):

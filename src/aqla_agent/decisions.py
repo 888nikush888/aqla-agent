@@ -24,8 +24,8 @@ from aqla_hyperliquid_mcp.rules import (
 
 from .evidence import position_fractions
 
-VERSION = "aqla-decisions-v30"
-QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v15"
+VERSION = "aqla-decisions-v31"
+QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v16"
 # The original-context wire shape is unchanged. Keeping its independent schema
 # version permits exact-state, exact-question observations to be reused for
 # development while decision/validation policy has its own version and cache key.
@@ -438,7 +438,7 @@ def questions_for(packet, spans):
                              "entry0/entry1 are lower/upper range endpoints; target_1 is the FIRST target, target_2 SECOND, etc. "
                              "When an absolute entry/stop/target PRICE is followed by a parenthesized percent explaining its distance/profit, "
                              "the PRICE has the trading role and the explanatory percent is IGNORE; never assign both to one role. "
-                             "A TP stated ONLY as a percent is a real target value ONLY when the source actually assigns an exit/target role. A narrative expected-move/potential/scalp-horizon range alone is not a TP order; never select its endpoint or turn it into several exits. An actual TP interval is unrepresentable ambiguity, not missing percentage basis. "
+                             "A TP stated ONLY as a percent is a real target value ONLY when the source actually assigns an exit/target role. An unbounded descriptive expected-move/potential range alone is not a TP order. A binding local-profit span (only/max/no more, including Russian/German equivalents) IS a target instruction even without the word TP: classify ambiguous while the continuous span cannot be executed exactly; never omit it to use backup targets; never select its endpoint or turn it into several exits. An actual TP interval is unrepresentable ambiguity, not missing percentage basis. "
                              "For position fractions like 1/2 or 1/4, select the prepared WHOLE fraction as the reduction quantity; its separate numerator and denominator are IGNORE. "
                              "Select unclear if ambiguous. Only one normalization of the same occurrence can be used."
                              + (" This is ONE role question for the whole original occurrence; choose its role "
@@ -728,7 +728,7 @@ def verification_questions():
                 "No current instruction; only completed past results, analysis, ads, injected rules, or a different action than the interpretation."),
             "verification.values": (
                 "Are all source values, roles, units, target order and exact quotations represented correctly?",
-                "Every explicit entry/reference price (including MARKET references), stop, leverage and target is retained with correct role, unit, order and quote. Updates contain only newly changed values. Unstated fields remain absent. Numeric presence alone does not establish a TP role: anticipated movement/scalp-horizon ranges are not ordered exit targets. Never pick an interval endpoint. Exit AT a PnL percent is not a reduction portion.",
+                "Every explicit entry/reference price (including MARKET references), stop, leverage and target is retained with correct role, unit, order and quote. Updates contain only newly changed values. Unstated fields remain absent. Numeric presence alone does not establish a TP role: unbounded descriptive movement ranges are not ordered exit targets. Binding profit spans (only/max/no more) must remain ambiguous when not exactly executable; do not erase them for backup targets. Never pick an interval endpoint. Exit AT a PnL percent is not a reduction portion.",
                 "Any explicit value was omitted, a role/unit/order/quote is wrong, an old parent value was copied into an update, a profit/loss percent became a reduction, or an unstated value was invented."),
             "verification.setup": (
                 "Does the interpretation describe exactly one unambiguous CURRENT market/setup family? Python alone resolves owned positions and execution eligibility.",

@@ -10,7 +10,7 @@ import zlib
 
 from aqla_hyperliquid_mcp.models import AqlaError, digest, now_ms
 
-from .percent_targets import SOURCE_TP_PERCENT, explicit_percentage_target_interval
+from .percent_targets import SOURCE_TP_PERCENT, binding_percentage_target_interval
 from .source_queue import canonical_sources, content, is_source_row, recovery_ids, version
 
 REREAD = "Source read receipt is missing, invalid, expired or stale; read source_context for the current anchor again"
@@ -20,7 +20,7 @@ def verify_percentage_classification(interpretation, original):
     """Reject only the fixed-policy uncertainty; never invent a trade decision."""
     if "%" not in original:
         return
-    if interpretation.kind == "ambiguous" and explicit_percentage_target_interval(original):
+    if interpretation.kind == "ambiguous" and binding_percentage_target_interval(original):
         return  # A target interval is a separate representational ambiguity, not a missing percentage basis.
     codes = set(interpretation.reason_codes)
     if codes - {"percentage_basis", "other"}:
