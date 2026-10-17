@@ -92,18 +92,23 @@ def decision_batch(contexts):
     for context in contexts:
         result = decision_context(context)
         assistance = result["interpretation_assistance"]
+        assistance.pop("anchor_setup_bound")  # The item's authoritative field is already present.
+        if not assistance["original_structure_vetoes"]:
+            assistance.pop("original_structure_vetoes")
         if "candidates" in assistance:
             spans = assistance.pop("candidates")
             candidates.update({span["candidate_id"]: span for span in spans})
             assistance["candidate_ids"] = [span["candidate_id"] for span in spans]
         if "contract" in assistance:
             contract = assistance.pop("contract")
-            for key in ("workflow", "candidate_roles_are_not_inferred"):
+            for key in ("workflow", "candidate_roles_are_not_inferred", "version", "candidate_limit",
+                        "vetoes_are_not_classification_or_permission"):
                 contract[key] = assistance.pop(key)
             identity = signature(contract)[:24]
             contracts[identity] = contract
             assistance["contract_id"] = identity
         percentage_rule = result.pop("percentage_rule")
+        result.pop("projection")
         source_messages = result.pop("messages")
         for identity, row in source_messages.items():
             if identity in messages and messages[identity] != row:
@@ -124,7 +129,7 @@ def decision_batch(contexts):
                       "trade_ids": trade_keys, "configuration_id": config_id})
     return {"view": "decision_batch", "items": items, "messages": messages, "trades": trades,
             "configurations": configurations, "interpretation_contracts": contracts, "interpretation_candidates": candidates,
-            "source_bodies": "lossless", "percentage_rule": percentage_rule}
+            "source_bodies": "lossless", "stored_trade_details_omitted": True, "percentage_rule": percentage_rule}
 
 
 def classification_ack(row, changed):

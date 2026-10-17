@@ -98,6 +98,10 @@ async def test_decision_context_and_batch_keep_originals_quotes_replies_and_rece
     assert len(batch["messages"]) == 3
     assert list(batch["messages"]) == [source.event_id for source in sources]
     assert len(batch["configurations"]) == 1
+    assert batch["stored_trade_details_omitted"]
+    for contract in batch["interpretation_contracts"].values():
+        assert contract["workflow"] and contract["version"] and contract["candidate_limit"] == 64
+        assert contract["vetoes_are_not_classification_or_permission"] and contract["candidate_roles_are_not_inferred"]
     assert {row["anchor_event_id"] for row in batch["items"]} == {source.event_id for source in sources}
     for source, item in zip(sources, batch["items"], strict=True):
         assert batch["messages"][source.event_id]["source"]["text"] == source.text
