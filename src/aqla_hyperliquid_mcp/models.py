@@ -241,7 +241,7 @@ class Evidence(Model):
         examples=["take_profits.0", "take_profits.1", "classification"])
     source_id: str
     quote: str = Field(min_length=1, max_length=1500,
-                       description="Exact original substring. Each numeric price/percentage field needs its own number (and % when present), without other numbers. Never quote a whole multi-price message for one numeric field.")
+                       description="Exact original substring. Each numeric price/percentage proof needs one actual value (include % when present). Verified target numbering may remain as context. Keep a longer unique original span when a bare number is ambiguous; never combine several trade values into one proof.")
 
 
 class SourceClassification(Model):
