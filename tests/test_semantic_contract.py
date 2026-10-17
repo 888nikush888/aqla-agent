@@ -191,7 +191,7 @@ async def test_native_report_and_update_admission_agree_with_completed_russian_a
     interpretation = Interpretation(kind="trade_update" if with_current_update else "report", symbol="BTC" if with_current_update else None,
         update_action="reduce" if with_current_update else None, reduce_percent=25 if with_current_update else None,
         source_refs=[source], reason="Completed results with one new reduction" if with_current_update else "Completed results",
-        evidence=([Evidence(field="update_action", source_id=source, quote=text),
+        evidence=([Evidence(field="symbol", source_id=source, quote="BTC"), Evidence(field="update_action", source_id=source, quote=text),
                    Evidence(field="reduce_percent", source_id=source, quote="четверть")] if with_current_update else
                   [Evidence(field="classification", source_id=source, quote=text)]))
     master = tmp_path / "master.md"
@@ -258,8 +258,16 @@ def test_parent_mixed_entry_and_stop_history_do_not_veto_current_update():
         text="BTC: reduce half now.")
     packet = packet_for(messages=[parent, anchor])
     interpretation = Interpretation(kind="trade_update", symbol="BTC", update_action="reduce", reduce_percent=50,
-        source_refs=[anchor.source_id], evidence=[Evidence(field="reduce_percent", source_id=anchor.source_id, quote="half")])
+        source_refs=[anchor.source_id], evidence=[Evidence(field="reduce_percent", source_id=anchor.source_id, quote="half"),
+            Evidence(field="symbol", source_id=anchor.source_id, quote="BTC")])
     validate_interpretation(packet, interpretation)
+
+
+@pytest.mark.parametrize("instruction", ["Move stop to 90", "Стоп в бу", "Переносим стоп на 90"])
+def test_real_management_inside_setup_is_not_an_initial_static_stop(instruction):
+    text = f"BTC LONG\nTarget 1: 110\n{instruction}"
+    assert current_actions(text)
+    assert supported_action_failure(text, Interpretation(kind="new_signal", symbol="BTC", side="long", source_refs=["synthetic"])) == "signal_contains_management_instruction"
 
 
 def test_completed_russian_stop_and_target_actions_are_not_current_instructions():

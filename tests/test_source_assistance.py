@@ -257,6 +257,57 @@ def test_unaccepted_full_setup_edit_is_not_a_management_instruction():
     assert check_interpretation(context, value)["valid"]
 
 
+@pytest.mark.parametrize("stop", ["Stop to 90", "Stopp auf 90", "Стоп на 90"])
+def test_initial_numeric_stop_field_does_not_turn_full_setup_into_management(stop):
+    source, context, value = material(f"BTC LONG X30\nTarget 1: 110\nTarget 2: 120\n{stop}")
+    value.entry_prices = []
+    value.evidence = [p for p in value.evidence if not p.field.startswith("entry_prices")]
+    value.evidence[2].quote = "90"
+    assert check_interpretation(context, value)["valid"]
+    update = Interpretation(kind="trade_update", symbol="BTC", update_action="move_stop", stop_loss=90,
+        source_refs=[source.source_id], evidence=[Evidence(field=f, source_id=source.source_id, quote=q)
+            for f, q in (("symbol", "BTC"), ("stop_loss", "90"))])
+    assert not check_interpretation(context, update)["valid"]
+
+
+def test_unbound_update_cannot_keep_a_neighbour_market_after_removing_its_proof():
+    source, context, _ = material("Taking 40% off here; moved stop loss to entry ($1,130).")
+    value = Interpretation(kind="trade_update", symbol="ZEC", update_action="reduce", reduce_percent=40,
+        source_refs=[source.source_id], evidence=[Evidence(field="reduce_percent", source_id=source.source_id, quote="40%")])
+    result = check_interpretation(context, value)
+    assert not result["valid"] and result["errors"][0]["code"] == "update_identity_missing"
+    context["bound_source_refs"] = [source.source_id]
+    assert check_interpretation(context, value)["valid"]
+
+
+def test_real_reply_supplies_original_market_for_unbound_update():
+    parent, context, _ = material("BTC LONG. Entry 100.")
+    source = SourceEvent(chat_id=parent.chat_id, message_id=2, reply_to_id=parent.message_id,
+        sent_at=now_ms(), text="Reduce 40% now.")
+    row = {"event_id": source.event_id, "source_id": source.source_id, "source": source.model_dump(mode="json")}
+    context = {**context, "event": row, "messages": [*context["messages"], row]}
+    value = Interpretation(kind="trade_update", symbol="BTC", update_action="reduce", reduce_percent=40,
+        source_refs=[source.source_id, parent.source_id], evidence=[
+            Evidence(field="symbol", source_id=parent.source_id, quote="BTC"),
+            Evidence(field="reduce_percent", source_id=source.source_id, quote="40%")])
+    assert check_interpretation(context, value)["valid"]
+
+
+def test_writer_rechecks_unbound_update_identity_before_saving(setup):
+    from aqla_agent.trading import Trading
+    from aqla_hyperliquid_mcp.models import AqlaError
+    settings, state, fake, exchange, _ = setup
+    trading = Trading(exchange, state)
+    source, _, _ = material("Reduce 40% now.")
+    trading.ingest(source)
+    before = state.snapshot()
+    value = Interpretation(kind="trade_update", symbol="BTC", update_action="reduce", reduce_percent=40,
+        source_refs=[source.source_id], evidence=[Evidence(field="reduce_percent", source_id=source.source_id, quote="40%")])
+    with pytest.raises(AqlaError, match="update_identity_missing"):
+        trading.record_interpretation(source.event_id, value)
+    assert state.snapshot() == before and not fake.actions
+
+
 def test_closed_owned_setup_still_proves_binding_but_does_not_become_an_open_position():
     from aqla_agent.trading import Trading
     source, context, _ = material()

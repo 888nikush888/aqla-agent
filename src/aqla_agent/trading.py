@@ -259,11 +259,16 @@ class Trading:
                         if trade["chat_id"] == row["source"]["chat_id"] and interpretation.bound_trade_id in (None, trade["trade_id"])
                         for ref in trade["plan"]["source_refs"])
             verify_setup_references(interpretation, row["source_id"], own_refs)
-            from .semantic_contract import supported_action_failure, unbound_setup_update_failure
+            from .semantic_contract import (
+                supported_action_failure,
+                unbound_setup_update_failure,
+                update_identity_failure,
+            )
             failure = supported_action_failure(row["source"].get("text", ""), interpretation)
             if failure is None and interpretation.kind == "trade_update":
                 from .decisions import build_packet
-                failure = unbound_setup_update_failure(build_packet(self.context(event_id, snapshot=snapshot)), interpretation)
+                packet = build_packet(self.context(event_id, snapshot=snapshot))
+                failure = unbound_setup_update_failure(packet, interpretation) or update_identity_failure(packet, interpretation)
             if failure:
                 raise AqlaError(failure)
             if interpretation.take_profit_unit in ("course_percent", "roi_percent") and interpretation.take_profits:

@@ -139,6 +139,17 @@ def unbound_setup_update_failure(packet, interpretation):
     return None
 
 
+def update_identity_failure(packet, interpretation):
+    if interpretation.kind != "trade_update" or packet.get("anchor_setup_bound"):
+        return None
+    from .decisions import linked_candidate_refs
+    linked = linked_candidate_refs(packet)
+    if not interpretation.symbol or not any(proof.field == "symbol" and proof.source_id in linked
+                                            for proof in interpretation.evidence):
+        return "update_identity_missing"
+    return None
+
+
 def bounded_live_entry_range(packet, spans):
     """One original bounded price phrase, never two unrelated numeric mentions."""
     if len(spans) != 2 or any(span is None or span.source_id != packet["anchor_source_id"]
@@ -166,13 +177,14 @@ def current_actions(text, *, include_tp_footers=True):
     """Recognize explicit current actions with their original clause boundaries."""
     actions = []
     normalized = text.casefold().replace("ё", "е")
+    initial_setup = bool(SETUP_HEADING.search(normalized) and TP_LABEL.search(normalized))
     if not include_tp_footers:
         normalized = ";".join(sentence for sentence in re.split(r"[;!?\n]|(?<!\d)\.(?!\d)", normalized)
                               if not tp_break_even_footer(sentence))
     for sentence in SENTENCES.split(normalized):
         blocked = False
         for clause in CONJUNCTIONS.split(sentence):
-            actions.extend(clause_actions(clause.strip(), blocked))
+            actions.extend(clause_actions(clause.strip(), blocked, initial_setup=initial_setup))
             markers = [(match.start(), True) for matcher in (PAST, HYPOTHETICAL, PAST_WORD) for match in matcher.finditer(clause)]
             markers += [(match.start(), False) for match in CURRENT.finditer(clause)]
             if markers:
@@ -180,7 +192,7 @@ def current_actions(text, *, include_tp_footers=True):
     return actions
 
 
-def clause_actions(clause, inherited_blocked):
+def clause_actions(clause, inherited_blocked, *, initial_setup=False):
     actions = []
     if not clause:
         return actions
@@ -201,6 +213,11 @@ def clause_actions(clause, inherited_blocked):
                 or PAST_MATCH.search(match.group()) or PAST_GOVERNOR.search(history_prefix)):
             continue
         if action == "stop":
+            # A bare numeric stop field in a full setup is initial protection;
+            # explicit move verbs and stop-to-entry instructions remain actions.
+            if (initial_setup and match.start() == 0 and not re.match(WORD + VERB, match.group(), re.I)
+                    and re.fullmatch(r"\s*\d+(?:[.,]\d+)*\s*", clause[match.end():])):
+                continue
             action = "break_even" if BE_DESTINATION.search(clause[match.end():]) else "move_stop"
         elif action == "exit":
             quantities = [quantity for quantity in PORTION.finditer(clause) if not (

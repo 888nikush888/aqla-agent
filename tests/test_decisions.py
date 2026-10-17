@@ -307,7 +307,8 @@ def test_reduction_requires_one_original_quantity_and_matching_mathematics(quote
     from aqla_agent.decisions import validate_interpretation
     packet = packet_for("BTC: reduce " + quote)
     result = Interpretation(kind="trade_update", symbol="BTC", source_refs=[packet["anchor_source_id"]], update_action="reduce",
-        reduce_percent=amount, evidence=[Evidence(field="reduce_percent", source_id=packet["anchor_source_id"], quote=quote)])
+        reduce_percent=amount, evidence=[Evidence(field="symbol", source_id=packet["anchor_source_id"], quote="BTC"),
+            Evidence(field="reduce_percent", source_id=packet["anchor_source_id"], quote=quote)])
     if accepted:
         validate_interpretation(packet, result)
     else:
@@ -805,7 +806,8 @@ def test_exact_fractional_position_quantities_keep_original_quotes(quote,value):
     span=next(s for s in candidates(packet) if s.notation=="position_fraction")
     assert span.quote==quote and span.value==str(value)
     interpretation=Interpretation(kind="trade_update",symbol="BTC",update_action="reduce",reduce_percent=value,
-        source_refs=[packet["anchor_source_id"]],evidence=[Evidence(field="reduce_percent",source_id=packet["anchor_source_id"],quote=quote)])
+        source_refs=[packet["anchor_source_id"]],evidence=[Evidence(field="symbol",source_id=packet["anchor_source_id"],quote="BTC"),
+            Evidence(field="reduce_percent",source_id=packet["anchor_source_id"],quote=quote)])
     from aqla_agent.decisions import validate_interpretation
     validate_interpretation(packet,interpretation)
 
