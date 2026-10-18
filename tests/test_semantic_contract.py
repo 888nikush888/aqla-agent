@@ -88,6 +88,11 @@ def test_completed_stop_move_after_its_destination_is_not_a_new_instruction(text
     report = Interpretation(kind="report", source_refs=[packet["anchor_source_id"]], reason="Completed stop move",
         evidence=[Evidence(field="classification", source_id=packet["anchor_source_id"], quote=text)])
     validate_interpretation(packet, report)
+    update = Interpretation(kind="trade_update", symbol="BTC", update_action="break_even", source_refs=report.source_refs,
+        evidence=[Evidence(field="symbol", source_id=packet["anchor_source_id"], quote="BTC"),
+            Evidence(field="update_action", source_id=packet["anchor_source_id"], quote=text)])
+    with pytest.raises(DecisionFailure, match="completed_stop_move_is_not_current_management"):
+        validate_interpretation(packet, update)
     assert current_actions(text + " Now close 25%.")[0][0] == "reduce"
 
 

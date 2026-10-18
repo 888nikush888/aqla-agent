@@ -420,6 +420,11 @@ def source_percentage_target_failure(text, interpretation):
 
 def supported_action_failure(text, interpretation):
     """Return a stable rejection code for explicitly unrepresentable instructions."""
+    if (interpretation.kind == "trade_update" and interpretation.update_action in (None, "move_stop", "break_even")
+            and not current_actions(text)
+            and any(POSTFIX_PAST_STOP.search(clause[match.end():])
+                for clause in SENTENCES.split(text.casefold().replace("ё", "е")) for match in STOP_ACTION.finditer(clause))):
+        return "completed_stop_move_is_not_current_management"
     if (interpretation.kind in ("report", "unrelated")
             and re.fullmatch(r"(?:#\w+[\s,]*)+", text.strip())
             and re.search(r"(?:#|_)(?:scenarios?|setups?|plans?|szenari\w*|сценари\w*|сетап\w*|план\w*)(?:_|$)", text, re.I)):
