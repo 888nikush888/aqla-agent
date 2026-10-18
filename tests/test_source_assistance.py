@@ -435,6 +435,35 @@ def test_update_direction_is_not_inferred_from_prices_or_market_opinion():
     assert check_interpretation(context, draft)["valid"] and draft.side is None
 
 
+@pytest.mark.parametrize("permission", [
+    "Кто еще не фиксил - можно сделать это сейчас.",
+    "Ктo еще не фиксил - мoжнo сделать этo сейчас.",
+    "Кто еще не фиксировал, может это сделать сейчас.",
+    "Who has not taken profit yet can do it now.",
+    "Wer noch nicht Gewinne mitgenommen hat, kann das jetzt tun.",
+])
+def test_conditional_exit_permission_cannot_be_dropped_to_execute_only_the_stop(permission, setup):
+    from aqla_agent.trading import Trading
+    from aqla_hyperliquid_mcp.models import AqlaError
+    source, context, _ = material("BTC\n" + permission + "\nStop to entry now.")
+    draft = Interpretation(kind="trade_update", symbol="BTC", update_action="break_even", source_refs=[source.source_id],
+        evidence=[Evidence(field="symbol", source_id=source.source_id, quote="BTC"),
+            Evidence(field="update_action", source_id=source.source_id, quote="Stop to entry now")])
+    checked = check_interpretation(context, draft)
+    assert not checked["valid"] and checked["errors"][0]["code"] == "scheduled_management_not_representable"
+    assert checked["errors"][0]["repair"] and checked["errors"][0]["field_paths"] == ["kind", "update_action"]
+    _, state, fake, exchange, _ = setup
+    trading = Trading(exchange, state)
+    trading.ingest(source)
+    before = state.snapshot()
+    with pytest.raises(AqlaError, match="scheduled_management_not_representable"):
+        trading.record_interpretation(source.event_id, draft)
+    assert state.snapshot() == before and not fake.actions
+    corrected = Interpretation(kind="ambiguous", source_refs=[source.source_id], reason="Conditional exit and separate stop cannot be partially executed",
+        evidence=[Evidence(field="classification", source_id=source.source_id, quote=source.text)])
+    assert check_interpretation(context, corrected)["valid"]
+
+
 @pytest.mark.parametrize("text", [
     "BTC LONG. Buy at current prices 100. No pending buy order 95.",
     "BTC LONG. Покупаем по текущим ценам 100. Не ставим отложенный ордер 95.",

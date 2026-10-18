@@ -22,6 +22,8 @@ CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_ac
                    "source_exchange", "single_entry_form", "single_management_action")
 CONTEXT_CANDIDATE_LIMIT = 64
 REPAIR_GUIDANCE = {
+    "scheduled_management_not_representable": "The original management is conditional or scheduled, including permission to take profit now IF not already done. This schema cannot represent that condition. Recheck ambiguous using anchor-only classification evidence; never erase the conditional action as optional background or execute only a separate stop instruction. Do not convert it into an unconditional exit.",
+    "management_actions_not_representable": "The original contains several distinct management actions. Recheck ambiguous using anchor-only classification evidence and omit unused trade fields. Never select just one action or discard a permitted/conditional instruction as optional background.",
     "managed_position_direction_missing_or_changed": "The current anchor expressly identifies the position being managed as a purchase/buy holding or sale/short holding. Preserve that POSITION direction with an exact current-anchor side quote. Closing a purchase is long; an exit sale is not a new short. Do not infer direction from prices, profit, market commentary or old parent values.",
     "multiple_managed_position_directions_require_review": "The source manages different position directions. Re-read the full source; do not select one side or execute a partial instruction. A single supported unambiguous action is required.",
     "completed_stop_move_is_not_current_management": "The original reports an already completed stop move: the past-tense governor follows the destination. Recheck report, preserving any genuinely separate current instruction. An unconditional-looking stop phrase does not override its explicit past tense or prove our own stop changed. Never repeat a completed author action merely because our own position state differs.",
@@ -42,6 +44,8 @@ REPAIR_GUIDANCE = {
     "unbound_setup_edit_is_not_management": "Python reports no accepted own setup binding. An edit/publication alone is not execution. This anchor still presents a complete entry setup, not an explicit management instruction: recheck corrected new_signal, or ambiguous when all original entry legs cannot be represented.",
 }
 REPAIR_FIELDS = {
+    "scheduled_management_not_representable": ["kind", "update_action"],
+    "management_actions_not_representable": ["kind", "update_action"],
     "managed_position_direction_missing_or_changed": ["side", "evidence"],
     "multiple_managed_position_directions_require_review": ["kind", "side", "update_action"],
     "completed_stop_move_is_not_current_management": ["kind", "update_action"],

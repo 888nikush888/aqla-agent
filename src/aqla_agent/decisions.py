@@ -24,8 +24,8 @@ from aqla_hyperliquid_mcp.rules import (
 
 from .evidence import position_fractions
 
-VERSION = "aqla-decisions-v39"
-QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v24"
+VERSION = "aqla-decisions-v40"
+QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v25"
 # The original-context wire shape is unchanged. Keeping its independent schema
 # version permits exact-state, exact-question observations to be reused for
 # development while decision/validation policy has its own version and cache key.
@@ -407,7 +407,7 @@ def questions_for(packet, spans):
                          "false": "Multiple independent setups, separate half-market PLUS half-limit orders, or an unbounded range without a representable single price limit. Never collapse separate orders into one form."}},
         "single_management_action": {"type": "noul", "instructions": "Can the current management instruction be represented by exactly one update_action?",
             "criteria": {"true": "One current action: change stop, break-even stop, replace targets, reduce, close, or cancel. Closing AT break-even is one CLOSE action. Past results and waiting/status comments are not extra actions. In a mixed-tense post, a completed past stop move is not a second current action alongside a present reduction. No management instruction also means yes.",
-                         "false": "Several distinct current actions: reduce AND move stop; break-even AND cancel; close several independent markets. A scheduled future update such as 'close tomorrow' or an unrepresented future trigger also cannot execute now. Do not execute only one part, discard an instruction, or turn a future action into an immediate one."}},
+                         "false": "Several distinct current actions: reduce AND move stop; break-even AND cancel; close several independent markets. Permission to take profit now if not already done is still a conditional management instruction, including 'who has not taken profit can do it now'. Do not discard it as optional background to execute only a separate stop instruction. A scheduled future update such as 'close tomorrow' or an unrepresented trigger also cannot execute now. Do not execute only one part, discard an instruction, or turn a conditional action into an unconditional one."}},
     }
     for identity, alternatives in numeric_occurrences(spans):
         span = alternatives[0]

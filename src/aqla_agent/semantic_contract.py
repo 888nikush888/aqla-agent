@@ -48,6 +48,13 @@ FUTURE = pattern(WORD + r"(?:tomorrow|tonight|later|next\s+\w+|in\s+\d+\s*(?:min
                  r"morgen|später|spaeter|nach\s+\d+\s*\w+|завтра|позже|потом|через\s+\d+\s*\w+)" + END)
 CONDITION = pattern(WORD + r"(?:if|when|once|after|until|falls|wenn|sobald|nachdem|nach\s+(?:tp\s*\d|ziel\w*|erreich\w*)|"
                     r"если|когда|после|при\s+(?:достижении|касании|пробое|tp\s*\d|тейк\w*|цел\w*))" + END)
+CONDITIONAL_EXIT_PERMISSION = pattern(WORD + r"(?:"
+    r"кто\s+(?:(?:еще|пока)\s+)?не\s+(?:фикс(?:ил|ировал)\w*|закры(?:л|вал)\w*)[^.!?\n]{0,30}"
+    r"(?:можно|можете|может)\s+(?:сделать\s+это|это\s+сделать)\s+(?:прямо\s+)?сейчас|"
+    r"(?:who(?:ever)?|anyone\s+who|if\s+you)\s+(?:(?:has|have|hasn't|haven't)\s+)?(?:not\s+)?(?:yet\s+)?"
+    r"(?:taken\s+profits?|closed)(?:\s+yet)?[^.!?\n]{0,30}(?:can|may)\s+do\s+(?:it|so)\s+now|"
+    r"wer\s+noch\s+nicht[^.!?\n]{0,30}(?:mitgenommen|geschlossen)\s+hat[^.!?\n]{0,20}"
+    r"kann\s+(?:das\s+)?jetzt\s+(?:tun|machen))" + END)
 STOP_CONDITION = pattern(WORD + r"(?:stop(?:[-\s]+loss)?|sl|стоп(?:[-\s]*лосс)?)\s*[:=-]?\s*"
                          r"(?:\w+\s+){0,4}(?:h\d+|\d+\s*[hm]|hourly|daily|candle\w*|свеч\w*|часов\w*|kerz\w*)" + END)
 EXTRA_ENTRY = pattern(WORD + r"(?:bids?|averag(?:e|ing)(?!\s+entry\s+price\b)|additional\s+(?:limit|entries|entry)|"
@@ -389,6 +396,10 @@ def entry_structure_failure(text):
 
 
 def management_structure_failure(text, *, ignore_tp_footers=False):
+    for sentence in SENTENCES.split(matching_words(text).casefold().replace("ё", "е")):
+        permission = CONDITIONAL_EXIT_PERMISSION.search(sentence)
+        if permission and not any(matcher.search(sentence[:permission.start()]) for matcher in (PAST, PAST_WORD, HYPOTHETICAL)):
+            return "scheduled_management_not_representable"
     actions = current_actions(text)
     if any(STOP_CONDITION.search(clause) and action in ("move_stop", "break_even") for action, clause in actions):
         return "conditional_stop_not_representable"

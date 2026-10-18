@@ -253,6 +253,17 @@ def test_update_scheduler_and_future_trigger_cannot_be_discarded(text):
     assert supported_action_failure(text, interpretation) == "scheduled_management_not_representable"
 
 
+@pytest.mark.parametrize("text", [
+    "BTC: yesterday I said whoever has not taken profit yet can do it now.",
+    "BTC example: whoever has not taken profit yet can do it now.",
+    "BTC: вчера писал: кто еще не фиксил - можно сделать это сейчас.",
+    "BTC: Stop to entry now. The profit already taken was 10%.",
+])
+def test_past_examples_or_profit_status_do_not_create_a_conditional_exit(text):
+    from aqla_agent.semantic_contract import management_structure_failure
+    assert management_structure_failure(text) is None
+
+
 @pytest.mark.parametrize("text,action", [
     ("BTC: yesterday I closed half at +70%. Now reduce half.", "reduce"),
     ("BTC: вчера закрыл половину на +70%. Сейчас закрываем четверть.", "reduce"),

@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--two-entry-orders", action="store_true")
     parser.add_argument("--analysis-entry-level", action="store_true")
     parser.add_argument("--managed-position-side", action="store_true")
+    parser.add_argument("--conditional-exit-permission", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root / "scripts"))
@@ -42,6 +43,8 @@ def main():
         text = "BTC LONG\nPrice swept the historical low at 85 and reacted.\nStop 80\nTarget 110"
     if args.managed_position_side:
         text = "BTC\nPurchase from 100 we close at current price 110."
+    if args.conditional_exit_permission:
+        text = "BTC\nWho has not taken profit yet can do it now.\nStop to entry now."
     source = SourceEvent(chat_id="synthetic-source", message_id=1, sent_at=1000, text=text, historical=True)
     unrelated = SourceEvent(chat_id="synthetic-source", message_id=2, sent_at=900,
         text="ETH SHORT. Entry 200. Stop 210. Target 180.", historical=True)
@@ -70,13 +73,16 @@ def main():
     if args.managed_position_side:
         value = Interpretation(kind="trade_update", symbol="BTC", update_action="close", source_refs=[source.source_id],
             evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in [("symbol","BTC"),("update_action",text.splitlines()[1])]])
+    if args.conditional_exit_permission:
+        value = Interpretation(kind="trade_update", symbol="BTC", update_action="break_even", source_refs=[source.source_id],
+            evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in [("symbol","BTC"),("update_action","Stop to entry now")]])
     corrected = value.model_copy(deep=True)
     if args.numbered_integer_target:
         corrected.evidence[-1].quote = "Target 3: 1"
     if args.empty_original:
         corrected.evidence = []
-    if args.two_entry_orders:
-        corrected = Interpretation(kind="ambiguous", source_refs=[source.source_id], reason="Two separate order legs cannot be represented by one entry",
+    if args.two_entry_orders or args.conditional_exit_permission:
+        corrected = Interpretation(kind="ambiguous", source_refs=[source.source_id], reason="Original instruction cannot be partially represented by one supported action",
             evidence=[Evidence(field="classification", source_id=source.source_id, quote=text)])
     if args.analysis_entry_level:
         corrected.entry_prices = []
@@ -120,7 +126,7 @@ def main():
                 return
             sequence = [("source_context", {"event_id": source.event_id, "view": "decision"}),
                         ("source_check_interpretation", {"event_id": source.event_id, "interpretation": value.model_dump(mode="json")})]
-            if args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.analysis_entry_level or args.managed_position_side:
+            if args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.analysis_entry_level or args.managed_position_side or args.conditional_exit_permission:
                 sequence.append(("source_check_interpretation", {"event_id": source.event_id, "interpretation": corrected.model_dump(mode="json")}))
             message = {"role": "assistant", "content": "Checked; no orders."}
             if index < len(sequence):
@@ -155,7 +161,7 @@ def main():
         result = native_worker(SimpleNamespace(worker_fixture=fixture, hermes_source=args.hermes_source.resolve(),
             mcp_python=args.mcp_python.absolute()), model_url=f"http://127.0.0.1:{model.server_port}/v1", model_key="synthetic-only", local_fixture=True,
             retry_sleep=waits.append)
-        expected_drafts = 2 if args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.analysis_entry_level or args.managed_position_side else 1
+        expected_drafts = 2 if args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.analysis_entry_level or args.managed_position_side or args.conditional_exit_permission else 1
         responses = 2 + expected_drafts
         assert result["completed"] and result["draft_count"] == expected_drafts and result["checks"][-1]["valid"], result
         if args.numbered_integer_target:
@@ -174,6 +180,10 @@ def main():
         elif args.managed_position_side:
             assert result["checks"][0]["errors"][0]["code"] == "managed_position_direction_missing_or_changed"
             assert result["checks"][-1]["interpretation"]["side"] == "long"
+        elif args.conditional_exit_permission:
+            assert result["checks"][0]["errors"][0]["code"] == "scheduled_management_not_representable"
+            assert result["checks"][-1]["interpretation"]["kind"] == "ambiguous"
+            assert result["checks"][-1]["interpretation"]["update_action"] is None
         else:
             assert result["checks"][-1]["interpretation"]["evidence"][-1]["quote"] == ("Target 3: 1" if args.numbered_integer_target else "110")
         assert not result["forbidden_tools"] and result["order_requests"] == 0
@@ -186,8 +196,9 @@ def main():
             "calls": [{"model": b.get("model"), "effort": b.get("reasoning_effort"), "keys": list(b)} for b in calls],
             "requests": result["request_attempts"], "responses": result["api_responses"]}
         assert not retained["plans"] and not retained["operations"] and not retained["trades"]
-        print(json.dumps({"native_high_mcp_loop": True, "original_quote_shortened": not (args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.managed_position_side),
+        print(json.dumps({"native_high_mcp_loop": True, "original_quote_shortened": not (args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.managed_position_side or args.conditional_exit_permission),
             "managed_position_side_kept": args.managed_position_side,
+            "conditional_exit_not_discarded": args.conditional_exit_permission,
             "mixed_script_entry_legs_blocked": args.two_entry_orders,
             "analysis_level_not_entry": args.analysis_entry_level,
             "empty_original_quote_exception": args.empty_original,
