@@ -33,7 +33,7 @@ Voraussetzungen: Linux mit systemd, Git und uv. Der Installer richtet eigene Pyt
 
    `/opt/aqla` muss neu oder leer sein. Mit ausreichenden Verzeichnisrechten ausführen. Der Zielordner erhält eigene Quellen, Konfiguration, Secrets-Verzeichnis, Hermes-Home, zwei venvs und eine systemd-Datei. Interpreter werden ebenfalls dort verwaltet; der Dienst hängt nicht an einem Python unter dem privaten Root-Home.
 
-   Standardmodell ist **DeepSeek V4.1 Flash über OpenCode Go** (`deepseek-v4.1-flash`, `https://opencode.ai/zen/go/v1`) mit Hermes-Reasoning **ultra**. Hermes übersetzt `ultra` für DeepSeek in die API-Stufe `max`. Andere Modelle und Endpunkte lassen sich ausdrücklich mit `--model` und `--model-url` wählen; Reasoning kann anschließend über Hermes geändert werden.
+   Standardmodell ist **DeepSeek V4.1 Flash über OpenCode Go** (`deepseek-v4.1-flash`, `https://opencode.ai/zen/go/v1`) mit Hermes-Reasoning **high**, nach dem vollständigen [Qualitätsnachweis mit Tools](docs/high-tools-qualification.md). Der tatsächliche API-Parameter lautet `high`. Andere Modelle und Endpunkte lassen sich ausdrücklich mit `--model` und `--model-url` wählen; Reasoning kann anschließend über Hermes geändert werden.
 
 2. `/opt/aqla/vps.env` ausfüllen:
 

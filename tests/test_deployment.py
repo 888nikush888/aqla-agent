@@ -19,7 +19,7 @@ def test_deployment_is_separate_and_has_native_hermes_transport(tmp_path):
     config = yaml.safe_load((target / "hermes-home" / "config.yaml").read_text())
     assert config["model"]["default"] == "test-model"
     assert config["model"]["base_url"] == "https://example.invalid/v1"
-    assert config["agent"]["reasoning_effort"] == "ultra"
+    assert config["agent"]["reasoning_effort"] == "high"
     assert config['agent']['clarify_timeout'] == 60
     assert {'clarify','todo','session_search'} <= set(config['platform_toolsets']['telegram'])
     assert config["skills"]["write_approval"] is True
@@ -45,14 +45,14 @@ def test_deployment_is_separate_and_has_native_hermes_transport(tmp_path):
         prepare(project, target, "12345", "test-model", "https://example.invalid/v1")
 
 
-def test_cli_new_install_defaults_to_deepseek_flash_ultra(tmp_path, monkeypatch):
+def test_cli_new_install_defaults_to_deepseek_flash_high(tmp_path, monkeypatch):
     target = tmp_path / "default-vps"
     monkeypatch.setattr("sys.argv", [argv[0], "--destination", str(target), "--owner-id", "12345", "--prepare-only"])
     install.main()
     config = yaml.safe_load((target / "hermes-home" / "config.yaml").read_text())
     assert config["model"]["default"] == "deepseek-v4.1-flash"
     assert config["model"]["base_url"] == "https://opencode.ai/zen/go/v1"
-    assert config["agent"]["reasoning_effort"] == "ultra"
+    assert config["agent"]["reasoning_effort"] == "high"
     assert config["model"]["api_key"] == "${HERMES_MODEL_API_KEY}"
     assert config["fallback_providers"] == []
     assert config["auxiliary"]["source_interpretation"]["fallback_chain"] == []

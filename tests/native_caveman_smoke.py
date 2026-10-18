@@ -30,7 +30,7 @@ def main():
     assert (home / "skills/aqla-master/SKILL.md").read_bytes() == (root / "skills/aqla-master/SKILL.md").read_bytes()
     assert b"Never drop not/never/no/only/except" in voice and b"Numbers and units exact" in voice
     assert "telegram_view.messages unverändert" in prompt
-    assert config["agent"]["reasoning_effort"] == "ultra"
+    assert config["agent"]["reasoning_effort"] == "high"
     assert config["auxiliary"]["background_review"]["enabled"] is True
     print(json.dumps({"native_caveman_loaded": True, "trade_master_last": True, "master_unchanged": True,
                       "upstream_sha256": hashlib.sha256(voice).hexdigest(), "model_calls": 0, "exchange_actions": 0}))
