@@ -464,6 +464,40 @@ def test_conditional_exit_permission_cannot_be_dropped_to_execute_only_the_stop(
     assert check_interpretation(context, corrected)["valid"]
 
 
+@pytest.mark.parametrize("status", [
+    "До третьей цели немного не дошли, второй можно фиксить сейчас, если забыли поставить ордер.",
+    "Target 2 reached. You can take profit now if you forgot to place its order.",
+    "Ziel 2 erreicht. Gewinn ist möglich, falls du den Auftrag vergessen hast.",
+])
+def test_existing_target_catchup_does_not_authorize_a_whole_position_close(status, setup):
+    from aqla_agent.trading import Trading
+    from aqla_hyperliquid_mcp.models import AqlaError
+    source, context, _ = material("BTC\n" + status)
+    draft = Interpretation(kind="trade_update", symbol="BTC", update_action="close", source_refs=[source.source_id],
+        evidence=[Evidence(field="symbol", source_id=source.source_id, quote="BTC"),
+            Evidence(field="update_action", source_id=source.source_id, quote=status)])
+    checked = check_interpretation(context, draft)
+    assert not checked["valid"] and checked["errors"][0]["code"] == "existing_target_catchup_requires_report_review"
+    _, state, fake, exchange, _ = setup
+    trading = Trading(exchange, state)
+    trading.ingest(source)
+    before = state.snapshot()
+    with pytest.raises(AqlaError, match="existing_target_catchup_requires_report_review"):
+        trading.record_interpretation(source.event_id, draft)
+    assert state.snapshot() == before and not fake.actions
+    corrected = Interpretation(kind="report", source_refs=[source.source_id], reason="Existing target/result reminder; no new instruction",
+        evidence=[Evidence(field="classification", source_id=source.source_id, quote=source.text)])
+    assert check_interpretation(context, corrected)["valid"]
+
+
+def test_target_result_reminder_keeps_a_separate_new_stop_instruction():
+    source, context, _ = material("BTC\nTarget 2 reached; you forgot to place its order.\nMove stop to entry now.")
+    draft = Interpretation(kind="trade_update", symbol="BTC", update_action="break_even", source_refs=[source.source_id],
+        evidence=[Evidence(field="symbol", source_id=source.source_id, quote="BTC"),
+            Evidence(field="update_action", source_id=source.source_id, quote="Move stop to entry now")])
+    assert check_interpretation(context, draft)["valid"]
+
+
 @pytest.mark.parametrize("text", [
     "BTC LONG. Buy at current prices 100. No pending buy order 95.",
     "BTC LONG. Покупаем по текущим ценам 100. Не ставим отложенный ордер 95.",

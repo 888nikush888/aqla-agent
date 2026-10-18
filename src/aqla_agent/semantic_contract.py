@@ -451,6 +451,11 @@ def source_percentage_target_failure(text, interpretation):
 
 def supported_action_failure(text, interpretation):
     """Return a stable rejection code for explicitly unrepresentable instructions."""
+    if (interpretation.kind == "trade_update" and TP_LABEL.search(text)
+            and re.search(r"(?:забыл\w*|забыли|forgot(?:ten)?)[^.!?\n]{0,45}(?:ордер\w*|order)|"
+                          r"(?:order|auftrag)[^.!?\n]{0,25}vergessen", text, re.I)
+            and not current_actions(text)):
+        return "existing_target_catchup_requires_report_review"
     direction_failure = managed_position_side_failure(text, interpretation)
     if direction_failure:
         return direction_failure
