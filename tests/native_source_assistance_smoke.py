@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--conditional-exit-permission", action="store_true")
     parser.add_argument("--target-catchup", action="store_true")
     parser.add_argument("--partial-exit-label", action="store_true")
+    parser.add_argument("--caveman", action="store_true")
     args = parser.parse_args()
     correction_needed = any((args.numbered_integer_target, args.empty_original, args.two_entry_orders,
         args.analysis_entry_level, args.managed_position_side, args.conditional_exit_permission, args.target_catchup, args.partial_exit_label))
@@ -106,9 +107,13 @@ def main():
         corrected = Interpretation(kind="report", source_refs=[source.source_id], reason="Existing target/result, not a new whole-position close",
             evidence=[Evidence(field="classification", source_id=source.source_id, quote=text)])
     fixture = home / "fixture.private.json"
-    write_private_json(fixture, {"packet": packet, "context_messages": [row, {"event_id": unrelated.event_id,
+    fixture_body = {"packet": packet, "context_messages": [row, {"event_id": unrelated.event_id,
         "source_id": unrelated.source_id, "source": unrelated.model_dump(mode="json")}],
-        "master": "Synthetic historical interpretation, no orders.", "session_id": "native-smoke"})
+        "master": "Synthetic historical interpretation, no orders.", "session_id": "native-smoke"}
+    if args.caveman:
+        fixture_body.update(caveman=(root / "skills/caveman/SKILL.md").read_text(encoding="utf-8"),
+                            master=(root / "skills/aqla-master/SKILL.md").read_text(encoding="utf-8"))
+    write_private_json(fixture, fixture_body)
     calls = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -219,6 +224,10 @@ def main():
         else:
             assert result["checks"][-1]["interpretation"]["evidence"][-1]["quote"] == ("Target 3: 1" if args.numbered_integer_target else "110")
         assert not result["forbidden_tools"] and result["order_requests"] == 0
+        if args.caveman:
+            prompt = json.dumps(calls[0]["messages"], ensure_ascii=False)
+            assert prompt.index('caveman') < prompt.index('aqla-master')
+            assert "Numbers and units exact" in prompt
         from aqla_hyperliquid_mcp.storage import read_snapshot
         retained = read_snapshot(home / "state.sqlite3")
         assert set(retained["events"]) == {source.event_id, unrelated.event_id}
@@ -235,6 +244,7 @@ def main():
             "requests": result["request_attempts"], "responses": result["api_responses"]}
         assert not retained["plans"] and not retained["operations"] and not retained["trades"]
         print(json.dumps({"native_high_mcp_loop": True, "original_quote_shortened": not (args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.managed_position_side or args.conditional_exit_permission or args.target_catchup or args.partial_exit_label),
+            "caveman_in_model_request": args.caveman,
             "managed_position_side_kept": args.managed_position_side,
             "conditional_exit_not_discarded": args.conditional_exit_permission,
             "target_catchup_not_new_exit": args.target_catchup,

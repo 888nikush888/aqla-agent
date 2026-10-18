@@ -40,6 +40,8 @@ class SourceJob(Model):
     cache_reused_from: str | None = None
     outcome: str | None = None
     review_sources: dict[str, str] = Field(default_factory=dict)
+    execution_path: Literal["express"] | None = None
+    express_timings: dict[str, int] = Field(default_factory=dict)
 
 
 class SourceProcessor:
@@ -51,6 +53,7 @@ class SourceProcessor:
         self.active_jobs = set()
         self.retry_max_attempts, self.retry_backoff_seconds, self.retry_max_age_seconds = 3, 15, 900
         self.decision_status = {}
+        self.express = None
 
     def configure(self, mode, owner, *, retry_max_attempts=3, retry_backoff_seconds=15, retry_max_age_seconds=900, decision_status=None):
         if mode not in ("legacy", "shadow", "hybrid") or not isinstance(owner, str) or not owner or len(owner) > 100:
@@ -75,6 +78,8 @@ class SourceProcessor:
         return {"mode": mode}
 
     def require_owner(self, owner):
+        if self.express is not None and self.express.owns(owner):
+            return
         if self.mode == "legacy" or owner != self.owner:
             raise AqlaError("Source processor ownership changed")
 
@@ -146,6 +151,8 @@ class SourceProcessor:
     def reconcile_jobs(self, owner, version, snapshot):
         """Finish durable outcomes before queue selection; never dispatch/recover orders."""
         for record in snapshot.get("source_jobs", {}).values():
+            if record.get("execution_path") == "express":
+                continue
             if record["status"] not in ("applying", "recovering", "retry_wait") or record["job_id"] in self.active_jobs:
                 continue
             job = SourceJob.model_validate(record)
@@ -217,6 +224,8 @@ class SourceProcessor:
             self.reconcile_jobs(owner, version, snapshot)
             snapshot = self.state.snapshot()
             for record in snapshot.get("source_jobs", {}).values():
+                if record.get("execution_path") == "express":
+                    continue
                 if record["status"] != "waiting_preview" or record["job_id"] in self.active_jobs:
                     continue
                 job = SourceJob.model_validate(record)
@@ -370,7 +379,10 @@ class SourceProcessor:
         record = self.state.read("source_jobs", entries={"source_jobs": [job_id]}).get("source_jobs", {}).get(job_id)
         if record is None:
             raise AqlaError("Unknown native source job")
-        return SourceJob.model_validate(record)
+        job = SourceJob.model_validate(record)
+        if job.execution_path == "express" and not (self.express and self.express.owns(owner, job)):
+            raise AqlaError("Express jobs are owned by the internal template processor")
+        return job
 
     def save(self, job):
         self.state.update_metadata(("source_jobs",), lambda data: data["source_jobs"].__setitem__(job.job_id, job.model_dump(mode="json")))
@@ -465,7 +477,8 @@ class SourceProcessor:
 
     async def apply_saved(self, owner, job_id):
         job = self.read_job(owner, job_id)
-        if self.mode != "hybrid":
+        express = self.express is not None and self.express.owns(owner, job)
+        if self.mode != "hybrid" and not express:
             raise AqlaError("Shadow source jobs cannot execute")
         if job.status == "done":
             return {"status": "done", "already_processed": True}
@@ -474,7 +487,8 @@ class SourceProcessor:
             raise AqlaError("Source job is not a validated unsubmitted interpretation")
         if job.result.collection_only:
             raise AqlaError("Collection-only decisions cannot execute")
-        if job.policy_version != self.policy_version or job.version != VERSION or job.result.question_version != VERSION:
+        policy_version = self.express.policy_version if express else self.policy_version
+        if job.policy_version != policy_version or job.version != VERSION or job.result.question_version != VERSION:
             raise AqlaError("Source processing policy changed; no new submission")
         # This read happens immediately before the existing transactional source/entry guards.
         context, packet, fingerprint = self.context(job.event_id)
@@ -487,7 +501,7 @@ class SourceProcessor:
                 raise AqlaError("No proven unsubmitted preview target or saved plan remains")
         else:
             validate_interpretation(packet, job.result.interpretation)
-        if not resume_preview and job.event_id not in queue_overview(self.state.snapshot(), limit=100000)["ready"]:
+        if not resume_preview and job.event_id not in queue_overview(self.state.snapshot(), limit=100000, include_express=express)["ready"]:
             raise AqlaError("Source job is no longer ready; recover existing operations")
         # Keep pending preview work discoverable if this read is interrupted
         # after another venue already opened its position.
@@ -532,7 +546,8 @@ class SourceProcessor:
             counts[row["status"]] += 1
         if self.mode == "legacy":
             return {"mode": "legacy", "processor": "Hermes + DeepSeek + Tools", "jobs": {},
-                    "historical_jobs": counts, "decision": {}, "diagnostics": []}
+                    "historical_jobs": counts, "decision": {}, "diagnostics": [],
+                    **({"express": self.express.overview()} if self.express else {})}
         diagnostics = [{"job_id": row["job_id"], "status": row["status"], "outcome": row.get("outcome"),
                         "failure": row.get("failure_detail"), "attempt_count": row.get("attempt_count", 1),
                         "next_retry_at": row.get("next_retry_at"), "retry_deadline_at": row.get("retry_deadline_at")}

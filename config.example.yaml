@@ -10,6 +10,9 @@ sources: []
 # Rules are set by you through Hermes; none are silently selected for you.
 policy: null
 ranking_enabled: true
+express:
+  mode: "off"
+  master_path: hermes-home/skills/aqla-master/SKILL.md
 # Each additional exchange/network has its own protected credentials and approval.
 # Account limits and activation are set explicitly through authenticated control.
 execution_accounts:

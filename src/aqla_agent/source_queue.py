@@ -138,7 +138,7 @@ def repair_queue(snapshot):
                 row["queue_anchor"] = True
 
 
-def queue_overview(snapshot, limit=50, *, event_rows=None):
+def queue_overview(snapshot, limit=50, *, event_rows=None, include_express=False):
     events = snapshot["events"]
     event_rows = [row for row in (events.values() if event_rows is None else event_rows) if is_source_row(row)]
     recovery = recovery_ids(snapshot, event_rows)
@@ -165,8 +165,14 @@ def queue_overview(snapshot, limit=50, *, event_rows=None):
                 signatures.append(digest(sorted(row["event_id"] for row in current)))
         elif anchor_row(current).get("status") in ("pending", "interpreted") and anchor_row(current)["event_id"] not in recovery:
             ready.append(anchor_row(current)["event_id"])
+    from .express import active_claim
+    express = [identity for identity in ready if active_claim(snapshot, identity)]
+    if not include_express:
+        claimed = set(express)
+        ready = [identity for identity in ready if identity not in claimed]
     operations = [identity for identity, operation in snapshot.get("operations", {}).items() if operation.get("phase") in ("prepared", "sending", "unknown")]
     return {"ready_total": len(ready), "ready": ready[:limit],
+            **({"express_total": len(express), "express": express[:limit]} if express else {}),
             "ready_signature": digest(sorted(ready)),
             "raw_unfinished_total": sum(row.get("status") in UNFINISHED for row in event_rows),
             "superseded_total": sum(row.get("status") == "superseded" for row in event_rows),

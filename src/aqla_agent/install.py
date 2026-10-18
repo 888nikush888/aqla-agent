@@ -62,6 +62,7 @@ def prepare(project: Path, destination: Path, owner: str,
     config = yaml.safe_load((destination / "config.example.yaml").read_text(encoding="utf-8"))
     config["private_key_file"] = None
     config["telegram_owner_id"] = owner
+    config["express"] = {"mode": "off", "master_path": str(destination / "hermes-home/skills/aqla-master/SKILL.md")}
     (destination / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     home = destination / "hermes-home"
     home.mkdir(mode=0o700)

@@ -117,6 +117,11 @@ class GoogleSheetsSettings(Model):
         return self
 
 
+class ExpressSettings(Model):
+    mode: Literal["off", "shadow", "live"] = "off"
+    master_path: Path | None = None
+
+
 class Settings(Model):
     network: Literal["mainnet", "testnet"]
     account: Address
@@ -140,6 +145,7 @@ class Settings(Model):
     venues: dict[Literal["aster", "lighter"], VenueSettings] = Field(default_factory=dict)
     execution_accounts: dict[str, ExecutionSettings] = Field(default_factory=dict)
     ranking_enabled: bool = False
+    express: ExpressSettings = Field(default_factory=ExpressSettings)
 
     @model_validator(mode="after")
     def journal_network(self):
@@ -161,6 +167,8 @@ class Settings(Model):
     def load(cls, path: str | Path):
         path = Path(path).resolve()
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if (raw.get("express") or {}).get("master_path"):
+            raw["express"]["master_path"] = str((path.parent / raw["express"]["master_path"]).resolve())
         for name in ("state_path", "private_key_file", "integration_key_file", "setup_password_hash_file", "telegram_session_file", "telegram_api_hash_file"):
             if raw.get(name):
                 raw[name] = str((path.parent / raw[name]).resolve())

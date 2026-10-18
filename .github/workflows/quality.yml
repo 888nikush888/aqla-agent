@@ -106,6 +106,7 @@ jobs:
         run: .cache/hermes-venv/bin/python tests/native_decision_smoke.py --hermes-source .cache/hermes-source --home .cache/decision-home
       - name: Native high with source assistance and isolated MCP
         run: |
+          .cache/hermes-venv/bin/python tests/native_source_assistance_smoke.py --hermes-source .cache/hermes-source --home .cache/source-caveman-home --mcp-python .venv/bin/python --caveman
           .cache/hermes-venv/bin/python tests/native_source_assistance_smoke.py --hermes-source .cache/hermes-source --home .cache/source-assistance-home --mcp-python .venv/bin/python --transport-failure
           .cache/hermes-venv/bin/python tests/native_source_assistance_smoke.py --hermes-source .cache/hermes-source --home .cache/source-integer-home --mcp-python .venv/bin/python --numbered-integer-target
           .cache/hermes-venv/bin/python tests/native_source_assistance_smoke.py --hermes-source .cache/hermes-source --home .cache/source-rate-limit-home --mcp-python .venv/bin/python --rate-limit-failure

@@ -124,6 +124,8 @@ class Trading:
             state["cursors"][source.chat_id] = max(source.message_id, state["cursors"].get(source.chat_id, 0))
             from .source_queue import repair_queue
             repair_queue(state)
+            if ingress := getattr(self, "express_ingress", None):
+                ingress(state, row)
             self.prune_events(state, inserted_event=source.event_id)
             return row
 
@@ -221,6 +223,8 @@ class Trading:
             row = snapshot["events"].get(event_id)
             if not is_source_row(row):
                 raise AqlaError("Unknown source event")
+            from .express import require_source_access
+            require_source_access(snapshot, event_id)
             previous = row.get("interpretation")
             from .efficiency import classification_ack
             def result():
@@ -402,6 +406,12 @@ class Trading:
 
     def validate_admission(self, snapshot, plan, account=None, *, owned=False, allowed_prepared=(), allowed_sending=()):
         self.assert_plan_binding(snapshot, plan)
+        if express_admission := getattr(self, "express_admission", None):
+            express_admission(snapshot, plan)
+        if not owned:
+            from .express import require_source_access
+            for event_id in plan.source_revisions.values():
+                require_source_access(snapshot, event_id)
         if any(row.get("protection_observation_pending") and row["status"] in OPEN for row in snapshot["trades"].values()):
             raise TemporaryObservation("read_unavailable", "protection", "transport")
         if owned and snapshot["trades"][plan.trade_id]["status"] not in OPEN:

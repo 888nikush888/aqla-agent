@@ -79,6 +79,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     from aqla_agent.delivery import NotificationOutbox
     from aqla_agent.source_processing import SourceProcessor
     processor = SourceProcessor(state, trading)
+    from aqla_agent.express_worker import ExpressWorker
+    express = ExpressWorker(processor, settings.express)
     outbox = NotificationOutbox(state, settings.telegram_owner_id)
     setup_gate = SetupGate(authority is not None and bool(settings.telegram_owner_id) and load_verifier(settings.setup_password_hash_file) is not None)
 
@@ -130,12 +132,14 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                     logging.getLogger(__name__).warning("Monthly accounting evidence unavailable; completeness remains explicit")
                 await asyncio.sleep(60)
         report_task = asyncio.create_task(report_evidence(), name="aqla-report-evidence")
+        express_task = asyncio.create_task(express.run(), name="aqla-express")
         try:
             yield None
         finally:
             task.cancel()
             report_task.cancel()
-            await asyncio.gather(task, report_task, return_exceptions=True)
+            express_task.cancel()
+            await asyncio.gather(task, report_task, express_task, return_exceptions=True)
             await trading.close()
             await streams.close()
             state.close()
@@ -803,6 +807,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     server.aqla_state, server.aqla_exchange, server.aqla_trading = state, exchange, trading
     server.aqla_authority = authority
     server.aqla_streams = streams
+    server.aqla_express = express
     return server
 
 

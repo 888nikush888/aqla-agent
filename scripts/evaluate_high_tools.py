@@ -66,7 +66,18 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
                   "args": ["-m", "aqla_agent.source_replay", str(fixture_path)], "cwd": str(ROOT),
                   "trust": "full", "supports_parallel_tool_calls": False,
                   "env": {"PYTHONPATH": str(ROOT / "src"), "HERMES_MODEL_API_KEY": ""}}}}
+    skill_prompt = fixture["master"]
+    if fixture.get("caveman"):
+        config["skills"] = {"auto_load": ["caveman", "aqla-master"]}
+        for name, body in (("caveman", fixture["caveman"]), ("aqla-master", fixture["master"])):
+            target = home / "skills" / name
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "SKILL.md").write_text(body, encoding="utf-8")
     (home / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    if fixture.get("caveman"):
+        from agent.skill_commands import build_auto_load_prompt
+        skill_prompt, loaded, missing = build_auto_load_prompt(user_config=config, home_override=home)
+        assert loaded == ["caveman", "aqla-master"] and missing == []
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
     from hermes_constants import parse_reasoning_effort
     from run_agent import AIAgent
@@ -144,7 +155,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
 
         agent._create_request_openai_client = guarded_client
         agent.client._client.event_hooks.setdefault("request", []).append(guard)
-        instruction = (fixture["master"] + "\n\n" + GUIDANCE + "\nHistorical quality replay only. "
+        instruction = (skill_prompt + "\n\n" + GUIDANCE + "\nHistorical quality replay only. "
             "The originals retain original timestamps and historical metadata. Classify communication intent AS OF the anchor publication; "
             "Python alone owns age, ownership, risk and execution permission. No trade, operator action or live write is available. "
             "Read source_context(view=decision), read the provided interpretation contract, and use source_check_interpretation. "
@@ -223,6 +234,7 @@ def main():
     parser.add_argument("--case-id", action="append")
     parser.add_argument("--worker-fixture", type=Path)
     parser.add_argument("--workers", type=int, choices=(1, 2, 4), default=2)
+    parser.add_argument("--caveman", type=Path, help="Actual deployed Caveman SKILL.md for the paired express baseline")
     args = parser.parse_args()
     logging.disable(logging.CRITICAL)
     if args.worker_fixture:
@@ -236,6 +248,7 @@ def main():
     payload = json.loads(args.dataset.read_text(encoding="utf-8"))
     cases = payload["cases"]
     master = args.master.read_text(encoding="utf-8")
+    caveman = args.caveman.read_text(encoding="utf-8") if args.caveman else None
     manifest = payload.get("protocol", payload.get("manifest"))
     assert digest(cases) == manifest["dataset_sha256"]
     identity = {"version": "high-tools-native-v3", "source_sha256": source_digest(),
@@ -245,6 +258,9 @@ def main():
                 "transport_wait_seconds": [15, 30],
                 "context_mode": "all_retained_original_messages_no_cached_labels",
                 "runs": args.runs, "workers": args.workers, "order_tools_available": False}
+    if caveman:
+        identity["caveman_sha256"] = hashlib.sha256(caveman.encode()).hexdigest()
+        identity["native_auto_load"] = ["caveman", "aqla-master"]
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
     seal = args.output / "identity.json"
     if seal.exists():
@@ -282,6 +298,8 @@ def main():
                         "mismatch_fields": ["quota_estimate_limit"], "order_requests": 0}
         fixture = {"packet": case["packet"], "context_messages": case_context(case)["messages"],
                    "master": master, "session_id": digest([case["id"], run])[:24]}
+        if caveman:
+            fixture["caveman"] = caveman
         fixture_path = directory / "fixture.private.json"
         write_private_json(fixture_path, fixture)
         command = [sys.executable, "-B", str(Path(__file__).resolve()), "--hermes-source", str(args.hermes_source),
