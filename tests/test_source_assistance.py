@@ -286,6 +286,22 @@ def test_completed_entry_status_cannot_reopen_the_setup(status):
     assert check_interpretation(context, report)["valid"]
 
 
+@pytest.mark.parametrize("caption", ["#setup_crypto", "#scenario_btc", "#план_крипто", "#сценарии_рынка"])
+def test_bare_setup_topic_is_not_explicit_market_report_framing(caption):
+    source, context, _ = material(caption)
+    draft = Interpretation(kind="report", source_refs=[source.source_id], reason="Missing media",
+        evidence=[Evidence(field="classification", source_id=source.source_id, quote=caption)])
+    for kind in ("report", "unrelated"):
+        draft.kind = kind
+        checked = check_interpretation(context, draft)
+        assert not checked["valid"]
+        assert checked["errors"][0]["code"] == "source_setup_topic_needs_original_context"
+    draft.kind = "incomplete"
+    assert check_interpretation(context, draft)["valid"]
+    assistance = source_assistance(context)
+    assert assistance["original_structure_vetoes"]["report"] == "source_setup_topic_needs_original_context"
+
+
 def test_discrete_entry_error_explains_why_renaming_to_range_is_not_a_correction():
     source, context, _ = material("BTC LONG\nEntry: limit orders at 100 and 95\nStop 90\nTarget 110")
     value = Interpretation(kind="new_signal", symbol="BTC", side="long", entry="range", entry_prices=[95,100],

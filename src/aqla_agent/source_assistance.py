@@ -22,6 +22,7 @@ CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_ac
                    "source_exchange", "single_entry_form", "single_management_action")
 CONTEXT_CANDIDATE_LIMIT = 64
 REPAIR_GUIDANCE = {
+    "source_setup_topic_needs_original_context": "A bare scenario/setup/plan topic tag does not establish market-outlook/report framing or reveal the missing media's instructions. Recheck incomplete when the original instruction is unavailable. Do not infer video contents or borrow neighbour instructions.",
     "source_percentage_target_interval_not_representable": "The original specifies a binding profit/TP interval, not an ordered list of exits. Recheck ambiguous; do not select an endpoint, invent several targets or erase the explicit target to use backup values. This is an interval problem, not missing percentage basis.",
     "entry_legs_not_representable": "Re-read contract.single_entry_form and the original separate orders. Renaming several discrete entry legs to range does not represent them. Use ambiguous when the source cannot fit one supported entry; omit unused trading fields and quote the conflicting original. Never pick one leg or repair this by changing its prices.",
     "source_percentage_targets_missing_or_changed": "The original explicitly lists percent-only TP targets. Under source-roe-v1 these are nominal ROE targets, not position allocations. Preserve every listed target in order with take_profit_unit=roe_percent and exact percent quotes. A separate deposit/margin percent is not a TP. Do not silently substitute backup targets.",
@@ -37,6 +38,7 @@ REPAIR_GUIDANCE = {
     "unbound_setup_edit_is_not_management": "Python reports no accepted own setup binding. An edit/publication alone is not execution. This anchor still presents a complete entry setup, not an explicit management instruction: recheck corrected new_signal, or ambiguous when all original entry legs cannot be represented.",
 }
 REPAIR_FIELDS = {
+    "source_setup_topic_needs_original_context": ["kind"],
     "source_percentage_target_interval_not_representable": ["kind", "take_profits", "take_profit_unit"],
     "entry_legs_not_representable": ["kind", "entry", "entry_prices"],
     "source_percentage_targets_missing_or_changed": ["take_profits", "take_profit_unit"],

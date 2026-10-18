@@ -371,6 +371,10 @@ def source_percentage_target_failure(text, interpretation):
 
 def supported_action_failure(text, interpretation):
     """Return a stable rejection code for explicitly unrepresentable instructions."""
+    if (interpretation.kind in ("report", "unrelated")
+            and re.fullmatch(r"(?:#\w+[\s,]*)+", text.strip())
+            and re.search(r"(?:#|_)(?:scenarios?|setups?|plans?|szenari\w*|сценари\w*|сетап\w*|план\w*)(?:_|$)", text, re.I)):
+        return "source_setup_topic_needs_original_context"
     scope = re.search(r"(?:everything\s+above\s+(?:is|was)\s+(?:an?\s+)?example|"
         r"alles\s+obige\s+(?:ist|war)\s+(?:ein\s+)?beispiel|"
         r"вс[её]\s*,?\s*что\s+выше[^\n.!?]{0,100}\bпример\w*)", text, re.I)
