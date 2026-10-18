@@ -611,6 +611,25 @@ async def test_sheets_delivery_acknowledges_only_after_success_and_isolates_outa
 
 
 @pytest.mark.asyncio
+async def test_unavailable_journal_rows_are_reported_without_ack_or_delivery(extension, tmp_path, caplog):
+    from aqla_hyperliquid_mcp.models import GoogleSheetsSettings
+
+    extension, ctx = extension
+    extension.settings.google_sheets = GoogleSheetsSettings(enabled=True, spreadsheet_id="ci-sheet-" + "0" * 30,
+        credentials_file=tmp_path / "google.secret")
+    calls = []
+    async def call(action, **kwargs):
+        calls.append(action)
+        assert action == "journal_snapshot"
+        return {"records": [], "pending": 1}
+    extension.call = call
+    ctx.call_mcp = lambda *_: pytest.fail("Unavailable rows were delivered or acknowledged")
+    await extension.sync_journal()
+    assert calls == ["journal_snapshot"]
+    assert "journal records unavailable (pending=1)" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_slow_google_sync_does_not_stop_source_wakeups(extension, tmp_path):
     from aqla_hyperliquid_mcp.models import GoogleSheetsSettings
 

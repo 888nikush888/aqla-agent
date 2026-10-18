@@ -16,6 +16,13 @@ def mainnet_state(old, account, stamp):
     data.update(network='mainnet',account=account.lower(),trading_account=account.lower(),paused=False,
                 sources_live_after=stamp,notifications={},bindings={},nonces={},sequence=0,journal_pending={},journal_history={})
     data.pop('journal_synced_at',None)
+    for key in ('journal_projection', 'journal_destination'):
+        data.pop(key, None)
+    if 'journal_order_archive' in data:
+        from aqla_sheets_mcp.journal import HEADERS
+        venue_column = HEADERS['Orders'].index('Börse')
+        data['journal_order_archive'] = {key: row for key, row in data['journal_order_archive'].items()
+                                        if row['values'][venue_column] != 'hyperliquid'}
     for collection in ('trades','plans'):
         data[collection]={key:row for key,row in data[collection].items() if row['plan'].get('exchange','hyperliquid')!='hyperliquid'}
     data['operations']={key:row for key,row in data['operations'].items() if row.get('exchange','hyperliquid')!='hyperliquid'}

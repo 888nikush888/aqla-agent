@@ -155,12 +155,22 @@ async def test_network_cutover_keeps_ids_and_prevents_old_signal_reentry(setup,s
     clo={row['cloid'] for row in trade['orders']}|{trade['entry_cloid']}
     confirm_manual_testnet_close(old,identity,net_size=0,order_statuses={key:'canceled' for key in clo},stamp=source.sent_at+1)
     assert old['trades'][identity]['manual_closure']['pnl_complete'] is False
+    from aqla_sheets_mcp.journal import HEADERS, fingerprint, project
+    row = next(row for row in project(old).values() if row['table'] == 'Orders')
+    other = copy.deepcopy(row)
+    other['record_id'] = other['values'][0] = 'aster-archive'
+    other['values'][HEADERS['Orders'].index('Börse')] = 'aster'
+    other['fingerprint'] = fingerprint(other['values'])
+    old.update(journal_order_archive={row['record_id']: row, other['record_id']: other},
+               journal_projection={'stale': 'version'}, journal_destination='previous-target')
     transitioned=mainnet_state(old,settings.account,source.sent_at+100)
     assert transitioned['network']=='mainnet' and transitioned['trades']=={} and transitioned['operations']=={} and transitioned['nonces']=={}
     assert transitioned['profiles']==original['profiles']
     assert transitioned['events'][source.event_id]['source']['historical']
     assert transitioned['context_cutoffs']['channel']>=source.message_id
     assert old['trades'][identity]['plan']==original['trades'][identity]['plan']
+    assert transitioned['journal_order_archive'] == {'aster-archive': other}
+    assert 'journal_projection' not in transitioned and 'journal_destination' not in transitioned
 
 
 @pytest.mark.asyncio

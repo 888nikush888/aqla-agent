@@ -256,6 +256,8 @@ class HermesExtension:
         try:
             pending = await self.call("journal_snapshot")
             if not pending["records"]:
+                if pending["pending"]:
+                    LOG.warning("aqla journal records unavailable (pending=%s); no acknowledgement issued", pending["pending"])
                 return
             delivered = await self.mcp_call("sheets", "sync_internal", {"token": self.authority.key.decode(), "records": pending["records"]})
             if delivered.get("accepted"):

@@ -6,7 +6,7 @@ import threading
 
 import portalocker
 
-from .models import AqlaError, Settings
+from .models import AqlaError, Settings, digest
 from .storage import SQLiteStore, database_path, read_snapshot
 
 METADATA_ROOTS = {"nonces": dict, "account_nonces": dict, "venue_nonces": dict, "cursors": dict,
@@ -81,7 +81,12 @@ class State:
                     row.update(tier="F", bootstrap=False)
             if self.journal_enabled:
                 from aqla_sheets_mcp.journal import seed
-                seed(self.data)
+                seed(self.data, destination=digest({"spreadsheet": settings.google_sheets.spreadsheet_id,
+                    "namespace": settings.google_sheets.tab_namespace, "network": settings.network, "account": target,
+                    "ranking": settings.ranking_enabled, "accounts": self.data.get("venue_accounts", {}),
+                    "execution_accounts": {key: {"network": row.network,
+                        "account": getattr(row, "vault_address", None) or row.account or str(row.account_index)}
+                        for key, row in settings.execution_accounts.items()}}))
             self._store = SQLiteStore(self.path, create=not existing)
             if not existing or migrated or legacy or self.journal_enabled:
                 self._write(self.data)

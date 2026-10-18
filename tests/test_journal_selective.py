@@ -8,6 +8,50 @@ from aqla_hyperliquid_mcp.models import SourceEvent
 from aqla_sheets_mcp import journal
 
 
+@pytest.mark.parametrize("removed", ["entry", "tp", "close"])
+def test_replaced_orders_keep_exact_export_until_and_after_digest_ack(financial_data, removed):
+    before = copy.deepcopy(financial_data)
+    trade = financial_data["trades"]["trade"]
+    identity = trade["entry_cloid"] if removed == "entry" else (trade["orders"] if removed == "tp" else trade["exit_orders"])[0]["cloid"]
+    key = "Orders:" + identity
+    original = journal.project(before)[key]
+    if removed == "entry":
+        trade["entry_cloid"] = "new-entry"
+    else:
+        trade["orders" if removed == "tp" else "exit_orders"] = []
+    financial_data["sequence"] += 1
+    journal.enqueue_changes(before, financial_data)
+    assert financial_data["journal_order_archive"][identity] == original
+    assert journal.project(financial_data)[key] == original
+    financial_data["journal_pending"] = {key: original["fingerprint"]}
+    assert journal.batch(financial_data)["records"] == [{**original, "revision": financial_data["sequence"]}]
+    preserved = copy.deepcopy(financial_data)
+    assert journal.acknowledge(financial_data, {key: "stale"})["acknowledged"] == 0
+    assert financial_data == preserved
+    assert journal.acknowledge(financial_data, {key: original["fingerprint"]}) == {"acknowledged": 1, "pending": 0}
+    financial_data["profiles"]["standard"]["revision"] += 1
+    assert journal.project(financial_data)[key] == original
+    assert financial_data["journal_order_archive"][identity] == original
+    assert financial_data["trades"] == preserved["trades"] and financial_data["operations"] == before["operations"]
+
+
+def test_current_order_wins_over_archive_and_refreshes_archive_on_next_replacement(financial_data):
+    trade = financial_data["trades"]["trade"]
+    identity = trade["entry_cloid"]
+    original = journal.project(financial_data)["Orders:" + identity]
+    financial_data["journal_order_archive"] = {identity: copy.deepcopy(original)}
+    trade["plan"]["quantity"] = "3"
+    current = journal.project(financial_data)["Orders:" + identity]
+    assert current != original
+    financial_data["journal_pending"] = {"Orders:" + identity: current["fingerprint"]}
+    assert journal.batch(financial_data)["records"] == [{**current, "revision": financial_data["sequence"]}]
+    previous = copy.deepcopy(financial_data)
+    trade["entry_cloid"] = "replacement"
+    financial_data["sequence"] += 1
+    journal.enqueue_changes(previous, financial_data)
+    assert financial_data["journal_order_archive"][identity] == current
+
+
 @pytest.fixture
 def financial_data(setup, monkeypatch):
     from test_monthly import trade

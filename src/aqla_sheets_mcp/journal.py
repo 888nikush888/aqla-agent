@@ -152,7 +152,7 @@ def _financial_record(data, table, identity, cache):
         trade_id = cache[index_key].get(identity)
     trade = data["trades"].get(trade_id)
     if trade is None:
-        return None
+        return data.get("journal_order_archive", {}).get(identity) if table == "Orders" else None
     cache_key = ("records", table, trade_id)
     if cache_key not in cache:
         if "aliases" not in cache:
@@ -242,6 +242,8 @@ def project(data):
                        event.get("reason"), event.get("proof_total"), event.get("factor")))
     for row in rows.values():
         _target_record(data, row)
+    for row in data.get("journal_order_archive", {}).values():
+        rows.setdefault(record_key(row), row)
     for row in data.get("journal_history", {}).values():
         add(row)
     return rows
@@ -287,6 +289,14 @@ def enqueue_changes(previous, proposed):
     before, after = project(previous), project(proposed)
     pending = proposed.setdefault("journal_pending", {})
     history = proposed.setdefault("journal_history", {})
+    # A retry may replace its IDs before an earlier journal delivery succeeds.
+    archive = proposed.get("journal_order_archive", {})
+    for key, row in before.items():
+        current = after.get(key)
+        if row["table"] == "Orders" and (current is None or current is archive.get(row["record_id"]) and current != row):
+            proposed.setdefault("journal_order_archive", {})[row["record_id"]] = row
+            after[key] = row
+            pending[key] = row["fingerprint"]
     for key, row in after.items():
         old = before.get(key)
         if old and old["fingerprint"] == row["fingerprint"]:
@@ -302,12 +312,20 @@ def enqueue_changes(previous, proposed):
             audit = record("Ereignisse", identity, timestamp(now_ms()), proposed["sequence"], row["table"], row["record_id"], summary(old), summary(row))
             history[identity] = audit
             pending[record_key(audit)] = audit["fingerprint"]
+    if "journal_projection" in proposed:
+        proposed["journal_projection"] = {key: row["fingerprint"] for key, row in after.items() if row["table"] != "Ereignisse"}
 
 
-def seed(data):
+def seed(data, *, destination=None):
     pending = data.setdefault("journal_pending", {})
-    for key, row in project(data).items():
-        pending[key] = row["fingerprint"]
+    rows = project(data)
+    queued = data.get("journal_projection", {}) if destination == data.get("journal_destination") else {}
+    for key, row in rows.items():
+        if destination is None or key in pending or row["table"] == "Ereignisse" or queued.get(key) != row["fingerprint"]:
+            pending[key] = row["fingerprint"]
+    if destination is not None:
+        data["journal_destination"] = destination
+        data["journal_projection"] = {key: row["fingerprint"] for key, row in rows.items() if row["table"] != "Ereignisse"}
 
 
 def batch(data, limit=100):

@@ -198,6 +198,81 @@ def test_durable_queue_survives_restart_and_ignores_stale_ack(tmp_path, sheets):
         assert restored.snapshot()["journal_history"] == {}
 
 
+def test_restart_preserves_only_unacknowledged_records_without_full_refresh(tmp_path, sheets):
+    selected, _, client = sheets
+    settings = Settings(network="testnet", account="0x" + "0" * 40, state_path=tmp_path / "state.sqlite3", google_sheets=selected)
+    with State(settings) as state:
+        state.acknowledge_journal(client.sync(state.journal_batch(500)["records"])["accepted"])
+        assert not state.snapshot()["journal_pending"]
+        state.update(lambda data: data.update(paused=True))
+        pending = state.snapshot()["journal_pending"]
+        assert {key for key in pending if not key.startswith("Ereignisse:")} == {"Regeln:aktuell", "Handelsparameter:paused"}
+        # Sheets accepted the write, but its local ACK was interrupted.
+        client.sync(state.journal_batch(500)["records"])
+    with State(settings) as state:
+        assert state.snapshot()["journal_pending"] == pending
+        state.acknowledge_journal(client.sync(state.journal_batch(500)["records"])["accepted"])
+    with State(settings) as state:
+        assert state.journal_batch(500) == {"records": [], "pending": 0}
+
+
+@pytest.mark.parametrize("change", ["disabled_changes", "projection_change", "destination"])
+def test_restart_catches_offline_changes_new_projection_and_destination(tmp_path, sheets, monkeypatch, change):
+    from aqla_sheets_mcp import journal
+
+    selected, _, client = sheets
+    settings = Settings(network="testnet", account="0x" + "0" * 40, state_path=tmp_path / "state.sqlite3", google_sheets=selected)
+    with State(settings) as state:
+        state.acknowledge_journal(client.sync(state.journal_batch(500)["records"])["accepted"])
+        if change == "disabled_changes":
+            state.journal_enabled = False
+            state.update(lambda data: data.update(paused=True))
+        assert not state.snapshot()["journal_pending"]
+    if change == "destination":
+        settings.google_sheets = selected.model_copy(update={"spreadsheet_id": "new-spreadsheet-" + "1" * 25})
+    elif change == "projection_change":
+        original_parameters = journal.parameter_values
+        def changed_parameters(data):
+            rows = list(original_parameters(data))
+            rows[0] = [*rows[0]]
+            rows[0][3] = "changed projection"
+            return rows
+        monkeypatch.setattr(journal, "parameter_values", changed_parameters)
+    with State(settings) as state:
+        pending = state.snapshot()["journal_pending"]
+        if change == "destination":
+            assert pending == {key: row["fingerprint"] for key, row in project(state.snapshot()).items()}
+        elif change == "disabled_changes":
+            assert set(pending) == {"Regeln:aktuell", "Handelsparameter:paused"}
+        else:
+            assert len(pending) == 1 and next(iter(pending)).startswith("Handelsparameter:")
+
+
+def test_replaced_order_lost_sheet_reply_survives_restart_and_never_duplicates(setup, completed_journal_trade, sheets):
+    settings, state, *_ = setup
+    selected, google, client = sheets
+    snapshot, trade = completed_journal_trade
+    state.update(lambda data: data.update(trades=snapshot["trades"]))
+    state.close()
+    settings.google_sheets = selected
+    with State(settings) as state:
+        state.acknowledge_journal(client.sync(state.journal_batch(500)["records"])["accepted"])
+        old = project(state.snapshot())["Orders:" + trade["entry_cloid"]]
+        state.update(lambda data: data["trades"][trade["trade_id"]].update(entry_cloid="replacement-entry"))
+        google.lose_reply = True
+        with pytest.raises(AqlaError):
+            client.sync(state.journal_batch(500)["records"])
+        expected_pending = state.snapshot()["journal_pending"]
+    with State(settings) as state:
+        assert state.snapshot()["journal_pending"] == expected_pending
+        state.acknowledge_journal(client.sync(state.journal_batch(500)["records"])["accepted"])
+        assert not state.snapshot()["journal_pending"]
+        assert state.snapshot()["journal_order_archive"][old["record_id"]] == old
+        rows = client.read("Orders")["rows"]
+        assert len([row for row in rows if row["ID"] == old["record_id"]]) == 1
+        assert all(row["_verified"] for row in rows)
+
+
 @pytest.mark.asyncio
 async def test_trade_fills_fees_profit_and_statistics_are_actual_facts(setup, signal, sheets, monkeypatch):
     _, state, fake, exchange, trading = setup
