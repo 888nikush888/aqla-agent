@@ -110,6 +110,7 @@ jobs:
           .cache/hermes-venv/bin/python tests/native_source_assistance_smoke.py --hermes-source .cache/hermes-source --home .cache/source-integer-home --mcp-python .venv/bin/python --numbered-integer-target
           .cache/hermes-venv/bin/python tests/native_source_assistance_smoke.py --hermes-source .cache/hermes-source --home .cache/source-rate-limit-home --mcp-python .venv/bin/python --rate-limit-failure
           .cache/hermes-venv/bin/python tests/native_source_assistance_smoke.py --hermes-source .cache/hermes-source --home .cache/source-empty-home --mcp-python .venv/bin/python --empty-original
+          .cache/hermes-venv/bin/python tests/native_source_assistance_smoke.py --hermes-source .cache/hermes-source --home .cache/source-two-entry-home --mcp-python .venv/bin/python --two-entry-orders
       - name: Operator questions, planning and legacy history migration
         run: .cache/hermes-venv/bin/python tests/native_interaction_smoke.py --hermes-source .cache/hermes-source --home .cache/interaction-home
       - name: Native Telegram message formatting, splitting and persistence

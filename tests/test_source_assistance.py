@@ -313,6 +313,55 @@ def test_discrete_entry_error_explains_why_renaming_to_range_is_not_a_correction
     assert "single_entry_form" in error["repair"] and "ambiguous" in error["repair"]
 
 
+@pytest.mark.parametrize("entry,values", [("unspecified", [95,100]), ("range", [95,100]),
+    ("market", [100]), ("limit", [95]), ("unspecified", [100])])
+@pytest.mark.parametrize("orders", [
+    "Buy at current prices 100\nPending buy order 95",
+    "Покупаем по текущим ценам = 100\nОтложенный ордер на покупку = 95",
+    "Пoкупаем пo текущим ценам = 100\noтлoженный oрдер на пoкупку = 95",
+])
+def test_separate_current_and_pending_orders_cannot_be_renamed_or_partially_dropped(entry, values, orders, setup):
+    from aqla_agent.trading import Trading
+    from aqla_hyperliquid_mcp.models import AqlaError
+    source, context, _ = material("BTC LONG\n" + orders + "\nStop 90\nTarget 110")
+    draft = Interpretation(kind="new_signal", symbol="BTC", side="long", entry=entry, entry_prices=values,
+        source_refs=[source.source_id], evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in
+            [("symbol","BTC"),("side","LONG")]+[(f"entry_prices.{i}",str(v)) for i,v in enumerate(values)]])
+    checked = check_interpretation(context, draft)
+    assert not checked["valid"] and checked["errors"][0]["code"] == "entry_legs_not_representable"
+    _, state, fake, exchange, _ = setup
+    trading = Trading(exchange, state)
+    trading.ingest(source)
+    before = state.snapshot()
+    with pytest.raises(AqlaError, match="entry_legs_not_representable|at most one reference"):
+        trading.record_interpretation(source.event_id, draft)
+    assert state.snapshot() == before and not fake.actions
+    review = Interpretation(kind="ambiguous", source_refs=[source.source_id], reason="Separate entry orders cannot fit one entry",
+        evidence=[Evidence(field="classification", source_id=source.source_id, quote=source.text)])
+    assert check_interpretation(context, review)["valid"]
+    assert source.text == context["event"]["source"]["text"]
+
+
+@pytest.mark.parametrize("entry", ["market", "unspecified"])
+def test_one_reference_limit_applies_even_without_recognized_entry_words(entry):
+    from aqla_hyperliquid_mcp.models import AqlaError
+    from aqla_hyperliquid_mcp.rules import verify_entry_shape
+    with pytest.raises(AqlaError, match="at most one reference"):
+        verify_entry_shape(Interpretation(kind="new_signal", source_refs=["current"], entry=entry, entry_prices=[95,100]))
+    for values in ([],[100]):
+        verify_entry_shape(Interpretation(kind="new_signal", source_refs=["current"], entry=entry, entry_prices=values))
+
+
+@pytest.mark.parametrize("text", [
+    "BTC LONG. Buy at current prices 100. No pending buy order 95.",
+    "BTC LONG. Покупаем по текущим ценам 100. Не ставим отложенный ордер 95.",
+    "BTC LONG. Pending buy order 100.", "BTC LONG. Entry range 95-100.",
+])
+def test_single_or_negated_pending_order_is_not_two_live_entry_legs(text):
+    from aqla_agent.semantic_contract import entry_structure_failure
+    assert entry_structure_failure(text) is None
+
+
 @pytest.mark.parametrize("text", ["BTC first target hit. Stop to entry.", "BTC Ziel erreicht. Stopp auf Einstand.",
                                   "BTC тейк. Стоп на точку входа."])
 def test_a_report_cannot_hide_one_current_management_instruction(text):

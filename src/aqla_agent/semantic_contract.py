@@ -19,6 +19,10 @@ WORD = r"(?<!\w)"
 END = r"(?!\w)"
 MARKET = pattern(WORD + r"(?:market|markt|рынок|маркет(?:у|ом)?|по\s+рынку)" + END)
 LIMIT = pattern(WORD + r"(?:limit|лимит(?:н(?:ый|ая|ые|ым|ую|ого|ой|ому|ом|ыми|ых)|к(?:а|и|ой|у|ами|ах)|ом)?)" + END)
+CURRENT_PRICE_ENTRY = pattern(WORD + r"(?:buy(?:ing)?|sell(?:ing)?|покупа(?:ем|ю)|прода(?:ем|ю)|kauf(?:e|en)|verkauf(?:e|en))\s+"
+    r"(?:(?:at|по|zum?)\s+)?(?:current\s+prices?|текущ\w*\s+цен\w*|aktuell\w*\s+(?:preis|kurs)\w*)" + END)
+PENDING_ENTRY_ORDER = pattern(WORD + r"(?:(?:pending|deferred|resting)\s+(?:(?:buy|sell|limit)\s+)?orders?|"
+    r"отложенн\w*\s+(?:ордер\w*|заявк\w*)|ausstehend\w*\s+(?:kauf|verkaufs?)?order\w*)" + END)
 ENTRY = pattern(WORD + r"(?:entry|enter|buy|sell|einstieg|einsteigen|вход|входим|войти)" + END)
 PORTION = pattern(WORD + r"(?:half|quarter|hälfte|halbe\w*|viertel|половин\w*|четверть|[1-3]\s*/\s*[24]|\d+\s*%)" + END)
 PAST = pattern(WORD + r"(?:yesterday|previously|already|earlier|gestern|bereits|zuvor|вчера|ранее|уже)" + END)
@@ -235,6 +239,17 @@ def clause_actions(clause, inherited_blocked, *, initial_setup=False):
     return actions
 
 
+def matching_words(text):
+    """Resolve lookalikes only inside Cyrillic/mixed words, never originals or prices."""
+    lookalikes = str.maketrans("ACEHKMOPTXYaceopxy", "АСЕНКМОРТХУасеорху")
+    def word(match):
+        value = match.group()
+        latin = len(re.findall(r"[a-z]", value, re.I))
+        cyrillic = len(re.findall(r"[а-яё]", value, re.I))
+        return value.translate(lookalikes) if latin and cyrillic >= latin else value
+    return re.sub(r"[A-Za-zА-Яа-яЁё]+", word, text)
+
+
 def current_structure_text(text):
     """Past/examples cannot become current entry constraints after conjunctions."""
     text = text.casefold().replace("ё", "е")
@@ -294,7 +309,7 @@ def tp_break_even_footer(sentence):
 
 
 def entry_structure_failure(text):
-    text = current_structure_text(text)
+    text = current_structure_text(matching_words(text))
     if STOP_CONDITION.search(text):
         return "conditional_stop_not_representable"
     # A legitimate zone has one form and two bounds. Separate MARKET and
@@ -302,8 +317,9 @@ def entry_structure_failure(text):
     forms = set()
     for clause_group in SENTENCES.split(text):
         if not PAST.search(clause_group) and (ENTRY.search(clause_group) or PORTION.search(clause_group)
+                or CURRENT_PRICE_ENTRY.search(clause_group) or PENDING_ENTRY_ORDER.search(clause_group)
                 or re.search(r"(?:market|рынок|маркет\w*|limit|лимит\w*)\s*[:@=-]?\s*\d", clause_group)):
-            for kind, matcher in (("market", MARKET), ("limit", LIMIT)):
+            for kind, matcher in (("market", MARKET), ("limit", LIMIT), ("market", CURRENT_PRICE_ENTRY), ("limit", PENDING_ENTRY_ORDER)):
                 for match in matcher.finditer(clause_group):
                     before, after = clause_group[:match.start()], clause_group[match.end():]
                     if NEGATED.search(before):
@@ -353,7 +369,8 @@ def unsupported_structure(packet):
     failure = incomplete_financial_instruction_failure(text) or future_entry_opportunity_failure(text)
     if failure:
         return failure
-    if ENTRY.search(text) or re.search(r"\b(?:long|short|лонг|шорт)\b", text, re.I):
+    if (ENTRY.search(text) or re.search(r"\b(?:long|short|лонг|шорт)\b", text, re.I)
+            or CURRENT_PRICE_ENTRY.search(matching_words(text)) or PENDING_ENTRY_ORDER.search(matching_words(text))):
         failure = entry_structure_failure(text)
         if failure:
             return failure
@@ -398,7 +415,8 @@ def supported_action_failure(text, interpretation):
             if PAST_WORD.search(text):
                 text = ";".join(sentence for sentence in SENTENCES.split(text)
                     if not (CONDITION.search(sentence) and OPPORTUNITY.search(sentence) and not CURRENT.search(sentence)))
-        if ENTRY.search(text) or re.search(r"\b(?:long|short|лонг|шорт)\b", text, re.I):
+        if (ENTRY.search(text) or re.search(r"\b(?:long|short|лонг|шорт)\b", text, re.I)
+            or CURRENT_PRICE_ENTRY.search(matching_words(text)) or PENDING_ENTRY_ORDER.search(matching_words(text))):
             failure = entry_structure_failure(text)
             if failure:
                 return failure

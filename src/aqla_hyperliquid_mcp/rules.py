@@ -232,6 +232,8 @@ def verify_setup_references(signal, anchor_source_id, own_setup_refs=()):
 
 
 def verify_entry_shape(signal):
+    if signal.kind == "new_signal" and signal.entry in ("market", "unspecified") and len(signal.entry_prices) > 1:
+        raise AqlaError("entry_prices: market/unspecified entry permits at most one reference price. Multiple order legs cannot be combined; do not drop a leg or rename separate orders to a range. Re-read the original and use ambiguous when one supported entry cannot represent it")
     if signal.kind == "new_signal" and signal.entry in ("limit", "range"):
         expected_prices = 2 if signal.entry == "range" else 1
         if len(signal.entry_prices) != expected_prices:

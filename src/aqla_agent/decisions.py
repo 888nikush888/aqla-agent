@@ -24,8 +24,8 @@ from aqla_hyperliquid_mcp.rules import (
 
 from .evidence import position_fractions
 
-VERSION = "aqla-decisions-v35"
-QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v20"
+VERSION = "aqla-decisions-v36"
+QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v21"
 # The original-context wire shape is unchanged. Keeping its independent schema
 # version permits exact-state, exact-question observations to be reused for
 # development while decision/validation policy has its own version and cache key.
@@ -385,7 +385,7 @@ def questions_for(packet, spans):
             "market": "An explicitly named market entry: MARKET, Markt, Рынок under Вход, по рынку, по маркету. It can include a reference price.",
             "limit": "An explicitly requested limit/resting-price entry (limit / Limit / лимит), or ONE directional entry boundary: SHORT zone price+ / >=price is a minimum sell price; LONG zone price- / <=price is a maximum buy price. Keep that one evidenced price; never invent a second range endpoint.",
             "range": "Exactly one explicitly bounded entry range/zone with two endpoints.",
-            "unspecified": "No explicit order form, even if one entry reference price is stated or the author announces a newly opened position.",
+            "unspecified": "No explicit order form; at most ONE reference price, even if the author announces a newly opened position. Several separate prices/orders cannot be hidden in unspecified; do not discard an order or turn independent legs into a range.",
             UNKNOWN: "The order form is conflicting or cannot be established.",
         }.items())),
         "entry_timing": choice("Does the anchor explicitly defer entry? A LIMIT price or expecting a retest alone is STANDARD; it is normal resting-order behavior, not an explicit instruction to wait before placing an order. DEFERRED requires wording such as tomorrow, do not enter yet, erst spaeter, вход позже.", [("standard", "Normal entry or standard limit"), ("deferred", "Explicitly delayed entry"), (UNKNOWN, "Unclear")]),
