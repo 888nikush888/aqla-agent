@@ -274,7 +274,8 @@ class Interpretation(Model):
     source_refs: list[str] = Field(min_length=1, max_length=20,
         description="For report/unrelated/incomplete/ambiguous use ONLY the selected anchor source_id. For an actionable setup include the live instruction; each additional source must supply original evidence or, for trade_update, belong to an existing own binding. Do not copy every context/receipt ref. Keep genuine setup origins, whose earliest publication fixes the deadline.")
     symbol: str | None = Field(default=None, max_length=100)
-    side: Literal["long", "short"] | None = None
+    side: Literal["long", "short"] | None = Field(default=None,
+        description="Source position direction. For updates retain a direction expressly identifying the managed position in the current anchor: closing a purchase/buy holding is long, covering a short is short. Do not confuse exit transaction side with position side, infer from profit/prices, copy a parent direction or use a market opinion as position identity.")
     leverage: Annotated[Decimal, Field(ge=1, allow_inf_nan=False)] | None = Field(default=None,
         description="Original evidenced signal leverage, including decimals. Python floors then caps it. Null only when absent; never round before quoting evidence. A source leverage interval such as 2-5x is ambiguous even with a fixed profile; never choose a bound or treat the interval as missing.")
     entry: Literal["market", "limit", "range", "unspecified"] = Field(default="unspecified",

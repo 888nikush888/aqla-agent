@@ -22,6 +22,8 @@ CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_ac
                    "source_exchange", "single_entry_form", "single_management_action")
 CONTEXT_CANDIDATE_LIMIT = 64
 REPAIR_GUIDANCE = {
+    "managed_position_direction_missing_or_changed": "The current anchor expressly identifies the position being managed as a purchase/buy holding or sale/short holding. Preserve that POSITION direction with an exact current-anchor side quote. Closing a purchase is long; an exit sale is not a new short. Do not infer direction from prices, profit, market commentary or old parent values.",
+    "multiple_managed_position_directions_require_review": "The source manages different position directions. Re-read the full source; do not select one side or execute a partial instruction. A single supported unambiguous action is required.",
     "completed_stop_move_is_not_current_management": "The original reports an already completed stop move: the past-tense governor follows the destination. Recheck report, preserving any genuinely separate current instruction. An unconditional-looking stop phrase does not override its explicit past tense or prove our own stop changed. Never repeat a completed author action merely because our own position state differs.",
     "update_identity_needs_current_quote": "This unbound update explicitly names its market in the current original. Preserve the symbol, quote it from anchor_source_id and remove a parent used only for that duplicate identity. Keep genuine other field contributions; Python's existing own setup bindings remain authoritative. Never change the market to avoid this evidence correction.",
     "source_setup_topic_needs_original_context": "A bare scenario/setup/plan topic tag does not establish market-outlook/report framing or reveal the missing media's instructions. Recheck incomplete when the original instruction is unavailable. Do not infer video contents or borrow neighbour instructions.",
@@ -40,6 +42,8 @@ REPAIR_GUIDANCE = {
     "unbound_setup_edit_is_not_management": "Python reports no accepted own setup binding. An edit/publication alone is not execution. This anchor still presents a complete entry setup, not an explicit management instruction: recheck corrected new_signal, or ambiguous when all original entry legs cannot be represented.",
 }
 REPAIR_FIELDS = {
+    "managed_position_direction_missing_or_changed": ["side", "evidence"],
+    "multiple_managed_position_directions_require_review": ["kind", "side", "update_action"],
     "completed_stop_move_is_not_current_management": ["kind", "update_action"],
     "update_identity_needs_current_quote": ["source_refs", "evidence"],
     "source_setup_topic_needs_original_context": ["kind"],

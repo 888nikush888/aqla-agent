@@ -397,6 +397,44 @@ def test_explicit_entry_assignment_or_current_price_can_use_a_technical_level(as
     assert check_interpretation(context, draft)["valid"]
 
 
+@pytest.mark.parametrize("management,expected", [
+    ("Purchase from 100 we close at current price 110.", "long"),
+    ("Close the purchase at current price 110.", "long"),
+    ("Покупку от уровня 100 закрываем по текущим ценам 110.", "long"),
+    ("Пoкупку oт урoвня 100 закрываем пo текущим ценам 110.", "long"),
+    ("Продажу от уровня 110 закрываем по текущим ценам 100.", "short"),
+])
+def test_current_managed_purchase_or_sale_direction_cannot_be_omitted_or_reversed(management, expected, setup):
+    from aqla_agent.trading import Trading
+    from aqla_hyperliquid_mcp.models import AqlaError
+    source, context, _ = material("BTC\n" + management)
+    draft = Interpretation(kind="trade_update", symbol="BTC", update_action="close", source_refs=[source.source_id],
+        evidence=[Evidence(field="symbol", source_id=source.source_id, quote="BTC"),
+            Evidence(field="update_action", source_id=source.source_id, quote=management)])
+    for side in (None,"short" if expected=="long" else "long"):
+        draft.side = side
+        checked = check_interpretation(context, draft)
+        assert not checked["valid"] and checked["errors"][0]["code"] == "managed_position_direction_missing_or_changed"
+    _, state, fake, exchange, _ = setup
+    trading = Trading(exchange, state)
+    trading.ingest(source)
+    before = state.snapshot()
+    with pytest.raises(AqlaError, match="managed_position_direction_missing_or_changed"):
+        trading.record_interpretation(source.event_id, draft)
+    assert state.snapshot() == before and not fake.actions
+    draft.side = expected
+    draft.evidence.append(Evidence(field="side", source_id=source.source_id, quote=management))
+    assert check_interpretation(context, draft)["valid"]
+
+
+def test_update_direction_is_not_inferred_from_prices_or_market_opinion():
+    source, context, _ = material("BTC\nClose the position from 100 at current price 110.\nI expect a short market move later.")
+    draft = Interpretation(kind="trade_update", symbol="BTC", update_action="close", source_refs=[source.source_id],
+        evidence=[Evidence(field="symbol", source_id=source.source_id, quote="BTC"),
+            Evidence(field="update_action", source_id=source.source_id, quote="Close the position")])
+    assert check_interpretation(context, draft)["valid"] and draft.side is None
+
+
 @pytest.mark.parametrize("text", [
     "BTC LONG. Buy at current prices 100. No pending buy order 95.",
     "BTC LONG. Покупаем по текущим ценам 100. Не ставим отложенный ордер 95.",

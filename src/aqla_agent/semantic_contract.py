@@ -277,6 +277,26 @@ def analysis_only_entry_evidence(original, quote, value):
     return bool(contexts) and all(contexts)
 
 
+def managed_position_side_failure(text, interpretation):
+    if interpretation.kind != "trade_update" or interpretation.update_action not in ("close", "reduce"):
+        return None
+    directions = set()
+    for action, clause in current_actions(matching_words(text)):
+        if action not in ("close", "reduce"):
+            continue
+        closing = r"(?:clos(?:e|ing)|exit(?:ing)?|reduc\w*|закрыва\w*|закрыть|сокраща\w*)"
+        for side, position in (("long", r"(?:purchase|buy\s+position|покупк\w*)"),
+                               ("short", r"(?:sale\s+position|sell\s+position|продаж\w*)")):
+            if (re.search(WORD + position + END + r".{0,100}" + WORD + closing + END, clause, re.I)
+                    or re.search(WORD + closing + END + r"\s+(?:(?:the|my|our)\s+)?" + position + END, clause, re.I)):
+                directions.add(side)
+    if len(directions) > 1:
+        return "multiple_managed_position_directions_require_review"
+    if directions and interpretation.side not in directions:
+        return "managed_position_direction_missing_or_changed"
+    return None
+
+
 def current_structure_text(text):
     """Past/examples cannot become current entry constraints after conjunctions."""
     text = text.casefold().replace("ё", "е")
@@ -420,6 +440,9 @@ def source_percentage_target_failure(text, interpretation):
 
 def supported_action_failure(text, interpretation):
     """Return a stable rejection code for explicitly unrepresentable instructions."""
+    direction_failure = managed_position_side_failure(text, interpretation)
+    if direction_failure:
+        return direction_failure
     if (interpretation.kind == "trade_update" and interpretation.update_action in (None, "move_stop", "break_even")
             and not current_actions(text)
             and any(POSTFIX_PAST_STOP.search(clause[match.end():])
