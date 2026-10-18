@@ -27,6 +27,8 @@ after nonce expiry or an empty order query and is never resubmitted by this
 mechanism. Terminal operation records are preserved on subsequent reconciliation.
 Transport failures retain a bounded exception category and HTTP status, without
 provider response bodies or signed credentials.
+If the exchange explicitly rejects the initial stop, an accepted resting entry
+is cancelled immediately through its existing exact identity.
 
 Tests cover lost replies before and after application, partial configuration,
 unchanged settings, expired signatures, wrong-market and stale-clock evidence,

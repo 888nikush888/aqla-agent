@@ -236,6 +236,20 @@ async def test_aster_stop_rejection_closes_owned_trade_and_pauses_entries(aster,
 
 
 @pytest.mark.asyncio
+async def test_aster_resting_entry_cannot_remain_live_after_initial_stop_rejection(aster, signal):
+    adapter, boundary, engine = aster
+    source, interpretation = signal
+    interpretation = interpretation.model_copy(update={"entry": "limit", "entry_prices": [Decimal(100)]})
+    boundary.reject_stop = True
+    plan = await engine.preview(source.event_id, interpretation)
+    result = await engine.execute(plan["plan_id"])
+    assert result["status"] == "rejected" and boundary.position == 0
+    assert boundary.orders[result["entry_cloid"]]["status"] == "CANCELED"
+    assert result["reserved_risk"] == "0"
+    await adapter.close()
+
+
+@pytest.mark.asyncio
 async def test_aster_last_sending_write_reobserves_and_protection_survives_pause(aster, setup, signal, monkeypatch):
     from aqla_agent import aster as aster_module
     from aqla_agent import entry, venues

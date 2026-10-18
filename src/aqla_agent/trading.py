@@ -782,6 +782,8 @@ class Trading:
             self._patch(plan.trade_id, status="rejected", reserved_risk="0", unsent_reason=result["result"]["error"], orders=[])
             return self.state.snapshot()["trades"][plan.trade_id]
         self.complete_observation_retry(plan.trade_id)
+        if any(leg["index"] == 1 and leg["disposition"] == "rejected" for leg in result.get("legs", [])):
+            await self.cancel_entry(plan.trade_id)
         try:
             await self.refresh_trade(plan.trade_id)
         except ExternalInterference as error:
