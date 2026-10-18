@@ -282,7 +282,7 @@ class Interpretation(Model):
     entry_timing: Literal["standard", "deferred"] = Field(default="standard", description="Explicitly delayed/not-now entry intent requires entry_timing evidence and a source price; Python waits, never substitute an immediate GTC order.")
     source_exchange: str | None = Field(default=None, min_length=1, max_length=100, description="Evidenced exchange named by the source. Metadata only; the operator pipeline chooses the execution exchange.")
     entry_prices: list[Positive] = Field(default_factory=list, max_length=2,
-        description="Positive numbers using JSON numbers or dot-decimal strings, never comma decimals. Evidence uses entry_prices.0 / entry_prices.1.")
+        description="Only stated current entry/execution reference prices; historical highs/lows, swept liquidity and analysis/support/resistance levels are not entries unless explicitly assigned that role. Unstated entry stays empty. market/unspecified has at most one reference, range exactly two bounds. Use JSON numbers or dot-decimal strings, never comma decimals. Evidence uses entry_prices.0 / entry_prices.1.")
     stop_loss: Positive | None = Field(default=None,
         description="Positive JSON number or dot-decimal string, never a comma decimal. Keep the original spelling only in the exact evidence quote.")
     take_profits: list[Positive] = Field(default_factory=list, max_length=20,

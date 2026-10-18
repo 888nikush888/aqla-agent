@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--rate-limit-failure", action="store_true")
     parser.add_argument("--empty-original", action="store_true")
     parser.add_argument("--two-entry-orders", action="store_true")
+    parser.add_argument("--analysis-entry-level", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root / "scripts"))
@@ -36,6 +37,8 @@ def main():
         text = ""
     if args.two_entry_orders:
         text = "BTC LONG\nПoкупаем пo текущим ценам = 100\noтлoженный oрдер на пoкупку = 95\nStop 90\nTarget 110"
+    if args.analysis_entry_level:
+        text = "BTC LONG\nPrice swept the historical low at 85 and reacted.\nStop 80\nTarget 110"
     source = SourceEvent(chat_id="synthetic-source", message_id=1, sent_at=1000, text=text, historical=True)
     unrelated = SourceEvent(chat_id="synthetic-source", message_id=2, sent_at=900,
         text="ETH SHORT. Entry 200. Stop 210. Target 180.", historical=True)
@@ -57,6 +60,10 @@ def main():
         value = Interpretation(kind="new_signal", symbol="BTC", side="long", entry_prices=[95,100],
             source_refs=[source.source_id], evidence=[Evidence(field=f, source_id=source.source_id, quote=q)
                 for f,q in [("symbol","BTC"),("side","LONG"),("entry_prices.0","95"),("entry_prices.1","100")]])
+    if args.analysis_entry_level:
+        value = Interpretation(kind="new_signal", symbol="BTC", side="long", entry_prices=[85], stop_loss=80, take_profits=[110],
+            source_refs=[source.source_id], evidence=[Evidence(field=f, source_id=source.source_id, quote=q)
+                for f,q in [("symbol","BTC"),("side","LONG"),("entry_prices.0","85"),("stop_loss","80"),("take_profits.0","Target 110")]])
     corrected = value.model_copy(deep=True)
     if args.numbered_integer_target:
         corrected.evidence[-1].quote = "Target 3: 1"
@@ -65,6 +72,9 @@ def main():
     if args.two_entry_orders:
         corrected = Interpretation(kind="ambiguous", source_refs=[source.source_id], reason="Two separate order legs cannot be represented by one entry",
             evidence=[Evidence(field="classification", source_id=source.source_id, quote=text)])
+    if args.analysis_entry_level:
+        corrected.entry_prices = []
+        corrected.evidence = [proof for proof in corrected.evidence if proof.field != "entry_prices.0"]
     fixture = home / "fixture.private.json"
     write_private_json(fixture, {"packet": packet, "context_messages": [row, {"event_id": unrelated.event_id,
         "source_id": unrelated.source_id, "source": unrelated.model_dump(mode="json")}],
@@ -101,7 +111,7 @@ def main():
                 return
             sequence = [("source_context", {"event_id": source.event_id, "view": "decision"}),
                         ("source_check_interpretation", {"event_id": source.event_id, "interpretation": value.model_dump(mode="json")})]
-            if args.numbered_integer_target or args.empty_original or args.two_entry_orders:
+            if args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.analysis_entry_level:
                 sequence.append(("source_check_interpretation", {"event_id": source.event_id, "interpretation": corrected.model_dump(mode="json")}))
             message = {"role": "assistant", "content": "Checked; no orders."}
             if index < len(sequence):
@@ -136,11 +146,14 @@ def main():
         result = native_worker(SimpleNamespace(worker_fixture=fixture, hermes_source=args.hermes_source.resolve(),
             mcp_python=args.mcp_python.absolute()), model_url=f"http://127.0.0.1:{model.server_port}/v1", model_key="synthetic-only", local_fixture=True,
             retry_sleep=waits.append)
-        expected_drafts = 2 if args.numbered_integer_target or args.empty_original or args.two_entry_orders else 1
+        expected_drafts = 2 if args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.analysis_entry_level else 1
         responses = 2 + expected_drafts
         assert result["completed"] and result["draft_count"] == expected_drafts and result["checks"][-1]["valid"], result
         if args.numbered_integer_target:
             assert not result["checks"][0]["valid"] and result["checks"][0]["errors"][0]["code"] == "source_numeric_proof_needs_context"
+        if args.analysis_entry_level:
+            assert result["checks"][0]["errors"][0]["code"] == "source_entry_reference_needs_role_review"
+            assert result["checks"][-1]["interpretation"]["entry_prices"] == []
         if args.empty_original:
             assert result["checks"][0]["errors"][0]["field_paths"] == ["evidence.0"]
             assert "evidence=[]" in result["checks"][0]["errors"][0]["repair"]
@@ -163,6 +176,7 @@ def main():
         assert not retained["plans"] and not retained["operations"] and not retained["trades"]
         print(json.dumps({"native_high_mcp_loop": True, "original_quote_shortened": not (args.numbered_integer_target or args.empty_original or args.two_entry_orders),
             "mixed_script_entry_legs_blocked": args.two_entry_orders,
+            "analysis_level_not_entry": args.analysis_entry_level,
             "empty_original_quote_exception": args.empty_original,
             "integer_target_context_kept": args.numbered_integer_target, "model_calls": len(calls),
             "transport_backoff_verified": waits, "order_requests": 0}))

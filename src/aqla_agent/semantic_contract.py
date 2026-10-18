@@ -177,6 +177,8 @@ STOP = r"(?:the\s+)?(?:stopp?(?:[-\s]+loss)?|стоп\w*)"
 BREAK_EVEN = r"(?:break[-\s]?even|breakeven|entry|einstand|безубыт\w*|б[./\s]?у|вход\w*)"
 STOP_ACTION = pattern(WORD + VERB + r"\s+(?:\w+\s+){0,3}" + STOP + r"|" + WORD + STOP + r"\s+(?:now\s+|jetzt\s+)?(?:to|auf|в|на)\s+")
 BE_DESTINATION = pattern(BREAK_EVEN)
+POSTFIX_PAST_STOP = pattern(r"^\s*(?:" + BREAK_EVEN + r"|\d+(?:[.,]\d+)?)\s+"
+    r"(?:(?:already|bereits|уже)\s+)?" + PAST_VERB + END)
 TARGET_ACTION = pattern(WORD + r"(?:replace|change|move|set|adjust|обнов\w*|замен\w*|переносим|перестав\w*|änder\w*|aender\w*|verschieb\w*)\s+(?:\w+\s+){0,3}(?:targets?|take[-\s]?profits?|tp|тейк\w*|цел\w*|ziel\w*)" + END)
 CANCEL_ACTION = pattern(WORD + r"(?:cancel\w*|remove|отмен\w*|stornier\w*)\s+(?:\w+\s+){0,3}(?:entry|order|orders|entries|вход\w*|заяв\w*|ордер\w*|einstieg)" + END)
 EXIT_ACTION = pattern(WORD + r"(?:reduce|reducing|trim|cut|close|closing|exit|exiting|take\s+(?:half|a\s+quarter)\s+off|"
@@ -225,6 +227,8 @@ def clause_actions(clause, inherited_blocked, *, initial_setup=False):
                 or PAST_MATCH.search(match.group()) or PAST_GOVERNOR.search(history_prefix)):
             continue
         if action == "stop":
+            if POSTFIX_PAST_STOP.search(clause[match.end():]):
+                continue
             # A bare numeric stop field in a full setup is initial protection;
             # explicit move verbs and stop-to-entry instructions remain actions.
             if (initial_setup and match.start() == 0 and not re.match(WORD + VERB, match.group(), re.I)
@@ -248,6 +252,29 @@ def matching_words(text):
         cyrillic = len(re.findall(r"[а-яё]", value, re.I))
         return value.translate(lookalikes) if latin and cyrillic >= latin else value
     return re.sub(r"[A-Za-zА-Яа-яЁё]+", word, text)
+
+
+def analysis_only_entry_evidence(original, quote, value):
+    """A real number still needs an entry role; reconstruct its original context."""
+    from aqla_hyperliquid_mcp.rules import SOURCE_NUMBERS, number_is_ordinal
+    technical = pattern(r"\bhistoric(?:al)?\b|all[- ]time|previous\s+(?:high|low|peak|trough)|historisch\w*|"
+        r"историческ\w*|(?:прошл\w*|предыдущ\w*)\s+(?:минимум\w*|максимум\w*)|"
+        r"\b(?:support|resistance|poi|fvg)\b|order[- ]?block|ключев\w*\s+зон\w*|ликвидност\w*|поддержк\w*|сопротивлен\w*")
+    assignment = pattern(r"\b(?:entry|enter\w*|buy\w*|bought|sell\w*|sold|einstieg\w*|kauf\w*|verkauf\w*|"
+        r"вход\w*|набор\w*|покупа\w*|прода\w*|открыва\w*|беру)\b|"
+        r"current\s+(?:market\s+)?price|текущ\w*\s+цен\w*|aktuell\w*\s+(?:preis|kurs)")
+    boundaries = list(SENTENCES.finditer(original))
+    contexts = []
+    for occurrence in re.finditer(re.escape(quote), original):
+        for number in SOURCE_NUMBERS.finditer(quote):
+            start, end = occurrence.start() + number.start(), occurrence.start() + number.end()
+            if value not in set(quoted_numbers(number.group())) or number_is_ordinal(original, start, end):
+                continue
+            left = max((m.end() for m in boundaries if m.end() <= start), default=0)
+            right = min((m.start() for m in boundaries if m.start() >= end), default=len(original))
+            sentence = matching_words(original[left:right])
+            contexts.append(bool(technical.search(sentence) and not assignment.search(sentence)))
+    return bool(contexts) and all(contexts)
 
 
 def current_structure_text(text):

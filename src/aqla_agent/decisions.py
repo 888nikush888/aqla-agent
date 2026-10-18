@@ -24,8 +24,8 @@ from aqla_hyperliquid_mcp.rules import (
 
 from .evidence import position_fractions
 
-VERSION = "aqla-decisions-v36"
-QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v21"
+VERSION = "aqla-decisions-v37"
+QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v22"
 # The original-context wire shape is unchanged. Keeping its independent schema
 # version permits exact-state, exact-question observations to be reused for
 # development while decision/validation policy has its own version and cache key.
@@ -435,7 +435,7 @@ def questions_for(packet, spans):
                 {"question": "Which SINGLE role does this occurrence have in the LIVE anchor's setup? "
                              "Historical numbers/TP labels/allocations/unrelated setups are ignore. "
                              "For UPDATE: only NEW changed values from the live anchor get a role; all old entry/SL/TP/leverage numbers are ignore. "
-                             "entry0/entry1 are lower/upper range endpoints; target_1 is the FIRST target, target_2 SECOND, etc. "
+                             "entry0/entry1 are CURRENT entry references or lower/upper entry-range bounds. Historical highs/lows, swept liquidity and analysis/support/resistance/POI levels are IGNORE unless the original expressly assigns them to the entry; a mentioned technical level alone does not supply a missing entry price; target_1 is the FIRST target, target_2 SECOND, etc. "
                              "When an absolute entry/stop/target PRICE is followed by a parenthesized percent explaining its distance/profit, "
                              "the PRICE has the trading role and the explanatory percent is IGNORE; never assign both to one role. "
                              "A TP stated ONLY as a percent is a real target value ONLY when the source actually assigns an exit/target role. An nonbinding descriptive expected-move/potential range alone is not a TP order. A binding local-profit span (only/max/no more, including Russian/German equivalents) IS a target instruction even without the word TP: classify ambiguous while the continuous span cannot be executed exactly; never omit it to use backup targets; never select its endpoint or turn it into several exits. An actual TP interval is unrepresentable ambiguity, not missing percentage basis. "

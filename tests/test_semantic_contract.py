@@ -78,6 +78,20 @@ def test_past_only_opportunity_descriptions_do_not_become_a_current_veto(text):
 
 
 @pytest.mark.parametrize("text", [
+    "BTC. Stop to entry moved.", "BTC. Stop to entry already moved.",
+    "BTC. Stopp auf Einstand verschoben.", "BTC. Стоп в бу перевел.",
+    "BTC. Стоп на 95 перенёс.",
+])
+def test_completed_stop_move_after_its_destination_is_not_a_new_instruction(text):
+    assert current_actions(text) == []
+    packet = packet_for(text)
+    report = Interpretation(kind="report", source_refs=[packet["anchor_source_id"]], reason="Completed stop move",
+        evidence=[Evidence(field="classification", source_id=packet["anchor_source_id"], quote=text)])
+    validate_interpretation(packet, report)
+    assert current_actions(text + " Now close 25%.")[0][0] == "reduce"
+
+
+@pytest.mark.parametrize("text", [
     "Earlier we agreed to close half and move stop to95 and cancel entry",
     "Trading example only: BTC close half and move stop to95",
     "Gestern vereinbarten wir BTC halb schließen und Stop auf 95 setzen und Entry stornieren",

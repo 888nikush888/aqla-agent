@@ -352,6 +352,51 @@ def test_one_reference_limit_applies_even_without_recognized_entry_words(entry):
         verify_entry_shape(Interpretation(kind="new_signal", source_refs=["current"], entry=entry, entry_prices=values))
 
 
+@pytest.mark.parametrize("commentary", [
+    "Price swept the historical low at 85 and reacted strongly.",
+    "Цена сняла ликвидность с исторического минимума на 85 и отскочила.",
+    "Der Kurs reagierte am historischen Tief 85.",
+    "The asset failed to hold above the key resistance zone 85-86.",
+    "Актив не смог закрепиться выше ключевой зоны 85-86.",
+])
+def test_historical_or_analysis_level_does_not_become_an_unstated_entry(commentary, setup):
+    from aqla_agent.trading import Trading
+    from aqla_hyperliquid_mcp.models import AqlaError
+    source, context, _ = material("BTC LONG\n" + commentary + "\nStop 80\nTarget 110")
+    draft = Interpretation(kind="new_signal", symbol="BTC", side="long", entry_prices=[85], stop_loss=80, take_profits=[110],
+        source_refs=[source.source_id], evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in (
+            ("symbol","BTC"),("side","LONG"),("entry_prices.0","85"),("stop_loss","80"),("take_profits.0","110"))])
+    checked = check_interpretation(context, draft)
+    assert not checked["valid"]
+    assert checked["errors"][0]["code"] == "source_entry_reference_needs_role_review"
+    assert "entry_prices.0" in checked["errors"][0]["field_paths"]
+    _, state, fake, exchange, _ = setup
+    trading = Trading(exchange, state)
+    trading.ingest(source)
+    before = state.snapshot()
+    with pytest.raises(AqlaError, match="Entry evidence selects only an analysis level"):
+        trading.record_interpretation(source.event_id, draft)
+    assert state.snapshot() == before and not fake.actions
+    draft.entry_prices = []
+    draft.evidence = [proof for proof in draft.evidence if proof.field != "entry_prices.0"]
+    corrected = check_interpretation(context, draft)
+    assert corrected["valid"] and corrected["interpretation"]["kind"] == "new_signal"
+    assert corrected["interpretation"]["stop_loss"] == "80" and corrected["interpretation"]["take_profits"] == ["110"]
+
+
+@pytest.mark.parametrize("assignment", [
+    "Entry: 85 at the historical low.", "Buy at support 85.",
+    "Вход: 85 на историческом минимуме.", "Current price: 85 at resistance.",
+    "Einstieg 85 am historischen Tief.",
+])
+def test_explicit_entry_assignment_or_current_price_can_use_a_technical_level(assignment):
+    source, context, _ = material("BTC LONG\n" + assignment)
+    draft = Interpretation(kind="new_signal", symbol="BTC", side="long", entry_prices=[85], source_refs=[source.source_id],
+        evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in (
+            ("symbol","BTC"),("side","LONG"),("entry_prices.0","85"))])
+    assert check_interpretation(context, draft)["valid"]
+
+
 @pytest.mark.parametrize("text", [
     "BTC LONG. Buy at current prices 100. No pending buy order 95.",
     "BTC LONG. Покупаем по текущим ценам 100. Не ставим отложенный ордер 95.",

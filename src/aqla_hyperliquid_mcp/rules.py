@@ -307,6 +307,13 @@ def verify_evidence(signal: Interpretation, events: dict):
             repair += "; numeric fields required: " + ", ".join(required)
         # Model fields bound this list to 25 required paths and 60 submitted paths.
         raise AqlaError("; ".join(errors) + repair)
+    if signal.kind == "new_signal":
+        from aqla_agent.semantic_contract import analysis_only_entry_evidence
+        for i, value in enumerate(signal.entry_prices):
+            field = f"entry_prices.{i}"
+            proofs = [proof for proof in signal.evidence if proof.field == field]
+            if proofs and all(analysis_only_entry_evidence(texts[proof.source_id], proof.quote, value) for proof in proofs):
+                raise AqlaError("Entry evidence selects only an analysis level: " + field)
     if signal.take_profit_unit not in ("price", "roe_percent") and signal.take_profits:
         unit_proof = " ".join(fields["take_profit_unit"])
         roi = re.search(r"\b(?:ROI|ROE)\b|return on (?:equity|investment)|рентабельност", unit_proof, re.I)
