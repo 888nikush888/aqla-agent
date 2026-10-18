@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from aqla_hyperliquid_mcp.models import TERMINAL_ORDER, AccountSnapshot, AqlaError, digest, now_ms
 
-from .observations import not_sent, read_observation
+from .observations import diagnostic, not_sent, read_observation
 
 
 def adapter_settings(root, venue):
@@ -174,7 +174,11 @@ class VenueAdapter:
                 phase = "unknown" if any(row.get("pending") for row in responses) else "rejected" if rejected and (not accepted or action["type"] != "order") else "acknowledged"
                 self.state.update(lambda data: data["operations"][operation_id].update(phase=phase, outcome="partial" if rejected and accepted else "rejected" if rejected else "accepted"))
             except BaseException as error:
-                self.state.update(lambda data: data["operations"][operation_id].update(phase="unknown", result={"error": "Exchange outcome unknown; reconcile exact identities, do not resubmit"}))
+                failure = {"error": "Exchange outcome unknown; reconcile exact identities, do not resubmit",
+                           "exception_type": diagnostic(error, "exchange_transport")["exception_type"]}
+                if type(getattr(error, "http_status", None)) is int:
+                    failure["http_status"] = error.http_status
+                self.state.update(lambda data: data["operations"][operation_id].update(phase="unknown", result=failure))
                 if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
                     raise
             return self.state.snapshot()["operations"][operation_id]
@@ -184,6 +188,9 @@ class VenueAdapter:
         if row is None:
             raise AqlaError("Unknown exchange operation")
         self.state.assert_operation_binding(self.settings, row)
+        if row["phase"] not in ("prepared", "sending", "unknown"):
+            return {"operation": self.public_operation(row), "resolved": True,
+                    "evidence": row.get("evidence", []), "resubmitted": False, "absence_is_proof": False}
         action = row["wire_action"]
         identities = [order["c"] for order in action.get("orders", [])]
         if action["type"] == "cancelByCloid":
@@ -193,8 +200,14 @@ class VenueAdapter:
         observations = [await self.order_status(identity) for identity in identities]
         proved = bool(identities) and all(item.get("status") == "order" and item["order"]["status"] not in ("unknownOid", None)
                                        and (action["type"] not in ("cancel", "cancelByCloid") or item["order"]["status"] in TERMINAL_ORDER) for item in observations)
-        if not identities and row.get("signed_requests"):
-            proved = await self.prove_configuration(row)
+        if not identities and action["type"] == "updateLeverage":
+            decision = await self.configuration_outcome(row)
+            if decision is not None:
+                outcome, observations = decision["outcome"], decision["evidence"]
+                phase = "reconciled" if outcome == "accepted" else "rejected"
+                self.state.update(lambda data: data["operations"][operation_id].update(phase=phase, outcome=outcome, evidence=observations))
+                return {"operation": self.public_operation(self.state.snapshot()["operations"][operation_id]),
+                        "resolved": True, "evidence": observations, "resubmitted": False, "absence_is_proof": False}
         if proved:
             self.state.update(lambda data: data["operations"][operation_id].update(phase="reconciled", evidence=observations))
         return {"operation": self.public_operation(self.state.snapshot()["operations"][operation_id]), "resolved": proved,
@@ -210,6 +223,9 @@ class VenueAdapter:
 
     async def prove_configuration(self, row):
         return False
+
+    async def configuration_outcome(self, row):
+        return {"outcome": "accepted", "evidence": []} if await self.prove_configuration(row) else None
 
     @staticmethod
     def rejected(response):

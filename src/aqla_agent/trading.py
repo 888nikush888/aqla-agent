@@ -718,6 +718,23 @@ class Trading:
                 or current_market.max_quantity is not None and plan.quantity > current_market.max_quantity
                 or any(size < current_market.min_quantity or size * price < current_market.min_notional for size, price in zip(plan.tp_quantities, plan.take_profits, strict=True))):
             raise AqlaError("Exchange minimum/maximum order sizes changed while entry was unsent")
+        prior_id = trade.get("leverage_operation_id", "leverage:" + plan.trade_id)
+        prior = self.state.read("operations", entries={"operations": [prior_id]})["operations"].get(prior_id)
+        if prior and prior.get("outcome") == "configuration_not_effective":
+            def rearm(data):
+                current = data["trades"][plan.trade_id]
+                self.validate_admission(data, plan, owned=True)
+                if (current.get("configuration_retry") or Decimal(current["filled_quantity"]) or current.get("orders")
+                        or any(key == "entry:" + plan.trade_id or key.startswith("entry:" + plan.trade_id + ":") for key in data["operations"])
+                        or data["operations"][prior_id]["phase"] != "rejected"):
+                    raise AqlaError("Configuration retry requires a completely unsent entry and is allowed only once")
+                identity = "leverage:" + plan.trade_id + ":configuration:1"
+                if identity in data["operations"]:
+                    raise AqlaError("Configuration retry already has a durable request; reconcile it")
+                current.setdefault("leverage_attempts", []).append(prior_id)
+                current.update(leverage_operation_id=identity, configuration_retry=True, status="preparing")
+                return current
+            trade = self.state.update(rearm)
         latest_account, latest_quote = None, None
         dispatch_operation = trade.get("leverage_operation_id", "leverage:" + plan.trade_id)
         async def live_guard():

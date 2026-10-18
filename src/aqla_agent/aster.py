@@ -82,7 +82,9 @@ class Aster(VenueAdapter):
             kwargs["auth"] = observation_auth(self.client)
         response = await self.client.request(request["method"], url, **kwargs)
         if response.status_code >= 500 or response.status_code in (408, 429):
-            raise AqlaError("Aster response is uncertain; reconcile before any further send")
+            error = AqlaError("Aster response is uncertain; reconcile before any further send")
+            error.http_status = response.status_code
+            raise error
         result = response.json()
         if response.status_code >= 400 and not self.rejected(result):
             raise AqlaError("Aster returned an unclassified exchange response")
@@ -162,8 +164,13 @@ class Aster(VenueAdapter):
     async def build_requests(self, action, deadline):
         if action["type"] == "updateLeverage":
             market = self.native_market(action["asset"])
-            return [self.signed("POST", "/fapi/v3/marginType", {"symbol": market.native_symbol, "marginType": "CROSSED" if action["isCross"] else "ISOLATED"}),
-                    self.signed("POST", "/fapi/v3/leverage", {"symbol": market.native_symbol, "leverage": str(action["leverage"])})]
+            current = await self.configuration_position(market)
+            requests = []
+            if current["marginType"] != ("cross" if action["isCross"] else "isolated"):
+                requests.append(self.signed("POST", "/fapi/v3/marginType", {"symbol": market.native_symbol, "marginType": "CROSSED" if action["isCross"] else "ISOLATED"}))
+            if int(current["leverage"]) != action["leverage"]:
+                requests.append(self.signed("POST", "/fapi/v3/leverage", {"symbol": market.native_symbol, "leverage": str(action["leverage"])}))
+            return requests
         if action["type"] == "order":
             requests = []
             for order in action["orders"]:
@@ -202,13 +209,49 @@ class Aster(VenueAdapter):
         # -4046 means the requested margin type is already effective; no change is necessary.
         return VenueAdapter.rejected(response) and response.get("code") != -4046
 
-    async def prove_configuration(self, record):
+    async def configuration_position(self, market):
+        started = now_ms()
+        rows = await self.read("positionRisk", {"symbol": market.native_symbol}, private=True)
+        if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
+                or rows[0].get("symbol") != market.native_symbol or rows[0].get("positionSide") != "BOTH"
+                or rows[0].get("marginType") not in ("cross", "isolated")
+                or isinstance(rows[0].get("leverage"), bool) or not str(rows[0].get("leverage", "")).isdigit()
+                or int(rows[0]["leverage"]) < 1):
+            raise AqlaError("Aster configuration observation has no unique one-way market identity")
+        if not 0 <= now_ms() - started <= 10000:
+            from .observations import TemporaryObservation
+            raise TemporaryObservation("account_stale", "configuration")
+        return rows[0]
+
+    async def configuration_outcome(self, record):
         action = record["wire_action"]
         if action["type"] != "updateLeverage":
-            return False
+            return None
         market = self.native_market(action["asset"])
-        rows = await self.read("positionRisk", {"symbol": market.native_symbol}, private=True)
-        return bool(rows) and all(int(row["leverage"]) == action["leverage"] and row.get("marginType", "").lower() == ("cross" if action["isCross"] else "isolated") for row in rows)
+        started = now_ms()
+        current = await self.configuration_position(market)
+        evidence = {"symbol": market.native_symbol, "leverage": int(current["leverage"]), "margin_type": current["marginType"], "observed_at": started}
+        if int(current["leverage"]) == action["leverage"] and current["marginType"] == ("cross" if action["isCross"] else "isolated"):
+            return {"outcome": "accepted", "evidence": [evidence]}
+        # Old configuration signatures cannot become effective after their
+        # exchange-clock nonce window; this never proves an order was unsent.
+        requests = record.get("signed_requests", [])
+        if record.get("signed_requests") == []:
+            return {"outcome": "configuration_not_effective", "evidence": [evidence]}
+        if not requests or any(r.get("method") != "POST" or r.get("path") not in ("/fapi/v3/marginType", "/fapi/v3/leverage")
+                               or r.get("params", {}).get("symbol") != market.native_symbol or type(r.get("nonce")) is not int for r in requests):
+            return None
+        clock = await self.read("time")
+        server = clock.get("serverTime") if isinstance(clock, dict) else None
+        if (type(server) is int and 0 <= now_ms() - server <= 2000 and 0 <= now_ms() - started <= 10000
+                and server * 1000 > max(r["nonce"] for r in requests) + 60_000_000):
+            evidence.update(server_time=server, nonce_window_ended_at=max(r["nonce"] for r in requests) // 1000 + 60000)
+            return {"outcome": "configuration_not_effective", "evidence": [evidence]}
+        return None
+
+    async def prove_configuration(self, record):
+        decision = await self.configuration_outcome(record)
+        return decision is not None and decision["outcome"] == "accepted"
 
     async def order_status(self, identity, user=None):
         market = next((market for record in self.state.snapshot()["operations"].values() for order in record["wire_action"].get("orders", [])

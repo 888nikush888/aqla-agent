@@ -23,6 +23,7 @@ class AsterBoundary:
         self.oid = 100
         self.lost = self.reject_stop = False
         self.leverage = 2
+        self.margin_type = "isolated"
 
     def handle(self, request):
         parameters = dict(request.url.params) if request.method == "GET" else {key: values[0] for key, values in parse_qs(request.content.decode()).items()}
@@ -57,9 +58,13 @@ class AsterBoundary:
             self.leverage = int(parameters["leverage"])
             result = {"leverage": self.leverage, "symbol": "BTCUSDT"}
         elif path == "marginType":
-            result = {"code": -4046, "msg": "No need to change margin type"}
+            desired = "cross" if parameters["marginType"] == "CROSSED" else "isolated"
+            result = {"code": -4046, "msg": "No need to change margin type"} if desired == self.margin_type else {"code": 200, "msg": "success"}
+            self.margin_type = desired
         elif path == "positionRisk":
-            result = [{"symbol": "BTCUSDT", "leverage": self.leverage, "marginType": "isolated"}]
+            result = [{"symbol": "BTCUSDT", "leverage": self.leverage, "marginType": self.margin_type, "positionSide": "BOTH"}]
+        elif path == "time":
+            result = {"serverTime": time.time_ns() // 1_000_000}
         elif path == "userTrades":
             result = [row for row in self.trades if int(parameters["startTime"]) <= row["time"] <= int(parameters["endTime"])]
         elif path == "order":
