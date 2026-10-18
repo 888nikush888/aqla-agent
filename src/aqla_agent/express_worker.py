@@ -13,7 +13,7 @@ from .decisions import DecisionResult
 from .express import ACTIVE, CLAIM, QUALIFIED_MASTER, VERSION, compile_template
 from .observations import retry_due
 from .source_assistance import VERSION as ASSISTANCE_VERSION
-from .source_assistance import check_interpretation, context_packet, precise_numeric_evidence
+from .source_assistance import check_interpretation, precise_numeric_evidence
 from .source_processing import SourceJob
 
 LOG = logging.getLogger(__name__)
@@ -95,7 +95,8 @@ class ExpressWorker:
             # Existing own entry bindings are expected after entry preparation;
             # repeat original proof checks, not new-source admission semantics.
             from aqla_hyperliquid_mcp.rules import verify_evidence
-            normalized = precise_numeric_evidence(context_packet(self.trading.context(event_id, decision=True)), draft)
+            packet = {"messages": [{"source_id": row["source_id"], "text": row["source"]["text"]}]}
+            normalized = precise_numeric_evidence(packet, draft)
             verify_evidence(normalized, snapshot["events"])
             if normalized.model_dump(mode="json") != saved:
                 raise AqlaError("Express original proof changed before send")

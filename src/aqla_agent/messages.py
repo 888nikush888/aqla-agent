@@ -564,7 +564,13 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None, notif
         blocks += [trade_block(data, trade, notices) for trade, notices in by_trade.values()]
         for _, notice, _, event in items:
             for target in notice.get("targets", []):
+                leg = target.get("leg_id") or target.get("pipeline_id", "legacy") + ":" + target.get("requested_exchange", target.get("exchange", "hyperliquid"))
+                target = (event or {}).get("targets", {}).get(leg, target)
                 if target.get("trade_id") in by_trade:
+                    continue
+                if trade := data["trades"].get(target.get("trade_id")):
+                    by_trade[trade["trade_id"]] = (trade, [notice])
+                    blocks.append(trade_block(data, trade, [notice]))
                     continue
                 plan = {name: target.get(name) for name in ("exchange", "network", "profile_id", "rank_snapshot", "requested_exchange", "fallback_reason")}
                 signal = (event or {}).get("interpretation") or {}

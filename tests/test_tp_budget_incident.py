@@ -111,6 +111,82 @@ async def test_unsent_budget_refresh_only_shrinks_and_original_plan_is_immutable
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('retry_first',[False,True])
+async def test_budget_drift_after_accepted_leverage_shrinks_unsent_entry_once(setup,signal,monkeypatch,retry_first):
+    from aqla_agent import observations
+    from aqla_hyperliquid_mcp.models import now_ms
+    _,state,fake,exchange,engine=setup
+    source,value=signal
+    original=await engine.preview(source.event_id,value)
+    account=exchange.account_snapshot
+    failing=retry_first
+    async def changed(market):
+        if failing and any(action['type']=='updateLeverage' for action in fake.actions):
+            raise TemporaryObservation('read_unavailable','account','transport')
+        result=await account(market)
+        return result.model_copy(update={'equity':Decimal(5000)}) if fake.actions else result
+    monkeypatch.setattr(exchange,'account_snapshot',changed)
+    trade=await engine.execute(original['plan_id'])
+    if retry_first:
+        assert trade['observation_retry']['attempts']==1
+        failing=False
+        monkeypatch.setattr(observations,'now_ms',lambda:now_ms()+30001)
+        await engine.recover()
+        trade=state.snapshot()['trades'][original['trade_id']]
+    assert trade['status']=='open'
+    fresh=trade['plan']
+    assert fresh['quantity']!=original['quantity'] and Decimal(fresh['risk_usdc'])<=Decimal(original['risk_usdc'])
+    assert fresh['policy']==original['policy'] and fresh['deadline_at']==original['deadline_at']
+    assert fresh['stop_loss']==original['stop_loss'] and fresh['take_profits']==original['take_profits']
+    assert state.snapshot()['plans'][original['plan_id']]['plan']==original
+    assert state.snapshot()['plans'][original['plan_id']]['refreshed_plan_id']==fresh['plan_id']
+    assert len([a for a in fake.actions if a['type']=='updateLeverage'])==1
+    assert len([a for a in fake.actions if a['type']=='order' and any(not o['r'] for o in a['orders'])])==1
+    sent=copy.deepcopy(fake.actions)
+    await engine.execute(original['plan_id'])
+    assert fake.actions==sent
+
+
+@pytest.mark.asyncio
+async def test_second_budget_drop_after_owned_refresh_is_terminal_without_entry(setup,signal,monkeypatch):
+    _,state,fake,exchange,engine=setup
+    source,value=signal
+    original=await engine.preview(source.event_id,value)
+    account=exchange.account_snapshot
+    async def falling(market):
+        result=await account(market)
+        if not fake.actions:
+            return result
+        equity=2500 if state.snapshot()['plans'][original['plan_id']].get('refreshed_plan_id') else 5000
+        return result.model_copy(update={'equity':Decimal(equity)})
+    monkeypatch.setattr(exchange,'account_snapshot',falling)
+    with pytest.raises(EntryBudgetChanged):
+        await engine.execute(original['plan_id'])
+    assert len(state.snapshot()['plans'])==2
+    assert state.snapshot()['trades'][original['trade_id']]['status']=='rejected'
+    assert not any(a['type']=='order' for a in fake.actions)
+
+
+@pytest.mark.asyncio
+async def test_manual_position_during_budget_refresh_stays_foreign_and_blocks_entry(setup,signal,monkeypatch):
+    _,state,fake,exchange,engine=setup
+    source,value=signal
+    original=await engine.preview(source.event_id,value)
+    account=exchange.account_snapshot
+    async def changed(market):
+        result=await account(market)
+        if fake.actions:
+            fake.position=1.0
+            return result.model_copy(update={'equity':Decimal(5000),'position_size':Decimal(1)})
+        return result
+    monkeypatch.setattr(exchange,'account_snapshot',changed)
+    with pytest.raises(AqlaError,match='exposure'):
+        await engine.execute(original['plan_id'])
+    assert fake.position==1.0 and len(state.snapshot()['plans'])==1
+    assert not any(a['type']=='order' for a in fake.actions)
+
+
+@pytest.mark.asyncio
 async def test_budget_refresh_is_one_durable_attempt_even_when_called_again(setup,signal,monkeypatch):
     _,state,fake,exchange,engine=setup
     source,value=signal

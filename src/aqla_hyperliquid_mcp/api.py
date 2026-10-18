@@ -56,18 +56,27 @@ class Hyperliquid:
 
     async def price_snapshot(self, market):
         from aqla_agent.entry import PriceSnapshot
-        started = now_ms()
-        raw = await self.info("metaAndAssetCtxs", **({"dex": market.dex} if market.dex else {}))
-        context = next((context for item, context in zip(raw[0]["universe"], raw[1], strict=True) if item["name"] == market.symbol), None)
-        if context is None:
-            raise AqlaError("Target market has no verified mark-price context")
-        book = await self.info("l2Book", coin=market.symbol)
-        if book.get("coin") != market.symbol or not all(book.get("levels", [])):
-            raise AqlaError("Target market has no executable order book")
-        bid, ask = Decimal(book["levels"][0][0]["px"]), Decimal(book["levels"][1][0]["px"])
-        return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
-                             stop_reference=context["markPx"], stop_reference_kind="mark", exchange_time=book["time"],
-                             started_at=started, observed_at=now_ms()).fresh()
+        from aqla_agent.observations import TemporaryObservation
+        for attempt in range(2):
+            started = now_ms()
+            try:
+                # Both independent reads must fit the unchanged 2 s proof window.
+                async with asyncio.timeout(2):
+                    raw, book = await asyncio.gather(
+                        self.info("metaAndAssetCtxs", **({"dex": market.dex} if market.dex else {})),
+                        self.info("l2Book", coin=market.symbol))
+                context = next((context for item, context in zip(raw[0]["universe"], raw[1], strict=True) if item["name"] == market.symbol), None)
+                if context is None:
+                    raise AqlaError("Target market has no verified mark-price context")
+                if book.get("coin") != market.symbol or not all(book.get("levels", [])):
+                    raise AqlaError("Target market has no executable order book")
+                bid, ask = Decimal(book["levels"][0][0]["px"]), Decimal(book["levels"][1][0]["px"])
+                return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
+                                     stop_reference=context["markPx"], stop_reference_kind="mark", exchange_time=book["time"],
+                                     started_at=started, observed_at=now_ms()).fresh()
+            except (TemporaryObservation, TimeoutError):
+                if attempt:
+                    raise
 
     async def funding_payments(self, market, start, end):
         from aqla_agent.funding import hyperliquid_funding
@@ -101,10 +110,10 @@ class Hyperliquid:
         return await self.info("userFillsByTime", user=self.account, startTime=start, endTime=end)
 
     async def markets(self, product="perp", dex=""):
-        mids = await self.info("allMids", **({"dex": dex} if dex else {}))
         result = {}
         if product == "perp":
-            meta = await self.info("meta", **({"dex": dex} if dex else {}))
+            fields = {"dex": dex} if dex else {}
+            mids, meta = await asyncio.gather(self.info("allMids", **fields), self.info("meta", **fields))
             # The native perp DEX has protocol USDC collateral. A HIP-3 DEX
             # must identify its collateral; a legacy/missing field proves none.
             collateral = meta.get("collateralToken", 0 if not dex else None)
@@ -132,7 +141,7 @@ class Hyperliquid:
                                       size_decimals=row["szDecimals"], max_leverage=row["maxLeverage"],
                                       mid=mids[name], dex=dex, collateral_token=collateral, quote_token=quote)
         else:
-            meta = await self.info("spotMeta")
+            mids, meta = await asyncio.gather(self.info("allMids"), self.info("spotMeta"))
             tokens = {item["index"]: item for item in meta["tokens"]}
             for row in meta["universe"]:
                 name = row["name"]
@@ -217,11 +226,10 @@ class Hyperliquid:
     async def account_inventory(self, market: Market | None = None):
         """Complete bounded REST observation; entry calls never use a cached budget."""
         stamp = now_ms()
-        mode = await self.info("userAbstraction", user=self.account)
+        mode, dexes, metas = await asyncio.gather(self.info("userAbstraction", user=self.account),
+                                                self.info("perpDexs"), self.info("allPerpMetas"))
         if mode not in ("disabled", None, "unifiedAccount"):
             raise AqlaError("Shared account entries require Standard or Unified Account mode; portfolio margin is unsupported")
-        dexes = await self.info("perpDexs")
-        metas = await self.info("allPerpMetas")
         if not isinstance(dexes, list) or not dexes or dexes[0] is not None or len(dexes) > 512:
             raise AqlaError("Complete DEX inventory is unavailable")
         names = [""] + [row["name"] for row in dexes[1:] if isinstance(row, dict) and isinstance(row.get("name"), str)]
@@ -239,7 +247,7 @@ class Hyperliquid:
                 if not isinstance(raw, dict) or not isinstance(raw.get("assetPositions"), list) or not isinstance(orders, list):
                     raise AqlaError("Account positions or orders are incomplete")
                 return dex, raw, orders
-        if len(names) > 64:
+        if len(names) > 1:
             from aqla_agent.inventory_stream import observe as observe_large_inventory
             observations = await observe_large_inventory(self, names)
         else:

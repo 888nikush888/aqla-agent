@@ -301,10 +301,11 @@ class Trading:
             raise AqlaError("Selected exchange does not support strict native maker orders")
         if policy.product != "perp":
             raise AqlaError("Automatic source trading requires perpetual markets with native reduce-only protection; Spot remains available through the full MCP")
-        active = [trade for trade in snapshot["trades"].values() if trade["status"] in OPEN]
+        refresh_trade = self.budget_refresh_trade(snapshot, TradePlan.model_validate(snapshot["plans"][_refresh_from]["plan"])) if _refresh_from else None
+        active = [trade for trade in snapshot["trades"].values() if trade["status"] in OPEN and trade is not refresh_trade]
         if len(active) >= policy.max_open_trades:
             raise AqlaError("Maximum open trade count reached")
-        if any(ref in snapshot["bindings"] for ref in interpretation.source_refs):
+        if any(ref in snapshot["bindings"] and (not refresh_trade or snapshot["bindings"][ref]["trade_id"] != refresh_trade["trade_id"]) for ref in interpretation.source_refs):
             raise AqlaError("This source already owns a trade; process its edit as an update")
         # The router may resolve this once under the same account lock for fallback.
         market = _market if _market is not None else await read_observation(lambda: self.exchange.market(interpretation.symbol, policy.product), "market")
@@ -360,9 +361,9 @@ class Trading:
                 self.validate_configuration(state, original)
                 if plan.policy != original.policy:
                     raise ConfigurationChanged("Configuration changed during budget refresh; create a fresh preview")
+                owned = self.budget_refresh_trade(state, original)
                 if (prior.get("refreshed_plan_id") or prior.get("refreshed_from_plan_id")
-                        or original.trade_id in state["trades"]
-                        or any(prefix + original.trade_id in state["operations"] for prefix in ("entry:", "leverage:"))):
+                        or not owned and any(prefix + original.trade_id in state["operations"] for prefix in ("entry:", "leverage:"))):
                     raise AqlaError("Entry preparation or budget refresh already started; reconcile it")
                 identity_fields = ("asset_id", "symbol", "product", "dex", "size_decimals", "price_tick", "quantity_step",
                                    "quote_token", "collateral_token", "base_token", "native_symbol", "margin_leverage_scale")
@@ -377,9 +378,36 @@ class Trading:
                 # Link both immutable plans in the same transaction, including across crashes.
                 prior["refreshed_plan_id"] = plan.plan_id
                 record["refreshed_from_plan_id"] = _refresh_from
+                if owned:
+                    owned.update(plan=record["plan"], reserved_risk=str(plan.risk_usdc), admission_refresh_from=_refresh_from)
+                    if owned.get("observation_retry"):
+                        record.update(observation_retry=owned["observation_retry"].copy(), execution_requested=True)
             state["plans"][plan.plan_id] = record
         self.state.update(save)
         return plan.model_dump(mode="json")
+
+    def budget_refresh_trade(self, snapshot, plan):
+        trade = snapshot["trades"].get(plan.trade_id)
+        if not trade:
+            return None
+        saved = snapshot["plans"][plan.plan_id]
+        leverage = snapshot["operations"].get(trade.get("leverage_operation_id", "leverage:" + plan.trade_id))
+        if (saved.get("refreshed_plan_id") or saved.get("refreshed_from_plan_id")
+                or trade["plan"]["plan_id"] != plan.plan_id or trade["status"] != "preparing"
+                or plan.entry_timing != "standard" or Decimal(trade["filled_quantity"]) or trade.get("orders")
+                or any(key == "entry:" + plan.trade_id or key.startswith("entry:" + plan.trade_id + ":") for key in snapshot["operations"])
+                or leverage and (leverage["phase"] not in ("acknowledged", "reconciled") or leverage.get("outcome") != "accepted")):
+            raise EntryBudgetChanged("Budget refresh requires a completely unsent entry and is allowed only once")
+        self.validate_admission(snapshot, plan, owned=True)
+        return trade
+
+    async def refresh_unsent_budget(self, plan):
+        snapshot = self.state.snapshot()
+        self.budget_refresh_trade(snapshot, plan)
+        saved = snapshot["plans"][plan.plan_id]
+        signal = Interpretation.model_validate(snapshot["events"][saved["event_id"]]["interpretation"])
+        fresh = TradePlan.model_validate(await self.preview(saved["event_id"], signal, _refresh_from=plan.plan_id))
+        return fresh, self.state.snapshot()["trades"][plan.trade_id]
 
     @staticmethod
     def source_revisions(snapshot, refs):
@@ -660,7 +688,11 @@ class Trading:
 
     async def guarded_entry_steps(self, plan, trade):
         try:
-            return await self._entry_steps(plan, trade)
+            try:
+                return await self._entry_steps(plan, trade)
+            except EntryBudgetChanged:
+                plan, trade = await self.refresh_unsent_budget(plan)
+                return await self._entry_steps(plan, trade)
         except TemporaryObservation as error:
             return self.retain_observation_retry(plan.plan_id, error)
         except AqlaError as error:
@@ -865,6 +897,8 @@ class Trading:
             self.validate_admission(self.state.snapshot(), plan, account, owned=True)
         except TemporaryObservation as error:
             return self.retain_observation_retry(plan.plan_id, error)
+        except EntryBudgetChanged:
+            return await self.guarded_entry_steps(plan, trade)
         except AqlaError as error:
             if any(row["phase"] in ("prepared", "sending", "unknown") for row in self.state.snapshot()["operations"].values()):
                 raise
@@ -888,8 +922,13 @@ class Trading:
                     and state["bindings"].get(pending["operation_id"]) == pending["source_binding"]):
                 pending["management_revision"] = changed["management_revision"]
             row.update(changed)
-            if "observation_retry" in changed:
-                state["plans"][row["plan"]["plan_id"]]["observation_retry"] = changed["observation_retry"].copy()
+            if row["status"] in ("rejected", "cancelled") and row.get("observation_retry"):
+                row["observation_retry"].update(exhausted=True, completed=True, attempt_inflight=False)
+            if row.get("observation_retry"):
+                state["plans"][row["plan"]["plan_id"]]["observation_retry"] = row["observation_retry"].copy()
+                for target in state["events"][row["event_id"]].get("targets", {}).values():
+                    if target.get("trade_id") == trade_id or target.get("plan_id") == row["plan"]["plan_id"]:
+                        target.update(status=row["status"], observation_retry=row["observation_retry"].copy())
             important = {key: value for key, value in changed.items() if key in ("status", "filled_quantity", "remaining_quantity", "stop_price", "tp_filled", "maker_target_rejection")}
             if row.get("lifecycle_version") and row["status"] == "closed":
                 from .lifecycle import record_lifecycle

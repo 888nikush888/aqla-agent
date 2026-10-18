@@ -42,6 +42,8 @@ def retry_view(row):
               if type(marker.get(key)) is int and 0 <= marker[key] < 253402300800000}
     if type(marker.get("exhausted")) is bool:
         output["exhausted"] = marker["exhausted"]
+    if marker.get("completed") or row.get("status") in ("rejected", "cancelled", "expired", "closed"):
+        output["exhausted"] = True
     if marker.get("authority") in ("execute", "preview"):
         output["authority"] = marker["authority"]
     for key in ("code", "stage", "category", "exception_type"):

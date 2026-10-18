@@ -365,6 +365,8 @@ class Router:
             except Exception as error:
                 row = {**target, "status": "rejected", "error": str(error) if isinstance(error, AqlaError) else "Exchange preview unavailable"}
                 row["entry_diagnostic"] = diagnostic(error, "preview")
+                if marker:
+                    row["observation_retry"] = {**marker, "exhausted": True, "completed": True, "attempt_inflight": False}
                 if isinstance(error, TemporaryObservation) and engine is not None:
                     retry = retry_marker(marker, error, deadline, "preview")
                     retry.update(configuration_revision=preview_basis["configuration_revision"], ranking_revision=preview_basis["ranking_revision"])
@@ -585,6 +587,10 @@ class Router:
             self._recovery_tasks.difference_update(tasks)
         def expire(data):
             data.setdefault("account_recovery", {}).update(diagnostics)
+            for trade in data["trades"].values():
+                if trade["status"] in ("rejected", "cancelled") and (marker := trade.get("observation_retry")):
+                    marker.update(exhausted=True, completed=True, attempt_inflight=False)
+                    data["plans"][trade["plan"]["plan_id"]]["observation_retry"] = marker.copy()
             stop_statuses = self.stop_event_statuses(data)
             for event_id, event in data["events"].items():
                 if event.get("update_targets") and (status := stop_statuses.get(event_id)):
@@ -594,7 +600,10 @@ class Router:
                     if target["status"] == "pending" and (marker := target.get("observation_retry")) and (marker["deadline_at"] <= now_ms() or marker["configuration_revision"] != data["configuration_revision"] or marker["ranking_revision"] != data["ranking_revision"]):
                         target.update(status="expired", error="Original preview retry expired or its configuration changed", observation_retry={**marker, "exhausted": True})
                     if target.get("trade_id") in data["trades"]:
-                        target["status"] = data["trades"][target["trade_id"]]["status"]
+                        trade = data["trades"][target["trade_id"]]
+                        target["status"] = trade["status"]
+                        if trade.get("observation_retry"):
+                            target["observation_retry"] = trade["observation_retry"].copy()
                     if target["status"] == "planned" and data["plans"][target["plan_id"]]["plan"]["deadline_at"] <= now_ms():
                         target.update(status="expired", error="Original signal deadline expired")
                 if event.get("targets") and all(target["status"] not in ("planned", "pending") for target in event["targets"].values()):

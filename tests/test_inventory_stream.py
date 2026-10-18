@@ -36,6 +36,33 @@ def inputs():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('count',[2,11,65])
+async def test_shared_account_uses_complete_stream_before_rest_fanout_exhausts_rate_budget(setup,monkeypatch,count):
+    from aqla_agent import inventory_stream
+    settings,_,fake,adapter,_=setup
+    settings.shared_account=True
+    market=await adapter.market('BTC')
+    names=['']+['dex'+str(i) for i in range(count-1)]
+    states={dex:{'time':now_ms(),'assetPositions':[],'withdrawable':'100','marginSummary':{'accountValue':'100'}} for dex in names}
+    frames=[{'channel':'allDexsClearinghouseState','data':{'user':adapter.account,'clearinghouseStates':list(map(list,states.items()))}}]
+    frames += [{'channel':'openOrders','data':{'user':adapter.account,'dex':dex,'orders':[]}} for dex in names]
+    socket=Socket(frames)
+    reads=[]
+    async def info(kind,**params):
+        reads.append(kind)
+        return {'userAbstraction':'disabled','perpDexs':[None]+[{'name':dex} for dex in names[1:]],
+                'allPerpMetas':[{'universe':[{'name':'BTC'}] if not dex else []} for dex in names]}[kind]
+    monkeypatch.setattr(adapter,'info',info)
+    async def stream(adapter,names):
+        return await observe(adapter,names,connector=lambda *args,**kwargs:socket)
+    monkeypatch.setattr(inventory_stream,'observe',stream)
+    account=await adapter.account_snapshot(market)
+    assert account.equity==100 and account.positions=={} and len(socket.sent)==count+1
+    assert sorted(reads)==['allPerpMetas','perpDexs','userAbstraction']
+    assert not fake.actions
+
+
+@pytest.mark.asyncio
 async def test_268_dex_snapshot_requires_every_order_scope_and_only_reads_nonempty_details():
     adapter, names, frames = inputs()
     frames[2]["data"]["orders"] = [{"coin": "dex0:BTC"}]

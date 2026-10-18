@@ -20,6 +20,63 @@ def entries(fake):
     return [action for action in fake.actions if action["type"] == "order" and any(not row["r"] for row in action["orders"])]
 
 
+@pytest.mark.asyncio
+async def test_terminal_rejection_completes_retry_and_updates_current_target(setup, signal, monkeypatch):
+    from aqla_agent.messages import telegram_view
+    _, state, fake, exchange, engine = setup
+    source, interpretation = signal
+    plan = await engine.preview(source.event_id, interpretation)
+    async def unavailable(market):
+        raise TemporaryObservation("read_unavailable", "account", "transport")
+    monkeypatch.setattr(exchange, "account_snapshot", unavailable)
+    await engine.execute(plan["plan_id"])
+    def attach(data):
+        data["events"][source.event_id]["targets"] = {"legacy:hyperliquid": {
+            "pipeline_id": "legacy", "exchange": "hyperliquid", "profile_id": "standard", "status": "preparing",
+            "plan_id": plan["plan_id"], "trade_id": plan["trade_id"],
+            "observation_retry": data["trades"][plan["trade_id"]]["observation_retry"].copy()}}
+    state.update(attach)
+    engine._patch(plan["trade_id"], status="rejected", reserved_risk="0", unsent_reason="Manual entry reserves this market")
+    snapshot = state.snapshot()
+    target = snapshot["events"][source.event_id]["targets"]["legacy:hyperliquid"]
+    assert target["status"] == "rejected" and target["observation_retry"]["completed"]
+    assert snapshot["plans"][plan["plan_id"]]["observation_retry"]["exhausted"]
+    rendered = json.dumps(telegram_view(snapshot, {}), ensure_ascii=False)
+    assert "Nächste Prüfung" not in rendered and "Wiederaufnahme ausstehend" not in rendered
+    assert not entries(fake)
+
+
+@pytest.mark.asyncio
+async def test_recovery_repairs_old_terminal_retry_without_reopening_manual_exposure(setup, signal, monkeypatch):
+    settings, state, fake, exchange, engine = setup
+    source, interpretation = signal
+    plan = await engine.preview(source.event_id, interpretation)
+    original = exchange.account_snapshot
+    async def unavailable(market):
+        raise TemporaryObservation("read_unavailable", "account", "transport")
+    monkeypatch.setattr(exchange, "account_snapshot", unavailable)
+    await engine.execute(plan["plan_id"])
+    def old_rejection(data):
+        trade = data["trades"][plan["trade_id"]]
+        trade.update(status="rejected", reserved_risk="0", unsent_reason="Current equity/margin no longer permits this exact plan")
+        data["events"][source.event_id]["targets"] = {"legacy:hyperliquid": {
+            "status": "preparing", "trade_id": plan["trade_id"], "plan_id": plan["plan_id"],
+            "observation_retry": trade["observation_retry"].copy()}}
+    state.update(old_rejection)
+    fake.position = 1.0
+    monkeypatch.setattr(exchange, "account_snapshot", original)
+    router = Router(settings, state, exchange)
+    try:
+        await router.recover()
+        snapshot = state.snapshot()
+        trade = snapshot["trades"][plan["trade_id"]]
+        assert trade["status"] == "rejected" and trade["observation_retry"]["completed"]
+        assert snapshot["events"][source.event_id]["targets"]["legacy:hyperliquid"]["observation_retry"] == trade["observation_retry"]
+        assert fake.position == 1.0 and not entries(fake)
+    finally:
+        await router.close()
+
+
 @pytest.fixture
 def clocked(setup, monkeypatch):
     import conftest

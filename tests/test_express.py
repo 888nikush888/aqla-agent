@@ -31,6 +31,51 @@ async def express_server(setup):
     await close_server(server)
 
 
+@pytest.mark.asyncio
+async def test_final_express_proof_uses_current_original_without_rebuilding_context(express_server, setup, monkeypatch):
+    from aqla_hyperliquid_mcp.models import TradePlan
+    _, state, _, _, _ = setup
+    router = express_server.aqla_trading
+    worker = express_server.aqla_express
+    event = source()
+    router.ingest(event)
+    await worker.tick()
+    plan = TradePlan.model_validate(next(iter(state.snapshot()["trades"].values()))["plan"])
+
+    def unavailable(*args, **kwargs):
+        raise AssertionError("Final entry proof must not rebuild neighbouring context")
+
+    monkeypatch.setattr(router, "context", unavailable)
+    worker.check_admission(state.snapshot(), plan)
+    changed = state.snapshot()
+    changed["events"][event.event_id]["source"]["text"] += "\nClose half now"
+    with pytest.raises(AqlaError):
+        worker.check_admission(changed, plan)
+
+
+@pytest.mark.asyncio
+async def test_express_routed_budget_drift_keeps_original_job_and_sends_one_smaller_entry(express_server, setup, monkeypatch):
+    from decimal import Decimal
+    _, state, fake, exchange, _ = setup
+    account = exchange.account_snapshot
+    async def changed(market):
+        result = await account(market)
+        return result.model_copy(update={"equity": Decimal(5000)}) if fake.actions else result
+    monkeypatch.setattr(exchange, "account_snapshot", changed)
+    event = source(TEXT.replace("99 - 100", "Market"))
+    express_server.aqla_trading.ingest(event)
+    await express_server.aqla_express.tick()
+    snapshot = state.snapshot()
+    job = next(iter(snapshot["source_jobs"].values()))
+    trade = next(iter(snapshot["trades"].values()))
+    original = snapshot["plans"][job["plan_ids"][0]]
+    assert job["status"] == "done" and job["express_timings"]["model_calls"] == 0
+    assert trade["status"] == "open" and original["refreshed_plan_id"] == trade["plan"]["plan_id"]
+    assert Decimal(trade["plan"]["quantity"]) < Decimal(original["plan"]["quantity"])
+    assert len([a for a in fake.actions if a["type"] == "updateLeverage"]) == 1
+    assert len([a for a in fake.actions if a["type"] == "order" and any(not o["r"] for o in a["orders"])]) == 1
+
+
 @pytest.mark.parametrize("entry,kind,prices", [("99 - 100", "range", ["99", "100"]),
     ("100 - 99", "range", ["99", "100"]), ("Market", "market", []),
     ("Рынок 100", "market", ["100"]), ("Limit 99", "limit", ["99"])])

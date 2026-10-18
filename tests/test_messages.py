@@ -10,6 +10,19 @@ from aqla_agent.messages import MAX_NOTIFICATIONS, literal, number, split_blocks
 READY = {'hyperliquid': {'configured': True, 'enabled': True, 'network': 'testnet'}}
 
 
+def test_delayed_target_notification_uses_current_terminal_outcome(opened):
+    trade=next(iter(opened['trades'].values()))
+    trade.update(status='rejected',filled_quantity='0',remaining_quantity='0',fill_events={})
+    marker={'authority':'preview','attempts':1,'next_retry_at':1000,'deadline_at':9999999999999,'exhausted':False,'code':'read_unavailable','stage':'market'}
+    old={'pipeline_id':'legacy','exchange':'hyperliquid','profile_id':'standard','network':'testnet','status':'pending','observation_retry':marker}
+    event=opened['events'][trade['event_id']]
+    event['targets']={'legacy:hyperliquid':{**old,'status':'rejected','error':'Current equity/margin no longer permits this exact plan'}}
+    opened['notifications']={'delayed':{'event_id':trade['event_id'],'targets':[old]}}
+    rendered=text(telegram_view(opened,READY))
+    assert 'Signal abgelehnt' in rendered and 'Nächste Prüfung' not in rendered
+    assert 'Eigenkapital' in rendered and 'Prüfung ausstehend' not in rendered
+
+
 @pytest.mark.parametrize('allocation',['adaptive','first_target'])
 def test_only_adaptive_mode_reports_adaptive_selection_and_backup_labels_use_active_targets(opened,allocation):
     trade=next(iter(opened['trades'].values()))

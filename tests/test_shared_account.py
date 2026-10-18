@@ -10,7 +10,8 @@ from aqla_hyperliquid_mcp.models import AqlaError
 
 
 @pytest.fixture
-def shared(setup):
+def shared(setup,monkeypatch):
+    from aqla_agent import inventory_stream
     settings,state,fake,exchange,trading=setup
     settings.shared_account=True
     manual={'ETH':'1','SOL':'2'}
@@ -38,6 +39,10 @@ def shared(setup):
                                                'tokenToAvailableAfterMaintenance':[[0,config['ceiling']]]})
         return original(request)
     exchange.client=httpx.AsyncClient(base_url=settings.base_url,transport=httpx.MockTransport(handle))
+    async def observe(adapter,names):
+        return [(dex,await adapter.info('clearinghouseState',user=adapter.account,**({'dex':dex} if dex else {})),
+                 await adapter.info('frontendOpenOrders',user=adapter.account,**({'dex':dex} if dex else {}))) for dex in names]
+    monkeypatch.setattr(inventory_stream,'observe',observe)
     return manual,orders,config,exchange,trading
 
 

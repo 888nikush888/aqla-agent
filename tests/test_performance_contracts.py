@@ -115,7 +115,7 @@ async def test_price_identity_and_freshness_validation_stay_strict(monkeypatch, 
     else:
         quote = await adapter.price_snapshot(market)
         assert quote.market == 'BTC' and quote.mid == quote.stop_reference == 100
-    assert len(started) == 2
+    assert len(started) == (4 if venue == 'hyperliquid' and invalid == 'stale' else 2)
 
 
 @pytest.mark.asyncio

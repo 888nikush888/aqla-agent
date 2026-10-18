@@ -102,8 +102,12 @@ async def test_unsent_recovery_rechecks_individual_risk_against_fresh_equity(set
 
     monkeypatch.setattr(exchange, "account_snapshot", changed)
     await trading.recover()
-    assert state.snapshot()["trades"][plan["trade_id"]]["status"] == "cancelled"
-    assert fake.actions == []
+    trade = state.snapshot()["trades"][plan["trade_id"]]
+    assert trade["status"] == "open"
+    assert Decimal(trade["plan"]["risk_usdc"]) <= Decimal(plan["risk_usdc"]) * 100 * Decimal(plan["policy"]["risk_percent"]) / 100
+    assert Decimal(trade["plan"]["quantity"]) < Decimal(plan["quantity"])
+    assert state.snapshot()["plans"][plan["plan_id"]]["plan"] == plan
+    assert len([action for action in fake.actions if action["type"] == "order" and any(not row["r"] for row in action["orders"])]) == 1
 
 
 @pytest.mark.asyncio
