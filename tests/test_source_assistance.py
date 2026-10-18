@@ -499,6 +499,55 @@ def test_target_result_reminder_keeps_a_separate_new_stop_instruction():
 
 
 @pytest.mark.parametrize("text", [
+    "BTC\nЧасть фикс и стоп в бу.",
+    "BTC\nФикс часть, стоп в БУ.",
+    "BTC\nЧасть фиксировать, стоп в бу.",
+    "BTC\nЧасть фикc и cтoп в бу.",
+    "BTC\nФиксим часть. Стоп в бу.",
+])
+def test_telegraphic_partial_exit_cannot_be_discarded_as_completed_status(text, setup):
+    from aqla_agent.trading import Trading
+    from aqla_hyperliquid_mcp.models import AqlaError
+    source, context, _ = material(text)
+    draft = Interpretation(kind="trade_update", symbol="BTC", update_action="break_even", source_refs=[source.source_id],
+        evidence=[Evidence(field="symbol", source_id=source.source_id, quote="BTC"),
+            Evidence(field="update_action", source_id=source.source_id, quote=text.splitlines()[1])])
+    checked = check_interpretation(context, draft)
+    assert not checked["valid"] and checked["errors"][0]["code"] == "management_actions_not_representable"
+    _, state, fake, exchange, _ = setup
+    trading = Trading(exchange, state)
+    trading.ingest(source)
+    before = state.snapshot()
+    with pytest.raises(AqlaError, match="management_actions_not_representable"):
+        trading.record_interpretation(source.event_id, draft)
+    assert state.snapshot() == before and not fake.actions
+    corrected = Interpretation(kind="ambiguous", source_refs=[source.source_id], reason="Partial exit and stop are distinct instructions",
+        evidence=[Evidence(field="classification", source_id=source.source_id, quote=text)])
+    assert check_interpretation(context, corrected)["valid"]
+
+
+@pytest.mark.parametrize("status", ["Вчера часть фикс.", "Часть фикс уже.", "Не фиксируем часть."])
+def test_explicit_past_or_negated_partial_exit_keeps_a_separate_current_stop(status):
+    source, context, _ = material("BTC\n" + status + "\nСтоп в бу.")
+    draft = Interpretation(kind="trade_update", symbol="BTC", update_action="break_even", source_refs=[source.source_id],
+        evidence=[Evidence(field="symbol", source_id=source.source_id, quote="BTC"),
+            Evidence(field="update_action", source_id=source.source_id, quote="Стоп в бу")])
+    assert check_interpretation(context, draft)["valid"]
+
+
+def test_unspecified_partial_exit_cannot_be_repaired_into_a_whole_position_close():
+    source, context, _ = material("BTC\nЧасть фикс.")
+    draft = Interpretation(kind="trade_update", symbol="BTC", update_action="reduce", source_refs=[source.source_id],
+        evidence=[Evidence(field="symbol", source_id=source.source_id, quote="BTC"),
+            Evidence(field="update_action", source_id=source.source_id, quote="Часть фикс")])
+    checked = check_interpretation(context, draft)
+    assert not checked["valid"] and any(e["code"] == "source_reduce_fraction_missing" for e in checked["errors"])
+    draft.update_action = "close"
+    checked = check_interpretation(context, draft)
+    assert not checked["valid"] and checked["errors"][0]["code"] == "management_action_mismatch"
+
+
+@pytest.mark.parametrize("text", [
     "BTC LONG. Buy at current prices 100. No pending buy order 95.",
     "BTC LONG. Покупаем по текущим ценам 100. Не ставим отложенный ордер 95.",
     "BTC LONG. Pending buy order 100.", "BTC LONG. Entry range 95-100.",

@@ -22,6 +22,7 @@ CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_ac
                    "source_exchange", "single_entry_form", "single_management_action")
 CONTEXT_CANDIDATE_LIMIT = 64
 REPAIR_GUIDANCE = {
+    "management_action_mismatch": "The selected action omits or changes the original current action. A partial exit is reduce, never close of the whole position. Keep its original fraction; when no fraction is stated this schema cannot execute it and requires ambiguous. Preserve every separate instruction; do not invent a fraction or discard an exit as past without original tense evidence.",
     "existing_target_catchup_requires_report_review": "The source discusses an existing target/result and catching up on a forgotten target order, with no separate current management instruction. Recheck report: this does not newly close the whole position or supply a reduction fraction. Use anchor-only classification evidence; do not borrow the parent's old setup fields. Preserve any genuinely separate new stop/exit instruction in other originals.",
     "scheduled_management_not_representable": "The original management is conditional or scheduled, including permission to take profit now IF not already done. This schema cannot represent that condition. Recheck ambiguous using anchor-only classification evidence; never erase the conditional action as optional background or execute only a separate stop instruction. Do not convert it into an unconditional exit.",
     "management_actions_not_representable": "The original contains several distinct management actions. Recheck ambiguous using anchor-only classification evidence and omit unused trade fields. Never select just one action or discard a permitted/conditional instruction as optional background.",
@@ -45,6 +46,7 @@ REPAIR_GUIDANCE = {
     "unbound_setup_edit_is_not_management": "Python reports no accepted own setup binding. An edit/publication alone is not execution. This anchor still presents a complete entry setup, not an explicit management instruction: recheck corrected new_signal, or ambiguous when all original entry legs cannot be represented.",
 }
 REPAIR_FIELDS = {
+    "management_action_mismatch": ["kind", "update_action", "reduce_percent"],
     "existing_target_catchup_requires_report_review": ["kind", "update_action", "source_refs"],
     "scheduled_management_not_representable": ["kind", "update_action"],
     "management_actions_not_representable": ["kind", "update_action"],
@@ -189,6 +191,9 @@ def check_interpretation(context, interpretation: Interpretation):
                        "field_paths": REPAIR_FIELDS.get(message, sorted(field for field in set(EVIDENCE_FIELDS) | set(Interpretation.model_fields)
                                        if re.search(r"(?<![\w.])" + re.escape(field) + r"(?![\w.])", field_message))),
                        "message": message, **({"repair": REPAIR_GUIDANCE[message]} if message in REPAIR_GUIDANCE else {})}
+        if message.startswith("Trade update reduce requires reduce_percent"):
+            detail.update(code="source_reduce_fraction_missing", field_paths=["kind", "update_action", "reduce_percent"],
+                repair="A partial exit requires an original fraction. Never replace it with a whole-position close or invent a fraction. Recheck ambiguous when the original does not specify one; preserve separate stop instructions without executing only that part.")
         if numeric_context:
             detail.update(code="source_numeric_proof_needs_context", repair="Use a longer UNIQUE exact original span, including the target label and its value if needed. Verified numbering labels are context, not prices. Do not resubmit a bare repeated number or crop digits from a decimal. Preserve the actual source value and unit.")
         if message.startswith("TP evidence selects a percentage-interval endpoint:"):

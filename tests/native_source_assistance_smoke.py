@@ -23,7 +23,10 @@ def main():
     parser.add_argument("--managed-position-side", action="store_true")
     parser.add_argument("--conditional-exit-permission", action="store_true")
     parser.add_argument("--target-catchup", action="store_true")
+    parser.add_argument("--partial-exit-label", action="store_true")
     args = parser.parse_args()
+    correction_needed = any((args.numbered_integer_target, args.empty_original, args.two_entry_orders,
+        args.analysis_entry_level, args.managed_position_side, args.conditional_exit_permission, args.target_catchup, args.partial_exit_label))
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root / "scripts"))
     from evaluate_high_tools import native_worker
@@ -48,6 +51,8 @@ def main():
         text = "BTC\nWho has not taken profit yet can do it now.\nStop to entry now."
     if args.target_catchup:
         text = "BTC\nTarget 2 reached; you can take profit now if you forgot to place its order."
+    if args.partial_exit_label:
+        text = "BTC\nЧасть фикс и стоп в бу."
     source = SourceEvent(chat_id="synthetic-source", message_id=1, sent_at=1000, text=text, historical=True)
     unrelated = SourceEvent(chat_id="synthetic-source", message_id=2, sent_at=900,
         text="ETH SHORT. Entry 200. Stop 210. Target 180.", historical=True)
@@ -76,9 +81,9 @@ def main():
     if args.managed_position_side:
         value = Interpretation(kind="trade_update", symbol="BTC", update_action="close", source_refs=[source.source_id],
             evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in [("symbol","BTC"),("update_action",text.splitlines()[1])]])
-    if args.conditional_exit_permission:
+    if args.conditional_exit_permission or args.partial_exit_label:
         value = Interpretation(kind="trade_update", symbol="BTC", update_action="break_even", source_refs=[source.source_id],
-            evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in [("symbol","BTC"),("update_action","Stop to entry now")]])
+            evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in [("symbol","BTC"),("update_action",text.splitlines()[-1])]])
     if args.target_catchup:
         value = Interpretation(kind="trade_update", symbol="BTC", update_action="close", source_refs=[source.source_id],
             evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in [("symbol","BTC"),("update_action",text.splitlines()[1])]])
@@ -87,7 +92,7 @@ def main():
         corrected.evidence[-1].quote = "Target 3: 1"
     if args.empty_original:
         corrected.evidence = []
-    if args.two_entry_orders or args.conditional_exit_permission:
+    if args.two_entry_orders or args.conditional_exit_permission or args.partial_exit_label:
         corrected = Interpretation(kind="ambiguous", source_refs=[source.source_id], reason="Original instruction cannot be partially represented by one supported action",
             evidence=[Evidence(field="classification", source_id=source.source_id, quote=text)])
     if args.analysis_entry_level:
@@ -135,7 +140,7 @@ def main():
                 return
             sequence = [("source_context", {"event_id": source.event_id, "view": "decision"}),
                         ("source_check_interpretation", {"event_id": source.event_id, "interpretation": value.model_dump(mode="json")})]
-            if args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.analysis_entry_level or args.managed_position_side or args.conditional_exit_permission or args.target_catchup:
+            if correction_needed:
                 sequence.append(("source_check_interpretation", {"event_id": source.event_id, "interpretation": corrected.model_dump(mode="json")}))
             message = {"role": "assistant", "content": "Checked; no orders."}
             if index < len(sequence):
@@ -170,7 +175,7 @@ def main():
         result = native_worker(SimpleNamespace(worker_fixture=fixture, hermes_source=args.hermes_source.resolve(),
             mcp_python=args.mcp_python.absolute()), model_url=f"http://127.0.0.1:{model.server_port}/v1", model_key="synthetic-only", local_fixture=True,
             retry_sleep=waits.append)
-        expected_drafts = 2 if args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.analysis_entry_level or args.managed_position_side or args.conditional_exit_permission or args.target_catchup else 1
+        expected_drafts = 2 if correction_needed else 1
         responses = 2 + expected_drafts
         assert result["completed"] and result["draft_count"] == expected_drafts and result["checks"][-1]["valid"], result
         if args.numbered_integer_target:
@@ -189,6 +194,9 @@ def main():
         elif args.managed_position_side:
             assert result["checks"][0]["errors"][0]["code"] == "managed_position_direction_missing_or_changed"
             assert result["checks"][-1]["interpretation"]["side"] == "long"
+        elif args.partial_exit_label:
+            assert result["checks"][0]["errors"][0]["code"] == "management_actions_not_representable"
+            assert result["checks"][-1]["interpretation"]["kind"] == "ambiguous"
         elif args.target_catchup:
             assert result["checks"][0]["errors"][0]["code"] == "existing_target_catchup_requires_report_review"
             assert result["checks"][-1]["interpretation"]["kind"] == "report"
@@ -208,10 +216,11 @@ def main():
             "calls": [{"model": b.get("model"), "effort": b.get("reasoning_effort"), "keys": list(b)} for b in calls],
             "requests": result["request_attempts"], "responses": result["api_responses"]}
         assert not retained["plans"] and not retained["operations"] and not retained["trades"]
-        print(json.dumps({"native_high_mcp_loop": True, "original_quote_shortened": not (args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.managed_position_side or args.conditional_exit_permission or args.target_catchup),
+        print(json.dumps({"native_high_mcp_loop": True, "original_quote_shortened": not (args.numbered_integer_target or args.empty_original or args.two_entry_orders or args.managed_position_side or args.conditional_exit_permission or args.target_catchup or args.partial_exit_label),
             "managed_position_side_kept": args.managed_position_side,
             "conditional_exit_not_discarded": args.conditional_exit_permission,
             "target_catchup_not_new_exit": args.target_catchup,
+            "partial_exit_not_dropped": args.partial_exit_label,
             "mixed_script_entry_legs_blocked": args.two_entry_orders,
             "analysis_level_not_entry": args.analysis_entry_level,
             "empty_original_quote_exception": args.empty_original,

@@ -24,8 +24,8 @@ from aqla_hyperliquid_mcp.rules import (
 
 from .evidence import position_fractions
 
-VERSION = "aqla-decisions-v41"
-QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v26"
+VERSION = "aqla-decisions-v42"
+QUESTION_CONTRACT_VERSION = "aqla-decision-questions-v27"
 # The original-context wire shape is unchanged. Keeping its independent schema
 # version permits exact-state, exact-question observations to be reused for
 # development while decision/validation policy has its own version and cache key.
@@ -406,7 +406,7 @@ def questions_for(packet, spans):
             "criteria": {"true": "Exactly one setup: market OR limit OR one bounded range OR an UNSTATED order form. One directional price boundary (SHORT price+ or LONG price-) is one LIMIT, not a two-price range. Missing entry price/stop/targets/leverage is allowed for Python backup; do not invent an order form. No entry requested also means yes.",
                          "false": "Multiple independent setups, separate half-market PLUS half-limit orders, or an unbounded range without a representable single price limit. Never collapse separate orders into one form."}},
         "single_management_action": {"type": "noul", "instructions": "Can the current management instruction be represented by exactly one update_action?",
-            "criteria": {"true": "One current action: change stop, break-even stop, replace targets, reduce, close, or cancel. Closing AT break-even is one CLOSE action. Past results and waiting/status comments are not extra actions. In a mixed-tense post, a completed past stop move is not a second current action alongside a present reduction. No management instruction also means yes.",
+            "criteria": {"true": "One current action: change stop, break-even stop, replace targets, reduce, close, or cancel. Closing AT break-even is one CLOSE action. Telegraphic lists such as 'часть фикс и стоп в бу' contain an exit AND stop instruction; absent explicit past tense, never call the exit already done to keep just the stop. A qualitative 'part' supplies no execution fraction. Past results and waiting/status comments are not extra actions. In a mixed-tense post, a completed past stop move is not a second current action alongside a present reduction. No management instruction also means yes.",
                          "false": "Several distinct current actions: reduce AND move stop; break-even AND cancel; close several independent markets. A NEW conditional profit-taking instruction, including 'who has not taken profit can do it now', must be preserved. Distinguish a mere catch-up reminder for an already reached original TP whose order was forgotten: that changes no instruction and remains result/status. Do not discard it as optional background to execute only a separate stop instruction. A scheduled future update such as 'close tomorrow' or an unrepresented trigger also cannot execute now. Do not execute only one part, discard an instruction, or turn a conditional action into an unconditional one."}},
     }
     for identity, alternatives in numeric_occurrences(spans):

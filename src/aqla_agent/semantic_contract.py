@@ -24,7 +24,7 @@ CURRENT_PRICE_ENTRY = pattern(WORD + r"(?:buy(?:ing)?|sell(?:ing)?|покупа(
 PENDING_ENTRY_ORDER = pattern(WORD + r"(?:(?:pending|deferred|resting)\s+(?:(?:buy|sell|limit)\s+)?orders?|"
     r"отложенн\w*\s+(?:ордер\w*|заявк\w*)|ausstehend\w*\s+(?:kauf|verkaufs?)?order\w*)" + END)
 ENTRY = pattern(WORD + r"(?:entry|enter|buy|sell|einstieg|einsteigen|вход|входим|войти)" + END)
-PORTION = pattern(WORD + r"(?:half|quarter|hälfte|halbe\w*|viertel|половин\w*|четверть|[1-3]\s*/\s*[24]|\d+\s*%)" + END)
+PORTION = pattern(WORD + r"(?:half|quarter|part|portion|hälfte|halbe\w*|viertel|teil|половин\w*|четверть|часть|частичн\w*|[1-3]\s*/\s*[24]|\d+\s*%)" + END)
 PAST = pattern(WORD + r"(?:yesterday|previously|already|earlier|gestern|bereits|zuvor|вчера|ранее|уже)" + END)
 NEGATED = pattern(WORD + r"(?:do\s+not|don't|never|not|no|nicht|kein\w*|не|нельзя)\s+(?:\w+\s+){0,2}$")
 PAST_PREFIX = pattern(WORD + r"(?:did|had|have|has|was|were|habe|haben|hatte|hat|wurde|был\w*)\s+(?:\w+\s+){0,3}$")
@@ -190,11 +190,13 @@ TARGET_ACTION = pattern(WORD + r"(?:replace|change|move|set|adjust|обнов\w*
 CANCEL_ACTION = pattern(WORD + r"(?:cancel\w*|remove|отмен\w*|stornier\w*)\s+(?:\w+\s+){0,3}(?:entry|order|orders|entries|вход\w*|заяв\w*|ордер\w*|einstieg)" + END)
 EXIT_ACTION = pattern(WORD + r"(?:reduce|reducing|trim|cut|close|closing|exit|exiting|take\s+(?:half|a\s+quarter)\s+off|"
                       r"сократ\w*|закрыва\w*|закрыть|закрой\w*|закроем|закрою|выхожу|выходим|выйти|фиксируем|фиксирую|зафиксиру\w*|"
+                      r"фиксим|фиксан(?:у|ем|уть)|фиксн(?:у|ем)|часть\s+фикс(?:ировать|ить)?|фикс\s+часть|"
                       r"reduzier\w*|schließ\w*|schliess\w*|schließe\w*|schliesse\w*)" + END)
 
 
 def current_actions(text, *, include_tp_footers=True):
     """Recognize explicit current actions with their original clause boundaries."""
+    text = matching_words(text)
     actions = []
     normalized = text.casefold().replace("ё", "е")
     live = current_structure_text(text)
@@ -243,6 +245,8 @@ def clause_actions(clause, inherited_blocked, *, initial_setup=False):
                 continue
             action = "break_even" if BE_DESTINATION.search(clause[match.end():]) else "move_stop"
         elif action == "exit":
+            if "фикс" in match.group() and PORTION.search(match.group()) and PAST.search(clause[match.end():]):
+                continue
             quantities = [quantity for quantity in PORTION.finditer(clause) if not (
                 "%" in quantity.group() and re.search(r"(?:[-−+]\s*|(?:at|на|в)\s*)$", clause[:quantity.start()]))]
             action = "reduce" if quantities or match.group().startswith(("reduce", "reducing", "trim", "cut", "сократ", "reduzier")) else "close"
