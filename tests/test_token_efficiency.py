@@ -112,7 +112,7 @@ async def test_decision_context_and_batch_keep_originals_quotes_replies_and_rece
         interpretation = Interpretation.model_validate({key: value for key, value in report_item(source, item["source_read_receipt"]).items()
                                                         if key not in ("event_id", "source_read_receipt")})
         verify_disposition(state.snapshot(), source.event_id, interpretation, item["source_read_receipt"], efficiency_server.aqla_authority.key)
-    separate = [len(json.dumps(await call(efficiency_server, "source_context", event_id=source.event_id), ensure_ascii=False)) for source in sources]
+    separate = [len(json.dumps(await call(efficiency_server, "source_context", event_id=source.event_id, view="decision"), ensure_ascii=False)) for source in sources]
     assert len(json.dumps(batch, ensure_ascii=False)) < sum(separate)
 
 
