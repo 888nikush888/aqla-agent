@@ -718,23 +718,6 @@ class Trading:
                 or current_market.max_quantity is not None and plan.quantity > current_market.max_quantity
                 or any(size < current_market.min_quantity or size * price < current_market.min_notional for size, price in zip(plan.tp_quantities, plan.take_profits, strict=True))):
             raise AqlaError("Exchange minimum/maximum order sizes changed while entry was unsent")
-        prior_id = trade.get("leverage_operation_id", "leverage:" + plan.trade_id)
-        prior = self.state.read("operations", entries={"operations": [prior_id]})["operations"].get(prior_id)
-        if prior and prior.get("outcome") == "configuration_not_effective":
-            def rearm(data):
-                current = data["trades"][plan.trade_id]
-                self.validate_admission(data, plan, owned=True)
-                if (current.get("configuration_retry") or Decimal(current["filled_quantity"]) or current.get("orders")
-                        or any(key == "entry:" + plan.trade_id or key.startswith("entry:" + plan.trade_id + ":") for key in data["operations"])
-                        or data["operations"][prior_id]["phase"] != "rejected"):
-                    raise AqlaError("Configuration retry requires a completely unsent entry and is allowed only once")
-                identity = "leverage:" + plan.trade_id + ":configuration:1"
-                if identity in data["operations"]:
-                    raise AqlaError("Configuration retry already has a durable request; reconcile it")
-                current.setdefault("leverage_attempts", []).append(prior_id)
-                current.update(leverage_operation_id=identity, configuration_retry=True, status="preparing")
-                return current
-            trade = self.state.update(rearm)
         latest_account, latest_quote = None, None
         dispatch_operation = trade.get("leverage_operation_id", "leverage:" + plan.trade_id)
         async def live_guard():
@@ -902,6 +885,10 @@ class Trading:
         plan = TradePlan.model_validate(trade["plan"])
         if trade["entry_operation_id"] in snapshot["operations"]:
             return await self.refresh_trade(trade_id)
+        parent = trade.get("configuration_parent_id", trade.get("leverage_operation_id", "leverage:" + trade_id))
+        configuration = snapshot["operations"].get(parent, {})
+        if configuration.get("configuration_retry_needed") and configuration["phase"] in ("prepared", "sending", "unknown"):
+            return await self.repair_unsent_configuration(plan, parent)
         self.assert_plan_binding(snapshot, plan)
         try:
             self.validate_admission(snapshot, plan, owned=True)
@@ -924,6 +911,50 @@ class Trading:
             self._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason=str(error))
             return self.state.snapshot()["trades"][trade_id]
         return await self.guarded_entry_steps(plan, trade)
+
+    async def repair_unsent_configuration(self, plan, parent):
+        child = "leverage:" + plan.trade_id + ":configuration:1"
+        action = {"type": "updateLeverage", "asset": plan.market.asset_id,
+                  "isCross": plan.policy.margin_mode == "cross", "leverage": plan.effective_leverage}
+        latest_account = None
+        def guard(data):
+            current, prior = data["trades"][plan.trade_id], data["operations"][parent]
+            if (prior["wire_action"] != action or Decimal(current["filled_quantity"]) or current.get("orders")
+                    or current.get("configuration_parent_id", parent) != parent
+                    or current.get("leverage_operation_id", parent) not in (parent, child)
+                    or any(key == "entry:" + plan.trade_id or key.startswith("entry:" + plan.trade_id + ":") for key in data["operations"])):
+                raise AqlaError("Configuration correction requires the exact original goal and a completely unsent entry")
+            pending = prior["phase"] in ("prepared", "sending", "unknown")
+            proof = prior.get("configuration_retry_needed")
+            if pending and (not proof or not 0 <= now_ms() - proof[0]["observed_at"] <= 10000):
+                raise TemporaryObservation("account_stale", "configuration")
+            # Only this non-exposure correction may pass its own unresolved
+            # parent. Normal entry admission still sees the complete ledger.
+            basis = {**data, "operations": {key: value for key, value in data["operations"].items() if not pending or key != parent}}
+            self.validate_admission(basis, plan, latest_account, owned=True, allowed_prepared=(child,), allowed_sending=(child,))
+        async def observe():
+            nonlocal latest_account
+            await self.exchange.reconcile(parent)
+            latest_account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
+            await read_observation(lambda: self.exchange.configuration_entry_clear(plan.market), "inventory")
+            guard(self.state.snapshot())
+        existing = self.state.snapshot()["operations"].get(child)
+        if existing is None:
+            await observe()
+            def claim(data):
+                guard(data)
+                current = data["trades"][plan.trade_id]
+                if current.get("configuration_retry") and current.get("leverage_operation_id") != child:
+                    raise AqlaError("Configuration correction was already attempted")
+                if not current.get("configuration_retry"):
+                    current.setdefault("leverage_attempts", []).append(parent)
+                current.update(configuration_retry=True, configuration_parent_id=parent, leverage_operation_id=child)
+            self.state.update(claim)
+            existing = await self.exchange.mutate(child, action, deadline=plan.deadline_at,
+                                                 prepare_guard=guard, async_prepare_guard=observe)
+        if existing["phase"] in ("acknowledged", "reconciled") and (await self.exchange.reconcile(parent))["resolved"]:
+            return await self.resume_unsent_entry(plan.trade_id)
+        return self.state.snapshot()["trades"][plan.trade_id]
 
     def _patch(self, trade_id, *, preserve_pending_stop=False, **values):
         old = self.state.snapshot()["trades"][trade_id]

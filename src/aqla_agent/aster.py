@@ -86,7 +86,7 @@ class Aster(VenueAdapter):
             error.http_status = response.status_code
             raise error
         result = response.json()
-        if response.status_code >= 400 and not self.rejected(result):
+        if response.status_code >= 400 and not VenueAdapter.rejected(result):
             raise AqlaError("Aster returned an unclassified exchange response")
         return result
 
@@ -166,9 +166,9 @@ class Aster(VenueAdapter):
             market = self.native_market(action["asset"])
             current = await self.configuration_position(market)
             requests = []
-            if current["marginType"] != ("cross" if action["isCross"] else "isolated"):
+            if current is None or current["marginType"] != ("cross" if action["isCross"] else "isolated"):
                 requests.append(self.signed("POST", "/fapi/v3/marginType", {"symbol": market.native_symbol, "marginType": "CROSSED" if action["isCross"] else "ISOLATED"}))
-            if int(current["leverage"]) != action["leverage"]:
+            if current is None or int(current["leverage"]) != action["leverage"]:
                 requests.append(self.signed("POST", "/fapi/v3/leverage", {"symbol": market.native_symbol, "leverage": str(action["leverage"])}))
             return requests
         if action["type"] == "order":
@@ -212,15 +212,17 @@ class Aster(VenueAdapter):
     async def configuration_position(self, market):
         started = now_ms()
         rows = await self.read("positionRisk", {"symbol": market.native_symbol}, private=True)
+        if not 0 <= now_ms() - started <= 10000:
+            from .observations import TemporaryObservation
+            raise TemporaryObservation("account_stale", "configuration")
+        if rows == []:
+            return None
         if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
                 or rows[0].get("symbol") != market.native_symbol or rows[0].get("positionSide") != "BOTH"
                 or rows[0].get("marginType") not in ("cross", "isolated")
                 or isinstance(rows[0].get("leverage"), bool) or not str(rows[0].get("leverage", "")).isdigit()
                 or int(rows[0]["leverage"]) < 1):
             raise AqlaError("Aster configuration observation has no unique one-way market identity")
-        if not 0 <= now_ms() - started <= 10000:
-            from .observations import TemporaryObservation
-            raise TemporaryObservation("account_stale", "configuration")
         return rows[0]
 
     async def configuration_outcome(self, record):
@@ -230,14 +232,16 @@ class Aster(VenueAdapter):
         market = self.native_market(action["asset"])
         started = now_ms()
         current = await self.configuration_position(market)
+        if current is None:
+            return None
         evidence = {"symbol": market.native_symbol, "leverage": int(current["leverage"]), "margin_type": current["marginType"], "observed_at": started}
         if int(current["leverage"]) == action["leverage"] and current["marginType"] == ("cross" if action["isCross"] else "isolated"):
             return {"outcome": "accepted", "evidence": [evidence]}
-        # Old configuration signatures cannot become effective after their
-        # exchange-clock nonce window; this never proves an order was unsent.
+        # Nonce expiry is only a cooldown for an idempotent correction: an
+        # already accepted request may still be queued. Keep it unresolved.
         requests = record.get("signed_requests", [])
         if record.get("signed_requests") == []:
-            return {"outcome": "configuration_not_effective", "evidence": [evidence]}
+            return {"outcome": "retry_configuration", "evidence": [evidence]}
         if not requests or any(r.get("method") != "POST" or r.get("path") not in ("/fapi/v3/marginType", "/fapi/v3/leverage")
                                or r.get("params", {}).get("symbol") != market.native_symbol or type(r.get("nonce")) is not int for r in requests):
             return None
@@ -246,12 +250,20 @@ class Aster(VenueAdapter):
         if (type(server) is int and 0 <= now_ms() - server <= 2000 and 0 <= now_ms() - started <= 10000
                 and server * 1000 > max(r["nonce"] for r in requests) + 60_000_000):
             evidence.update(server_time=server, nonce_window_ended_at=max(r["nonce"] for r in requests) // 1000 + 60000)
-            return {"outcome": "configuration_not_effective", "evidence": [evidence]}
+            return {"outcome": "retry_configuration", "evidence": [evidence]}
         return None
 
     async def prove_configuration(self, record):
         decision = await self.configuration_outcome(record)
         return decision is not None and decision["outcome"] == "accepted"
+
+    async def configuration_entry_clear(self, market):
+        rows = await self.read("openOrders", {"symbol": market.native_symbol}, private=True)
+        if not isinstance(rows, list) or any(not isinstance(row, dict) or row.get("symbol") != market.native_symbol
+                                             or type(row.get("reduceOnly")) is not bool for row in rows):
+            raise AqlaError("Aster configuration correction needs complete native order evidence")
+        if any(not row["reduceOnly"] for row in rows):
+            raise AqlaError("Manual entry orders now reserve this market")
 
     async def order_status(self, identity, user=None):
         market = next((market for record in self.state.snapshot()["operations"].values() for order in record["wire_action"].get("orders", [])

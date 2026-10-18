@@ -204,8 +204,11 @@ class VenueAdapter:
             decision = await self.configuration_outcome(row)
             if decision is not None:
                 outcome, observations = decision["outcome"], decision["evidence"]
-                phase = "reconciled" if outcome == "accepted" else "rejected"
-                self.state.update(lambda data: data["operations"][operation_id].update(phase=phase, outcome=outcome, evidence=observations))
+                if outcome != "accepted":
+                    self.state.update(lambda data: data["operations"][operation_id].update(configuration_retry_needed=observations))
+                    return {"operation": self.public_operation(self.state.snapshot()["operations"][operation_id]),
+                            "resolved": False, "evidence": observations, "resubmitted": False, "absence_is_proof": False}
+                self.state.update(lambda data: data["operations"][operation_id].update(phase="reconciled", outcome=outcome, evidence=observations, configuration_retry_needed=None))
                 return {"operation": self.public_operation(self.state.snapshot()["operations"][operation_id]),
                         "resolved": True, "evidence": observations, "resubmitted": False, "absence_is_proof": False}
         if proved:
@@ -226,6 +229,9 @@ class VenueAdapter:
 
     async def configuration_outcome(self, row):
         return {"outcome": "accepted", "evidence": []} if await self.prove_configuration(row) else None
+
+    async def configuration_entry_clear(self, market):
+        raise AqlaError("This venue has no verified configuration correction policy")
 
     @staticmethod
     def rejected(response):

@@ -65,6 +65,8 @@ class AsterBoundary:
             result = [{"symbol": "BTCUSDT", "leverage": self.leverage, "marginType": self.margin_type, "positionSide": "BOTH"}]
         elif path == "time":
             result = {"serverTime": time.time_ns() // 1_000_000}
+        elif path == "openOrders":
+            result = [row for row in self.orders.values() if row["status"] in ("NEW", "PARTIALLY_FILLED")]
         elif path == "userTrades":
             result = [row for row in self.trades if int(parameters["startTime"]) <= row["time"] <= int(parameters["endTime"])]
         elif path == "order":
@@ -90,7 +92,8 @@ class AsterBoundary:
                 result = self.orders[identity]
         else:
             raise AssertionError((request.method, request.url.path))
-        return httpx.Response(200, json=result, headers={'Date': formatdate(time.time(), usegmt=True)})
+        status = 400 if isinstance(result, dict) and result.get("code") == -4046 else 200
+        return httpx.Response(status, json=result, headers={'Date': formatdate(time.time(), usegmt=True)})
 
     def fill(self, identity):
         row = self.orders[identity]
