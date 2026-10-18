@@ -715,9 +715,14 @@ def test_two_prices_in_separate_mentions_do_not_prove_a_range():
     spans = candidates(packet)
     response = response_for(questions_for(packet, spans), overrides={"entry": "unspecified",
         **{"role." + span.candidate_id: "entry1" for span in spans if span.quote == "105"}})
+    with pytest.raises(DecisionFailure, match="decision_evidence_invalid"):
+        replay_decision(packet, CalibrationProfile(), [response, response_for(verification_questions())],
+            model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
+    response = response_for(questions_for(packet, spans), overrides={"entry": "unspecified"})
     result = replay_decision(packet, CalibrationProfile(), [response, response_for(verification_questions())],
         model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
     assert result.interpretation.entry == "unspecified"
+    assert result.interpretation.entry_prices == [100]
 
 
 def test_exact_same_live_tp_role_repetition_coalesces_without_merging_target_roles():
