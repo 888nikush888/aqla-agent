@@ -9,12 +9,13 @@ from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, Sou
 
 from .decisions import candidates
 
-VERSION = "express-fields-v1"
+VERSION = "express-fields-v2"
 QUALIFIED_MASTER = "eec4d5ef625ee5f592441f17db84fbcedcb3827d2c38438a21bc10375437d10f"
 CLAIM = ContextVar("aqla_express_claim", default=None)
 ACTIVE = {"prepared", "interpreted", "applying", "waiting_preview", "recovering"}
 NUMBER = r"[0-9]+(?:[.,][0-9]+)?"
 FLAGS = re.I
+HEADINGS = frozenset({"#FUTURES", "FUTURES", "FUTURES SIGNAL", "FUTURES SIGNALS", "PERPETUAL FUTURES"})
 HEADER = re.compile(r"(?:➡\ufe0f?\s*)?(?:(?P<side>LONG|SHORT)\s+(?P<symbol>[A-Z0-9][A-Z0-9._/:-]{0,99})|"
                     r"(?P<symbol_first>[A-Z0-9][A-Z0-9._/:-]{0,99})\s+(?P<side_last>LONG|SHORT))", FLAGS | re.ASCII)
 ENTRY = re.compile(r"(?:❇\ufe0f?\s*)?(?:Entry|Вход|Einstieg)\s*:\s*(?P<body>.+)", FLAGS)
@@ -51,7 +52,13 @@ def compile_template(source: SourceEvent):
         offset += len(raw)
     if not lines:
         return None
-    header = HEADER.fullmatch(lines[0][1])
+    first = 0
+    # Only complete leading category labels are metadata; keep original offsets.
+    while first < len(lines) and lines[first][1].upper() in HEADINGS:
+        first += 1
+    if first == len(lines):
+        return None
+    header = HEADER.fullmatch(lines[first][1])
     if header is None:
         return None
     ref = source.source_id
@@ -84,7 +91,7 @@ def compile_template(source: SourceEvent):
     proof("symbol", symbol)
     proof("side", side)
     try:
-        for origin, line in lines[1:]:
+        for origin, line in lines[first + 1:]:
             if match := ENTRY.fullmatch(line):
                 if "entry" in values:
                     return None

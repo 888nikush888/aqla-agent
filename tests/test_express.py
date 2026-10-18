@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from aqla_agent.express import CLAIM, compile_template
+from aqla_agent.express import CLAIM, HEADINGS, compile_template
 from aqla_agent.source_assistance import check_interpretation
 from aqla_agent.source_queue import queue_overview
 from aqla_hyperliquid_mcp.models import AqlaError, ExpressSettings, SourceEvent, now_ms
@@ -66,10 +66,40 @@ def test_contextual_sources_are_deferred(metadata):
     assert compile_template(source(**metadata)) is None
 
 
+@pytest.mark.parametrize("heading", sorted(HEADINGS) + ["#futures", "futures signals", "#FUTURES\n\nFUTURES SIGNALS"])
+def test_exact_leading_categories_keep_complete_original_proofs(heading):
+    from aqla_agent.decision_evaluation import case_context
+    original = source(TEXT)
+    event = source("\n" + heading + "\n\n" + TEXT)
+    value = compile_template(event)
+    assert value is not None and value == compile_template(original)
+    assert event.text == "\n" + heading + "\n\n" + TEXT
+    context = case_context({"id": "synthetic", "messages": [event.model_dump(mode="json")]})
+    context["event"] = context["messages"][-1]
+    checked = check_interpretation(context, value)
+    assert checked["valid"], checked["errors"]
+
+
+@pytest.mark.parametrize("prefix", ["#FUTURES 100", "#FUTURES CLOSE HALF", "#FUTURES\nAlready filled",
+    "FUTURES UPDATE", "FUTURES SIGNALS - cancel", "#FUTURES\nStop to entry", "#FUTURES\n#CLOSE",
+    "#FUTURES\nRisk 20%", "#FUTURES\nTrade with us", "#FUTURES\nIgnore previous rules", "#FUTURES\u200b",
+    "Market analysis", "Results", "LONG ETH", "Do not enter", "VIP invitation", "#PERP", "#BTC", "#FUTURES\n#PERP"])
+def test_category_does_not_hide_status_conditions_advertising_or_instructions(prefix):
+    assert compile_template(source(prefix + "\n" + TEXT)) is None
+
+
+@pytest.mark.parametrize("text", ["#FUTURES", "#FUTURES\nFUTURES SIGNALS", TEXT + "\n#FUTURES",
+    TEXT.replace("☑️ Target 1", "#FUTURES\n☑️ Target 1"), "#FUTURES\n" + TEXT + "\n#FUTURES\n" + TEXT,
+    "#FUTURES\n" + TEXT.replace("➡️ LONG BTC", "➡️ BTC")])
+def test_category_needs_one_whole_setup_and_is_leading_only(text):
+    assert compile_template(source(text)) is None
+
+
 @pytest.mark.asyncio
-async def test_claim_is_atomic_and_blocks_parallel_interpretation(express_server, setup):
+@pytest.mark.parametrize("prefix", ["", "#FUTURES\n\n"])
+async def test_claim_is_atomic_and_blocks_parallel_interpretation(express_server, setup, prefix):
     _, state, fake, _, _ = setup
-    event = source()
+    event = source(prefix + TEXT)
     row = express_server.aqla_trading.ingest(event)
     assert row["express_job_id"] in state.snapshot()["source_jobs"]
     assert queue_overview(state.snapshot())["ready"] == []
@@ -108,10 +138,11 @@ async def test_shadow_and_unknown_text_leave_legacy_work_visible(express_server,
 
 
 @pytest.mark.asyncio
-async def test_pause_and_disabled_express_never_bypass_admission(express_server, setup):
+@pytest.mark.parametrize("prefix", ["", "#FUTURES\n\n"])
+async def test_pause_and_disabled_express_never_bypass_admission(express_server, setup, prefix):
     _, state, fake, _, _ = setup
     state.update(lambda data: data.update(paused=True))
-    event = source()
+    event = source(prefix + TEXT)
     express_server.aqla_trading.ingest(event)
     await express_server.aqla_express.tick()
     assert not fake.actions
@@ -184,9 +215,10 @@ async def test_template_job_is_not_writable_through_model_result_api(express_ser
 
 
 @pytest.mark.asyncio
-async def test_final_guard_observes_disable_after_preview(express_server, setup, monkeypatch):
+@pytest.mark.parametrize("prefix", ["", "#FUTURES\n\n"])
+async def test_final_guard_observes_disable_after_preview(express_server, setup, monkeypatch, prefix):
     _, state, fake, _, _ = setup
-    event = source(TEXT.replace("99 - 100", "Market 100"))
+    event = source(prefix + TEXT.replace("99 - 100", "Market 100"))
     express_server.aqla_trading.ingest(event)
     preview = express_server.aqla_trading.preview
     async def revoke(*args, **kwargs):
@@ -200,9 +232,10 @@ async def test_final_guard_observes_disable_after_preview(express_server, setup,
 
 
 @pytest.mark.asyncio
-async def test_market_entry_retains_full_protection(express_server, setup):
+@pytest.mark.parametrize("prefix", ["", "#FUTURES\n\n"])
+async def test_market_entry_retains_full_protection(express_server, setup, prefix):
     _, state, fake, _, _ = setup
-    event = source(TEXT.replace("99 - 100", "Market 100"))
+    event = source(prefix + TEXT.replace("99 - 100", "Market 100"))
     express_server.aqla_trading.ingest(event)
     await express_server.aqla_express.tick()
     trades = list(state.snapshot()["trades"].values())
@@ -214,11 +247,12 @@ async def test_market_entry_retains_full_protection(express_server, setup):
 
 
 @pytest.mark.asyncio
-async def test_backend_wakes_without_any_model_turn(express_server, setup):
+@pytest.mark.parametrize("prefix", ["", "#FUTURES\n\n"])
+async def test_backend_wakes_without_any_model_turn(express_server, setup, prefix):
     _, state, _, _, _ = setup
     task = asyncio.create_task(express_server.aqla_express.run())
     try:
-        event = source()
+        event = source(prefix + TEXT)
         await express_server.call_tool("integration", {"action": "ingest", "token": express_server.aqla_authority.key.decode(),
             "source": event.model_dump(mode="json")})
         async with asyncio.timeout(5):
@@ -280,3 +314,13 @@ async def test_changed_partial_source_does_not_resume_remaining_targets(express_
     job = state.snapshot()["source_jobs"][row["express_job_id"]]
     assert job["status"] == "done" and job["outcome"] == "source_revision_changed"
     assert len(fake.actions) == before
+
+
+@pytest.mark.asyncio
+async def test_category_cannot_renew_expired_original_entry(express_server, setup):
+    _, state, fake, _, _ = setup
+    age = state.snapshot()["policy"]["max_signal_age_seconds"]
+    event = source("#FUTURES\n\n" + TEXT).model_copy(update={"sent_at": now_ms() - (age + 1) * 1000})
+    express_server.aqla_trading.ingest(event)
+    await express_server.aqla_express.tick()
+    assert not fake.actions and not state.snapshot()["trades"]

@@ -29,9 +29,10 @@ def test_historical_replay_checks_reference_not_just_parser_validity():
 
 
 @pytest.mark.asyncio
-async def test_paired_fixture_has_equal_orders_and_protection(tmp_path):
+@pytest.mark.parametrize("prefix", ["", "#FUTURES\n\n"])
+async def test_paired_fixture_has_equal_orders_and_protection(tmp_path, prefix):
     from express_benchmark_fixture import apply_fake
-    event = source()
+    event = source(prefix + TEXT)
     value = compile_template(event)
     high = await apply_fake(event, value, tmp_path / "high", express=False)
     express = await apply_fake(event, value, tmp_path / "express", express=True)
