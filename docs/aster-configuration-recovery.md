@@ -32,6 +32,12 @@ admission always sees the full ledger and remains blocked until positive
 configuration confirmation. A second uncertain attempt causes no further writes
 and remains unresolved. Foreign exposure blocks continuation. Quantity and risk
 are not increased; market and price checks remain mandatory before entry.
+Configuration correction and entry execution run in separate recovery cycles
+so each keeps its own bounded runtime. If a recovery timeout cancels an entry
+guard before transport, its durable `not_sent` record enters the existing bounded
+observation retry. A cancellation during transport remains uncertain. Recovery
+also repairs older `opening` rows whose entry is durably known to be unsent;
+non-retryable guard failures terminate instead of appearing as active orders.
 
 This rule is specific to configuration. An uncertain order remains uncertain
 after nonce expiry or an empty order query and is never resubmitted by this

@@ -781,8 +781,19 @@ class Trading:
     @staticmethod
     def raise_temporary_not_sent(operation):
         fact = (operation.get("result") or {}).get("diagnostic", {})
-        if operation.get("outcome") == "not_sent" and fact.get("retryable"):
-            raise TemporaryObservation(fact["code"], fact["stage"], fact["category"])
+        if operation.get("phase") == "rejected" and operation.get("outcome") == "not_sent" and not operation.get("legs"):
+            if fact.get("retryable"):
+                raise TemporaryObservation(fact["code"], fact["stage"], fact["category"])
+            if fact.get("exception_type") == "CancelledError" and fact.get("stage") in ("prepared_guard", "transport_guard"):
+                raise TemporaryObservation("read_unavailable", fact["stage"], "transport")
+
+    @staticmethod
+    def entry_not_sent(snapshot, trade):
+        entries = [trade["entry_operation_id"], *trade.get("entry_attempts", [])]
+        return (not Decimal(trade["filled_quantity"]) and not Decimal(trade["remaining_quantity"])
+                and not any(row.get("kind") == "entry" for row in trade.get("fill_events", {}).values())
+                and all(identity not in snapshot["operations"] or (snapshot["operations"][identity].get("outcome") == "not_sent"
+                        and snapshot["operations"][identity]["phase"] == "rejected" and not snapshot["operations"][identity].get("legs")) for identity in entries))
 
     def complete_observation_retry(self, trade_id):
         def complete(data):
@@ -798,10 +809,8 @@ class Trading:
             saved = data["plans"][plan_id]
             plan = TradePlan.model_validate(saved["plan"])
             trade = data["trades"].get(plan.trade_id)
-            if trade:
-                entries = [trade["entry_operation_id"], *trade.get("entry_attempts", [])]
-                if Decimal(trade["filled_quantity"]) or any(identity in data["operations"] and data["operations"][identity].get("outcome") != "not_sent" for identity in entries):
-                    raise error
+            if trade and not self.entry_not_sent(data, trade):
+                raise error
             if any(row["phase"] in ("prepared", "sending", "unknown") for row in data["operations"].values()):
                 raise error
             previous = trade.get("observation_retry") if trade else saved.get("observation_retry")
@@ -953,7 +962,8 @@ class Trading:
             existing = await self.exchange.mutate(child, action, deadline=plan.deadline_at,
                                                  prepare_guard=guard, async_prepare_guard=observe)
         if existing["phase"] in ("acknowledged", "reconciled") and (await self.exchange.reconcile(parent))["resolved"]:
-            return await self.resume_unsent_entry(plan.trade_id)
+            # Entry has its own recovery-cycle time budget after this correction.
+            self._patch(plan.trade_id, status="preparing")
         return self.state.snapshot()["trades"][plan.trade_id]
 
     def _patch(self, trade_id, *, preserve_pending_stop=False, **values):
@@ -2339,6 +2349,19 @@ class Trading:
                     continue
             if trade["status"] in OPEN:
                 try:
+                    current = self.state.snapshot()
+                    entry = current["operations"].get(trade["entry_operation_id"], {})
+                    if entry.get("phase") == "rejected" and entry.get("outcome") == "not_sent" and self.entry_not_sent(current, trade):
+                        try:
+                            self.raise_temporary_not_sent(entry)
+                        except TemporaryObservation as error:
+                            if not trade.get("observation_retry") or trade["observation_retry"].get("attempt_inflight"):
+                                trade = self.retain_observation_retry(trade["plan"]["plan_id"], error)
+                        else:
+                            self._patch(trade_id, status="rejected", reserved_risk="0", orders=[],
+                                        unsent_reason=entry.get("result", {}).get("error", "Entry guard rejected before exchange transport"),
+                                        entry_diagnostic=entry.get("result", {}).get("diagnostic", {}))
+                            continue
                     if trade["status"] == "cleanup":
                         reports.append(await self.finish_cleanup(trade_id))
                     elif trade["status"] == "waiting_entry":

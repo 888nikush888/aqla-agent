@@ -1,4 +1,5 @@
 # ruff: noqa: F811
+import asyncio
 import copy
 import json
 import time
@@ -95,6 +96,9 @@ async def test_lost_configuration_ack_is_recovered_without_replaying_original_si
         assert (await adapter.reconcile(identity))["resolved"] is False
         assert engine.state.snapshot()["operations"][identity]["phase"] == "unknown"
     await engine.recover()
+    if not applied:
+        assert engine.state.snapshot()["trades"][trade["trade_id"]]["status"] == "preparing" and not boundary.orders
+        await engine.recover()
     snapshot = engine.state.snapshot()
     trade = snapshot["trades"][trade["trade_id"]]
     assert trade["status"] == "open"
@@ -295,4 +299,125 @@ async def test_expired_unknown_order_is_never_treated_as_configuration_failure(a
     await engine.recover()
     assert engine.state.snapshot()["operations"][trade["entry_operation_id"]]["phase"] == "unknown"
     assert not boundary.orders and not engine.state.snapshot()["trades"][trade["trade_id"]].get("configuration_retry")
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_retry",[False,True])
+async def test_cancelled_prepared_entry_recovers_only_its_durable_unsent_attempt(aster, signal, clock, monkeypatch, cancel_retry):
+    adapter, boundary, engine = aster
+    source, value = signal
+    plan = await engine.preview(source.event_id, value)
+    account = adapter.account_snapshot
+    async def interrupted(market):
+        snapshot=engine.state.snapshot()
+        identity=snapshot["trades"].get(plan["trade_id"],{}).get("entry_operation_id","entry:"+plan["trade_id"])
+        operation = snapshot["operations"].get(identity)
+        if operation and operation["phase"] == "prepared":
+            raise asyncio.CancelledError
+        return await account(market)
+    monkeypatch.setattr(adapter,"account_snapshot",interrupted)
+    with pytest.raises(asyncio.CancelledError):
+        await engine.execute(plan["plan_id"])
+    identity = "entry:"+plan["trade_id"]
+    old = copy.deepcopy(engine.state.snapshot()["operations"][identity])
+    assert old["outcome"] == "not_sent" and not boundary.orders
+    monkeypatch.setattr(adapter,"account_snapshot",account)
+    await engine.recover()
+    current = engine.state.snapshot()["trades"][plan["trade_id"]]
+    assert current["status"] == "preparing" and current["observation_retry"]["attempts"] == 1
+    assert not current["orders"]
+    clock[0] += 30001
+    if cancel_retry:
+        monkeypatch.setattr(adapter,"account_snapshot",interrupted)
+        with pytest.raises(asyncio.CancelledError):
+            await engine.recover()
+        monkeypatch.setattr(adapter,"account_snapshot",account)
+        await engine.recover()
+        marker=engine.state.snapshot()["trades"][plan["trade_id"]]["observation_retry"]
+        assert marker["attempts"] == 2 and not marker["attempt_inflight"]
+        await engine.recover()
+        assert engine.state.snapshot()["trades"][plan["trade_id"]]["observation_retry"] == marker
+        clock[0] += 60001
+    await engine.recover()
+    current = engine.state.snapshot()["trades"][plan["trade_id"]]
+    assert current["status"] == "open" and current["entry_operation_id"] != identity
+    assert engine.state.snapshot()["operations"][identity] == old
+    assert len([r for r in boundary.orders.values() if not r["reduceOnly"]]) == 1
+    await engine.recover()
+    assert len([r for r in boundary.orders.values() if not r["reduceOnly"]]) == 1
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_transport_is_never_reclassified_as_unsent(aster, signal, clock):
+    adapter, boundary, engine = aster
+    source, value = signal
+    plan = await engine.preview(source.event_id, value)
+    original = boundary.handle
+    def interrupted(request):
+        if request.method == "POST" and request.url.path.endswith("/order"):
+            raise asyncio.CancelledError
+        return original(request)
+    adapter.client._transport = httpx.MockTransport(interrupted)
+    with pytest.raises(asyncio.CancelledError):
+        await engine.execute(plan["plan_id"])
+    old = copy.deepcopy(engine.state.snapshot()["operations"]["entry:"+plan["trade_id"]])
+    assert old["phase"] == "unknown" and old.get("outcome") != "not_sent"
+    clock[0] += 61001
+    await engine.recover()
+    current = engine.state.snapshot()["trades"][plan["trade_id"]]
+    assert not current.get("observation_retry") and not current.get("entry_attempts") and not boundary.orders
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_old_opening_row_with_permanent_unsent_guard_failure_is_terminal(aster, signal, clock, monkeypatch):
+    adapter, boundary, engine = aster
+    source, value = signal
+    plan = await engine.preview(source.event_id, value)
+    account = adapter.account_snapshot
+    async def rejected(market):
+        operation = engine.state.snapshot()["operations"].get("entry:"+plan["trade_id"])
+        if operation and operation["phase"] == "prepared":
+            raise ValueError("PRIVATE_GUARD_ERROR")
+        return await account(market)
+    monkeypatch.setattr(adapter,"account_snapshot",rejected)
+    await engine.execute(plan["plan_id"])
+    engine.state.update(lambda d:d["trades"][plan["trade_id"]].update(status="opening"))
+    monkeypatch.setattr(adapter,"account_snapshot",account)
+    await engine.recover()
+    current = engine.state.snapshot()["trades"][plan["trade_id"]]
+    assert current["status"] == "rejected" and current["reserved_risk"] == "0" and not current["orders"]
+    assert not current.get("observation_retry") and not boundary.orders
+    assert "PRIVATE_GUARD_ERROR" not in json.dumps(engine.state.snapshot())
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_unsent_current_attempt_cannot_hide_uncertain_previous_entry(aster, signal, clock, monkeypatch):
+    adapter, boundary, engine = aster
+    source, value = signal
+    plan = await engine.preview(source.event_id, value)
+    account = adapter.account_snapshot
+    async def interrupted(market):
+        operation = engine.state.snapshot()["operations"].get("entry:"+plan["trade_id"])
+        if operation and operation["phase"] == "prepared":
+            raise asyncio.CancelledError
+        return await account(market)
+    monkeypatch.setattr(adapter,"account_snapshot",interrupted)
+    with pytest.raises(asyncio.CancelledError):
+        await engine.execute(plan["plan_id"])
+    def prior_unknown(data):
+        trade=data["trades"][plan["trade_id"]]
+        prior=copy.deepcopy(data["operations"][trade["entry_operation_id"]])
+        prior.update(operation_id="entry:"+plan["trade_id"]+":prior",phase="unknown",outcome="unknown")
+        data["operations"][prior["operation_id"]]=prior
+        trade["entry_attempts"]=[prior["operation_id"]]
+    engine.state.update(prior_unknown)
+    monkeypatch.setattr(adapter,"account_snapshot",account)
+    await engine.recover()
+    current=engine.state.snapshot()["trades"][plan["trade_id"]]
+    assert not current.get("observation_retry") and len(current["entry_attempts"]) == 1
+    assert not boundary.orders
     await adapter.close()
