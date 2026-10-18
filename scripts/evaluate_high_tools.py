@@ -67,8 +67,8 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
                   "trust": "full", "supports_parallel_tool_calls": False,
                   "env": {"PYTHONPATH": str(ROOT / "src"), "HERMES_MODEL_API_KEY": ""}}}}
     (home / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
-    from hermes_constants import parse_reasoning_effort
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+    from hermes_constants import parse_reasoning_effort
     from run_agent import AIAgent
     from tools.mcp_tool_discovery import discover_mcp_tools
     from tools.mcp_tool_lifecycle import shutdown_mcp_servers
