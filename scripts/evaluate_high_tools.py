@@ -33,6 +33,18 @@ def source_digest():
     return digest([(str(p.relative_to(ROOT)).replace("\\", "/"), hashlib.sha256(p.read_bytes()).hexdigest()) for p in files])
 
 
+def transport_retryable(result):
+    if result.get("completed"):
+        return False
+    reason = result.get("failure_reason")
+    if reason is not None:
+        return result.get("failure_retryable") is True and reason in {
+            "timeout", "rate_limit", "upstream_rate_limit", "overloaded", "server_error"}
+    error = str(result.get("error", "")).lower()
+    return any(marker in error for marker in ("connection", "timeout", "timed out", "broken pipe", "errno 32",
+        "rate limit", "rate_limit", "429", "temporar", "503", "502", "empty stream"))
+
+
 def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fixture=False, retry_sleep=time.sleep):
     import yaml
 
@@ -48,7 +60,6 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     assert local_fixture or model_url == DEFAULT_MODEL_URL
     config = {"model": {"default": DEFAULT_MODEL, "provider": "custom", "base_url": model_url},
               "agent": {"stream": False, "api_max_retries": 1, "auto_recovery_cycles": 0},
-              "providers": {"custom": {"models": {DEFAULT_MODEL: {"timeout_seconds": 120, "stale_timeout_seconds": 120}}}},
               "compression": {"enabled": False}, "plugins": {"enabled": []}, "fallback_providers": [],
               "display": {"tool_progress": "off"}, "tools": {"tool_search": {"enabled": False}},
               "mcp_servers": {"aqla": {"command": str(args.mcp_python),
@@ -57,10 +68,13 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
                   "env": {"PYTHONPATH": str(ROOT / "src"), "HERMES_MODEL_API_KEY": ""}}}}
     (home / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     from hermes_constants import parse_reasoning_effort
+    from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
     from run_agent import AIAgent
     from tools.mcp_tool_discovery import discover_mcp_tools
     from tools.mcp_tool_lifecycle import shutdown_mcp_servers
     from tools.registry import registry
+
+    assert get_reasoning_stale_timeout_floor(DEFAULT_MODEL) == 600
 
     from aqla_agent.hermes_runtime import install_strict_profile
     from aqla_agent.provider_cooldown import REPLAY
@@ -89,6 +103,8 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     measured.tool = observe_tool
     token = RUN.set(measured)
     requests = []
+    transport_retries = []
+    turn_attempts = 0
     agent = None
     result = None
     worker_error_type = None
@@ -139,14 +155,14 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
             "Do not stop with an unchecked answer. Correct specific tool errors: at most THREE checker calls TOTAL, including schema-invalid calls. Do not resubmit a valid draft merely to reword a reason or remove optional reason_codes. If semantic review finds no material error, finish with the checked draft unchanged. "
             "Never use another model. Expected answers are unavailable to you.")
         for attempt in range(3):
+            turn_attempts += 1
             result = agent.run_conversation(user_message="Process historical source anchor " + fixture["packet"]["anchor_event_id"],
                                             system_message=instruction)
-            if not result.get("error") or attempt == 2:
+            if attempt == 2 or not transport_retryable(result):
                 break
             # Only transport recovery may repeat a turn; a semantic failure never does.
-            error = str(result.get("error", "")).lower()
-            if not any(s in error for s in ("connection", "timeout", "rate limit", "rate_limit", "429", "temporar", "503", "502", "empty stream")):
-                break
+            transport_retries.append({"attempt": turn_attempts, "failure_reason": result.get("failure_reason") or "transport",
+                                      "wait_seconds": 15 * 2 ** attempt})
             retry_sleep(15 * 2 ** attempt)
     except Exception as error:
         worker_error_type = type(error).__name__
@@ -163,6 +179,8 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     return {"completed": bool(result is not None and result.get("completed") is True and not result.get("error")
                                and not result.get("failed") and not result.get("interrupted") and not result.get("partial")),
             "native_exit_reason": result.get("turn_exit_reason") if result else None, "worker_error_type": worker_error_type,
+            "native_failure_reason": result.get("failure_reason") if result else None,
+            "transport_turn_attempts": turn_attempts, "transport_retries": transport_retries,
             "served_model": result.get("served_model") if result else None, "checks": checks,
             "draft_count": sum(event["name"].endswith("source_check_interpretation") for event in tool_events),
             "duration_seconds": time.monotonic() - started,
@@ -187,6 +205,8 @@ def grade(case, observed):
     submissions = [event for event in observed.get("tool_events", []) if event["name"].endswith("source_check_interpretation")]
     if len(submissions) > 3:
         errors.append("draft_limit_exceeded")
+    if observed.get("transport_turn_attempts", 1) > 3 or len(observed.get("transport_retries", [])) > 2:
+        errors.append("transport_attempt_limit_exceeded")
     return {"passed": not errors, "first_draft_passed": bool(checks and submissions and not submissions[0]["error"]
             and checks[0].get("submitted_valid") and not check(checks[0])),
             "mismatch_fields": errors, "interpretation": checks[-1]["interpretation"] if checks else None}
@@ -218,10 +238,11 @@ def main():
     master = args.master.read_text(encoding="utf-8")
     manifest = payload.get("protocol", payload.get("manifest"))
     assert digest(cases) == manifest["dataset_sha256"]
-    identity = {"version": "high-tools-native-v2", "source_sha256": source_digest(),
+    identity = {"version": "high-tools-native-v3", "source_sha256": source_digest(),
                 "dataset_sha256": digest(cases), "master_sha256": hashlib.sha256(master.encode()).hexdigest(),
                 "effort": "high", "model": DEFAULT_MODEL, "draft_limit": 3, "transport_attempt_limit": 3,
-                "request_timeout_seconds": 120, "transport_wait_seconds": [15, 30],
+                "request_timeout_policy": "native_provider_defaults", "reasoning_stale_timeout_floor_seconds": 600,
+                "transport_wait_seconds": [15, 30],
                 "context_mode": "all_retained_original_messages_no_cached_labels",
                 "runs": args.runs, "workers": args.workers, "order_tools_available": False}
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -288,6 +309,9 @@ def main():
     durations = sorted(row["duration_seconds"] for row in rows if "duration_seconds" in row)
     total_durations = sorted(row["total_case_seconds"] for row in rows if "total_case_seconds" in row)
     report = {"identity": identity, "cases": len(selected), "observations": len(rows), "passed": passed,
+              "transport_retries": sum(len(row.get("transport_retries", [])) for row in rows),
+              "observations_with_unknown_request_usage": sum(len(row.get("request_attempts", [])) > len(row.get("api_responses", []))
+                  or any(not response.get("usage_available") for response in row.get("api_responses", [])) for row in rows),
               "first_draft_passed": sum(row["first_draft_passed"] for row in rows),
               "all_passed": passed == len(rows), "three_runs_complete": args.runs == 3 and len(selected) == len(cases),
               "model_request_attempts": sum(len(row.get("request_attempts", [])) for row in rows),

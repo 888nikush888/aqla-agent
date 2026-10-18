@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 from aqla_agent.decision_evaluation import case_context, case_packet, complete_fields
 from aqla_agent.source_replay import canonical_symbol, mismatches
 from aqla_hyperliquid_mcp.models import Interpretation
@@ -40,3 +42,22 @@ def test_only_final_valid_checked_native_result_can_pass():
     assert not script.grade(case, {**good, "completed": False})["passed"]
     assert not script.grade(case, {**good, "forbidden_tools": ["terminal"]})["passed"]
     assert not script.grade(case, {**good, "checks": [checked, {**checked, "valid": False}]})["passed"]
+    assert not script.grade(case, {**good, "transport_turn_attempts": 4})["passed"]
+
+
+@pytest.mark.parametrize("result,expected", [
+    ({"completed": False, "error": "[Errno 32] Broken pipe"}, True),
+    ({"completed": False, "error": "Request timed out."}, True),
+    ({"completed": False, "error": "localized text", "failure_reason": "timeout", "failure_retryable": True}, True),
+    ({"completed": False, "failure_reason": "rate_limit", "failure_retryable": True}, True),
+    ({"completed": False, "failure_reason": "server_error", "failure_retryable": True}, True),
+    ({"completed": False, "error": "connection issue", "failure_reason": "billing", "failure_retryable": False}, False),
+    ({"completed": False, "error": "timeout", "failure_reason": "auth_permanent", "failure_retryable": False}, False),
+    ({"completed": False, "error": "Invalid interpretation"}, False),
+    ({"completed": True, "error": "timeout mentioned in an answer"}, False),
+])
+def test_native_transport_retry_uses_classification_without_rescuing_semantic_failures(result, expected):
+    spec = importlib.util.spec_from_file_location("evaluate_high_tools", Path(__file__).resolve().parents[1] / "scripts/evaluate_high_tools.py")
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    assert script.transport_retryable(result) is expected

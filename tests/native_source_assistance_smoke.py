@@ -15,6 +15,7 @@ def main():
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--mcp-python", type=Path, required=True)
     parser.add_argument("--transport-failure", action="store_true")
+    parser.add_argument("--transport-exhausted", action="store_true")
     parser.add_argument("--numbered-integer-target", action="store_true")
     parser.add_argument("--rate-limit-failure", action="store_true")
     parser.add_argument("--empty-original", action="store_true")
@@ -122,7 +123,7 @@ def main():
                 return
             calls.append(body)
             assert body.get("reasoning_effort") == "high", {"model": body.get("model"), "keys": list(body), "messages_count": len(body.get("messages", []))}
-            failures = 2 if args.transport_failure or args.rate_limit_failure else 0
+            failures = 3 if args.transport_exhausted else 2 if args.transport_failure or args.rate_limit_failure else 0
             index = len(calls) - 1 - failures
             if index < 0:
                 if args.rate_limit_failure:
@@ -175,6 +176,17 @@ def main():
         result = native_worker(SimpleNamespace(worker_fixture=fixture, hermes_source=args.hermes_source.resolve(),
             mcp_python=args.mcp_python.absolute()), model_url=f"http://127.0.0.1:{model.server_port}/v1", model_key="synthetic-only", local_fixture=True,
             retry_sleep=waits.append)
+        if args.transport_exhausted:
+            from aqla_hyperliquid_mcp.storage import read_snapshot
+            retained = read_snapshot(home / "state.sqlite3")
+            assert not result["completed"] and not result["checks"] and result["draft_count"] == 0
+            assert result["transport_turn_attempts"] == 3 and waits == [15, 30]
+            assert len(calls) == len(result["request_attempts"]) == 3 and not result["api_responses"]
+            assert not retained["plans"] and not retained["operations"] and not retained["trades"]
+            assert not result["forbidden_tools"] and result["order_requests"] == 0
+            print(json.dumps({"native_transport_exhaustion": True, "model_calls": 3, "transport_backoff_verified": waits,
+                "checked_drafts": 0, "order_requests": 0}))
+            return
         expected_drafts = 2 if correction_needed else 1
         responses = 2 + expected_drafts
         assert result["completed"] and result["draft_count"] == expected_drafts and result["checks"][-1]["valid"], result
@@ -211,6 +223,12 @@ def main():
         retained = read_snapshot(home / "state.sqlite3")
         assert set(retained["events"]) == {source.event_id, unrelated.event_id}
         assert waits == ([15, 30] if args.transport_failure or args.rate_limit_failure else [])
+        assert result["transport_turn_attempts"] == (3 if waits else 1)
+        assert [retry["wait_seconds"] for retry in result["transport_retries"]] == waits
+        from agent.error_classifier import classify_api_error
+        from evaluate_high_tools import transport_retryable
+        broken = classify_api_error(BrokenPipeError(32, "Broken pipe"), provider="custom", model="deepseek-v4.1-flash")
+        assert transport_retryable({"completed": False, "failure_reason": broken.reason.value, "failure_retryable": broken.retryable})
         assert len(calls) == len(result["request_attempts"]) == responses + (2 if args.transport_failure or args.rate_limit_failure else 0)
         assert len(result["api_responses"]) == responses, {
             "calls": [{"model": b.get("model"), "effort": b.get("reasoning_effort"), "keys": list(b)} for b in calls],
