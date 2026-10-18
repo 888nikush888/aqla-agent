@@ -22,6 +22,7 @@ CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_ac
                    "source_exchange", "single_entry_form", "single_management_action")
 CONTEXT_CANDIDATE_LIMIT = 64
 REPAIR_GUIDANCE = {
+    "update_identity_needs_current_quote": "This unbound update explicitly names its market in the current original. Preserve the symbol, quote it from anchor_source_id and remove a parent used only for that duplicate identity. Keep genuine other field contributions; Python's existing own setup bindings remain authoritative. Never change the market to avoid this evidence correction.",
     "source_setup_topic_needs_original_context": "A bare scenario/setup/plan topic tag does not establish market-outlook/report framing or reveal the missing media's instructions. Recheck incomplete when the original instruction is unavailable. Do not infer video contents or borrow neighbour instructions.",
     "source_percentage_target_interval_not_representable": "The original specifies a binding profit/TP interval, not an ordered list of exits. Recheck ambiguous; do not select an endpoint, invent several targets or erase the explicit target to use backup values. This is an interval problem, not missing percentage basis.",
     "entry_legs_not_representable": "Re-read contract.single_entry_form and the original separate orders. Renaming several discrete entry legs to range does not represent them. Use ambiguous when the source cannot fit one supported entry; omit unused trading fields and quote the conflicting original. Never pick one leg or repair this by changing its prices.",
@@ -38,6 +39,7 @@ REPAIR_GUIDANCE = {
     "unbound_setup_edit_is_not_management": "Python reports no accepted own setup binding. An edit/publication alone is not execution. This anchor still presents a complete entry setup, not an explicit management instruction: recheck corrected new_signal, or ambiguous when all original entry legs cannot be represented.",
 }
 REPAIR_FIELDS = {
+    "update_identity_needs_current_quote": ["source_refs", "evidence"],
     "source_setup_topic_needs_original_context": ["kind"],
     "source_percentage_target_interval_not_representable": ["kind", "take_profits", "take_profit_unit"],
     "entry_legs_not_representable": ["kind", "entry", "entry_prices"],
@@ -97,12 +99,15 @@ def source_assistance(context):
             "candidate_limit": CONTEXT_CANDIDATE_LIMIT,
             "candidate_roles_are_not_inferred": True,
             "workflow": "Use source_check_interpretation before saving or planning. Copy original candidate quotes. "
+                        "Inspect original_structure_vetoes before drafting; a listed kind/shape is rejected, never authorized. "
                         "Only Python's anchor_setup_bound proves an accepted own setup; publication/edited_at never does. "
                         "Check the complete anchor, including new management instructions in reports. "
                         "Non-actionable results need only kind, source_refs, classification evidence and reason; "
                         "reason_codes are optional (use only declared values or omit them); "
                         "for an empty original use incomplete with evidence=[] (there is no original quote); never borrow a context quote. "
-                        "omit all unused trading fields. Correct at most three drafts per processing turn. "
+                        "omit all unused trading fields. At most THREE checker calls total per processing turn, including schema-invalid calls. "
+                        "Do not resubmit a valid draft just to reword its reason or remove optional reason_codes. "
+                        "If the third call is valid and semantic review finds no material error, finish using that checked draft unchanged. "
                         "valid only means the automated checks passed: before saving, independently recheck the complete "
                         "original against verification.intent, verification.values, verification.setup and the kind criteria; "
                         "correct a semantic mistake even when the tool found no structural error. "
@@ -175,7 +180,7 @@ def check_interpretation(context, interpretation: Interpretation):
         if numeric_context:
             detail.update(code="source_numeric_proof_needs_context", repair="Use a longer UNIQUE exact original span, including the target label and its value if needed. Verified numbering labels are context, not prices. Do not resubmit a bare repeated number or crop digits from a decimal. Preserve the actual source value and unit.")
         if message.startswith("TP evidence selects a percentage-interval endpoint:"):
-            detail.update(code="source_percentage_interval_needs_role_review", repair="An interval endpoint is not one discrete TP. Re-read the original financial role: an nonbinding descriptive expected-move range alone is not a TP instruction; a binding profit span (only/max/no more) or explicit TP interval requires ambiguous, even without a TP label. Never erase a binding span to use backup targets. Never pick one bound or split a continuous range into invented exits. Use a unique original quote if a separate real target has the same number.")
+            detail.update(code="source_percentage_interval_needs_role_review", repair="An interval endpoint is not one discrete TP. Re-read the original financial role: a nonbinding descriptive expected-move range alone is not a TP instruction; a binding profit span (only/max/no more) or explicit TP interval requires ambiguous, even without a TP label. Never erase a binding span to use backup targets. Never pick one bound or split a continuous range into invented exits. Use a unique original quote if a separate real target has the same number.")
         if message == "Evidence does not occur in its original source":
             originals = {row["source_id"]: row["text"] for row in packet["messages"]}
             detail.update(field_paths=[f"evidence.{i}" for i, proof in enumerate(result.evidence)

@@ -149,6 +149,11 @@ def update_identity_failure(packet, interpretation):
     if not interpretation.symbol or not any(proof.field == "symbol" and proof.source_id in linked
                                             for proof in interpretation.evidence):
         return "update_identity_missing"
+    anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    if (re.search(WORD + re.escape(interpretation.symbol) + END, anchor["text"], re.I)
+            and not any(proof.field == "symbol" and proof.source_id == packet["anchor_source_id"]
+                        for proof in interpretation.evidence)):
+        return "update_identity_needs_current_quote"
     return None
 
 

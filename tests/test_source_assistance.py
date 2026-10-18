@@ -566,6 +566,26 @@ def test_check_preserves_trusted_closed_parent_binding_without_exposing_a_positi
     assert check_interpretation(context, value)["valid"] and context["trades"] == []
 
 
+def test_unbound_update_uses_its_explicit_current_market_instead_of_duplicate_parent_identity():
+    parent, _, _ = material()
+    source = SourceEvent(chat_id=parent.chat_id, message_id=2, reply_to_id=parent.message_id,
+        sent_at=now_ms(), text="BTC target reached. Stop to entry. ETH had a small loss.")
+    rows = [{"event_id": s.event_id, "source_id": s.source_id, "source": s.model_dump(mode="json")} for s in (parent, source)]
+    context = {"event": rows[-1], "messages": rows, "trades": []}
+    draft = Interpretation(kind="trade_update", symbol="BTC", update_action="break_even",
+        source_refs=[source.source_id, parent.source_id], evidence=[
+            Evidence(field="symbol", source_id=parent.source_id, quote="BTC"),
+            Evidence(field="update_action", source_id=source.source_id, quote="Stop to entry")])
+    checked = check_interpretation(context, draft)
+    assert not checked["valid"] and checked["errors"][0]["code"] == "update_identity_needs_current_quote"
+    context["bound_source_refs"] = [parent.source_id]
+    assert check_interpretation(context, draft)["valid"]
+    context.pop("bound_source_refs")
+    draft.evidence[0].source_id = source.source_id
+    draft.source_refs = [source.source_id]
+    assert check_interpretation(context, draft)["valid"]
+
+
 @pytest.mark.parametrize("action,field,values,quote", [("move_stop", "stop_loss", {"stop_loss": 95}, "95"),
     ("replace_targets", "take_profits.0", {"take_profits": [110]}, "110"), ("reduce", "reduce_percent", {"reduce_percent": 50}, "50%")])
 def test_update_value_proof_must_be_current_even_when_parent_is_our_owned_setup(action, field, values, quote):

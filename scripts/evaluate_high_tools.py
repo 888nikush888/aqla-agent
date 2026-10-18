@@ -136,7 +136,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
             "valid=true only confirms automated checks. Before finishing, independently recheck the full original against "
             "verification.intent, verification.values, verification.setup and the kind criteria. Correct a semantic mistake "
             "even if no tool error was returned; your LAST checked interpretation is the evaluated result. "
-            "Do not stop with an unchecked answer. Correct specific tool errors, at most three drafts. "
+            "Do not stop with an unchecked answer. Correct specific tool errors: at most THREE checker calls TOTAL, including schema-invalid calls. Do not resubmit a valid draft merely to reword a reason or remove optional reason_codes. If semantic review finds no material error, finish with the checked draft unchanged. "
             "Never use another model. Expected answers are unavailable to you.")
         for attempt in range(3):
             result = agent.run_conversation(user_message="Process historical source anchor " + fixture["packet"]["anchor_event_id"],
@@ -164,7 +164,8 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
                                and not result.get("failed") and not result.get("interrupted") and not result.get("partial")),
             "native_exit_reason": result.get("turn_exit_reason") if result else None, "worker_error_type": worker_error_type,
             "served_model": result.get("served_model") if result else None, "checks": checks,
-            "draft_count": len(checks), "duration_seconds": time.monotonic() - started,
+            "draft_count": sum(event["name"].endswith("source_check_interpretation") for event in tool_events),
+            "duration_seconds": time.monotonic() - started,
             "api_responses": measured.api, "request_attempts": requests,
             "tool_events": tool_events,
             "tool_metrics": measured.tools, "forbidden_tools": sorted(set(measured.tools) - allowed_tools),
