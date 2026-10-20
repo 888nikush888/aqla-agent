@@ -259,6 +259,9 @@ class Trading:
             verify_evidence(interpretation, snapshot["events"])
             verify_entry_shape(interpretation)
             verify_update_shape(interpretation)
+            if interpretation.kind not in ("new_signal", "trade_update"):
+                from .source_disposition import verify_classification_policy
+                verify_classification_policy(interpretation, row["source"].get("text", ""))
             own_refs = (ref for trade in snapshot["trades"].values()
                         if trade["chat_id"] == row["source"]["chat_id"] and interpretation.bound_trade_id in (None, trade["trade_id"])
                         for ref in trade["plan"]["source_refs"])

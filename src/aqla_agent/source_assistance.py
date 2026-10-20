@@ -17,7 +17,7 @@ from .decisions import (
     verification_questions,
 )
 
-VERSION = "source-assistance-v2"
+VERSION = "source-assistance-v3"
 CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_action",
                    "source_exchange", "single_entry_form", "single_management_action")
 CONTEXT_CANDIDATE_LIMIT = 64
@@ -115,6 +115,8 @@ def source_assistance(context):
             "workflow": "Use source_check_interpretation before saving or planning. Copy original candidate quotes. "
                         "Inspect original_structure_vetoes before drafting; a listed kind/shape is rejected, never authorized. "
                         "Only Python's anchor_setup_bound proves an accepted own setup; publication/edited_at never does. "
+                        "Missing source SL/TP/leverage stays null/[]; trade_preview applies configured Backup or rejects execution. "
+                        "Explicit TP percentages use roe_percent; do not demand absolute prices or a new operator stop rule. "
                         "Check the complete anchor, including new management instructions in reports. "
                         "Non-actionable results need only kind, source_refs, classification evidence and reason; "
                         "reason_codes are optional (use only declared values or omit them); "
@@ -191,6 +193,9 @@ def check_interpretation(context, interpretation: Interpretation):
                        "field_paths": REPAIR_FIELDS.get(message, sorted(field for field in set(EVIDENCE_FIELDS) | set(Interpretation.model_fields)
                                        if re.search(r"(?<![\w.])" + re.escape(field) + r"(?![\w.])", field_message))),
                        "message": message, **({"repair": REPAIR_GUIDANCE[message]} if message in REPAIR_GUIDANCE else {})}
+        if message.startswith("Missing source SL/TP/leverage alone"):
+            detail.update(code="missing_execution_fields_are_not_ambiguity", field_paths=["kind", "reason"],
+                repair="Re-read the kind criteria and original. Missing source SL/TP/leverage alone is not ambiguity. Preserve absent fields as null/[], explicit target percentages as roe_percent and exact original quotes. Use trade_preview for configured Backup and unchanged risk checks; never invent prices, ignore a genuine independent ambiguity or execute without authorization.")
         if message.startswith("Trade update reduce requires reduce_percent"):
             detail.update(code="source_reduce_fraction_missing", field_paths=["kind", "update_action", "reduce_percent"],
                 repair="A partial exit requires an original fraction. Never replace it with a whole-position close or invent a fraction. Recheck ambiguous when the original does not specify one; preserve separate stop instructions without executing only that part.")

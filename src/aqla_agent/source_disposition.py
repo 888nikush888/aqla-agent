@@ -16,10 +16,8 @@ from .source_queue import canonical_sources, content, is_source_row, recovery_id
 REREAD = "Source read receipt is missing, invalid, expired or stale; read source_context for the current anchor again"
 
 
-def verify_percentage_classification(interpretation, original):
-    """Reject only the fixed-policy uncertainty; never invent a trade decision."""
-    if "%" not in original:
-        return
+def verify_classification_policy(interpretation, original):
+    """Missing execution inputs and fixed TP policy are not semantic ambiguity."""
     if interpretation.kind == "ambiguous" and binding_percentage_target_interval(original):
         return  # A target interval is a separate representational ambiguity, not a missing percentage basis.
     codes = set(interpretation.reason_codes)
@@ -36,7 +34,20 @@ def verify_percentage_classification(interpretation, original):
     percentage = re.search(r"%|percent|prozent|процент", reason)
     basis = re.search(r"\bro[ei]\b|price movement|course|kurs|margin|equity|цены|ценов|марж|движени|доходност", reason)
     uncertain = re.search(r"ambig|unclear|unknown|unspecif|missing|not (?:clear|specified)|mehrdeutig|uneindeutig|unklar|unbekannt|nicht eindeutig|nicht .*belegbar|fehl|неяс|неоднознач|неизвест|непонят|не определ|не указан", reason)
-    other = re.search(r"(?:missing|unknown|unclear|ambig|not (?:clear|specified))\s+(?:market|symbol|direction|reference|entry price)|(?:market|symbol|direction|reference|entry price)\s+(?:missing|unknown|unclear|ambig)|(?:markt|symbol|richtung|referenz|einstiegspreis).{0,30}(?:fehl|unbekannt|unklar|mehrdeutig)|(?:fehl|unbekannt|unklar|mehrdeutig).{0,30}(?:markt|symbol|richtung|referenz|einstiegspreis)|(?:рынок|тикер|направлен|ссылк|цен[аы] входа).{0,30}(?:неяс|неизвест|отсутств|не указан)|contradict|widerspr|противореч", reason)
+    other = re.search(r"(?:missing|unknown|unclear|ambig|not (?:clear|specified))\s+(?:market|symbol|direction|reference|entry price)|(?:market|symbol|direction|reference|entry price)\s+(?:missing|unknown|unclear|ambig)|(?:markt|symbol|richtung|referenz|einstiegspreis).{0,30}(?:fehl|unbekannt|unklar|mehrdeutig)|(?:fehl|unbekannt|unklar|mehrdeutig).{0,30}(?:markt|symbol|richtung|referenz|einstiegspreis)|(?:рынок|тикер|направлен|ссылк|цен[аы] входа).{0,30}(?:неяс|неизвест|отсутств|не указан)|contradict|conflict|widerspr|противореч", reason)
+    other = other or re.search(r"(?:no|kein\w*)\s+(?:market|symbol|direction|markt|richtung)|"
+        r"(?:leverage|hebel|плеч\w*)[^.!?;\n]{0,60}(?:interval|spanne|range|диапазон)|"
+        r"(?:interval|spanne|range|диапазон)[^.!?;\n]{0,60}(?:leverage|hebel|плеч\w*)", reason)
+    if interpretation.kind in ("ambiguous", "incomplete") and not other:
+        field = r"(?:\bsl\b|stop(?:[-\s]*loss)?|stopp?loss|стоп(?:[-\s]*лосс)?|targets?|take[-\s]*profits?|tps?\b|ziele?|цел[ьи]|тейк\w*|leverage|hebel|плечо)"
+        missing = r"(?:missing|absent|without|not\s+(?:given|provided|stated|specified)|no\b|fehl\w*|ohne|kein\w*|nicht\s+(?:genannt|angegeben|vorhanden)|нет\b|без\b|отсутств\w*|не\s+указан\w*)"
+        if re.search(field + r"[^.!?;\n]{0,45}" + missing + "|" + missing + r"[^.!?;\n]{0,45}" + field, reason):
+            from .semantic_contract import unsupported_structure
+            packet = {"anchor_event_id": "anchor", "messages": [{"event_id": "anchor", "text": original}]}
+            if not unsupported_structure(packet):
+                raise AqlaError("Missing source SL/TP/leverage alone cannot classify this source as non-actionable. Keep unstated values absent; trade_preview applies configured Backup or rejects execution. Explicit TP percentages use source-roe-v1 roe_percent, never require invented absolute prices. Re-read source_context and correct the interpretation; genuine independent ambiguity remains blocked.")
+    if "%" not in original:
+        return
     percentage_only = not other and (explicit or bool((target or source_target) and percentage and basis and uncertain))
     if percentage_only:
         raise AqlaError("Percentage basis alone cannot classify this source as non-actionable: source-roe-v1 defines source TP % as nominal ROE on own initial margin before costs. Re-read source_context and reinterpret with roe_percent; keep all other market, direction, evidence and execution guards.")
@@ -112,4 +123,4 @@ def verify_disposition(snapshot, event_id, interpretation, token, key, *, stamp=
     if not any(proof.field == "classification" and proof.source_id == row["source_id"]
                and proof.quote.strip() and proof.quote in row["source"]["text"] for proof in interpretation.evidence):
         raise AqlaError("Classification requires a classification evidence quote from the original anchor")
-    verify_percentage_classification(interpretation, row["source"]["text"])
+    verify_classification_policy(interpretation, row["source"]["text"])
