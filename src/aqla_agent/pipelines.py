@@ -404,7 +404,7 @@ class VenueState:
             raise AqlaError("Policy changed; legacy unsent plan cannot execute")
 
     def limits(self, plan=None):
-        data = self.root.snapshot()
+        data = self.root.read("network", "venue_accounts", "venue_limits", "account_limits")
         selected = data["venue_limits"].get(self.exchange) if self.legacy_context(data) else data["account_limits"].get(self.account_key)
         if selected is None:
             raise AqlaError("Explicit exchange account limits are required")

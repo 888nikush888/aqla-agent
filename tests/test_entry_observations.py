@@ -92,6 +92,43 @@ def clocked(setup, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "pause", "always_slow"])
+async def test_last_local_admission_can_refresh_once_without_skipping_rechecks(setup, signal, clocked, monkeypatch, change):
+    from test_trade_guard_regressions import admitted_without_entry
+
+    from aqla_hyperliquid_mcp.models import AqlaError, TradePlan
+
+    _, state, fake, exchange, engine = setup
+    source, value = signal
+    plan = TradePlan.model_validate(await admitted_without_entry(engine, source, value, monkeypatch))
+    quotes = []
+    original_quote, original_admission = exchange.price_snapshot, engine.validate_admission
+    async def quote(market):
+        if quotes and change == "pause":
+            state.update(lambda data: data.update(paused=True))
+        result = await original_quote(market)
+        quotes.append(result)
+        return result
+    def admission(*args, **kwargs):
+        original_admission(*args, **kwargs)
+        if quotes and (len(quotes) == 1 or change == "always_slow"):
+            clocked[0] += 2001
+    monkeypatch.setattr(exchange, "price_snapshot", quote)
+    monkeypatch.setattr(engine, "validate_admission", admission)
+    account = await exchange.account_snapshot(plan.market)
+    if change:
+        with pytest.raises(TemporaryObservation if change == "always_slow" else AqlaError,
+                           match="observation is stale" if change == "always_slow" else "Pause"):
+            await engine.live_entry_guard(plan, account=account)
+    else:
+        _, result = await engine.live_entry_guard(plan, account=account)
+        result.fresh()
+        assert result is quotes[-1]
+    assert len(quotes) == 2 and not entries(fake)
+    assert state.snapshot()["plans"][plan.plan_id]["plan"] == plan.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delay_at", ["signing", "audit_write", "sending_write"])
 async def test_slow_local_preparation_reobserves_before_entry_transport(setup, signal, clocked, monkeypatch, delay_at):
     _, state, fake, exchange, engine = setup

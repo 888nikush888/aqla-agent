@@ -29,3 +29,10 @@ They cover configured/unconfigured Backup, retained ROE targets, non-actional
 write paths, real independent ambiguity, post-fill protection and repeated
 recovery without duplicate sends. Private originals and model observations stay
 outside the repository.
+
+Final entry admission retains the two-second price-proof limit. If local audit
+writes or the final admission check age a previously fresh quote, the guard may
+read it once more and repeat all admission and price checks. Persistent delay,
+a changed source/configuration, expired deadlines or exhausted retries still
+block entry. Reading current account limits uses only their existing state roots;
+it does not copy source bodies or financial history and never caches the limits.

@@ -679,15 +679,18 @@ class Trading:
             raise
         if audit:
             self.state.update(lambda data: data["trades"][plan.trade_id].setdefault("price_checks", []).append({"phase": "before_send", "snapshot": quote.model_dump(mode="json"), "result": result}))
-        try:
-            quote.fresh()
-        except TemporaryObservation:
-            quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
-            trade = self.state.snapshot()["trades"][plan.trade_id]
-            validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=trade["targets"])
-        self.validate_admission(self.state.snapshot(), plan, account, owned=True, allowed_prepared=allowed, allowed_sending=(dispatch_operation,))
-        quote.fresh()
-        return account, quote
+        for attempt in range(2):
+            self.validate_admission(self.state.snapshot(), plan, account, owned=True, allowed_prepared=allowed, allowed_sending=(dispatch_operation,))
+            try:
+                quote.fresh()
+                return account, quote
+            except TemporaryObservation:
+                if attempt:
+                    raise
+                # Local checks can age a valid quote; refresh once and recheck every guard.
+                quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
+                trade = self.state.snapshot()["trades"][plan.trade_id]
+                validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=trade["targets"])
 
     async def guarded_entry_steps(self, plan, trade):
         try:

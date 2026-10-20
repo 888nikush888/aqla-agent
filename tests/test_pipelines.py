@@ -35,6 +35,18 @@ def routed(setup):
     return router, boundaries
 
 
+@pytest.mark.parametrize("exchange", ["hyperliquid", "aster", "lighter"])
+def test_fresh_account_limits_do_not_copy_financial_and_source_history(routed, setup, monkeypatch, exchange):
+    router, _ = routed
+    root = setup[1]
+    view = router.engines[exchange].state
+    before = view.limits()
+    monkeypatch.setattr(root, "snapshot", lambda: pytest.fail("Reading limits copied the complete financial state"))
+    assert view.limits() == before
+    root.update(lambda data: data["venue_limits"][exchange].update(max_open_trades=before.max_open_trades + 1))
+    assert view.limits().max_open_trades == before.max_open_trades + 1
+
+
 @pytest.mark.asyncio
 async def test_ranked_fallback_preserves_leg_profile_network_and_explicit_priority(routed, setup, signal, monkeypatch):
     from aqla_hyperliquid_mcp.models import SymbolUnavailable
