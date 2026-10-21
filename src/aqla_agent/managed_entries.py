@@ -456,6 +456,33 @@ async def _start(engine, plan, trade):
     configuration = engine.state.snapshot()["operations"].get(parent, {})
     if configuration.get("configuration_retry_needed") and configuration["phase"] in ("prepared", "sending", "unknown"):
         return await engine.repair_unsent_configuration(plan, parent)
+    if existing and existing["phase"] == "rejected" and existing.get("outcome") == "not_sent" and not existing.get("legs"):
+        try:
+            engine.raise_temporary_not_sent(existing)
+        except TemporaryObservation:
+            marker = trade.get("managed_entry_retry")
+            if not marker or marker.get("attempt_inflight"):
+                raise
+            def rearm(data):
+                current = data["trades"][plan.trade_id]
+                retry = current["managed_entry_retry"]
+                prior = data["operations"][identity]
+                if (not retry_due(retry) or retry["attempts"] >= 5 or current.get("orders")
+                        or Decimal(current["filled_quantity"]) or Decimal(current["remaining_quantity"])
+                        or current.get("fill_events") or prior["phase"] != "rejected"
+                        or prior.get("outcome") != "not_sent" or prior.get("legs")
+                        or any(item["phase"] != "pending" and not item.get("not_sent") for item in current["entry_orders"])
+                        or any(item["operation_id"] in data["operations"] for item in current["entry_orders"])):
+                    raise AqlaError("Managed configuration retry requires a bounded, completely unsent entry")
+                replacement = f"leverage:{plan.trade_id}:observation:{retry['attempts'] + 1}"
+                if replacement in data["operations"]:
+                    raise AqlaError("Configuration retry already has a durable request; reconcile it")
+                retry.update(attempts=retry["attempts"] + 1, attempt_inflight=True)
+                current.setdefault("leverage_attempts", []).append(identity)
+                current["leverage_operation_id"] = replacement
+                return replacement
+            identity = engine.state.update(rearm)
+            existing = None
     if existing is None:
         first = next(row for row in trade["entry_orders"] if not row.get("not_sent"))
         view = leg_view(plan, first)
@@ -474,6 +501,11 @@ async def _start(engine, plan, trade):
             "isCross": plan.policy.margin_mode == "cross", "leverage": plan.effective_leverage},
             deadline=plan.deadline_at, async_prepare_guard=guard)
     if existing["phase"] not in ("acknowledged", "reconciled"):
+        engine.raise_temporary_not_sent(existing)
+        if existing["phase"] == "rejected" and (existing.get("outcome") == "rejected" or existing.get("outcome") == "not_sent" and not existing.get("legs")):
+            await cancel(engine, plan.trade_id)
+            engine._patch(plan.trade_id, status="rejected", reserved_risk="0", unsent_reason=existing.get("result", {}).get("error", "Configuration guard rejected before transport"))
+            return engine.state.snapshot()["trades"][plan.trade_id]
         engine._patch(plan.trade_id, status="unknown" if existing["phase"] == "unknown" else "protecting", waiting_error="Leverage configuration requires exact reconciliation")
         return engine.state.snapshot()["trades"][plan.trade_id]
     await dispatch_next(engine, plan.trade_id)

@@ -16,6 +16,12 @@ und bestätigtem Schutz der vorhandenen eigenen Position. Ein Teilfill beendet
 den Rest dieses Legs. Die übrigen ursprünglich geplanten Entries behalten
 ihre eigenen Identitäten.
 
+Eine vor dem Versand belegbar gescheiterte Hebelkonfiguration nutzt das
+vorhandene begrenzte Wiederaufnahmebudget. Alte signierte Versuche bleiben
+unverändert erhalten; neue Identitäten entstehen nur bei belegtem
+`not_sent`, ohne Entry-Fills oder Entry-Operationen. Unbekannte Sendungen
+werden weiterhin exakt abgeglichen und nie als ungesendet wiederholt.
+
 Bei ausdrücklich konfigurierter adaptiver TP-Verteilung wird dieselbe native
 Mindestgrößenregel auch auf jede Teilposition angewendet. Beide Entries
 verwenden den längsten gemeinsamen ausführbaren Zielpräfix. Das gilt ebenso

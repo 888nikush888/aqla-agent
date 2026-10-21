@@ -165,6 +165,96 @@ async def test_adaptive_split_protects_the_first_fill_before_sending_second_entr
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_unsent_leverage_guard_does_not_strand_a_managed_trade(setup, monkeypatch, permanent):
+    from aqla_agent.observations import TemporaryObservation
+    _, state, fake, _, trading = setup
+    state.update(lambda data: data["policy"].update(entry_range_choice="split"))
+    original = trading.live_entry_guard
+    failed = False
+    reads = {}
+    async def guard(plan, **kwargs):
+        nonlocal failed
+        operation = kwargs.get("dispatch_operation", "")
+        reads[operation] = reads.get(operation, 0) + 1
+        if not failed and operation.startswith("leverage:") and reads[operation] == 3:
+            failed = True
+            if permanent:
+                raise AqlaError("Shared account risk no longer permits this entry")
+            raise TemporaryObservation("read_unavailable", "inventory", "transport")
+        return await original(plan, **kwargs)
+    monkeypatch.setattr(trading, "live_entry_guard", guard)
+    source, value = source_zone(trading)
+    plan = await trading.preview(source.event_id, value)
+    trade = await trading.execute(plan["plan_id"])
+    prior = state.snapshot()["operations"]["leverage:" + trade["trade_id"]]
+    assert prior["phase"] == "rejected" and prior["outcome"] == "not_sent" and not fake.orders
+    if permanent:
+        assert trade["status"] == "rejected" and trade["reserved_risk"] == "0"
+        return
+    assert trade["managed_entry_retry"]["attempts"] == 1
+    state.update(lambda data: data["trades"][trade["trade_id"]]["managed_entry_retry"].update(next_retry_at=0))
+    await trading.refresh_trade(trade["trade_id"])
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert current["status"] == "opening" and current["plan"]["deadline_at"] == plan["deadline_at"]
+    assert state.snapshot()["operations"]["leverage:" + trade["trade_id"]] == prior
+    assert current["leverage_operation_id"] != "leverage:" + trade["trade_id"]
+    assert current["entry_orders"][0]["cloid"] == trade["entry_orders"][0]["cloid"]
+    sent = len(fake.actions)
+    await trading.refresh_trade(trade["trade_id"])
+    assert len(fake.actions) == sent
+
+
+@pytest.mark.asyncio
+async def test_managed_unsent_configuration_retry_keeps_the_five_attempt_budget(setup, monkeypatch):
+    from aqla_agent.observations import TemporaryObservation
+    _, state, fake, _, trading = setup
+    state.update(lambda data: data["policy"].update(entry_range_choice="split"))
+    original = trading.live_entry_guard
+    reads = {}
+    async def unavailable(plan, **kwargs):
+        operation = kwargs.get("dispatch_operation", "")
+        reads[operation] = reads.get(operation, 0) + 1
+        if reads[operation] == 3:
+            raise TemporaryObservation("read_unavailable", "inventory", "transport")
+        return await original(plan, **kwargs)
+    monkeypatch.setattr(trading, "live_entry_guard", unavailable)
+    source, value = source_zone(trading)
+    plan = await trading.preview(source.event_id, value)
+    trade = await trading.execute(plan["plan_id"])
+    for _ in range(4):
+        state.update(lambda data: data["trades"][trade["trade_id"]]["managed_entry_retry"].update(next_retry_at=0))
+        await trading.refresh_trade(trade["trade_id"])
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert current["status"] == "rejected" and current["reserved_risk"] == "0"
+    assert current["managed_entry_retry"]["exhausted"] and current["managed_entry_retry"]["attempts"] == 5
+    assert len(current["leverage_attempts"]) == 4 and not fake.actions and not fake.orders
+
+
+@pytest.mark.asyncio
+async def test_unknown_leverage_result_is_never_retried_as_a_locally_unsent_request(setup):
+    _, state, fake, _, trading = setup
+    state.update(lambda data: data["policy"].update(entry_range_choice="split"))
+    source, value = source_zone(trading)
+    plan = await trading.preview(source.event_id, value)
+    trade = await trading.execute(plan["plan_id"])
+    # Isolated restart snapshot: configuration may have reached the venue, entry has not.
+    identity = "leverage:" + trade["trade_id"]
+    def interrupted(data):
+        current = data["trades"][trade["trade_id"]]
+        current["entry_orders"][0]["phase"] = "pending"
+        current["orders"] = []
+        data["operations"].pop(current["entry_orders"][0]["operation_id"])
+        data["operations"][identity].update(phase="unknown", outcome="unknown")
+    state.update(interrupted)
+    before = len(fake.actions)
+    await trading.refresh_trade(trade["trade_id"])
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert current["status"] == "unknown" and not current.get("leverage_attempts")
+    assert len(fake.actions) == before and state.snapshot()["operations"][identity]["phase"] == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_tp1_cross_without_fill_cancels_all_original_entries(setup):
     state, fake, trading, _, trade = await opened_zone(setup)
     fake.mid = "121"
