@@ -503,9 +503,13 @@ async def _start(engine, plan, trade):
             nonlocal latest_account
             latest_account = None
         guard.invalidate_account = invalidate_account
+        def final_guard(data):
+            engine.validate_admission(data, view, latest_account, owned=True,
+                allowed_prepared=(identity,), allowed_sending=(identity,))
+            latest_quote.fresh()
         existing = await engine.exchange.mutate(identity, {"type": "updateLeverage", "asset": plan.market.asset_id,
             "isCross": plan.policy.margin_mode == "cross", "leverage": plan.effective_leverage},
-            deadline=plan.deadline_at, async_prepare_guard=guard)
+            deadline=plan.deadline_at, async_prepare_guard=guard, prepare_guard=final_guard)
     if existing["phase"] not in ("acknowledged", "reconciled"):
         engine.raise_temporary_not_sent(existing)
         if existing["phase"] == "rejected" and (existing.get("outcome") == "rejected" or existing.get("outcome") == "not_sent" and not existing.get("legs")):

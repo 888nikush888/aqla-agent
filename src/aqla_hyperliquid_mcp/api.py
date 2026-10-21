@@ -705,4 +705,6 @@ class Hyperliquid:
                 "resolved": proven, "resubmitted": False, "absence_is_proof": False}
 
     async def close(self):
+        if feed := getattr(self, "_inventory_feed", None):
+            await feed.close()
         await self.client.aclose()

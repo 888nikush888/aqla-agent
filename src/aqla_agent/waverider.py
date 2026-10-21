@@ -25,9 +25,9 @@ MIN_CASES, MIN_WAVES = 30, 10
 @lru_cache(maxsize=1)
 def software_hash():
     root = Path(__file__).parent
-    files = [root / name for name in ("waverider.py", "waverider_replay.py", "managed_entries.py", "trading.py", "entry.py",
+    files = [root / name for name in ("waverider.py", "waverider_replay.py", "managed_entries.py", "trading.py", "entry.py", "inventory_stream.py",
         "entry_watch.py", "liquidity.py", "aster.py", "lighter.py", "pipelines.py", "monthly.py", "percent_targets.py")]
-    files += [root.parent / "aqla_hyperliquid_mcp" / name for name in ("models.py", "rules.py", "api.py")]
+    files += [root.parent / "aqla_hyperliquid_mcp" / name for name in ("models.py", "rules.py", "api.py", "streams.py")]
     return digest({path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in files})
 
 

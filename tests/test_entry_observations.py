@@ -21,6 +21,35 @@ def entries(fake):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("equity", ["10000", "1"])
+async def test_entry_guard_refreshes_account_with_too_little_time_left(setup, signal, monkeypatch, equity):
+    from aqla_hyperliquid_mcp.models import AqlaError, TradePlan
+    _, state, fake, exchange, engine = setup
+    source, value = signal
+    raw = await engine.preview(source.event_id, value)
+    plan = TradePlan.model_validate(raw)
+    trade = engine.new_trade(state.snapshot(), state.snapshot()["plans"][plan.plan_id], plan)
+    state.update(lambda data: data["trades"].__setitem__(plan.trade_id, trade))
+    previous = await exchange.account_snapshot(plan.market)
+    previous = previous.model_copy(update={"observed_at": now_ms() - 8000})
+    original = exchange.account_snapshot
+    reads = 0
+    async def account(market):
+        nonlocal reads
+        reads += 1
+        observed = await original(market)
+        return observed.model_copy(update={"equity": Decimal(equity), "available_margin": Decimal(equity)})
+    monkeypatch.setattr(exchange, "account_snapshot", account)
+    if equity == "1":
+        with pytest.raises(AqlaError):
+            await engine.live_entry_guard(plan, account=previous, dispatch_operation=trade["entry_operation_id"])
+    else:
+        observed, _ = await engine.live_entry_guard(plan, account=previous, dispatch_operation=trade["entry_operation_id"])
+        assert now_ms() - observed.observed_at < 1000
+    assert reads == 1 and not fake.actions
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("replacement_age", [0, 2501])
 async def test_entry_guard_refreshes_a_nearly_expired_book_before_atomic_preparation(setup, signal, monkeypatch, replacement_age):
     from aqla_hyperliquid_mcp.models import TradePlan

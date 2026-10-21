@@ -36,6 +36,36 @@ def routed(setup):
 
 
 @pytest.mark.parametrize("exchange", ["hyperliquid", "aster", "lighter"])
+def test_projected_snapshots_never_share_mutable_profiles_with_writer_or_preview_basis(routed, setup, exchange):
+    router, _ = routed
+    view = router.engines[exchange].state
+    original = setup[1].snapshot()
+    selected = view.snapshot()
+    selected["profiles"]["a"]["parameters"]["risk_percent"] = "99"
+    assert setup[1].snapshot()["profiles"] == original["profiles"]
+    with view.scope({"pipeline_id": "source-one", "profile_id": "a"}, preview_snapshot=original):
+        preview = view.preview_snapshot()
+        preview["profiles"]["a"]["parameters"]["risk_percent"] = "98"
+    assert original["profiles"]["a"]["parameters"]["risk_percent"] == "0.25"
+
+
+@pytest.mark.asyncio
+async def test_admission_checks_the_current_transaction_snapshot(routed, setup, signal):
+    from aqla_agent.pipelines import ConfigurationChanged
+    from aqla_hyperliquid_mcp.models import TradePlan
+    router, _ = routed
+    source, value = signal
+    raw = await router.preview(source.event_id, value)
+    plan = TradePlan.model_validate(next(row["plan"] for row in raw["targets"] if row["exchange"] == "hyperliquid"))
+    engine = router.engines["hyperliquid"]
+    current = engine.state.snapshot()
+    current["paused"] = True
+    assert not setup[1].snapshot()["paused"]
+    with pytest.raises(ConfigurationChanged, match="paused"):
+        engine.validate_configuration(current, plan)
+
+
+@pytest.mark.parametrize("exchange", ["hyperliquid", "aster", "lighter"])
 def test_fresh_account_limits_do_not_copy_financial_and_source_history(routed, setup, monkeypatch, exchange):
     router, _ = routed
     root = setup[1]

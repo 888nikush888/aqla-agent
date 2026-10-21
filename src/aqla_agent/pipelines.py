@@ -293,7 +293,7 @@ class VenueState:
         return bool(binding and binding["network"] == self.settings.network) or not binding and (self.exchange != "hyperliquid" or data["network"] == self.settings.network)
 
     def snapshot(self):
-        return copy.deepcopy(self.project(self.root.snapshot()))
+        return self.project(self.root.snapshot())
 
     def read(self, *roots, entries=None):
         dependencies = {"network", "venue_accounts", "profiles", "venue_limits", "account_limits", "paused",
@@ -316,7 +316,7 @@ class VenueState:
         basis = self.preview_basis.get()
         result = self.project(copy.deepcopy(basis) if basis is not None else self.root.snapshot())
         result["preview_route"] = copy.deepcopy(self.route.get())
-        return copy.deepcopy(result)
+        return result
 
     def update(self, callback):
         def change(data):
@@ -380,8 +380,8 @@ class VenueState:
                 plan.setup_id = route["setup_id"]
                 plan.rank_revision = route["rank_snapshot"]["source_revision"]
 
-    def validate_route(self, plan):
-        data = self.root.snapshot()
+    def validate_route(self, plan, *, snapshot=None):
+        data = snapshot if snapshot is not None and plan.pipeline_id else self.root.snapshot()
         validate_ranking_binding(data, plan)
         if plan.backup_fields and data["profiles"]["backup"]["revision"] != plan.backup_profile_revision:
             raise AqlaError("Backup profile changed; create a new unsent plan")

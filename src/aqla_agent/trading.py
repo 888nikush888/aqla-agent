@@ -442,7 +442,7 @@ class Trading:
             if plan.backup_fields and snapshot["profiles"]["backup"]["revision"] != plan.backup_profile_revision:
                 raise AqlaError("Backup profile changed; create a new unsent plan")
             if hasattr(self.state, "validate_route"):
-                self.state.validate_route(plan)
+                self.state.validate_route(plan, snapshot=snapshot)
             elif snapshot["paused"] or snapshot["policy_revision"] != plan.policy_revision:
                 raise AqlaError("Pause or policy changed; create a new unsent plan")
         except AqlaError as error:
@@ -697,7 +697,8 @@ class Trading:
             raise
 
     async def live_entry_guard(self, plan, *, dispatch_operation=None, account=None, audit=False):
-        if account is None or not 0 <= now_ms() - account.observed_at <= 10000:
+        # Refresh before the remaining checks can consume the existing 10 s account window.
+        if account is None or not 0 <= now_ms() - account.observed_at <= 7000:
             account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
         snapshot = self.state.snapshot()
         allowed = (snapshot["trades"][plan.trade_id].get("leverage_operation_id", "leverage:" + plan.trade_id), snapshot["trades"][plan.trade_id]["entry_operation_id"])

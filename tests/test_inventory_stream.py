@@ -1,3 +1,5 @@
+import asyncio
+import copy
 import json
 from types import SimpleNamespace
 
@@ -17,6 +19,15 @@ class Socket:
     async def __aexit__(self, *_):
         pass
 
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        while not self.frames:
+            await asyncio.sleep(.001)
+        await asyncio.sleep(.001)
+        return await self.recv()
+
     async def send(self, text):
         self.sent.append(json.loads(text))
 
@@ -33,6 +44,99 @@ def inputs():
     frames = [{"channel": "allDexsClearinghouseState", "data": {"user": account, "clearinghouseStates": list(map(list, states.items()))}}]
     frames += [{"channel": "openOrders", "data": {"user": account, "dex": name, "orders": []}} for name in names]
     return SimpleNamespace(account=account, settings=SimpleNamespace(base_url="https://api.hyperliquid-testnet.xyz")), names, frames
+
+
+@pytest.mark.asyncio
+async def test_repeated_inventory_waits_for_new_account_frame_without_resubscribing_orders():
+    adapter, names, frames = inputs()
+    aggregate = copy.deepcopy(frames[0])
+    socket = Socket(frames)
+    connections = []
+    def connector(*args, **kwargs):
+        connections.append(args)
+        return socket
+    first = await observe(adapter, names, connector=connector)
+    task = asyncio.create_task(observe(adapter, names, connector=connector))
+    await asyncio.sleep(.01)
+    assert not task.done(), "A previously returned budget is not a fresh observation"
+    aggregate["data"]["clearinghouseStates"][0][1]["marginSummary"]["accountValue"] = "42"
+    socket.frames.extend([{"channel": "subscriptionResponse", "data": {"method": "subscribe", "subscription": {"type": "allDexsClearinghouseState", "user": adapter.account}}}, aggregate])
+    second = await task
+    assert first[0][1]["marginSummary"]["accountValue"] == "100"
+    assert second[0][1]["marginSummary"]["accountValue"] == "42"
+    assert len(connections) == 1 and len(socket.sent) == len(names) + 3
+    assert sum(row["subscription"]["type"] == "openOrders" for row in socket.sent) == len(names)
+    await adapter._inventory_feed.close()
+
+
+@pytest.mark.asyncio
+async def test_gap_discards_every_cached_order_scope_before_readmission():
+    adapter, names, frames = inputs()
+    aggregate = copy.deepcopy(frames[0])
+    order_frames = copy.deepcopy(frames[1:])
+    socket = Socket(frames)
+    def connector(*args, **kwargs):
+        return socket
+    await observe(adapter, names, connector=connector)
+    feed = adapter._inventory_feed
+    feed._event({"channel": "gap", "data": {"reason": "decode_failure"}})
+    assert feed.states is None and not feed.orders
+    task = asyncio.create_task(observe(adapter, names, connector=connector))
+    await asyncio.sleep(.01)
+    socket.frames.extend([{"channel": "subscriptionResponse", "data": {"method": "subscribe", "subscription": {"type": "allDexsClearinghouseState", "user": adapter.account}}}, aggregate])
+    await asyncio.sleep(.01)
+    assert not task.done(), "A new balance cannot replace missing order proofs"
+    socket.frames.extend(order_frames)
+    assert len(await task) == len(names)
+    await feed.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_during_rest_details_cannot_return_a_cached_budget():
+    adapter, names, frames = inputs()
+    frames[1]["data"]["orders"] = [{"coin": "BTC"}]
+    entered = asyncio.Event()
+    async def info(*args, **kwargs):
+        feed = adapter._inventory_feed
+        feed.ready.clear()
+        feed._event({"channel": "connection", "data": {"connected": False}})
+        entered.set()
+        return [{"coin": "BTC", "reduceOnly": False}]
+    adapter.info = info
+    task = asyncio.create_task(observe(adapter, names, connector=lambda *args, **kwargs: Socket(frames)))
+    await entered.wait()
+    await asyncio.sleep(.01)
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert adapter._inventory_feed is None
+
+
+@pytest.mark.asyncio
+async def test_inventory_memory_limit_discards_all_prior_proofs():
+    adapter, names, frames = inputs()
+    await observe(adapter, names, connector=lambda *args, **kwargs: Socket(frames))
+    feed = adapter._inventory_feed
+    feed.max_event_bytes = 1024
+    feed._event({"channel": "openOrders", "data": {"user": adapter.account, "dex": "", "orders": [{"coin": "BTC", "extra": "x" * 2048}]}})
+    assert isinstance(feed.error, AqlaError) and feed.states is None and not feed.orders
+    await feed.close()
+
+
+@pytest.mark.asyncio
+async def test_account_change_never_borrows_existing_stream_coverage():
+    adapter, names, frames = inputs()
+    socket = Socket(frames)
+    await observe(adapter, names, connector=lambda *args, **kwargs: socket)
+    previous = adapter._inventory_feed
+    adapter.account = "0x" + "2" * 40
+    _, _, replacement = inputs()
+    for frame in replacement:
+        frame["data"]["user"] = adapter.account
+    await observe(adapter, names, connector=lambda *args, **kwargs: Socket(replacement))
+    assert previous.closed and adapter._inventory_feed is not previous
+    await adapter._inventory_feed.close()
 
 
 @pytest.mark.asyncio
