@@ -165,6 +165,46 @@ async def test_adaptive_split_protects_the_first_fill_before_sending_second_entr
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("guard_read", [1, 2, 3, 4])
+async def test_entry_guard_retry_stages_only_with_a_durable_request(setup, monkeypatch, guard_read):
+    from aqla_agent.observations import TemporaryObservation
+    _, state, fake, _, trading = setup
+    state.update(lambda data: data["policy"].update(entry_range_choice="split"))
+    original = trading.live_entry_guard
+    reads = 0
+    failed = False
+    async def guard(plan, **kwargs):
+        nonlocal reads, failed
+        if kwargs.get("dispatch_operation", "").startswith("entry:"):
+            reads += 1
+            if not failed and reads == guard_read:
+                failed = True
+                raise TemporaryObservation("price_stale", "price")
+        return await original(plan, **kwargs)
+    monkeypatch.setattr(trading, "live_entry_guard", guard)
+    source, value = source_zone(trading)
+    plan = await trading.preview(source.event_id, value)
+    trade = await trading.execute(plan["plan_id"])
+    assert failed and trade["managed_entry_retry"]["attempts"] == 1 and not fake.orders
+    assert all(row["phase"] == "pending" or row.get("not_sent") for row in trade["entry_orders"])
+    assert not any(not row.get("retired") for row in trade["orders"])
+    prior = state.snapshot()["operations"].get("entry:" + trade["trade_id"])
+    if prior:
+        assert prior["phase"] == "rejected" and prior["outcome"] == "not_sent"
+    state.update(lambda data: data["trades"][trade["trade_id"]]["managed_entry_retry"].update(next_retry_at=0))
+    await trading.refresh_trade(trade["trade_id"])
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert current["plan"]["deadline_at"] == plan["deadline_at"] and current["managed_entry_retry"]["completed"]
+    assert len([row for row in fake.orders.values() if not row["order"]["reduceOnly"]]) == 1
+    assert len([action for action in fake.actions if action["type"] == "updateLeverage"]) == 1
+    sent = len(fake.actions)
+    await trading.refresh_trade(trade["trade_id"])
+    assert len(fake.actions) == sent
+    if prior:
+        assert state.snapshot()["operations"]["entry:" + trade["trade_id"]] == prior
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("permanent", [False, True])
 async def test_unsent_leverage_guard_does_not_strand_a_managed_trade(setup, monkeypatch, permanent):
     from aqla_agent.observations import TemporaryObservation

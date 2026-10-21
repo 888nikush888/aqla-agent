@@ -608,16 +608,19 @@ async def _dispatch_next(engine, trade_id):
     protective = engine.order(view, view.quantity, price_grid(stop * (Decimal(".95") if plan.side == "long" else Decimal("1.05")), plan.market, up=plan.side == "short"),
         reduce=True, trigger=("sl", stop), cloid=engine.exchange.cloid(row["operation_id"], 1))
     def stage(data):
+        final_guard(data)
         current = data["trades"][trade_id]
         owned = next(item for item in current["entry_orders"] if item["cloid"] == row["cloid"])
+        if owned["phase"] == "dispatching" and row["operation_id"] in data["operations"]:
+            return
         if owned["phase"] != "pending" or current.get("entries_disabled"):
             raise AqlaError("Managed entry no longer owns its reservation")
         owned["phase"] = "dispatching"
         current["orders"].append({"kind": "sl", "cloid": protective["c"], "quantity": protective["s"], "price": str(stop)})
         current["status"] = "opening" if not Decimal(current["filled_quantity"]) else "protecting"
-    engine.state.update(stage)
+    # Stage the leg atomically with its request; failed early reads leave it retryable.
     result = await engine.exchange.mutate(row["operation_id"], {"type": "order", "orders": [entry, protective], "grouping": "normalTpsl"},
-        deadline=plan.deadline_at, async_prepare_guard=guard, prepare_guard=final_guard)
+        deadline=plan.deadline_at, async_prepare_guard=guard, prepare_guard=stage)
     if result.get("outcome") == "not_sent":
         patch_row(engine, trade_id, row["cloid"], not_sent=True, phase="terminal", confirmed_filled="0")
         def prepare_retry(data):
