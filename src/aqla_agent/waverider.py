@@ -65,13 +65,17 @@ def pools(trade, percent):
                 core_exit, flex_exit = size, Decimal(0)
             else:
                 ratio = size / (core + flex)
-                core_exit, flex_exit = core * ratio, flex * ratio
+                core_exit = core * ratio
+                flex_exit = size - core_exit
                 rights *= 1 - ratio
             core_average, flex_average = core_cost / core if core else Decimal(0), flex_cost / flex if flex else Decimal(0)
             losses += max(Decimal(0), -(price - core_average) * core_exit * direction)
             losses += max(Decimal(0), -(price - flex_average) * flex_exit * direction)
             core_cost, flex_cost = core_cost - core_exit * core_average, flex_cost - flex_exit * flex_average
-            core, flex = core - core_exit, flex - flex_exit
+            # Preserve the exact native quantity instead of rounding both remaining shares.
+            remaining = core + flex - size
+            core -= core_exit
+            flex = remaining - core
     funding = sum((max(Decimal(0), -Decimal(row["amount"])) for row in trade.get("funding_events", {}).values()), Decimal(0))
     return {"core": core, "flex": flex, "core_basis": core_cost / core if core else Decimal(0), "flex_basis": flex_cost / flex if flex else Decimal(0),
             "rights": max(Decimal(0), rights), "spent": losses + fees + funding}

@@ -84,6 +84,25 @@ def test_source_tp_retires_rights_even_when_flex_is_out_of_market():
     assert pools(data, Decimal(50))["rights"] == Decimal(".5")
 
 
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_partial_targets_preserve_exact_inventory_after_multiple_waves(side):
+    data = ledger([("entry", "original", ".1994", "2500.1"),
+                   ("waverider", None, ".0997", "2539.9"),
+                   ("entry", "waverider", ".0997", "2490.1"),
+                   ("waverider", None, ".0997", "2589.9"),
+                   ("entry", "waverider", ".0927", "2510.1"),
+                   ("tp", None, ".0961", "2700.9")])
+    data["plan"]["side"] = side
+    result = pools(data, Decimal(50))
+    assert result["core"] + result["flex"] == Decimal(".0963")
+    data["fill_events"]["6"] = {"kind": "tp", "sz": ".09631", "px": "2850.9", "fee": ".01", "time": 6}
+    with pytest.raises(AqlaError, match="flexible inventory"):
+        pools(data, Decimal(50))
+    data["fill_events"]["6"]["sz"] = ".0963"
+    result = pools(data, Decimal(50))
+    assert result["core"] == result["flex"] == result["rights"] == 0
+
+
 @pytest.mark.parametrize("value", [0, 21, True, "TP1", "", -1])
 def test_invalid_profile_endpoints_are_not_saved(value):
     with pytest.raises(ValueError):
