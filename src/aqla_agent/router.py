@@ -553,7 +553,9 @@ class Router:
                 category: RecoveryCategory = "unavailable"
                 rows = []
                 try:
-                    rows = await asyncio.wait_for(self._recover_account(engine), timeout=self._recovery_timeout)
+                    # Trades share an account lock and reconcile serially; each needs its bounded read budget.
+                    active = sum(row["status"] in OPEN for row in engine.state.read("trades")["trades"].values())
+                    rows = await asyncio.wait_for(self._recover_account(engine), timeout=self._recovery_timeout * max(1, active))
                     view = engine.state.read("operations", "trades")
                     unresolved = any(row["phase"] in ("prepared", "sending", "unknown") for row in view["operations"].values())
                     unsettled = any(row["status"] in OPEN and (row["status"] not in ("open", "opening", "waiting_entry")

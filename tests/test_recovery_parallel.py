@@ -97,6 +97,36 @@ async def test_account_timeout_and_fault_preserve_facts_and_emit_only_safe_diagn
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("count", [0, 1, 3, 8])
+async def test_serial_trade_budget_is_scoped_to_each_account(setup, signal, monkeypatch, count):
+    router = accounts(setup, recovery_timeout_seconds=1)
+    source, interpretation = signal
+    plan = await setup[4].preview(source.event_id, interpretation)
+    def seed(data):
+        for index in range(count):
+            data["trades"][str(index)] = {"plan": copy.deepcopy(plan), "status": "open", "remaining_quantity": "1"}
+        data["trades"]["closed"] = {"plan": copy.deepcopy(plan), "status": "closed"}
+    setup[1].update(seed)
+    timeouts = []
+    wait_for = asyncio.wait_for
+    async def bounded(work, *, timeout):
+        timeouts.append(timeout)
+        return await wait_for(work, timeout=timeout)
+    async def recovered(engine):
+        engine.recovery_checked = True
+        return []
+    monkeypatch.setattr(asyncio, "wait_for", bounded)
+    monkeypatch.setattr(router, "_recover_account", recovered)
+    try:
+        await router.recover()
+        assert sorted(timeouts) == sorted([max(1, count), 1])
+        assert setup[1].snapshot()["account_recovery"]["hyperliquid:testnet"]["category"] == "complete"
+        assert setup[2].actions == []
+    finally:
+        await router.close()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancels_all_recovery_accounts_and_releases_locks(setup, monkeypatch):
     router = accounts(setup)
     entered = {name: asyncio.Event() for name in router.engines}
