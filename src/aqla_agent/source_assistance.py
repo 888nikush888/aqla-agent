@@ -17,7 +17,7 @@ from .decisions import (
     verification_questions,
 )
 
-VERSION = "source-assistance-v5"
+VERSION = "source-assistance-v6"
 CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_action",
                    "source_exchange", "single_entry_form", "single_management_action")
 CONTEXT_CANDIDATE_LIMIT = 64
@@ -97,7 +97,7 @@ def source_assistance(context):
     entry = json.loads(contract["entry"]["instructions"])
     contract["entry"] = {**contract["entry"], "instructions": entry["question"]}
     contract["entry"]["criteria"] = {**contract["entry"]["criteria"],
-        "split": "Two discrete original entries of ONE setup. Preserve both entry_legs and their original forms/prices/weights; never flatten them into range or select one leg."}
+        "split": "Two discrete original entries of ONE setup: entry=split, entry_prices=[], parent entry_timing=standard, entry_legs=[{kind,price,weight_percent,timing},{kind,price,weight_percent,timing}]. ALL leg prices/timings belong INSIDE entry_legs, never in parent entry_prices. Preserve original forms/prices/weights; never flatten into range or select one leg."}
     contract["verification"] = verification_questions()
     from .semantic_contract import supported_action_failure, unbound_setup_update_failure
     anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
@@ -153,8 +153,7 @@ def precise_numeric_evidence(packet, interpretation):
     for proof in result.evidence:
         value = numeric.get(proof.field)
         original = originals.get(proof.source_id, "")
-        if (value is None or proof.source_id not in result.source_refs or proof.quote not in original
-                or value not in set(quoted_numbers(proof.quote))):
+        if value is None or proof.source_id not in result.source_refs or proof.quote not in original:
             continue
         occurrences = list(re.finditer(re.escape(proof.quote), original))
         if len(occurrences) != 1:

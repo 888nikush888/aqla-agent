@@ -322,7 +322,7 @@ class Interpretation(Model):
     entry_prices: list[Positive] = Field(default_factory=list, max_length=2,
         description="Only stated current entry/execution reference prices; historical highs/lows, swept liquidity and analysis/support/resistance levels are not entries unless explicitly assigned that role. Unstated entry stays empty. market/unspecified has at most one reference, range exactly two bounds. Use JSON numbers or dot-decimal strings, never comma decimals. Evidence uses entry_prices.0 / entry_prices.1.")
     entry_legs: list[SourceEntryLeg] = Field(default_factory=list, max_length=2,
-        description="Only for entry=split: exactly two separately instructed entries of ONE setup. Quote each entry_legs.i.kind, each supplied .price/.weight_percent and deferred .timing. Preserve both orders; never encode separate entries as a range. Missing weights mean 50/50 position quantity; no deposit/risk allocations.")
+        description="Only for entry=split: exactly two separately instructed entries of ONE setup. Set entry_prices=[] and parent entry_timing=standard; put EACH price, kind, weight_percent and timing INSIDE its leg. Each kind proof quotes its complete original entry clause including price/allocation; separately quote .price/.weight_percent and deferred .timing. Never flatten separate entries into entry_prices/range. Missing weights mean 50/50 position quantity; no deposit/risk allocations.")
     stop_loss: Positive | None = Field(default=None,
         description="Positive JSON number or dot-decimal string, never a comma decimal. Keep the original spelling only in the exact evidence quote.")
     take_profits: list[Positive] = Field(default_factory=list, max_length=20,

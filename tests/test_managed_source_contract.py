@@ -47,6 +47,20 @@ def test_weight_repair_identifies_the_missing_context_without_changing_values(se
     assert [row["weight_percent"] for row in rejected["interpretation"]["entry_legs"]] == ["25", "75"]
 
 
+def test_tp_label_digit_cannot_merge_with_its_three_digit_price(setup):
+    trading = setup[-1]
+    source, value = pair(trading)
+    source = source.model_copy(update={"message_id": 92, "text": source.text.replace("TP 110", "TP1 110")})
+    trading.ingest(source)
+    value.source_refs = [source.source_id]
+    value.evidence = [proof.model_copy(update={"source_id": source.source_id,
+        "quote": "TP1 110" if proof.field == "take_profits.0" else proof.quote}) for proof in value.evidence]
+    result = check_interpretation(trading.context(source.event_id), value)
+    assert result["valid"], result["errors"]
+    assert next(row["quote"] for row in result["interpretation"]["evidence"] if row["field"] == "take_profits.0") == "110"
+    assert "entry_prices=[]" in source_assistance(trading.context(source.event_id))["contract"]["entry"]["criteria"]["split"]
+
+
 @pytest.mark.parametrize("change,code", [("drop", "entry_legs_not_representable"), ("third", "entry_legs_not_representable"), ("weights", "split_entry_weights_missing_or_changed")])
 def test_source_legs_or_weights_cannot_be_silently_dropped(setup, change, code):
     trading = setup[-1]
