@@ -495,10 +495,10 @@ async def _start(engine, plan, trade):
                 await cancel(engine, plan.trade_id)
                 engine._patch(plan.trade_id, status="cancelled", reserved_risk="0", unsent_reason="Deferred source entry was missed")
                 return engine.state.snapshot()["trades"][plan.trade_id]
-        latest_account = None
+        latest_account, latest_quote = None, None
         async def guard():
-            nonlocal latest_account
-            latest_account, _ = await engine.live_entry_guard(view, dispatch_operation=identity, account=latest_account, audit=latest_account is None)
+            nonlocal latest_account, latest_quote
+            latest_account, latest_quote = await engine.live_entry_guard(view, dispatch_operation=identity, account=latest_account, audit=latest_quote is None)
         def invalidate_account():
             nonlocal latest_account
             latest_account = None
@@ -589,7 +589,7 @@ async def _dispatch_next(engine, trade_id):
     latest_account, latest_quote = None, None
     async def guard():
         nonlocal latest_account, latest_quote
-        latest_account, latest_quote = await engine.live_entry_guard(view, dispatch_operation=row["operation_id"], account=latest_account, audit=latest_account is None)
+        latest_account, latest_quote = await engine.live_entry_guard(view, dispatch_operation=row["operation_id"], account=latest_account, audit=latest_quote is None)
         current = engine.state.snapshot()["trades"][trade_id]
         if row["kind"] == "original" and entry_missed(current, latest_quote):
             raise AqlaError("Original entry target/stop was reached before dispatch")

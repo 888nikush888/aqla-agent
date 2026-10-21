@@ -171,7 +171,7 @@ async def test_managed_guards_refresh_complete_accounts_at_each_prepare_boundary
     original = trading.live_entry_guard
     reads = {}
     async def guard(plan, **kwargs):
-        reads.setdefault(kwargs["dispatch_operation"], []).append(kwargs.get("account"))
+        reads.setdefault(kwargs["dispatch_operation"], []).append((kwargs.get("account"), kwargs.get("audit")))
         return await original(plan, **kwargs)
     monkeypatch.setattr(trading, "live_entry_guard", guard)
     source, value = source_zone(trading)
@@ -180,8 +180,9 @@ async def test_managed_guards_refresh_complete_accounts_at_each_prepare_boundary
     for prefix in ("leverage:", "entry:"):
         values = reads[prefix + trade["trade_id"]]
         assert len(values) == 4
-        assert values[0] is None and values[2] is None
-        assert values[1] is not None and values[3] is not None
+        assert values[0][0] is None and values[2][0] is None
+        assert values[1][0] is not None and values[3][0] is not None
+        assert [value[1] for value in values] == [True, False, False, False]
 
 
 @pytest.mark.asyncio

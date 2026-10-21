@@ -709,7 +709,7 @@ class Trading:
         if audit:
             self._patch(plan.trade_id, entry_equity_snapshot={"equity": str(account.equity), "currency": plan.market.quote_token, "observed_at": account.observed_at})
         quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
-        trade = self.state.snapshot()["trades"][plan.trade_id]
+        trade = self.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
         targets = [value for index, value in enumerate(trade["targets"]) if trade.get("lifecycle_version") != 2 or index not in trade.get("completed_target_indices", [])]
         try:
             result = validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=targets)
@@ -732,7 +732,7 @@ class Trading:
                     raise
                 # Local checks can age a valid quote; refresh once and recheck every guard.
                 quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
-                trade = self.state.snapshot()["trades"][plan.trade_id]
+                trade = self.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
                 validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=targets)
 
     async def guarded_entry_steps(self, plan, trade):
