@@ -20,7 +20,10 @@ class EntryOperations:
                 self.by_trade.setdefault(trade_id, []).append(row)
 
     def for_trade(self, trade):
-        rows = self.by_trade.get(trade.get("trade_id"), [])
+        rows = list(self.by_trade.get(trade.get("trade_id"), []))
+        for entry in trade.get("entry_orders", []):
+            if (row := self.by_id.get(entry["operation_id"])) is not None and all(row is not previous for previous in rows):
+                rows.append(row)
         current = self.by_id.get(trade.get("entry_operation_id"))
         return [*rows, current] if current is not None and all(current is not row for row in rows) else rows
 
@@ -35,7 +38,7 @@ def quantity(value):
 
 def retry_view(row):
     """Expose bounded categories/times only, never an arbitrary provider error."""
-    marker = row.get("observation_retry")
+    marker = row.get("observation_retry") or row.get("managed_entry_retry")
     if not isinstance(marker, dict):
         return None
     output = {key: marker[key] for key in ("attempts", "next_retry_at", "deadline_at")
@@ -89,7 +92,8 @@ def trade_outcome(trade, operations=()):
     outcome = current.get("outcome")
     fills = list(trade.get("fill_events", {}).values())
     entries = [row for row in fills if row.get("kind") == "entry"]
-    valid = all(row.get("kind") in ("entry", "tp", "sl", "close") and quantity(row.get("sz")) is not None and quantity(row.get("sz")) > 0 for row in fills)
+    kinds = ("entry", "tp", "sl", "close", "waverider", "waverider_retirement") if trade.get("lifecycle_version") == 2 else ("entry", "tp", "sl", "close")
+    valid = all(row.get("kind") in kinds and quantity(row.get("sz")) is not None and quantity(row.get("sz")) > 0 for row in fills)
     entered = sum((quantity(row["sz"]) for row in entries), Decimal(0)) if valid else None
     exited = sum((quantity(row["sz"]) for row in fills if row.get("kind") != "entry"), Decimal(0)) if valid else None
     recorded = quantity(trade.get("filled_quantity"))

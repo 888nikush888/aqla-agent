@@ -30,7 +30,7 @@ from aqla_hyperliquid_mcp.models import Interpretation, digest  # noqa: E402
 
 def source_digest():
     files = sorted((ROOT / "src").rglob("*.py")) + [Path(__file__)]
-    return digest([(str(p.relative_to(ROOT)).replace("\\", "/"), hashlib.sha256(p.read_bytes()).hexdigest()) for p in files])
+    return digest([(str(p.relative_to(ROOT)).replace("\\", "/"), hashlib.sha256(p.read_bytes().replace(b"\r\n", b"\n")).hexdigest()) for p in files])
 
 
 def transport_retryable(result):

@@ -52,6 +52,7 @@ UNITS = {
     "max_open_trades": "Trades", "max_total_risk_percent": "%", "leverage": "×",
     "take_profit_weights": "Gewichte (JSON-Liste)", "allowed_updates": "JSON-Liste",
     "break_even_after_tp": "TP-Nummer",
+    "waverider_flex_percent": "% der eigenen Entry-Menge", "waverider_until_tp": "TP-Nummer 1–20 oder last",
 }
 BACKUP_UNIT_LABELS = {"course_percent": "% Kursbewegung", "roe_percent": "% ROE (ursprüngliche Margin)"}
 LIMIT_FIELDS = {"offene_trades": "max_open_trades", "offene trades": "max_open_trades",
@@ -372,9 +373,11 @@ class NativeCommands:
         if dialog.command == "aqla_parameter" and dialog.field.startswith("fallback_") and "roe_percent" in parameters.values():
             text += "\nROE-Basis: ursprüngliche Positionsmargin vor Gebühren und Funding."
         if options is not None:
-            buttons = self.choices([(BACKUP_UNIT_LABELS.get(value, str(value)) if dialog.field in ("fallback_stop_loss_unit", "fallback_take_profit_unit") else str(value), value) for value in options], "value")
+            buttons = self.choices([(BACKUP_UNIT_LABELS.get(value, str(value)) if dialog.field in ("fallback_stop_loss_unit", "fallback_take_profit_unit") else {"standard": "Standard", "waverider": "Waverider"}.get(value, str(value)) if dialog.field == "management_mode" else str(value), value) for value in options], "value")
         else:
             example = '["move_stop", "close"]' if dialog.field == "allowed_updates" else "[1, 2]" if selected.get("type") == "array" else "5" if selected.get("type") == "integer" else "0,5"
+            if dialog.field == "waverider_until_tp":
+                example = "1 oder last"
             text += "\nSende den neuen Wert. Beispiel: " + example
             if any(row.get("type") == "null" for row in variants):
                 text += "; null = aus"

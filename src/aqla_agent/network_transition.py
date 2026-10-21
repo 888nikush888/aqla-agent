@@ -48,7 +48,8 @@ def confirm_manual_testnet_close(data, trade_id, *, net_size, order_statuses, st
     trade=data['trades'][trade_id]
     if trade['plan']['network']!='testnet' or trade['plan'].get('exchange','hyperliquid')!='hyperliquid':
         raise AqlaError('Only the original Testnet trade can be archived here')
-    identities={row['cloid'] for row in [*trade['orders'],*trade.get('exit_orders',[])]}|{trade['entry_cloid']}
+    from .managed_entries import all_order_rows
+    identities={row['cloid'] for row in all_order_rows(trade)}
     from aqla_hyperliquid_mcp.models import TERMINAL_ORDER
     if net_size!=0 or set(order_statuses)!=identities or any(value not in TERMINAL_ORDER for value in order_statuses.values()):
         raise AqlaError('Manual Testnet closure/cancellation is not fully proved')

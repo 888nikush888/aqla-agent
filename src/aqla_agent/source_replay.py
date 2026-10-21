@@ -26,6 +26,9 @@ def mismatches(interpretation, expected):
     actual = complete_fields(interpretation)
     fields = ("kind", "source_refs") if expected["kind"] not in ("new_signal", "trade_update") else (
         field for field in CRITICAL_FIELDS if field != "evidence")
+    fields = list(fields)
+    if expected.get("entry") == "split" or actual.get("entry") == "split":
+        fields.append("entry_legs")
     errors = []
     for field in fields:
         left, right = actual.get(field), expected.get(field)
@@ -35,6 +38,10 @@ def mismatches(interpretation, expected):
             left, right = sorted(left or []), sorted(right or [])
         elif field == "source_exchange":
             left, right = (left or "").casefold(), (right or "").casefold()
+        elif field == "entry_legs":
+            from aqla_hyperliquid_mcp.models import SourceEntryLeg
+            left = [SourceEntryLeg.model_validate(row) for row in left or []]
+            right = [SourceEntryLeg.model_validate(row) for row in right or []]
         if not equal(left, right):
             errors.append(field)
     return errors

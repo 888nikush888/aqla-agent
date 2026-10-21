@@ -133,13 +133,16 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 await asyncio.sleep(60)
         report_task = asyncio.create_task(report_evidence(), name="aqla-report-evidence")
         express_task = asyncio.create_task(express.run(), name="aqla-express")
+        from aqla_agent.entry_watch import EntryWatch
+        entry_task = asyncio.create_task(EntryWatch(trading).run(), name="aqla-entry-watch")
         try:
             yield None
         finally:
             task.cancel()
             report_task.cancel()
             express_task.cancel()
-            await asyncio.gather(task, report_task, express_task, return_exceptions=True)
+            entry_task.cancel()
+            await asyncio.gather(task, report_task, express_task, entry_task, return_exceptions=True)
             await trading.close()
             await streams.close()
             state.close()

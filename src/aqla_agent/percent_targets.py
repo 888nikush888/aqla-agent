@@ -62,7 +62,7 @@ def reference_entry(signal, policy):
     if signal.entry not in ("limit", "range") or not signal.entry_prices:
         return None
     low, high = signal.entry_prices[0], signal.entry_prices[-1]
-    if policy.entry_range_choice == "midpoint":
+    if policy.entry_range_choice in ("midpoint", "split"):
         return (low + high) / 2
     long = signal.side == "long"
     return (high if long else low) if policy.entry_range_choice == "near" else (low if long else high)

@@ -191,6 +191,7 @@ async def test_pending_target_with_started_operation_cannot_switch_venue(routed,
     ranked(state)
     source, value = signal
     first = (await router.preview(source.event_id, value))['targets'][0]
+    original_plan_ids = set(state.snapshot()['plans'])
     def started(data):
         data['events'][source.event_id]['targets']['source-one:hyperliquid']['status'] = 'pending'
         data['operations'][prefix + first['plan']['trade_id']] = {'account_key': 'hyperliquid:testnet'}
@@ -203,7 +204,7 @@ async def test_pending_target_with_started_operation_cannot_switch_venue(routed,
     monkeypatch.setattr(router.engines['aster'], 'preview', forbidden)
     target = (await router.preview(source.event_id, value))['targets'][0]
     assert target['status'] == 'rejected' and target['exchange'] == 'hyperliquid'
-    assert target['error'] == 'Confirmed absent' and len(state.snapshot()['plans']) == 1
+    assert target['error'] == 'Confirmed absent' and set(state.snapshot()['plans']) == original_plan_ids
     await router.close()
 
 

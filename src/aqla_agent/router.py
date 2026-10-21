@@ -357,6 +357,13 @@ class Router:
                         engine = replacement
                 else:
                     plan = await preview_on(engine, target)
+                if ranked and requested == "hyperliquid" and not self.target_started(self.state.snapshot(), target):
+                    from .liquidity import select
+                    pipeline_target = next(row for row in preview_basis["pipelines"][target["pipeline_id"]]["targets"] if row["exchange"] == requested)
+                    replacements = pipeline_target.get("fallback_exchanges")
+                    replacements = ["aster", "lighter"] if replacements is None else replacements
+                    engine, target, plan = await select(self, plan, target, requested, network, replacements,
+                                                        preview_on, reserved, preview_basis)
                 row = {**target, "status": "planned", "plan_id": plan["plan_id"]}
                 if marker:
                     row["observation_retry"] = {**marker, "completed": True, "exhausted": True}
@@ -401,6 +408,8 @@ class Router:
         saved = self.state.snapshot()["plans"].get(plan_id)
         if saved is None:
             raise AqlaError("Unknown immutable plan")
+        if saved.get("liquidity_candidate") and not saved.get("liquidity_selected"):
+            raise AqlaError("Another venue owns this setup's selected execution; candidate plans cannot execute")
         plan = saved["plan"]
         venue = plan.get("exchange", "hyperliquid")
         engine = self.engine_for_plan(plan)

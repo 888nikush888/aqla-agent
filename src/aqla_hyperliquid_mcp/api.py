@@ -73,7 +73,9 @@ class Hyperliquid:
                 bid, ask = Decimal(book["levels"][0][0]["px"]), Decimal(book["levels"][1][0]["px"])
                 return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
                                      stop_reference=context["markPx"], stop_reference_kind="mark", exchange_time=book["time"],
-                                     started_at=started, observed_at=now_ms()).fresh()
+                                     started_at=started, observed_at=now_ms(),
+                                     bids=[(row["px"], row["sz"]) for row in book["levels"][0] if Decimal(row["sz"]) > 0] if all("sz" in row for row in book["levels"][0]) else [],
+                                     asks=[(row["px"], row["sz"]) for row in book["levels"][1] if Decimal(row["sz"]) > 0] if all("sz" in row for row in book["levels"][1]) else []).fresh()
             except (TemporaryObservation, TimeoutError):
                 if attempt:
                     raise

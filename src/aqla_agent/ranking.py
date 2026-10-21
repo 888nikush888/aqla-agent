@@ -169,6 +169,8 @@ def outcomes(data, *, selected_ids=None, report_rows=None):
         if refs & index.pending_refs or pending and pending.has_other_family((source, family)):
             reasons.append("Weitere Ausführung dieses Setups noch nicht abgeschlossen")
         for trade in trades:
+            if trade.get("rerouted_to_plan_id") and not Decimal(trade.get("filled_quantity", "0")):
+                continue
             if trade["status"] not in ("closed", "cancelled", "rejected"):
                 reasons.append("Trade noch offen")
                 continue

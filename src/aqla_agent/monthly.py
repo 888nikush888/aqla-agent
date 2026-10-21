@@ -153,6 +153,10 @@ def accounting_facts(trade):
     exited = sum((Decimal(row["sz"]) for row in exits), Decimal(0))
     entry_status = trade.get("order_observations", {}).get(trade.get("entry_cloid"), {}).get("status")
     entry_final = entry_status in TERMINAL_ORDER and trade.get("entry_fill_quantity_confirmed") is not None and total == Decimal(trade["entry_fill_quantity_confirmed"])
+    if trade.get("lifecycle_version") == 2:
+        from .managed_entries import entry_final as managed_final
+        entry_final = (managed_final(trade) and (not trade.get("waverider") or trade["waverider"].get("finished"))
+            and trade.get("entry_fill_quantity_confirmed") is not None and total == Decimal(trade["entry_fill_quantity_confirmed"]))
     result = {}
     if total and entry_final and all(isinstance(row.get("time"), int) for row in entries):
         notional = sum((Decimal(row["sz"]) * Decimal(row["px"]) for row in entries), Decimal(0))
@@ -163,6 +167,12 @@ def accounting_facts(trade):
                    "entry_at": min(row["time"] for row in entries), "entry_final_at": max(row["time"] for row in entries),
                    "entry_fingerprint": digest(sorted(fill_identity(row) for row in entries)),
                    "basis": "calculated_initial_margin"}
+        if trade.get("lifecycle_version") == 2:
+            from .managed_entries import original_fills
+            original = original_fills(trade)
+            original_notional = sum((Decimal(row["sz"]) * Decimal(row["px"]) for row in original), Decimal(0))
+            metrics.update(initial_margin=str(original_notional / leverage), original_entry_notional=str(original_notional),
+                           original_entry_quantity=str(sum((Decimal(row["sz"]) for row in original), Decimal(0))), entry_turnover=str(notional))
         if not trade.get("entry_accounting"):
             result["entry_accounting"] = metrics
         elif trade["entry_accounting"] != metrics:
@@ -186,8 +196,11 @@ def accounting_issues(trade, facts):
         issues.append("Entry-Fills oder endgültiger Margin-Hebel nicht vollständig belegt")
     entry_fills = [row for row in fills if row["kind"] == "entry"]
     confirmed = trade.get("entry_fill_quantity_confirmed")
-    if (confirmed is None or sum((Decimal(row["sz"]) for row in entry_fills), Decimal(0)) != Decimal(confirmed)
-            or trade.get("order_observations", {}).get(trade.get("entry_cloid"), {}).get("status") not in TERMINAL_ORDER):
+    final_status = trade.get("order_observations", {}).get(trade.get("entry_cloid"), {}).get("status") in TERMINAL_ORDER
+    if trade.get("lifecycle_version") == 2:
+        from .managed_entries import entry_final as managed_final
+        final_status = managed_final(trade)
+    if (confirmed is None or sum((Decimal(row["sz"]) for row in entry_fills), Decimal(0)) != Decimal(confirmed) or not final_status):
         issues.append("Endgültige Entry-Ausführungsmenge nicht vollständig belegt")
     if facts.get("accounting_conflict"):
         issues.append(facts["accounting_conflict"])

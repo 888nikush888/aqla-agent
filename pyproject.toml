@@ -38,6 +38,7 @@ aqla-install-hermes = "aqla_agent.install:main"
 aqla-build-vps = "aqla_agent.release:main"
 aqla-google-sheets-mcp = "aqla_sheets_mcp.__main__:main"
 aqla-evaluate-decisions = "aqla_agent.decision_evaluation:main"
+aqla-evaluate-waverider = "aqla_agent.waverider_replay:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aqla_agent", "src/aqla_hyperliquid_mcp", "src/aqla_sheets_mcp"]

@@ -83,7 +83,10 @@ async def observe_conflict(engine, trade_id):
     plan = TradePlan.model_validate(trade["plan"])
     engine.assert_plan_binding(snapshot, plan)
     reasons = []
-    identities = {trade["entry_cloid"]: {"kind": "entry"}}
+    identities = {} if trade.get("lifecycle_version") == 2 else {trade["entry_cloid"]: {"kind": "entry"}}
+    identities.update({row["cloid"]: {"kind": "entry", "entry_role": row["kind"], "entry_leg": row["index"]}
+        for row in trade.get("entry_orders", []) if not row.get("not_sent")
+        and not (row.get("phase") == "pending" and row["operation_id"] not in snapshot["operations"])})
     identities.update({row["cloid"]: row for row in [*trade["orders"], *trade.get("exit_orders", [])]})
     statuses, order_ids = {}, {}
     for identity, role in identities.items():
@@ -106,6 +109,14 @@ async def observe_conflict(engine, trade_id):
     try:
         entry = await engine.order_status(trade["entry_cloid"])
         confirmed = entry_quantity_evidence(entry)
+        if trade.get("lifecycle_version") == 2:
+            amounts = []
+            for row in trade["entry_orders"]:
+                if row.get("not_sent") or row.get("phase") == "pending" and row["operation_id"] not in snapshot["operations"]:
+                    amounts.append("0")
+                else:
+                    amounts.append(entry_quantity_evidence(await engine.order_status(row["cloid"])))
+            confirmed = str(sum(map(Decimal, amounts))) if all(value is not None for value in amounts) else None
         if confirmed is None or Decimal(confirmed) != Decimal(trade["filled_quantity"]):
             reasons.append("entry_quantity_not_reconciled")
     except (InvalidOperation, ValueError, TypeError):
@@ -142,6 +153,8 @@ async def observe_conflict(engine, trade_id):
             fact = {key: raw.get(key) for key in ("oid", "tid", "time", "sz", "px", "fee", "feeToken", "coin")}
             if role:
                 fact.update(kind=role["kind"], index=role.get("index"))
+                if trade.get("lifecycle_version") == 2 and role["kind"] == "entry":
+                    fact.update(entry_role=role.get("entry_role", "original"), entry_leg=role.get("entry_leg", 0))
                 if identity in owned and owned[identity] != fact:
                     reasons.append("immutable_fill_changed")
                     break

@@ -54,6 +54,7 @@ def public_action_requires_setup(request, data, *, account_key=None, account=Non
             continue
         if trade.get("entry_cloid"):
             known.add(trade["entry_cloid"])
+        known.update(row["cloid"] for row in trade.get("entry_orders", []))
         for order in [*trade.get("orders", []), *trade.get("entry_orders", []), *trade.get("exit_orders", [])]:
             for key in ("oid", "cloid"):
                 if order.get(key) is not None:

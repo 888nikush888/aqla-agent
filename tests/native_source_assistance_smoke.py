@@ -35,7 +35,7 @@ def main():
 
     from aqla_agent.decision_evaluation import write_private_json
     from aqla_agent.decisions import build_packet
-    from aqla_hyperliquid_mcp.models import Evidence, Interpretation, SourceEvent
+    from aqla_hyperliquid_mcp.models import Evidence, Interpretation, SourceEntryLeg, SourceEvent
 
     home = args.home.resolve()
     home.mkdir(parents=True, exist_ok=True)
@@ -97,6 +97,14 @@ def main():
     if args.two_entry_orders or args.conditional_exit_permission or args.partial_exit_label:
         corrected = Interpretation(kind="ambiguous", source_refs=[source.source_id], reason="Original instruction cannot be partially represented by one supported action",
             evidence=[Evidence(field="classification", source_id=source.source_id, quote=text)])
+    if args.two_entry_orders:
+        corrected = Interpretation(kind="new_signal", symbol="BTC", side="long", entry="split",
+            entry_legs=[SourceEntryLeg(kind="unspecified", price=100), SourceEntryLeg(kind="limit", price=95)],
+            stop_loss=90, take_profits=[110], source_refs=[source.source_id], evidence=[
+                Evidence(field=field, source_id=source.source_id, quote=quote) for field, quote in (
+                    ("symbol", "BTC"), ("side", "LONG"), ("entry_legs.0.kind", "Пoкупаем пo текущим ценам = 100"),
+                    ("entry_legs.0.price", "100"), ("entry_legs.1.kind", "oтлoженный oрдер на пoкупку = 95"),
+                    ("entry_legs.1.price", "95"), ("stop_loss", "90"), ("take_profits.0", "110"))])
     if args.analysis_entry_level:
         corrected.entry_prices = []
         corrected.evidence = [proof for proof in corrected.evidence if proof.field != "entry_prices.0"]
@@ -206,8 +214,8 @@ def main():
             assert result["checks"][-1]["interpretation"]["evidence"] == []
         elif args.two_entry_orders:
             assert result["checks"][0]["errors"][0]["code"] == "entry_legs_not_representable"
-            assert result["checks"][-1]["interpretation"]["kind"] == "ambiguous"
-            assert result["checks"][-1]["interpretation"]["evidence"][-1]["quote"] == text
+            assert result["checks"][-1]["interpretation"]["entry"] == "split"
+            assert [row["price"] for row in result["checks"][-1]["interpretation"]["entry_legs"]] == ["100", "95"]
         elif args.managed_position_side:
             assert result["checks"][0]["errors"][0]["code"] == "managed_position_direction_missing_or_changed"
             assert result["checks"][-1]["interpretation"]["side"] == "long"
@@ -249,7 +257,7 @@ def main():
             "conditional_exit_not_discarded": args.conditional_exit_permission,
             "target_catchup_not_new_exit": args.target_catchup,
             "partial_exit_not_dropped": args.partial_exit_label,
-            "mixed_script_entry_legs_blocked": args.two_entry_orders,
+            "mixed_script_entry_legs_preserved": args.two_entry_orders,
             "analysis_level_not_entry": args.analysis_entry_level,
             "empty_original_quote_exception": args.empty_original,
             "integer_target_context_kept": args.numbered_integer_target, "model_calls": len(calls),

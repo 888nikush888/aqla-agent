@@ -59,7 +59,10 @@ class Policy(Model):
     entry_mode: Literal["source", "source_or_market"] = "source_or_market"
     entry_execution: Literal["standard", "maker_only"] = Field(default="standard", repr=False)
     take_profit_execution: Literal["standard", "maker_only"] = Field(default="standard", repr=False)
-    entry_range_choice: Literal["near", "far", "midpoint"] = "midpoint"
+    entry_range_choice: Literal["near", "far", "midpoint", "split"] = "midpoint"
+    management_mode: Literal["standard", "waverider"] = Field(default="standard", repr=False)
+    waverider_flex_percent: Positive = Field(default=Decimal(50), lt=100, repr=False)
+    waverider_until_tp: Annotated[int, Field(ge=1, le=20, strict=True)] | Literal["last"] = Field(default=1, repr=False)
     max_slippage_percent: Positive = Field(default=Decimal("0.3"), le=10)
     max_signal_age_seconds: int = Field(default=300, ge=1, le=86400)
     take_profit_allocation: Literal["equal", "halving", "custom", "adaptive", "first_target"] = "equal"
@@ -74,12 +77,20 @@ class Policy(Model):
         # Historical plan hashes use default=str. Keep the legacy text exactly,
         # while explicit ROE remains part of the immutable plan identity.
         for name, value in super().__repr_args__():
+            if name in ("management_mode", "waverider_flex_percent", "waverider_until_tp") and value == {"management_mode": "standard", "waverider_flex_percent": Decimal(50), "waverider_until_tp": 1}[name]:
+                continue
             if name not in ("fallback_stop_loss_unit", "fallback_take_profit_unit") or value != "course_percent":
+                yield name, value
+        for name, default in (("management_mode", "standard"), ("waverider_flex_percent", Decimal(50)), ("waverider_until_tp", 1)):
+            if (value := getattr(self, name)) != default:
                 yield name, value
 
     @model_serializer(mode="wrap")
     def compatible_execution_fields(self, handler):
         result = handler(self)
+        for key, default in (("management_mode", "standard"), ("waverider_flex_percent", Decimal(50)), ("waverider_until_tp", 1)):
+            if getattr(self, key) == default:
+                result.pop(key, None)
         for key in ("entry_execution", "take_profit_execution"):
             if getattr(self, key) == "standard":
                 result.pop(key, None)
@@ -90,6 +101,8 @@ class Policy(Model):
 
     @model_validator(mode="after")
     def consistent(self):
+        if isinstance(self.waverider_until_tp, bool) or isinstance(self.waverider_until_tp, int) and not 1 <= self.waverider_until_tp <= 20:
+            raise ValueError("Waverider endpoint must be TP 1 through 20 or last")
         if (any(value >= 100 for value in self.fallback_take_profit_percentages)
                 or self.fallback_take_profit_percentages != sorted(set(self.fallback_take_profit_percentages))):
             raise ValueError("Backup TP percentages must be unique, ascending and between 0 and 100")
@@ -236,6 +249,7 @@ EVIDENCE_FIELDS = (
     "classification", "symbol", "side", "leverage", "stop_loss", "reduce_percent", "entry",
     "entry_timing", "source_exchange", "take_profit_unit", "update_action", "bound_trade_id", "margin_mode",
     *(f"entry_prices.{index}" for index in range(2)), *(f"take_profits.{index}" for index in range(20)),
+    *(f"entry_legs.{index}.{field}" for index in range(2) for field in ("kind", "price", "weight_percent", "timing")),
 )
 ClassificationReason = Literal["percentage_basis", "missing_market", "missing_direction", "missing_reference",
     "contradictory_source", "missing_entry_price", "missing_source_text", "non_trade", "result_report", "other"]
@@ -273,6 +287,21 @@ class SourceClassification(Model):
         return result
 
 
+class SourceEntryLeg(Model):
+    kind: Literal["market", "limit", "unspecified"] = Field(description="Original form of this leg: market only if explicitly named; a current-price announcement without a named form stays unspecified. Python applies only the approved entry fallback.")
+    price: Positive | None = None
+    weight_percent: Positive | None = Field(default=None, lt=100)
+    timing: Literal["standard", "deferred"] = "standard"
+
+    @model_validator(mode="after")
+    def valid_entry(self):
+        if (self.kind == "limit" or self.timing == "deferred") and self.price is None:
+            raise ValueError("Limit/deferred entry leg needs its original price")
+        if self.kind != "limit" and self.timing != "standard":
+            raise ValueError("A deferred leg needs its explicit source limit")
+        return self
+
+
 class Interpretation(Model):
     """Use only declared fields. Python owns risk and margin policy; source risk_percent,
     margin_mode and deposit allocations are not Interpretation parameters.
@@ -286,12 +315,14 @@ class Interpretation(Model):
         description="Source position direction. For updates retain a direction expressly identifying the managed position in the current anchor: closing a purchase/buy holding is long, covering a short is short. Do not confuse exit transaction side with position side, infer from profit/prices, copy a parent direction or use a market opinion as position identity.")
     leverage: Annotated[Decimal, Field(ge=1, allow_inf_nan=False)] | None = Field(default=None,
         description="Original evidenced signal leverage, including decimals. Python floors then caps it. Null only when absent; never round before quoting evidence. A source leverage interval such as 2-5x is ambiguous even with a fixed profile; never choose a bound or treat the interval as missing.")
-    entry: Literal["market", "limit", "range", "unspecified"] = Field(default="unspecified",
+    entry: Literal["market", "limit", "range", "unspecified", "split"] = Field(default="unspecified",
         description="Original SOURCE order form, not Python's execution default. market requires an explicitly named MARKET/Рынок/по рынку order. A current-price announcement without a named form stays unspecified. limit requires an explicit limit or one directional price boundary (SHORT price+ / LONG price-); range has exactly two original bounds. Never infer a source form from one reference price.")
     entry_timing: Literal["standard", "deferred"] = Field(default="standard", description="Explicitly delayed/not-now entry intent requires entry_timing evidence and a source price; Python waits, never substitute an immediate GTC order.")
     source_exchange: str | None = Field(default=None, min_length=1, max_length=100, description="Evidenced exchange named by the source. Metadata only; the operator pipeline chooses the execution exchange.")
     entry_prices: list[Positive] = Field(default_factory=list, max_length=2,
         description="Only stated current entry/execution reference prices; historical highs/lows, swept liquidity and analysis/support/resistance levels are not entries unless explicitly assigned that role. Unstated entry stays empty. market/unspecified has at most one reference, range exactly two bounds. Use JSON numbers or dot-decimal strings, never comma decimals. Evidence uses entry_prices.0 / entry_prices.1.")
+    entry_legs: list[SourceEntryLeg] = Field(default_factory=list, max_length=2,
+        description="Only for entry=split: exactly two separately instructed entries of ONE setup. Quote each entry_legs.i.kind, each supplied .price/.weight_percent and deferred .timing. Preserve both orders; never encode separate entries as a range. Missing weights mean 50/50 position quantity; no deposit/risk allocations.")
     stop_loss: Positive | None = Field(default=None,
         description="Positive JSON number or dot-decimal string, never a comma decimal. Keep the original spelling only in the exact evidence quote.")
     take_profits: list[Positive] = Field(default_factory=list, max_length=20,
@@ -310,6 +341,8 @@ class Interpretation(Model):
     @model_serializer(mode="wrap")
     def compatible_entry_fields(self, handler):
         result = handler(self)
+        if not self.entry_legs:
+            result.pop("entry_legs", None)
         if self.entry_timing == "standard":
             result.pop("entry_timing", None)
         if self.source_exchange is None:
@@ -332,6 +365,18 @@ class Interpretation(Model):
     def deferred_has_price(self):
         if self.entry_timing == "deferred" and (self.entry not in ("limit", "range") or not self.entry_prices):
             raise ValueError("Deferred entry requires an explicit source limit or range")
+        return self
+
+    @model_validator(mode="after")
+    def split_entries(self):
+        if self.entry == "split":
+            if len(self.entry_legs) != 2 or self.entry_prices or self.entry_timing != "standard":
+                raise ValueError("Split entry needs exactly two legs and no flattened prices/timing")
+            weights = [leg.weight_percent for leg in self.entry_legs]
+            if any(weight is not None for weight in weights) and (None in weights or sum(weights) != 100):
+                raise ValueError("Explicit position weights must cover both entries and total 100")
+        elif self.entry_legs:
+            raise ValueError("entry_legs requires entry=split")
         return self
 
     @field_validator("leverage", mode="before")
@@ -443,6 +488,15 @@ class BackupValues(Model):
         return self
 
 
+class EntryLegPlan(Model):
+    index: int = Field(ge=0, le=1)
+    kind: Literal["market", "limit"]
+    price: Positive
+    limit: Positive
+    quantity: Positive
+    timing: Literal["standard", "deferred"] = "standard"
+
+
 class TradePlan(Model):
     plan_id: str
     trade_id: str
@@ -463,6 +517,7 @@ class TradePlan(Model):
     market: Market
     side: Literal["long", "short"]
     entry_kind: Literal["market", "limit"]
+    entry_legs: list[EntryLegPlan] = Field(default_factory=list, max_length=2)
     entry_execution: Literal["standard", "maker_only"] = Field(default="standard", repr=False)
     take_profit_execution: Literal["standard", "maker_only"] = Field(default="standard", repr=False)
     entry_timing: Literal["standard", "deferred"] = "standard"
@@ -499,6 +554,8 @@ class TradePlan(Model):
     @model_serializer(mode="wrap")
     def compatible_entry_fields(self, handler):
         result = handler(self)
+        if not self.entry_legs:
+            result.pop("entry_legs", None)
         for key in ("entry_execution", "take_profit_execution"):
             if getattr(self, key) == "standard":
                 result.pop(key, None)
@@ -517,6 +574,9 @@ class TradePlan(Model):
     def execution_consistent(self):
         if self.entry_execution != self.policy.entry_execution or self.take_profit_execution != self.policy.take_profit_execution:
             raise ValueError("Saved execution modes differ from the immutable policy")
+        if self.entry_legs and (len(self.entry_legs) != 2 or {leg.index for leg in self.entry_legs} != {0, 1}
+                or sum(leg.quantity for leg in self.entry_legs) != self.quantity):
+            raise ValueError("Entry legs must partition the saved total quantity exactly")
         return self
 
     @model_validator(mode="after")

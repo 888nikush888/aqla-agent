@@ -117,7 +117,9 @@ class Lighter(VenueAdapter):
                         timestamp = timestamp * 1000 if timestamp < 10**12 else timestamp
                         return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
                                              stop_reference=stats["mark_price"], stop_reference_kind="mark", exchange_time=timestamp,
-                                             started_at=started, observed_at=now_ms()).fresh()
+                                             started_at=started, observed_at=now_ms(),
+                                             bids=[(row["price"], row["size"]) for row in book["bids"] if Decimal(row["size"]) > 0] if all("size" in row for row in book["bids"]) else [],
+                                             asks=[(row["price"], row["size"]) for row in book["asks"] if Decimal(row["size"]) > 0] if all("size" in row for row in book["asks"]) else []).fresh()
         raise AqlaError("Lighter has no fresh timestamped mark-price/order-book pair")
 
     async def funding_payments(self, market, start, end):

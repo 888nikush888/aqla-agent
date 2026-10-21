@@ -31,6 +31,18 @@ def sign_parameters(wallet, parameters, *, network="mainnet"):
 class Aster(VenueAdapter):
     supports_maker_orders = True
 
+    async def depth_snapshot(self, market):
+        from .entry import PriceSnapshot
+        started = now_ms()
+        contract = await self.read("ticker/price", {"symbol": market.native_symbol}, fresh=True)
+        book = await self.read("depth", {"symbol": market.native_symbol, "limit": 100})
+        if contract.get("symbol") != market.native_symbol or not book.get("bids") or not book.get("asks"):
+            raise AqlaError("Aster depth does not identify an executable requested market")
+        bid, ask = Decimal(book["bids"][0][0]), Decimal(book["asks"][0][0])
+        return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
+            stop_reference=contract["price"], stop_reference_kind="contract", exchange_time=book["T"],
+            started_at=started, observed_at=now_ms(), bids=book["bids"], asks=book["asks"]).fresh()
+
     async def price_snapshot(self, market):
         from .entry import PriceSnapshot
         started = now_ms()
@@ -270,6 +282,7 @@ class Aster(VenueAdapter):
                        if order.get("c") == identity for market in self.market_cache.values() if market.asset_id == order["a"]), None)
         if market is None:
             trade = next((trade for trade in self.state.snapshot()["trades"].values() if identity == trade["entry_cloid"]
+                          or any(order["cloid"] == identity for order in trade.get("entry_orders", []))
                           or any(order["cloid"] == identity for order in [*trade["orders"], *trade.get("exit_orders", [])])), None)
             if trade:
                 market = Market.model_validate(trade["plan"]["market"])

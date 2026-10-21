@@ -399,6 +399,58 @@ def entry_structure_failure(text):
     return None
 
 
+def split_entry_failure(text, interpretation):
+    """A two-leg schema does not authorize omitted legs or independent setups."""
+    legs = interpretation.entry_legs
+    if len(legs) != 2 or re.search(r"\b(?:third|dritt\w*|трет\w*|(?:entry|einstieg|вход)\s*[#:]?\s*3)\b", text, re.I):
+        return "entry_legs_not_representable"
+    pairs = {re.sub(r"(?:USDT|USDC)$", "", value) for value in re.findall(r"\b[A-Z0-9]{2,}(?:USDT|USDC)\b", text)}
+    normalized_text = "\n".join(SENTENCES.split(matching_words(text)))
+    headings = {match.group().strip().split()[0].lstrip("#$").upper() for match in SETUP_HEADING.finditer(normalized_text)}
+    headings.update(match.group(1).upper() for match in re.finditer(r"(?im)^\s*(?:long|short|лонг|шорт)\s+[$#]?([a-z0-9]+)\b", normalized_text))
+    headings = {re.sub(r"(?:USDT|USDC)$", "", value) for value in headings}
+    directions = {value.casefold() for value in re.findall(r"\b(?:long|short)\b", matching_words(text), re.I)}
+    if len(pairs) > 1 or len(headings) > 1 or len(directions) > 1:
+        return "entry_legs_not_representable"
+    scopes = [part for part in SENTENCES.split(current_structure_text(text)) if re.search(r"\d|half|половин|hälfte", part, re.I)]
+    if sum(len(MARKET.findall(part)) + len(LIMIT.findall(part)) for part in scopes) > 2:
+        return "entry_legs_not_representable"
+    spans = []
+    for index, leg in enumerate(legs):
+        proofs = [proof for proof in interpretation.evidence if proof.field == f"entry_legs.{index}.kind"]
+        contexts = [proof.quote for proof in proofs if proof.quote in text and text.count(proof.quote) == 1]
+        valid = []
+        for quote in contexts:
+            normalized = matching_words(quote)
+            if HYPOTHETICAL.search(normalized):
+                continue
+            if any(NEGATED.search(normalized[:match.start()]) for matcher in (MARKET, LIMIT) for match in matcher.finditer(normalized)):
+                continue
+            if leg.kind == "market":
+                form = bool(MARKET.search(normalized)) and not LIMIT.search(normalized)
+            elif leg.kind == "unspecified":
+                form = bool(CURRENT_PRICE_ENTRY.search(normalized)) and not MARKET.search(normalized) and not LIMIT.search(normalized)
+            else:
+                form = bool(LIMIT.search(normalized) or PENDING_ENTRY_ORDER.search(normalized)
+                    or ENTRY.search(normalized) and leg.price is not None)
+                form = form and not MARKET.search(normalized)
+            if form and (leg.price is None or leg.price in set(quoted_numbers(quote))):
+                from .evidence import position_fractions
+                portions = {value for _, value in position_fractions(quote)}
+                portions.update(Decimal(match.group(1).replace(",", ".")) for match in re.finditer(r"(\d+(?:[.,]\d+)?)\s*%", quote))
+                if leg.weight_percent is not None and not portions:
+                    return "split_entry_weights_missing_or_changed"
+                if portions and portions != {leg.weight_percent or Decimal(50)}:
+                    return "split_entry_weights_missing_or_changed"
+                valid.append((text.index(quote), text.index(quote) + len(quote)))
+        if not valid:
+            return "split_entry_evidence_needs_role_review"
+        spans.append(valid[0])
+    if max(spans[0][0], spans[1][0]) < min(spans[0][1], spans[1][1]):
+        return "split_entry_evidence_needs_role_review"
+    return None
+
+
 def management_structure_failure(text, *, ignore_tp_footers=False):
     for sentence in SENTENCES.split(matching_words(text).casefold().replace("ё", "е")):
         permission = CONDITIONAL_EXIT_PERMISSION.search(sentence)
@@ -521,7 +573,7 @@ def supported_action_failure(text, interpretation):
     if interpretation.update_action in ("move_stop", "break_even") and STOP_CONDITION.search(current_structure_text(text)):
         return "conditional_stop_not_representable"
     if interpretation.kind == "new_signal":
-        failure = entry_structure_failure(text)
+        failure = split_entry_failure(text, interpretation) if interpretation.entry == "split" else entry_structure_failure(text)
         if failure:
             return failure
         failure = source_leverage_interval_failure(text, interpretation)

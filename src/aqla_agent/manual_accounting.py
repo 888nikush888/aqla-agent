@@ -31,7 +31,8 @@ def attribute_manual_closure(trade, observed, payments):
     from .monthly import fill_identity
     plan = TradePlan.model_validate(trade["plan"])
     closure = trade.get("manual_closure", {})
-    identities = {trade["entry_cloid"], *(row["cloid"] for row in [*trade["orders"], *trade.get("exit_orders", [])])}
+    from .managed_entries import all_order_rows
+    identities = {row["cloid"] for row in all_order_rows(trade)}
     statuses = closure.get("order_statuses", {}) if isinstance(closure, dict) else {}
     if (trade["status"] != "closed" or plan.exchange != "hyperliquid" or plan.market.product != "perp"
             or closure.get("basis") not in ("proved_original_account_closure", "proved_account_flat_after_last_owned_fill")

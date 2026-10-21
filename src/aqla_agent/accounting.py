@@ -17,6 +17,10 @@ def foreign_entry_orders(data, account, symbol):
             continue
         if row.get('entry_cloid'):
             own_cloids.add(row['entry_cloid'])
+        for entry in row.get('entry_orders', []):
+            own_cloids.add(entry['cloid'])
+            if (oid := row.get('order_observations', {}).get(entry['cloid'], {}).get('oid')) is not None:
+                ours.add(oid)
         observed = row.get('order_observations', {}).get(row.get('entry_cloid'), {})
         if observed.get('oid') is not None:
             ours.add(observed['oid'])

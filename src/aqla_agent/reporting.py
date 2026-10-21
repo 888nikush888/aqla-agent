@@ -76,7 +76,8 @@ class Reporting:
         mapping = {}
         observations = {}
         confirmed_quantity = None
-        orders = [{"kind": "entry", "cloid": trade["entry_cloid"]}, *trade.get("orders", []), *trade.get("exit_orders", [])]
+        from .managed_entries import all_order_rows
+        orders = all_order_rows(trade)
         for order in orders:
             observed = await adapter.order_status(order["cloid"])
             if order["kind"] == "entry":

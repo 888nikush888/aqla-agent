@@ -279,6 +279,17 @@ def trade_block(data, trade, notices):
         if trade.get("admission_refresh_from"):
             lines.append("**Menge vor Versand:** an das aktuelle Kontobudget angepasst")
         lines.append(f"**SL:** {number(trade.get('stop_price', plan.get('stop_loss')))} {quote}" + (" · vorgesehen" if stage == "waiting_entry" else " · Bestätigung ausstehend" if stage in ("unknown", "protecting", "opening") else ""))
+        if plan.get("entry_legs"):
+            entry_lines = [f"Entry {leg['index'] + 1}: {number(leg['price'])} {quote} · {number(leg['quantity'])} · "
+                           + ("Markt" if leg['kind'] == 'market' else "Limit") for leg in plan["entry_legs"]]
+            lines.append("**Ursprüngliche Entries**\n" + "\n".join(entry_lines))
+        if plan.get("policy", {}).get("management_mode") == "waverider":
+            wave = trade.get("waverider", {})
+            mode = "Shadow" if wave.get("shadow", True) else "Live"
+            lines.append(f"**Waverider:** {mode} · {literal(wave.get('phase', 'warming_up'))} · Flex {number(plan['policy'].get('waverider_flex_percent', 50))} %")
+            lines.append(f"**Waverider-Ende:** TP {literal(plan['policy'].get('waverider_until_tp', 1))} oder ursprüngliche Signalfrist")
+            if wave.get("reason"):
+                lines.append("**Waverider-Prüfung:** " + literal(wave["reason"]))
         targets = trade.get("targets", plan.get("take_profits", []))
         budgets = trade.get("target_budgets") or plan.get("tp_quantities", [])
         total = sum((decimal(value) or Decimal(0) for value in budgets), Decimal(0))

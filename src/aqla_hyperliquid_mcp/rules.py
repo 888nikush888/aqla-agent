@@ -232,6 +232,10 @@ def verify_setup_references(signal, anchor_source_id, own_setup_refs=()):
 
 
 def verify_entry_shape(signal):
+    if signal.kind == "new_signal" and signal.entry == "split":
+        if len(signal.entry_legs) != 2 or signal.entry_prices:
+            raise AqlaError("Split entry needs both separate entry legs, never flattened prices")
+        return
     if signal.kind == "new_signal" and signal.entry in ("market", "unspecified") and len(signal.entry_prices) > 1:
         raise AqlaError("entry_prices: market/unspecified entry permits at most one reference price. Multiple order legs cannot be combined; do not drop a leg or rename separate orders to a range. Re-read the original and use ambiguous when one supported entry cannot represent it")
     if signal.kind == "new_signal" and signal.entry in ("limit", "range"):
@@ -270,6 +274,19 @@ def verify_evidence(signal: Interpretation, events: dict):
     numeric = {"stop_loss": signal.stop_loss}
     numeric.update({f"take_profits.{i}": value for i, value in enumerate(signal.take_profits)})
     numeric.update({f"entry_prices.{i}": value for i, value in enumerate(signal.entry_prices)})
+    for index, leg in enumerate(signal.entry_legs):
+        numeric[f"entry_legs.{index}.price"] = leg.price
+        if leg.weight_percent is not None:
+            from aqla_agent.evidence import position_fractions
+            quotes = fields.get(f"entry_legs.{index}.weight_percent", [])
+            supported = any({value for _, value in position_fractions(quote)} == {leg.weight_percent}
+                            or len(list(re.finditer(r"\d+(?:[.,]\d+)?\s*%", quote))) == 1 and leg.weight_percent in set(quoted_numbers(quote)) for quote in quotes)
+            if not supported:
+                errors.append(f"Entry position weight needs its own fraction/percent evidence: entry_legs.{index}.weight_percent")
+        if not fields.get(f"entry_legs.{index}.kind"):
+            errors.append(f"Entry leg form needs original contextual evidence: entry_legs.{index}.kind")
+        if leg.timing == "deferred" and not fields.get(f"entry_legs.{index}.timing"):
+            errors.append(f"Deferred leg needs original timing evidence: entry_legs.{index}.timing")
     for field, value in numeric.items():
         if value is None:
             continue
@@ -309,8 +326,9 @@ def verify_evidence(signal: Interpretation, events: dict):
         raise AqlaError("; ".join(errors) + repair)
     if signal.kind == "new_signal":
         from aqla_agent.semantic_contract import analysis_only_entry_evidence
-        for i, value in enumerate(signal.entry_prices):
-            field = f"entry_prices.{i}"
+        entry_values = {f"entry_prices.{i}": value for i, value in enumerate(signal.entry_prices)}
+        entry_values.update({f"entry_legs.{i}.price": leg.price for i, leg in enumerate(signal.entry_legs) if leg.price is not None})
+        for field, value in entry_values.items():
             proofs = [proof for proof in signal.evidence if proof.field == field]
             if proofs and all(analysis_only_entry_evidence(texts[proof.source_id], proof.quote, value) for proof in proofs):
                 raise AqlaError("Entry evidence selects only an analysis level: " + field)
@@ -395,7 +413,11 @@ def entry_prices(signal: Interpretation, market: Market, policy: Policy, *, make
 
 def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, policy: Policy,
               revision: int, source_time: int, binding: tuple[str, str], reserved_risk=Decimal(0), stamp=None, principal=None,
-              backup: BackupValues | None = None, backup_revision=None, maker_price: Decimal | None = None) -> TradePlan:
+              backup: BackupValues | None = None, backup_revision=None, maker_price: Decimal | None = None, *, _managed=False) -> TradePlan:
+    if signal.entry == "split" or signal.entry == "range" and policy.entry_range_choice == "split":
+        from aqla_agent.managed_entries import make_entry_plan
+        return make_entry_plan(signal, market, account, policy, revision, source_time, binding,
+                               reserved_risk, stamp, principal, backup, backup_revision, maker_price)
     stamp = now_ms() if stamp is None else stamp
     with localcontext() as context:
         context.prec = 50
@@ -429,7 +451,9 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
                 raise AqlaError("Entry missing and Backup market entry is not configured")
         selected_entry = entry_prices(signal, market, policy, maker_price=maker_price)
         kind, entry, limit = selected_entry.kind, selected_entry.price, selected_entry.limit
-        derived_stop, derived_targets = backup_prices(entry, signal.side, market,
+        managed = _managed or policy.entry_range_choice == "split" or policy.management_mode == "waverider"
+        backup_reference = limit if managed else entry
+        derived_stop, derived_targets = backup_prices(backup_reference, signal.side, market,
             backup.fallback_stop_loss_percent if "stop_loss" in fields else None,
             selected_targets(backup.fallback_take_profit_percentages, policy) if "take_profits" in fields else (),
             stop_unit=backup.fallback_stop_loss_unit if backup else "course_percent",
@@ -460,6 +484,9 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         cost = limit * policy.cost_reserve_bps / 10000
         distance = abs(limit - stop) + cost
         position_price = max(entry, limit, market.mid if kind == "limit" else entry)
+        if managed and not long:
+            # Any valid favorable short fill is below its stop, including the second entry.
+            position_price = max(position_price, stop)
         if signal.entry_timing == "deferred":
             position_price = max(position_price, entry * (1 + policy.max_slippage_percent / 100))
         maximum = min(budget / distance, policy.max_notional_usdc / position_price,
@@ -472,12 +499,13 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
                 # Lower-only convergence: a wider ROE stop can reduce notional into
                 # another bracket. Never raise leverage or quantity to chase a tier.
                 for _ in range(len(market.leverage_tiers) + 1):
-                    tier = next((tier for tier in market.leverage_tiers if tier.notional_floor <= quantity * limit < tier.notional_cap), None)
+                    tier_price = position_price if managed and not long else limit
+                    tier = next((tier for tier in market.leverage_tiers if tier.notional_floor <= quantity * tier_price < tier.notional_cap), None)
                     if tier is None:
                         raise AqlaError("Planned notional is outside the supported leverage brackets")
                     market = market.model_copy(update={"max_leverage": min(market.max_leverage, tier.max_leverage)})
                     leverage = effective_leverage(signal, market, policy, backup)
-                    derived_stop, derived_targets = backup_prices(entry, signal.side, market,
+                    derived_stop, derived_targets = backup_prices(backup_reference, signal.side, market,
                         backup.fallback_stop_loss_percent if "stop_loss" in fields else None,
                         selected_targets(backup.fallback_take_profit_percentages, policy) if "take_profits" in fields else (),
                         stop_unit=backup.fallback_stop_loss_unit, take_profit_unit=backup.fallback_take_profit_unit,
@@ -489,20 +517,24 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
                     if not (stop < min(entry, limit) and all(t > max(entry, limit) for t in targets) if long else stop > max(entry, limit) and all(t < min(entry, limit) for t in targets)):
                         raise AqlaError("SL, entry and TPs have invalid direction/ordering after rounding")
                     distance = abs(limit - stop) + cost
+                    if managed and not long:
+                        position_price = max(position_price, stop)
                     reduced = quantity_grid(min(quantity, budget / distance,
-                                                account.available_margin * margin_leverage(leverage, market) / limit), market)
+                                                policy.max_notional_usdc / position_price,
+                                                account.available_margin * margin_leverage(leverage, market) / (position_price if managed and not long else limit)), market)
                     if reduced == quantity:
                         break
                     quantity = reduced
                 else:
                     raise AqlaError("Backup ROE leverage brackets did not converge")
             else:
-                tier = next((tier for tier in market.leverage_tiers if tier.notional_floor <= quantity * limit < tier.notional_cap), None)
+                tier_price = position_price if managed and not long else limit
+                tier = next((tier for tier in market.leverage_tiers if tier.notional_floor <= quantity * tier_price < tier.notional_cap), None)
                 if tier is None:
                     raise AqlaError("Planned notional is outside the supported leverage brackets")
                 market = market.model_copy(update={"max_leverage": min(market.max_leverage, tier.max_leverage)})
                 leverage = effective_leverage(signal, market, policy, backup)
-                quantity = quantity_grid(min(quantity, account.available_margin * margin_leverage(leverage, market) / limit), market)
+                quantity = quantity_grid(min(quantity, account.available_margin * margin_leverage(leverage, market) / tier_price), market)
         if quantity <= 0 or quantity < market.min_quantity or quantity * limit < market.min_notional:
             raise AqlaError("Insufficient risk/margin budget or exchange minimum notional")
         if source_tp is not None and signal.take_profit_unit == "roe_percent":

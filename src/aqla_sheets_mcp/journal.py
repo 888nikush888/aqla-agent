@@ -140,8 +140,8 @@ def _financial_record(data, table, identity, cache):
             owners = {}
             for trade_id, trade in data["trades"].items():
                 if table == "Orders":
-                    for cloid in [trade["entry_cloid"], *(row["cloid"] for row in trade["orders"]),
-                                  *(row["cloid"] for row in trade.get("exit_orders", []))]:
+                    from aqla_agent.managed_entries import all_order_rows
+                    for cloid in [row["cloid"] for row in all_order_rows(trade)]:
                         owners[cloid] = trade_id
                 else:
                     from aqla_agent.manual_accounting import verified_manual_accounting
@@ -188,8 +188,8 @@ def _trade_records(data, identity, trade, aliases, actions, tables=("Trades", "O
             net = None
         yield record("Trades", identity, aliases.get(trade["chat_id"], trade["chat_id"]), plan["market"]["symbol"], plan["side"], trade["status"], timestamp(plan["created_at"]), number(plan["entry_price"]), number(entry), number(plan["quantity"]), number(trade["filled_quantity"]), number(trade["remaining_quantity"]), number(trade["stop_price"]), text(trade.get("targets", plan["take_profits"])), number(plan["risk_usdc"]), number(trade["reserved_risk"]), number(gross), number(fees), number(net), text(plan["source_refs"]))
     if "Orders" in tables:
-        entry_order = {"kind": "entry", "cloid": trade["entry_cloid"], "quantity": plan["quantity"], "price": plan["entry_limit"]}
-        for order in [entry_order, *trade["orders"], *trade.get("exit_orders", [])]:
+        from aqla_agent.managed_entries import all_order_rows
+        for order in all_order_rows(trade):
             action = actions.get(order["cloid"], {})
             observed = trade.get("order_observations", {}).get(order["cloid"], {})
             yield record("Orders", order["cloid"], identity, order["kind"], order.get("index"), number(order.get("quantity", action.get("s"))), number(order.get("price", action.get("p"))), order.get("retired", False), observed.get("status", ""), str(observed["oid"]) if observed.get("oid") is not None else "", timestamp(observed.get("changed_at")))

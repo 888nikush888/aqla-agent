@@ -1,0 +1,142 @@
+# Zwei Entries, Börsenauswahl und Waverider
+
+`entry_range_choice=split` teilt eine belegte Zone in zwei Limits an ihren
+Grenzen. Ohne andere belegte Positionsgewichtung erhält jedes die halbe
+Gesamtmenge. Zwei getrennt genannte ursprüngliche Orders verwenden
+`entry=split` und genau zwei `entry_legs`; sie sind keine Range. Die einzelnen
+Orderformen, Preise, ausdrücklichen Gewichte und Verzögerungen brauchen
+zugeordnete Originalbelege. Mehrere unabhängige Setups, ein dritter Einstieg
+oder ein unvollständiger Zusatzentry bleiben gesperrt.
+
+Ein Setup reserviert gemeinsam Risiko, Margin und einen Kontomarkt. Der Plan
+prüft beide Entries und ihre TP-Mengen gegen native Mindestgrößen. Er erhöht
+keine Menge, um ein Minimum zu erreichen, und lässt keinen Entry verschwinden.
+Die Ausführung aktiviert den nächsten Entry erst nach geklärter Ausführung
+und bestätigtem Schutz der vorhandenen eigenen Position. Ein Teilfill beendet
+den Rest dieses Legs. Die übrigen ursprünglich geplanten Entries behalten
+ihre eigenen Identitäten.
+
+Bestehende gespeicherte Pläne behalten ihren bisherigen Ablauf. Neue Profile
+verwenden `split`; bestehende Profile behalten ihren ausdrücklich gespeicherten
+Wert, bis der Betreiber ihn ändert. Ein Quellen-Edit setzt weder Frist noch
+Versuchszähler zurück und eröffnet keinen weiteren Trade.
+
+## Preis und Börse
+
+Limitpreise sind bindend. Bessere Fills bleiben zulässig, wenn Stop, Ziele und
+Risiko passen. Ausdrücklich verzögerte Entries behalten ihre Auslösebedingung.
+Ein bereits erreichter absoluter erster TP oder eine Stop-Invalidierung
+verhindert einen späten Einstieg. Vor dem ersten tatsächlichen Fill ist eine
+provisorische ROE-Zielberechnung kein Nachweis eines erreichten TP.
+
+Der Router vergleicht konfigurierte, freigegebene Alternativen desselben
+Netzwerks anhand der innerhalb des Limits ausführbaren ersten Entry-Menge.
+Danach entscheiden Preisvorteil und konfigurierte Reihenfolge. Best Bid/Ask
+ohne Mengen belegt keine beliebig große Liquidität. Fehlende Daten und nicht
+ausgewählte Vergleichspläne verleihen keine Ausführungsfreigabe.
+
+Ein bereits wartendes Setup darf einmal wechseln. Dafür müssen alle alten
+Entries und Schutzkinder nachweislich beendet sein, sämtliche Operationen
+geklärt und Position sowie Entry-Fills null sein. Ein Checkpoint hält die
+Übergabe auch über Neustarts fest. Neue Menge und Frist überschreiten die
+ursprünglichen Grenzen nicht; das Zielkonto prüft seine eigenen Limits.
+Ein Fill während des Stornos beendet den Wechsel. Nach einem Fill findet
+keine Übertragung auf eine andere Börse statt.
+
+Native Buchereignisse wecken gezielte Verwaltung im vorhandenen Backend.
+Sie sind keine Autorisierung: Vor neuem Versand werden Konto, Quelle,
+Schutz, Budgets und frische Preise erneut geprüft. Buchbeobachtungen enthalten
+keine erfundene Mark-/Stopreferenz; finanzielle Guards lesen diese gesondert.
+Die bestehende Zwei-Sekunden-Grenze bleibt erhalten.
+
+## Profiloption Waverider
+
+Die Profilparameter sind:
+
+| Feld | Bedeutung | Vorgabe |
+| --- | --- | --- |
+| `management_mode` | `standard` oder `waverider` | `standard` |
+| `waverider_flex_percent` | Flex-Anteil je tatsächlich ursprünglichem Fill | `50` |
+| `waverider_until_tp` | TP-Nummer 1–20 oder `last`; höchstens vorhandenes letztes TP | `1` |
+
+Kern und Flex werden bereits nach dem ersten Fill getrennt geführt. Long
+wird ausschließlich reduziert und günstiger zurückgekauft, Short reduziert
+und teurer wieder aufgebaut. Der Preisvorteil muss nach Gebühren und
+Ausführungskosten bestehen. Ohne geeigneten Rücklauf bleibt der verkaufte
+Teil außerhalb des Marktes. Es entstehen keine Gegenpositionen.
+
+Die deterministischen Startregeln verwenden geschlossene Minutenkerzen,
+ATR(14), die tatsächliche Kontogebühr und ausführbare Buchtiefe. Eine günstige
+Bewegung muss mindestens ein ATR beziehungsweise das Doppelte konservativer
+Zykluskosten erreichen. Die Umkehr benötigt mindestens ein halbes ATR oder
+zwei Ticks und drei unterschiedliche Beobachtungen über mindestens zwei
+Sekunden. Die Regeln benötigen keine zusätzlichen Modellaufrufe.
+
+Ein Setup erhält ein durchgehendes Verlustbudget. Verluste, Gebühren und
+belastendes Funding werden berücksichtigt; Gewinne erhöhen das Budget nicht.
+Rückkäufe bleiben auf belegte vorherige Flex-Verkäufe, verbleibende Rechte,
+ursprüngliche Mengenobergrenze und die aktuellen Kontolimits begrenzt.
+Reguläre Exits reduzieren die Rückkaufrechte. Der wirksame Stop wird niemals
+gelockert. Quelle und Betreiber behalten Vorrang vor optionalen Wellen.
+
+Optionale Gewinnmitnahmen klären die betroffenen normalen TP-Orders vor der
+Reduktion und stellen passende Ziele für die tatsächlich verbleibende Menge
+wieder her. Der Stop bleibt bestehen. Ein unbekannter Versand wird anhand
+seiner ursprünglichen Identität abgeglichen; er erzeugt keine Ersatzorder.
+Auch ein Maker-Wellenauftrag darf keine unbegrenzt wartende Restmenge halten.
+
+Am gewählten TP, bei der ursprünglichen Signalfrist, Stop beziehungsweise
+einer übergeordneten Schließung enden neue Wellen. Es gibt keinen erzwungenen
+Wiederaufbau. Bestehende Positionen behalten ihre normale Absicherung.
+
+## Shadow und Qualitätsfreigabe
+
+Die Profilwahl allein gibt keine echten Wellenorders frei. Ohne passende
+Qualifikation zeigt Waverider **Shadow** beziehungsweise einen konkreten
+fehlenden Beleg. Fehlende Kontogebühren, Kerzen oder Tiefe pausieren Wellen;
+normale Position und Schutz werden weiter verwaltet. Ein nicht unterstützter
+Adapter darf fehlende Gebühren niemals als null behandeln.
+
+Die Beobachtungen liegen separat in `waverider-replay.sqlite3` neben dem
+Finanzzustand. Die Datei enthält private Setup-Metadaten und gehört nicht
+ins öffentliche Repository. Markt-Ticks werden nicht in die finanzielle
+JSON-Struktur kopiert. Nur relevante Zustandswechsel und Checkpoints werden
+im Trade gespeichert. Die private Beobachtungsdatei ist auf 512 MiB begrenzt.
+
+Der wiederverwendbare Offline-Lauf ist:
+
+```text
+aqla-evaluate-waverider --dataset PRIVATE.json --output PRIVATE-report.json
+aqla-evaluate-waverider --from-replay waverider-replay.sqlite3 --output PRIVATE-report.json
+```
+
+Er konstruiert keinen Börsentransport. Er vergleicht dieselben zeitlich
+geordneten, belegten Preis-/Tiefensnapshots mit Standardverwaltung und
+Waverider. Kosten, mindestens eine Sekunde Ausführungslatenz und ein Abschlag
+auf sichtbare Tiefe werden berücksichtigt. Kerzen allein qualifizieren
+keine Ausführung. Geldwerte verschiedener Börsen/Netze/Währungen werden
+getrennt verglichen und nicht stillschweigend addiert.
+
+Die Live-Schranke benötigt mindestens 30 getrennte Holdout-Setups und zehn
+abgeschlossene Wellen, keine kritischen Fehler sowie mindestens gleichwertiges
+Nettoergebnis und keinen höheren Drawdown. Entwicklungs- und Holdout-Familien
+dürfen sich nicht überschneiden. Synthetische Daten können diese Freigabe
+nicht erzeugen. Eine qualifizierte Datei benötigt außerdem eine Signatur,
+den Software-Hash, die passenden Profilparameter und eine geprüfte Börse.
+Software- oder Parameteränderungen heben die passende Freigabe damit auf.
+
+## Journal und Betrieb
+
+Ursprüngliche Entry-Fills bestimmen weiterhin die Quellen-ROE-Basis und die
+ursprüngliche Initialmargin. Wiederholte Rückkäufe sind Umsatz, keine neue
+Initialmargin. Das Journal hält alle eigenen Orders, Fills, Gebühren und
+Funding-Vorgänge zusammen in einem Setup. Replaced Orders und beendete
+Börsenversuche bleiben nachvollziehbar; Quellenbewertung zählt die Familie
+einmal. Waverider verwendet das ursprüngliche freigegebene Risikobudget als
+feste R-Basis.
+
+Tests und Qualifikation verwenden isolierten Zustand und Fake-Börsen.
+Bestehende Finanzdaten werden nicht zurückgesetzt. Ein Rückfall deaktiviert
+neue Entries und Wellen, behält aber Schutz und Verwaltung vorhandener
+Positionen. Alte Software darf keine aktiven Datensätze dieser neuen
+Lifecycle-Version übernehmen.
