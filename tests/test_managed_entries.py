@@ -165,6 +165,52 @@ async def test_adaptive_split_protects_the_first_fill_before_sending_second_entr
 
 
 @pytest.mark.asyncio
+async def test_managed_guards_refresh_complete_accounts_at_each_prepare_boundary(setup, monkeypatch):
+    _, state, _, _, trading = setup
+    state.update(lambda data: data["policy"].update(entry_range_choice="split"))
+    original = trading.live_entry_guard
+    reads = {}
+    async def guard(plan, **kwargs):
+        reads.setdefault(kwargs["dispatch_operation"], []).append(kwargs.get("account"))
+        return await original(plan, **kwargs)
+    monkeypatch.setattr(trading, "live_entry_guard", guard)
+    source, value = source_zone(trading)
+    plan = await trading.preview(source.event_id, value)
+    trade = await trading.execute(plan["plan_id"])
+    for prefix in ("leverage:", "entry:"):
+        values = reads[prefix + trade["trade_id"]]
+        assert len(values) == 4
+        assert values[0] is None and values[2] is None
+        assert values[1] is not None and values[3] is not None
+
+
+@pytest.mark.asyncio
+async def test_managed_guard_does_not_reuse_budget_after_preparation(setup, monkeypatch):
+    _, state, fake, exchange, trading = setup
+    state.update(lambda data: data["policy"].update(entry_range_choice="split"))
+    original = trading.live_entry_guard
+    reads = 0
+    async def guard(plan, **kwargs):
+        nonlocal reads
+        if kwargs.get("dispatch_operation", "").startswith("entry:"):
+            reads += 1
+            if reads == 3:
+                assert kwargs.get("account") is None
+                original_snapshot = exchange.account_snapshot
+                async def insufficient(market):
+                    account = await original_snapshot(market)
+                    return account.model_copy(update={"equity": Decimal("1"), "available_margin": Decimal("1")})
+                monkeypatch.setattr(exchange, "account_snapshot", insufficient)
+        return await original(plan, **kwargs)
+    monkeypatch.setattr(trading, "live_entry_guard", guard)
+    source, value = source_zone(trading)
+    plan = await trading.preview(source.event_id, value)
+    trade = await trading.execute(plan["plan_id"])
+    assert reads == 3 and not fake.orders
+    assert state.snapshot()["operations"]["entry:" + trade["trade_id"]]["outcome"] == "not_sent"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("guard_read", [1, 2, 3, 4])
 async def test_entry_guard_retry_stages_only_with_a_durable_request(setup, monkeypatch, guard_read):
     from aqla_agent.observations import TemporaryObservation
