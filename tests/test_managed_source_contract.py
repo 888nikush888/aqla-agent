@@ -32,6 +32,21 @@ def test_two_complete_legs_pass_the_same_production_checker(setup):
     assert "split" in brief["contract"]["entry"]["criteria"]
 
 
+def test_weight_repair_identifies_the_missing_context_without_changing_values(setup):
+    trading = setup[-1]
+    source, value = pair(trading, first=25, second=75)
+    for index, weight in enumerate((25, 75)):
+        value.entry_legs[index].weight_percent = Decimal(weight)
+        value.evidence.append(Evidence(field=f"entry_legs.{index}.weight_percent", source_id=source.source_id, quote=f"{weight}%"))
+    assert check_interpretation(trading.context(source.event_id), value)["valid"]
+    value.evidence = [proof.model_copy(update={"quote": proof.quote.split(" (")[0]})
+                      if proof.field.endswith(".kind") else proof for proof in value.evidence]
+    rejected = check_interpretation(trading.context(source.event_id), value)
+    failure = next(row for row in rejected["errors"] if row["code"] == "split_entry_weights_missing_or_changed")
+    assert "entry_legs.i.kind" in failure["repair"] and "INCLUDING its price AND allocation" in failure["repair"]
+    assert [row["weight_percent"] for row in rejected["interpretation"]["entry_legs"]] == ["25", "75"]
+
+
 @pytest.mark.parametrize("change,code", [("drop", "entry_legs_not_representable"), ("third", "entry_legs_not_representable"), ("weights", "split_entry_weights_missing_or_changed")])
 def test_source_legs_or_weights_cannot_be_silently_dropped(setup, change, code):
     trading = setup[-1]

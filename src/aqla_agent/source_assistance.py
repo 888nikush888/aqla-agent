@@ -17,7 +17,7 @@ from .decisions import (
     verification_questions,
 )
 
-VERSION = "source-assistance-v4"
+VERSION = "source-assistance-v5"
 CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_action",
                    "source_exchange", "single_entry_form", "single_management_action")
 CONTEXT_CANDIDATE_LIMIT = 64
@@ -34,7 +34,7 @@ REPAIR_GUIDANCE = {
     "source_percentage_target_interval_not_representable": "The original specifies a binding profit/TP interval, not an ordered list of exits. Recheck ambiguous; do not select an endpoint, invent several targets or erase the explicit target to use backup values. This is an interval problem, not missing percentage basis.",
     "entry_legs_not_representable": "Re-read contract.single_entry_form: one setup can now have TWO separate original entries. Use entry=split, entry_legs with both kind/price/weight_percent/timing and indexed original evidence. Never flatten separate orders into range or drop a leg. More than two entries or independent setups remain ambiguous.",
     "split_entry_evidence_needs_role_review": "Each entry_legs.i.kind needs its own distinct original entry clause, including its price when present. A current-price purchase without a named MARKET form stays unspecified, never invent market. Quote each price/position weight separately. Never use the whole message for both form proofs or borrow another leg's prices.",
-    "split_entry_weights_missing_or_changed": "Preserve both stated position weights, total 100, with exact indexed weight_percent evidence. Only an unstated allocation defaults to 50/50. Deposit, leverage and target percentages are not entry weights. Do not invent a decimal convention for an unclear fraction.",
+    "split_entry_weights_missing_or_changed": "Copy the COMPLETE original entry clause into EACH entry_legs.i.kind proof, INCLUDING its price AND allocation (for example: Entry 1 LIMIT 100: 25% position). A form/price quote ending before the allocation cannot associate that weight with this leg. Also keep separate exact entry_legs.i.weight_percent evidence (for example: 25%). Preserve both weights, total 100; only an unstated allocation defaults to 50/50. Deposit, leverage and TP percentages are not entry weights. Never invent a decimal convention for an unclear fraction.",
     "source_percentage_targets_missing_or_changed": "The original explicitly lists percent-only TP targets. Under source-roe-v1 these are nominal ROE targets, not position allocations. Preserve every listed target in order with take_profit_unit=roe_percent and exact percent quotes. A separate deposit/margin percent is not a TP. Do not silently substitute backup targets.",
     "live_anchor_missing": "Use anchor_source_id in source_refs, not event_id/chat_id/message_id. Evidence.source_id uses the same original source IDs. Do not remove a correctly named symbol while correcting references.",
     "update_identity_missing": "An unbound update needs both its symbol FIELD and literal symbol evidence from this anchor or its actual reply chain. Unlinked neighbours and matching prices cannot identify the market. Without original identity or Python's own binding, classify incomplete; never retain a guessed symbol after removing its proof.",
@@ -126,7 +126,7 @@ def source_assistance(context):
                         "Only Python's anchor_setup_bound proves an accepted own setup; publication/edited_at never does. "
                         "Missing source SL/TP/leverage stays null/[]; trade_preview applies configured Backup or rejects execution. "
                         "Explicit TP percentages use roe_percent; do not demand absolute prices or a new operator stop rule. "
-                        "TWO original entries of ONE setup use entry=split and both entry_legs with separate form/price evidence; more than two or independent setups remain ambiguous. "
+                        "TWO original entries of ONE setup use entry=split: each kind proof quotes its FULL original entry clause INCLUDING price and any stated allocation; price and weight also get their own indexed proofs. More than two or independent setups remain ambiguous. "
                         "Check the complete anchor, including new management instructions in reports. "
                         "Non-actionable results need only kind, source_refs, classification evidence and reason; "
                         "reason_codes are optional (use only declared values or omit them); "
