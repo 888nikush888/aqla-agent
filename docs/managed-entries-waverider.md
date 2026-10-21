@@ -117,6 +117,48 @@ auf sichtbare Tiefe werden berücksichtigt. Kerzen allein qualifizieren
 keine Ausführung. Geldwerte verschiedener Börsen/Netze/Währungen werden
 getrennt verglichen und nicht stillschweigend addiert.
 
+### Gebühren, Funding und ein aktuelles Split-Profil im Replay
+
+Ein privater Datensatz kann `target_parameters` mit den aktuellen vollständigen
+Profilparametern enthalten. Dann wird jeder Fall aus seiner ursprünglichen
+`interpretation` mit dem Produktionsplaner neu berechnet. Das Replay verwendet
+das unveränderte ursprüngliche Risiko- und Mengenbudget und verlängert keine
+Frist. Die daraus abgeleitete Budgetgrenze ist kein historischer Kontostand.
+Beide Vergleichswege verwenden denselben neu berechneten Plan; die tatsächlichen
+Fills eines alten Ein-Entry-Plans werden nicht als hypothetische Split-Fills
+übernommen. Eine Ablehnung durch den Produktionsplaner bleibt sichtbar und
+wird nicht als Performance-Fall mit null Gewinn ausgegeben.
+
+Native Daten brauchen eine durchgehende Beobachtungsreihe bis zur ursprünglichen
+Frist, weiterhin mit höchstens zwei Sekunden alten Preisbelegen. Eine
+`fee_schedule` bindet Taker-Raten an Börse, Netz, Konto, Markt, Quote-Währung und
+ihren belegten Gültigkeitszeitraum. Aktuelle Kontosnapshots dürfen nicht in die
+Vergangenheit datiert werden; Maker-Fillgebühren ersetzen keine Taker-Raten.
+Der Beobachtungsexport erhält Gebührenbelege und ihre Zeitgrenzen. Die native
+Hyperliquid-Kontogebühr berücksichtigt den aktiven Referral-Rabatt einmal.
+
+`funding` enthält tatsächliche native Abrechnungen mit `time`, `rate`,
+`reference_price`, `reference_kind`, `market`, `exchange`, `network`, `currency`
+und `settled=true`. Für Hyperliquid ist die Preisbasis `oracle`, für Aster
+`mark`. `funding_coverage` dokumentiert Start, Ende, die Herkunft
+`native_settled_funding_history` und die Prüfsumme des Originalbelegs. Die
+stündlichen Hyperliquid-Abrechnungen müssen vollständig sein. Nur eine Rate
+ohne belegten Abrechnungspreis ist noch kein vollständiger Funding-Beleg.
+
+Abrechnungen und ursprüngliche Fills werden zeitlich zusammengeführt. Funding
+gilt für die dann gehaltene Menge; eine unbewiesene Reihenfolge gleichzeitiger
+Originalfills und Funding sperrt den Vergleich. Zahlungen gehen in das
+Nettoergebnis ein. Belastendes Funding verbraucht zusätzlich das durchgehende
+Verlustbudget; spätere Gutschriften füllen es nicht wieder auf.
+
+Der Bericht unterscheidet `cases_requested`, vollständig ausgewertete `cases`,
+fehlende Belege (`data_errors`), reguläre Planablehnungen
+(`admission_rejections`) und kritische Fehler. Fehlende Setups bleiben im
+Bericht sichtbar. Eine Freigabe benötigt alle angeforderten Fälle und das
+Kostenmodell `fees-funding-profile-v2`; das Live-Gate prüft außerdem den
+passenden Börsen-, Netzwerk- und Währungsbereich. Daten einer anderen Umgebung
+oder ein nur umbenanntes altes Profil verleihen keine Live-Berechtigung.
+
 Die Live-Schranke benötigt mindestens 30 getrennte Holdout-Setups und zehn
 abgeschlossene Wellen, keine kritischen Fehler sowie mindestens gleichwertiges
 Nettoergebnis und keinen höheren Drawdown. Entwicklungs- und Holdout-Familien

@@ -6,15 +6,152 @@ import hashlib
 import hmac
 import json
 import sqlite3
+from bisect import bisect_right
 from decimal import Decimal
 from pathlib import Path
 
-from aqla_hyperliquid_mcp.models import AqlaError, TradePlan, digest
-from aqla_hyperliquid_mcp.rules import backup_prices, quantity_grid, slippage_price
+from aqla_hyperliquid_mcp.models import AccountSnapshot, AqlaError, Interpretation, TradePlan, digest
+from aqla_hyperliquid_mcp.rules import backup_prices, make_plan, quantity_grid, slippage_price
 
 from .entry import PriceSnapshot, gate_state, validate_entry_prices
-from .managed_entries import leg_view, target_allocations
-from .waverider import VERSION, advance, profile_hash, reset_phase, software_hash
+from .managed_entries import cap_quantity, leg_view, target_allocations
+from .observations import TemporaryObservation
+from .waverider import COST_MODEL, VERSION, advance, profile_hash, reset_phase, software_hash
+
+
+class ReplayEvidenceError(AqlaError):
+    """Missing evidence is an incomplete measurement, never a trading loss or a pass."""
+
+
+class ReplayAdmissionRejected(AqlaError):
+    """A valid production admission refusal does not become a zero-PnL performance case."""
+
+
+def replan_case(case, parameters):
+    """Compare the current profile inside the original approved budget, without an account read."""
+    from .pipelines import AccountLimits, Parameters
+    original = TradePlan.model_validate(case["plan"])
+    if "interpretation" not in case:
+        raise ReplayEvidenceError("Current-profile replay needs the original evidenced interpretation")
+    signal = Interpretation.model_validate(case["interpretation"])
+    if set(signal.source_refs) != set(original.source_refs):
+        raise ReplayEvidenceError("Replanning source references differ from the original plan")
+    profile = Parameters.model_validate(parameters)
+    policy = profile.policy(AccountLimits(max_open_trades=original.policy.max_open_trades,
+                                         max_total_risk_percent=original.policy.max_total_risk_percent))
+    policy.risk_percent = min(policy.risk_percent, original.policy.risk_percent)
+    policy.max_notional_usdc = min(policy.max_notional_usdc, original.policy.max_notional_usdc)
+    policy.max_signal_age_seconds = min(policy.max_signal_age_seconds, original.policy.max_signal_age_seconds)
+    # A budget witness is derived from the immutable plan, not a claimed historical balance.
+    account = AccountSnapshot(equity=original.risk_usdc * 100 / policy.risk_percent,
+                              available_margin=original.quantity * max(original.entry_limit, original.stop_loss)
+                              / (original.effective_leverage or 1), observed_at=original.created_at)
+    source_time = original.deadline_at - original.policy.max_signal_age_seconds * 1000
+    try:
+        plan = make_plan(signal, original.market, account, policy, original.policy_revision, source_time,
+                         (original.network, original.account), stamp=original.created_at, principal=original.principal,
+                         backup=original.backup_values, backup_revision=original.backup_profile_revision)
+        plan = cap_quantity(plan, original.quantity)
+        if plan.risk_usdc > original.risk_usdc:
+            plan = cap_quantity(plan, plan.quantity * original.risk_usdc / plan.risk_usdc)
+    except AqlaError as error:
+        raise ReplayAdmissionRejected(str(error)) from error
+    if plan.risk_usdc > original.risk_usdc or plan.quantity > original.quantity or plan.deadline_at > original.deadline_at:
+        raise AqlaError("Replanning exceeded the original risk, quantity or deadline")
+    plan.exchange = original.exchange
+    plan.base_parameters = profile.model_dump(mode="json")
+    plan.plan_id = digest({key: value for key, value in plan.model_dump().items() if key != "plan_id"})
+    return {**case, "plan": plan.model_dump(mode="json"), "original_entry_events": [], "initial_fills": [],
+            "replanning": {"original_plan_hash": digest(case["plan"]), "budget": "original_approved_plan",
+                           "entry_path": "counterfactual", "profile_hash": profile_hash(plan.policy, plan.base_parameters)}}
+
+
+def funding_schedule(case, plan):
+    rows = case.get("funding", [])
+    previous = -1
+    expected_kind = {"hyperliquid": "oracle", "aster": "mark"}.get(plan.exchange)
+    for row in rows:
+        stamp, rate, price = int(row["time"]), Decimal(row["rate"]), Decimal(row["reference_price"])
+        if (stamp <= previous or not rate.is_finite() or not price.is_finite() or price <= 0
+                or row["reference_kind"] != expected_kind or row["market"] != plan.market.symbol
+                or row["network"] != plan.network or row["exchange"] != plan.exchange
+                or row["currency"] != plan.market.quote_token or row.get("settled") is not True):
+            raise ReplayEvidenceError("Funding needs ordered native settlements with the venue's correct price basis")
+        previous = stamp
+    return rows
+
+
+def validate_native_evidence(case, plan):
+    """Native provenance alone cannot certify costs, continuity or the active profile."""
+    records = case["observations"]
+    if len(records) < 5:
+        raise ReplayEvidenceError("Native replay has too few executable observations")
+    stamps = [row["quote"]["observed_at"] for row in records]
+    if (abs(stamps[0] - plan.created_at) > 2000 or abs(stamps[-1] - plan.deadline_at) > 2000
+            or any(not 0 < right - left <= 2000 for left, right in zip(stamps, stamps[1:], strict=False))):
+        raise ReplayEvidenceError("Native observations do not continuously cover the original setup window")
+    for record in records:
+        try:
+            quote = PriceSnapshot.model_validate(record["quote"])
+            quote.fresh(as_of=quote.observed_at)
+            if quote.stop_reference_kind != ("contract" if plan.exchange == "aster" else "mark"):
+                raise ReplayEvidenceError("The native stop reference uses another venue's price kind")
+        except TemporaryObservation as error:
+            raise ReplayEvidenceError("Native book or stop reference exceeds the unchanged two-second freshness limit") from error
+    for event in case.get("original_entry_events", case.get("initial_fills", [])):
+        if (event.get("fee") is None or event.get("feeToken") != plan.market.quote_token
+                or not Decimal(event["fee"]).is_finite() or not stamps[0] <= event["time"] <= stamps[-1]):
+            raise ReplayEvidenceError("Original entries need actual fees in the native quote currency and covered time window")
+    schedules = case.get("fee_schedule", [])
+    if not schedules:
+        raise ReplayEvidenceError("Historical account taker fee schedule is missing")
+    previous_end = None
+    for row in schedules:
+        if (row["exchange"] != plan.exchange or row["network"] != plan.network or row["account"] != plan.account
+                or row["market"] != plan.market.symbol or row["currency"] != plan.market.quote_token
+                or row["liquidity"] != "taker" or not row.get("evidence_hash")
+                or row["valid_until"] <= row["valid_from"]
+                or previous_end is not None and row["valid_from"] != previous_end):
+            raise ReplayEvidenceError("Historical taker fee evidence has a gap, overlap or another account/market")
+        if row["source"] == "native_account_snapshot":
+            if row["valid_from"] < row["observed_at"] or row["valid_until"] - row["observed_at"] > 60000:
+                raise ReplayEvidenceError("A current fee snapshot cannot be backdated into historical fee evidence")
+        elif row["source"] != "native_account_fee_history":
+            raise ReplayEvidenceError("Unverified or maker-only rates cannot certify account taker fees")
+        rate = Decimal(row["rate"])
+        if not rate.is_finite() or not 0 <= rate <= Decimal(".1"):
+            raise ReplayEvidenceError("Historical taker fee rate is invalid")
+        previous_end = row["valid_until"]
+    starts = [row["valid_from"] for row in schedules]
+    for record, stamp in zip(records, stamps, strict=True):
+        index = bisect_right(starts, stamp) - 1
+        if index < 0 or stamp >= schedules[index]["valid_until"] or Decimal(record["fee_rate"]) != Decimal(schedules[index]["rate"]):
+            raise ReplayEvidenceError("An executable observation has no matching historical taker fee")
+    coverage = case.get("funding_coverage", {})
+    if (coverage.get("start", stamps[0] + 1) > stamps[0] or coverage.get("end", stamps[-1] - 1) < stamps[-1]
+            or coverage.get("source") != "native_settled_funding_history" or not coverage.get("evidence_hash")):
+        raise ReplayEvidenceError("Settled funding coverage is not proved for the complete replay window")
+    rows = funding_schedule(case, plan)
+    if plan.exchange == "hyperliquid":
+        # Native settlement timestamps can be a few milliseconds after the hour.
+        expected = set(range((stamps[0] // 3600000 + 1), stamps[-1] // 3600000 + 1))
+        actual = [row["time"] // 3600000 for row in rows if stamps[0] < row["time"] <= stamps[-1]]
+        if len(set(actual)) != len(actual) or set(actual) != expected:
+            raise ReplayEvidenceError("Hourly native funding settlements are missing or duplicated")
+    if plan.base_parameters is None:
+        raise ReplayEvidenceError("Replay has no explicit base profile binding")
+    from .pipelines import Parameters
+    base = Parameters.model_validate(plan.base_parameters)
+    effective = Parameters.from_policy(plan.policy)
+    for field in Parameters.model_fields:
+        if field == "management_mode":
+            continue
+        if field in ("risk_percent", "max_notional_quote") and getattr(effective, field) <= getattr(base, field):
+            continue
+        if getattr(effective, field) != getattr(base, field):
+            raise ReplayEvidenceError("Saved plan differs from its claimed base profile: " + field)
+    if plan.entry_execution == "maker_only" or plan.take_profit_execution == "maker_only":
+        raise ReplayEvidenceError("Maker execution needs native queue-position evidence; IOC depth is insufficient")
 
 
 def simulate(case, *, wave):
@@ -32,6 +169,8 @@ def simulate(case, *, wave):
     curve = []
     original_events = sorted(case.get("original_entry_events", case.get("initial_fills", [])), key=lambda row: (row["time"], str(row.get("tid", ""))))
     original_cursor = 0
+    settlements = funding_schedule(case, plan)
+    funding_cursor, funding, funding_spent = 0, Decimal(0), Decimal(0)
     target_prices = list(plan.take_profits)
     target_budgets, target_spent = None, [Decimal(0)] * len(target_prices)
     stop = plan.stop_loss
@@ -61,29 +200,41 @@ def simulate(case, *, wave):
             raise AqlaError("Candles or best quotes alone cannot qualify Waverider")
         own = core + flex
         grew = False
-        if original_events:
-            while original_cursor < len(original_events) and original_events[original_cursor]["time"] <= stamp:
-                event = original_events[original_cursor]
-                original_cursor += 1
-                if event.get("kind") != "entry" or event.get("entry_role", "original") != "original":
-                    raise AqlaError("Only proved original entries may seed both comparison paths")
-                amount, price = Decimal(event["sz"]), Decimal(event["px"])
-                if amount <= 0 or price <= 0:
-                    raise AqlaError("Original entry evidence has invalid size/price")
-                if event.get("fee") is not None and event.get("feeToken") not in (None, plan.market.quote_token):
-                    raise AqlaError("Original entry fee currency differs from the comparison currency")
-                part = amount * plan.policy.waverider_flex_percent / 100 if wave else Decimal(0)
-                venue_average = (venue_average * (core + flex) + amount * price) / (core + flex + amount)
-                core, flex = core + amount - part, flex + part
-                core_cost, flex_cost = core_cost + (amount - part) * price, flex_cost + part * price
-                cash -= amount * price * sign
-                paid = Decimal(event["fee"]) if event.get("fee") is not None else amount * price * rate
-                fees += paid
-                risk_fees += max(Decimal(0), paid)
-                source_index = event.get("entry_leg", 0)
-                entered.update(index for index, leg in enumerate(entries) if (leg.index if plan.entry_legs else 0) == source_index)
-                state["last_original_fill"] = event["time"]
-                original_quantity, original_cost, grew = original_quantity + amount, original_cost + amount * price, True
+        while (original_cursor < len(original_events) and original_events[original_cursor]["time"] <= stamp
+               or funding_cursor < len(settlements) and settlements[funding_cursor]["time"] <= stamp):
+            entry_time = original_events[original_cursor]["time"] if original_cursor < len(original_events) else float("inf")
+            funding_time = settlements[funding_cursor]["time"] if funding_cursor < len(settlements) else float("inf")
+            if entry_time == funding_time:
+                raise ReplayEvidenceError("Entry/funding ordering at the same timestamp is not proved")
+            if funding_time < entry_time:
+                event = settlements[funding_cursor]
+                amount = -(core + flex) * sign * Decimal(event["reference_price"]) * Decimal(event["rate"])
+                cash += amount
+                funding += amount
+                funding_spent += max(Decimal(0), -amount)
+                funding_cursor += 1
+                continue
+            event = original_events[original_cursor]
+            original_cursor += 1
+            if event.get("kind") != "entry" or event.get("entry_role", "original") != "original":
+                raise AqlaError("Only proved original entries may seed both comparison paths")
+            amount, price = Decimal(event["sz"]), Decimal(event["px"])
+            if amount <= 0 or price <= 0:
+                raise AqlaError("Original entry evidence has invalid size/price")
+            if event.get("fee") is not None and event.get("feeToken") not in (None, plan.market.quote_token):
+                raise AqlaError("Original entry fee currency differs from the comparison currency")
+            part = amount * plan.policy.waverider_flex_percent / 100 if wave else Decimal(0)
+            venue_average = (venue_average * (core + flex) + amount * price) / (core + flex + amount)
+            core, flex = core + amount - part, flex + part
+            core_cost, flex_cost = core_cost + (amount - part) * price, flex_cost + part * price
+            cash -= amount * price * sign
+            paid = Decimal(event["fee"]) if event.get("fee") is not None else amount * price * rate
+            fees += paid
+            risk_fees += max(Decimal(0), paid)
+            source_index = event.get("entry_leg", 0)
+            entered.update(index for index, leg in enumerate(entries) if (leg.index if plan.entry_legs else 0) == source_index)
+            state["last_original_fill"] = event["time"]
+            original_quantity, original_cost, grew = original_quantity + amount, original_cost + amount * price, True
         target_end = len(plan.take_profits) if plan.policy.waverider_until_tp == "last" else min(plan.policy.waverider_until_tp, len(plan.take_profits))
         endpoint = plan.take_profits[target_end - 1]
         reached_end = quote.bid >= endpoint if sign == 1 else quote.ask <= endpoint
@@ -108,7 +259,7 @@ def simulate(case, *, wave):
                     except AqlaError:
                         continue
                     amount, price = fill(quote, buy=sign == 1, limit=limit, quantity=size, stamp=stamp)
-                    if amount < size:
+                    if amount <= 0:
                         continue
                     part = amount * plan.policy.waverider_flex_percent / 100 if wave else Decimal(0)
                     venue_average = (venue_average * (core + flex) + amount * price) / (core + flex + amount)
@@ -202,7 +353,8 @@ def simulate(case, *, wave):
                 reserved_risk = sum((leg.quantity * (abs((leg.limit if plan.entry_legs else plan.entry_limit) - stop)
                     + (leg.limit if plan.entry_legs else plan.entry_limit) * plan.policy.cost_reserve_bps / 10000)
                     for i, leg in enumerate(entries) if i not in entered and stamp < plan.deadline_at and not target_one), Decimal(0))
-                remaining_risk = plan.risk_usdc - losses - risk_fees - max(Decimal(0), (core_cost - core * stop) * sign) - max(Decimal(0), (flex_cost - flex * stop) * sign) - reserved_risk
+                open_reserve = (core_cost + flex_cost) * plan.policy.cost_reserve_bps / 10000
+                remaining_risk = plan.risk_usdc - losses - risk_fees - funding_spent - open_reserve - max(Decimal(0), (core_cost - core * stop) * sign) - max(Decimal(0), (flex_cost - flex * stop) * sign) - reserved_risk
                 maximum = quantity_grid(max(Decimal(0), remaining_risk) / (abs(limit - stop) + limit * plan.policy.cost_reserve_bps / 10000), plan.market)
                 size = min(size, maximum, plan.quantity - core - flex - reserved_quantity)
                 if size > 0 and (Decimal(state["sale_price"]) - limit) * sign > pending["cost"]:
@@ -232,31 +384,47 @@ def simulate(case, *, wave):
         if own > plan.quantity or core_cost + flex_cost > plan.policy.max_notional_usdc:
             raise AqlaError("Replay exceeded original quantity/notional constraints")
         stop_risk = max(Decimal(0), (core_cost - core * stop) * sign) + max(Decimal(0), (flex_cost - flex * stop) * sign)
-        if grew and losses + risk_fees + stop_risk > plan.risk_usdc:
+        if grew and losses + risk_fees + funding_spent + stop_risk > plan.risk_usdc:
             raise AqlaError("Replay exceeded the original lifetime loss budget")
         mark = quote.bid if sign == 1 else quote.ask
         equity = cash + own * mark * sign - fees - own * mark * rate
         peak = max(peak, equity)
         drawdown = max(drawdown, peak - equity)
         curve.append((stamp, str(equity)))
-    return {"net_pnl": str(equity), "max_drawdown": str(drawdown), "waves": cycles, "valuation": "conservative_mark_to_market", "equity": curve}
+    return {"net_pnl": str(equity), "max_drawdown": str(drawdown), "waves": cycles, "fees": str(fees),
+            "funding": str(funding), "funding_spent": str(funding_spent),
+            "original_entries_filled": sorted(entered), "original_quantity": str(original_quantity), "remaining_quantity": str(own),
+            "valuation": "conservative_mark_to_market", "equity": curve}
 
 
 def evaluate(dataset):
     families = [case["family"] for case in dataset["cases"]]
     if len(set(families)) != len(families) or set(families) & set(dataset.get("development_families", [])):
         raise AqlaError("Development/holdout families overlap or a setup is counted twice")
-    rows, errors = [], 0
+    source_refs = [ref for case in dataset["cases"] for ref in set(case["plan"]["source_refs"])]
+    if len(source_refs) != len(set(source_refs)):
+        raise AqlaError("A source is reused across supposedly independent setup families")
+    rows, failures, errors, data_errors, admission_rejections = [], [], 0, 0, 0
     profiles = set()
     for case in dataset["cases"]:
-        plan = TradePlan.model_validate(case["plan"])
-        profiles.add(profile_hash(plan.policy, plan.base_parameters))
         try:
+            if dataset.get("target_parameters") is not None:
+                case = replan_case(case, dataset["target_parameters"])
             plan = TradePlan.model_validate(case["plan"])
+            profiles.add(profile_hash(plan.policy, plan.base_parameters))
+            if dataset.get("provenance") == "recorded_native_depth":
+                validate_native_evidence(case, plan)
             rows.append({"id": digest(case["family"])[:16], "cohort": f"{plan.exchange}:{plan.network}:{plan.market.quote_token}",
                          "baseline": simulate(case, wave=False), "waverider": simulate(case, wave=True)})
-        except (AqlaError, ValueError, KeyError, ArithmeticError, TypeError):
+        except ReplayAdmissionRejected as error:
+            admission_rejections += 1
+            failures.append({"id": digest(case["family"])[:16], "kind": "admission_rejected", "reason": str(error)})
+        except ReplayEvidenceError as error:
+            data_errors += 1
+            failures.append({"id": digest(case["family"])[:16], "kind": "missing_evidence", "reason": str(error)})
+        except (AqlaError, ValueError, KeyError, ArithmeticError, TypeError) as error:
             errors += 1
+            failures.append({"id": digest(case["family"])[:16], "kind": "safety_or_invalid_input", "error_type": type(error).__name__})
     cohorts = {}
     for cohort in sorted({row["cohort"] for row in rows}):
         summary = {}
@@ -280,7 +448,9 @@ def evaluate(dataset):
         cohorts[cohort] = summary
     aggregate = next(iter(cohorts.values())) if len(cohorts) == 1 else {key: None for key in ("net_pnl", "baseline_net_pnl", "max_drawdown", "baseline_max_drawdown")}
     report = {"version": VERSION, "software_hash": software_hash(), "profile_hash": next(iter(profiles)) if len(profiles) == 1 else "mixed",
-        "cases": len(rows), "critical_errors": errors, "waves": sum(row["waverider"]["waves"] for row in rows),
+        "cost_model": COST_MODEL, "cases_requested": len(families), "cases": len(rows), "critical_errors": errors,
+        "data_errors": data_errors, "admission_rejections": admission_rejections,
+        "failures": failures, "waves": sum(row["waverider"]["waves"] for row in rows),
         **aggregate, "cohorts": cohorts, "aggregate_monetary_totals_unavailable": len(cohorts) != 1,
         "allowed_venues": sorted({cohort.split(":", 1)[0] for cohort in cohorts}),
         "data_kind": "executable_depth" if dataset.get("provenance") == "recorded_native_depth" else "synthetic",
@@ -303,11 +473,17 @@ def export_replay(path, *, maximum=30):
                 continue
             profile = current
             records = [json.loads(row[0]) for row in db.execute("SELECT payload FROM observations WHERE setup=? ORDER BY stamp", (identity,))]
-            observations = [{"quote": row["quote"], "fee_rate": row["facts"].get("fee_rate"), "atr": row["facts"].get("atr")}
+            observations = [{"quote": row["quote"], "fee_rate": row["facts"].get("fee_rate"), "atr": row["facts"].get("atr"),
+                             "facts": row["facts"]}
                             for row in records if "stop_reference" in row["quote"]]
             entries = [json.loads(row[0]) for row in db.execute("SELECT payload FROM original_fills WHERE setup=?", (identity,))]
+            fees = {row["facts"]["fee_evidence"]["valid_from"]: dict(row["facts"]["fee_evidence"])
+                    for row in records if row["facts"].get("fee_evidence")}
+            fee_schedule = [fees[key] for key in sorted(fees)]
+            for left, right in zip(fee_schedule, fee_schedule[1:], strict=False):
+                left["valid_until"] = min(left["valid_until"], right["valid_from"])
             cases.append({"id": identity, "family": meta["family"], "plan": meta["plan"], "latency_ms": 1000,
-                          "original_entry_events": entries, "observations": observations})
+                          "original_entry_events": entries, "observations": observations, "fee_schedule": fee_schedule})
             families.add(meta["family"])
             if len(cases) >= maximum:
                 break
@@ -331,7 +507,8 @@ def main():
         if args.signing_key_file is None:
             raise SystemExit("Qualification needs an explicit private integration key file")
         from .waverider import MIN_CASES, MIN_WAVES
-        passed = (report["cases"] >= MIN_CASES and report["waves"] >= MIN_WAVES and not report["critical_errors"]
+        passed = (report["cases"] >= MIN_CASES and report["cases"] == report["cases_requested"]
+            and report["waves"] >= MIN_WAVES and not report["critical_errors"] and not report["data_errors"]
             and report["data_kind"] == "executable_depth" and report["holdout_hash"] and report["profile_hash"] != "mixed"
             and all(Decimal(group["net_pnl"]) >= Decimal(group["baseline_net_pnl"])
                     and Decimal(group["max_drawdown"]) <= Decimal(group["baseline_max_drawdown"]) for group in report["cohorts"].values()))

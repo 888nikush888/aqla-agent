@@ -100,15 +100,30 @@ def test_live_gate_requires_authenticated_complete_comparison(tmp_path):
     path = tmp_path / "qualification.json"
     key = b"test-only-integration-key"
     assert not qualification_valid(path, key)
-    payload = {"version": VERSION, "critical_errors": 0, "cases": 30, "waves": 10, "net_pnl": "1", "baseline_net_pnl": "0",
+    from aqla_agent.waverider import COST_MODEL
+    payload = {"version": VERSION, "cost_model": COST_MODEL, "cases_requested": 30, "data_errors": 0,
+               "critical_errors": 0, "cases": 30, "waves": 10, "net_pnl": "1", "baseline_net_pnl": "0",
                "max_drawdown": "1", "baseline_max_drawdown": "1", "data_kind": "executable_depth", "holdout_hash": "frozen-test", "software_hash": software_hash()}
     def save():
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         path.write_text(json.dumps({**payload, "signature": hmac.new(key, body, hashlib.sha256).hexdigest()}))
     save()
     assert qualification_valid(path, key)
+    assert not qualification_valid(path, key, expected_cohort="hyperliquid:mainnet:USDC")
     assert not qualification_valid(path, b"another-key")
     payload["cases"] = 29
+    save()
+    assert not qualification_valid(path, key)
+    payload["cases"] = 30
+    payload["data_errors"] = 1
+    save()
+    assert not qualification_valid(path, key)
+    payload["data_errors"] = 0
+    payload["cases_requested"] = 31
+    save()
+    assert not qualification_valid(path, key)
+    payload["cases_requested"] = 30
+    payload.pop("cost_model")
     save()
     assert not qualification_valid(path, key)
 

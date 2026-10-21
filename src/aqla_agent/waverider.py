@@ -18,6 +18,7 @@ from .managed_entries import position_basis
 from .observations import read_observation
 
 VERSION = "waverider-v1"
+COST_MODEL = "fees-funding-profile-v2"
 MIN_CASES, MIN_WAVES = 30, 10
 
 
@@ -141,7 +142,7 @@ def advance(state, *, side, price, basis, volatility, cycle_cost, tick, stamp):
     return result, None
 
 
-def qualification_valid(path, key, expected_profile=None, expected_venue=None):
+def qualification_valid(path, key, expected_profile=None, expected_venue=None, expected_cohort=None):
     try:
         report = json.loads(Path(path).read_text(encoding="utf-8"))
         signature = report.pop("signature")
@@ -154,7 +155,10 @@ def qualification_valid(path, key, expected_profile=None, expected_venue=None):
         return (valid and comparisons and report["software_hash"] == software_hash()
             and (expected_profile is None or report["profile_hash"] == expected_profile)
             and (expected_venue is None or expected_venue in report["allowed_venues"])
+            and (expected_cohort is None or expected_cohort in report.get("cohorts", {}))
             and report["version"] == VERSION and report["critical_errors"] == 0
+            and report.get("cost_model") == COST_MODEL and report.get("data_errors") == 0
+            and report.get("cases_requested") == report["cases"]
             and report["cases"] >= MIN_CASES and report["waves"] >= MIN_WAVES
             and report["data_kind"] == "executable_depth" and bool(report["holdout_hash"]))
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
@@ -171,7 +175,8 @@ def live_permission(engine, plan):
     identity = profile_hash(plan.policy, plan.base_parameters)
     directory = Path(settings.state_path).parent
     key = key_path.read_bytes().strip()
-    return any(qualification_valid(path, key, identity, plan.exchange) for path in (
+    cohort = f"{plan.exchange}:{plan.network}:{plan.market.quote_token}"
+    return any(qualification_valid(path, key, identity, plan.exchange, cohort) for path in (
         directory / f"waverider-qualification-{identity}.json", directory / "waverider-qualification.json"))
 
 
@@ -182,7 +187,11 @@ async def market_facts(exchange, market):
         if market.dex:
             raise AqlaError("Waverider needs verified deployment-specific fees for this market")
         fee = await exchange.info("userFees", user=exchange.account)
-        rate = Decimal(fee["userCrossRate"])
+        discount = Decimal(fee["activeReferralDiscount"])
+        if not discount.is_finite() or not 0 <= discount < 1:
+            raise AqlaError("Waverider account referral discount is invalid")
+        rate = Decimal(fee["userCrossRate"]) * (1 - discount)
+        fee_observed_at = now_ms()
         raw = await exchange.info("candleSnapshot", req={"coin": market.symbol, "interval": "1m", "startTime": stamp - 3600000, "endTime": stamp})
         candles = [{"start": row["t"], "end": row["T"], "high": row["h"], "low": row["l"], "close": row["c"]} for row in raw]
     elif venue == "aster":
@@ -190,6 +199,7 @@ async def market_facts(exchange, market):
         if fee.get("symbol") != market.native_symbol:
             raise AqlaError("Waverider fees belong to another market")
         rate = Decimal(fee["takerCommissionRate"])
+        fee_observed_at = now_ms()
         raw = await exchange.read("klines", {"symbol": market.native_symbol, "interval": "1m", "limit": 60})
         candles = [{"start": row[0], "end": row[6], "high": row[2], "low": row[3], "close": row[4]} for row in raw]
     else:
@@ -199,7 +209,11 @@ async def market_facts(exchange, market):
         return await reader(market)
     if not rate.is_finite() or not 0 <= rate <= Decimal(".1"):
         raise AqlaError("Waverider fee observation is invalid")
-    return {"fee_rate": str(rate), "atr": str(atr(candles, stamp)), "observed_at": stamp,
+    evidence = {"exchange": venue, "network": exchange.settings.network, "account": exchange.account,
+                "market": market.symbol, "currency": market.quote_token, "liquidity": "taker", "rate": str(rate),
+                "source": "native_account_snapshot", "observed_at": fee_observed_at,
+                "valid_from": fee_observed_at, "valid_until": fee_observed_at + 60000, "evidence_hash": digest(fee)}
+    return {"fee_rate": str(rate), "fee_evidence": evidence, "atr": str(atr(candles, stamp)), "observed_at": stamp,
             "version": VERSION, "market": market.symbol}
 
 
