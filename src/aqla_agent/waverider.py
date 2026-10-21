@@ -1,4 +1,4 @@
-"""Deterministic same-direction waves; live orders require signed qualification."""
+"""Deterministic same-direction waves; live orders require signed authority."""
 from __future__ import annotations
 
 import asyncio
@@ -165,19 +165,49 @@ def qualification_valid(path, key, expected_profile=None, expected_venue=None, e
         return False
 
 
-def live_permission(engine, plan):
-    if plan.policy.management_mode != "waverider":
+def operator_authorized(path, key, plan):
+    """A separately signed owner waiver never becomes a historical qualification."""
+    try:
+        report = json.loads(Path(path).read_text(encoding="utf-8"))
+        signature = report.pop("signature")
+        body = json.dumps(report, sort_keys=True, separators=(",", ":")).encode()
+        issued = report["issued_at"]
+        account = f"{plan.exchange}:{plan.network}:{plan.account.lower()}"
+        cohort = f"{plan.exchange}:{plan.network}:{plan.market.quote_token}"
+        return (hmac.compare_digest(signature, hmac.new(key, body, hashlib.sha256).hexdigest())
+            and report["kind"] == "waverider_operator_live_v1" and report["version"] == VERSION
+            and report["historical_quality_waived"] is True and isinstance(report["operator"], str) and bool(report["operator"].strip())
+            and len(report["consent_sha256"]) == 64 and all(c in "0123456789abcdef" for c in report["consent_sha256"])
+            and type(issued) is int and 0 <= issued <= now_ms() and plan.created_at >= issued
+            and report["software_hash"] == software_hash()
+            and report["profile_hash"] == profile_hash(plan.policy, plan.base_parameters)
+            and isinstance(report["allowed_accounts"], list) and isinstance(report["allowed_cohorts"], list)
+            and account in report["allowed_accounts"] and cohort in report["allowed_cohorts"])
+    except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
         return False
+
+
+def live_authority(engine, plan):
+    if plan.policy.management_mode != "waverider":
+        return None
     settings = engine.exchange.settings
     key_path = settings.integration_key_file
     if not key_path or not key_path.is_file():
-        return False
+        return None
     identity = profile_hash(plan.policy, plan.base_parameters)
     directory = Path(settings.state_path).parent
     key = key_path.read_bytes().strip()
     cohort = f"{plan.exchange}:{plan.network}:{plan.market.quote_token}"
-    return any(qualification_valid(path, key, identity, plan.exchange, cohort) for path in (
-        directory / f"waverider-qualification-{identity}.json", directory / "waverider-qualification.json"))
+    if any(qualification_valid(path, key, identity, plan.exchange, cohort) for path in (
+            directory / f"waverider-qualification-{identity}.json", directory / "waverider-qualification.json")):
+        return "qualification"
+    if operator_authorized(directory / f"waverider-operator-live-{identity}.json", key, plan):
+        return "operator"
+    return None
+
+
+def live_permission(engine, plan):
+    return live_authority(engine, plan) is not None
 
 
 async def market_facts(exchange, market):
@@ -292,10 +322,11 @@ async def tick(engine, trade_id, quote):
         return
     settings = engine.exchange.settings
     root_path = Path(settings.state_path).parent
-    qualified = live_permission(engine, plan)
-    state["shadow"] = not qualified
+    authority = live_authority(engine, plan)
+    permitted = authority is not None
+    state.update(shadow=not permitted, live_authority=authority)
     try:
-        if qualified and state.get("phase") in ("pending_reduce", "pending_reenter"):
+        if permitted and state.get("phase") in ("pending_reduce", "pending_reenter"):
             state = await resume_cycle(engine, trade_id, state)
             trade = engine.state.snapshot()["trades"][trade_id]
         facts = state.get("market_facts")
@@ -308,11 +339,11 @@ async def tick(engine, trade_id, quote):
         own_quantity, basis, realized, fees = position_basis(trade)
         inventory = pools(trade, plan.policy.waverider_flex_percent)
         rebuying = state.get("phase") in ("waiting_rebound", "pending_reenter")
-        quantity = quantity_grid(max(Decimal(0), inventory["rights"] - inventory["flex"]) if rebuying and qualified
-                                else min(own_quantity, inventory["rights"]) if not qualified else inventory["flex"], plan.market)
+        quantity = quantity_grid(max(Decimal(0), inventory["rights"] - inventory["flex"]) if rebuying and permitted
+                                else min(own_quantity, inventory["rights"]) if not permitted else inventory["flex"], plan.market)
         if inventory["flex"]:
             basis = inventory["flex_basis"]
-        if not qualified:
+        if not permitted:
             basis = Decimal(state.get("paper_basis", str(basis)))
         state.update(core_quantity=str(inventory["core"]), flexible_quantity=str(inventory["flex"]),
                      remaining_risk_budget=str(max(Decimal(0), plan.risk_usdc - inventory["spent"])))
@@ -336,7 +367,7 @@ async def tick(engine, trade_id, quote):
                  "facts": facts, "state": state, "quantity": str(quantity), "basis": str(basis), "action": action})
             state["last_captured_at"] = now_ms()
         if action:
-            if qualified:
+            if permitted:
                 await execute(engine, trade_id, state, action, quantity, quote, cost)
                 return
             state.setdefault("paper_actions", []).append({"action": action, "at": quote.observed_at, "price": str(price), "quantity": str(quantity)})
@@ -452,6 +483,8 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
     trade = engine.state.snapshot()["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
     if action != "retire":
+        if not live_permission(engine, plan):
+            raise AqlaError("Waverider live management is not authorized")
         engine.validate_configuration(engine.state.snapshot(), plan)
     signed = engine.position_size(await engine.positions(plan.market), plan.market)
     engine.owned_remaining(trade_id, signed)
@@ -493,6 +526,8 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
         def guard(data):
             current = data["trades"][trade_id]
             if not corrective:
+                if not live_permission(engine, plan):
+                    raise AqlaError("Waverider authorization changed before transport")
                 engine.validate_configuration(data, plan)
             if current["status"] != "open" or not corrective and (current.get("entries_disabled") or current["waverider"].get("finished")):
                 raise AqlaError("Waverider reduction no longer owns its setup")

@@ -590,6 +590,10 @@ async def _dispatch_next(engine, trade_id):
         if current.get("entries_disabled") or current["status"] in ("closing", "cleanup", "closed", "conflicted", "rejected", "cancelled"):
             raise AqlaError("Managed entry was terminated before dispatch")
     def final_guard(data):
+        if row["kind"] == "waverider":
+            from .waverider import live_permission
+            if not live_permission(engine, plan):
+                raise AqlaError("Waverider authorization changed before reentry transport")
         engine.validate_admission(data, view, latest_account, owned=True,
             allowed_prepared=(row["operation_id"],), allowed_sending=(row["operation_id"],))
         latest_quote.fresh()

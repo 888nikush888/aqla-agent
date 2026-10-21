@@ -179,6 +179,21 @@ nicht erzeugen. Eine qualifizierte Datei benötigt außerdem eine Signatur,
 den Software-Hash, die passenden Profilparameter und eine geprüfte Börse.
 Software- oder Parameteränderungen heben die passende Freigabe damit auf.
 
+Ein Betreiber kann diese historische Qualitätsbedingung ausdrücklich aufheben.
+Dafür gibt es eine getrennte, mit dem privaten Integrationsschlüssel signierte
+Datei `waverider-operator-live-<profile_hash>.json` neben dem Finanzzustand.
+Ihr Typ ist `waverider_operator_live_v1`; `historical_quality_waived=true`,
+Betreiber, Zustimmungsprüfsumme, Ausstellungszeit, Software-/Profilhash sowie
+die ausdrücklich erlaubten Konto- und Börsen-/Netz-/Währungsbereiche sind
+verpflichtend. Nur danach neu angelegte Waverider-Pläne werden freigegeben.
+Diese Betreiberfreigabe ist kein bestandener historischer Qualitätsnachweis.
+Der Trade hält die Herkunft als `live_authority=operator` fest. Löschen der
+Datei, ein Versionswechsel oder eine Profiländerung entzieht diese Freigabe.
+Quelle, eigene Fill-Zuordnung, Kontolimits, SL, frische Preise, Gebühren,
+Liquidität und ursprüngliches Verlustbudget werden weiterhin unverändert
+geprüft. Die Berechtigung wird vor optionalen Positionsänderungen und erneut
+vor dem Orderversand geprüft; ursprüngliche Schutzverwaltung bleibt erhalten.
+
 ## Journal und Betrieb
 
 Ursprüngliche Entry-Fills bestimmen weiterhin die Quellen-ROE-Basis und die

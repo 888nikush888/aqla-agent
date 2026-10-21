@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 from decimal import Decimal
 
@@ -61,6 +63,39 @@ async def wave_trade(setup, signal, monkeypatch):
     plan = await trading.preview(source.event_id, value)
     trade = await trading.execute(plan["plan_id"])
     return state, boundary, exchange, trading, plan, trade
+
+
+@pytest.mark.asyncio
+async def test_operator_authorization_uses_guarded_orders_and_revocation_stops_new_waves(setup, signal, monkeypatch):
+    from aqla_agent.waverider import VERSION, live_authority, profile_hash, software_hash
+    from aqla_hyperliquid_mcp.models import AqlaError, TradePlan
+    state, boundary, exchange, trading, raw, trade = await wave_trade(setup, signal, monkeypatch)
+    monkeypatch.setattr(waverider, "qualification_valid", lambda *_: False)
+    plan = TradePlan.model_validate(raw)
+    identity = profile_hash(plan.policy, plan.base_parameters)
+    payload = {"kind": "waverider_operator_live_v1", "version": VERSION, "operator": "test-owner",
+        "historical_quality_waived": True, "consent_sha256": hashlib.sha256(b"explicit test owner waiver").hexdigest(),
+        "issued_at": plan.created_at, "software_hash": software_hash(), "profile_hash": identity,
+        "allowed_accounts": [f"{plan.exchange}:{plan.network}:{plan.account.lower()}"],
+        "allowed_cohorts": [f"{plan.exchange}:{plan.network}:{plan.market.quote_token}"]}
+    key = exchange.settings.integration_key_file.read_bytes().strip()
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    path = exchange.settings.state_path.parent / f"waverider-operator-live-{identity}.json"
+    path.write_text(json.dumps({**payload, "signature": hmac.new(key, body, hashlib.sha256).hexdigest()}))
+    assert live_authority(trading, plan) == "operator"
+    initial = Decimal(trade["remaining_quantity"])
+    boundary.mid = "104"
+    quote = await exchange.price_snapshot(plan.market)
+    wave = {**state.snapshot()["trades"][plan.trade_id]["waverider"], "shadow": False, "live_authority": "operator"}
+    await execute(trading, plan.trade_id, wave, "reduce", initial / 2, quote, Decimal(".2"))
+    current = state.snapshot()["trades"][plan.trade_id]
+    assert boundary.position == initial / 2 and current["waverider"]["live_authority"] == "operator"
+    assert any(row["status"] == "open" and row["order"]["isTrigger"] and row["order"]["reduceOnly"] for row in boundary.orders.values())
+    path.unlink()
+    before = list(boundary.actions)
+    with pytest.raises(AqlaError, match="not authorized"):
+        await execute(trading, plan.trade_id, current["waverider"], "reduce", initial / 2, quote, Decimal(".2"))
+    assert boundary.actions == before and boundary.position == initial / 2
 
 
 @pytest.mark.asyncio

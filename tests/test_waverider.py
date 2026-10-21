@@ -128,6 +128,50 @@ def test_live_gate_requires_authenticated_complete_comparison(tmp_path):
     assert not qualification_valid(path, key)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [None, "signature", "waiver", "software", "profile", "account", "network", "future", "old_plan", "scope_string"])
+async def test_explicit_operator_authorization_is_separate_and_narrowly_bound(setup, signal, invalid):
+    from aqla_agent.waverider import live_authority, live_permission, operator_authorized, profile_hash
+    from aqla_hyperliquid_mcp.models import TradePlan
+    settings, state, _, _, trading = setup
+    state.update(lambda data: data["policy"].update(management_mode="waverider"))
+    source, value = signal
+    plan = TradePlan.model_validate(await trading.preview(source.event_id, value))
+    identity = profile_hash(plan.policy, plan.base_parameters)
+    path = settings.state_path.parent / f"waverider-operator-live-{identity}.json"
+    key = settings.integration_key_file.read_bytes().strip()
+    payload = {"kind": "waverider_operator_live_v1", "version": VERSION, "operator": "test-owner",
+        "historical_quality_waived": True, "consent_sha256": hashlib.sha256(b"explicit test owner consent").hexdigest(),
+        "issued_at": plan.created_at, "software_hash": software_hash(), "profile_hash": identity,
+        "allowed_accounts": [f"{plan.exchange}:{plan.network}:{plan.account.lower()}"],
+        "allowed_cohorts": [f"{plan.exchange}:{plan.network}:{plan.market.quote_token}"]}
+    assert live_authority(trading, plan) is None
+    if invalid == "waiver":
+        payload["historical_quality_waived"] = False
+    elif invalid == "software":
+        payload["software_hash"] = "another-version"
+    elif invalid == "profile":
+        payload["profile_hash"] = "another-profile"
+    elif invalid == "account":
+        payload["allowed_accounts"] = [f"{plan.exchange}:{plan.network}:another-account"]
+    elif invalid == "network":
+        payload["allowed_cohorts"] = [f"{plan.exchange}:mainnet:{plan.market.quote_token}"]
+    elif invalid == "scope_string":
+        payload["allowed_accounts"] = payload["allowed_accounts"][0] + "another-account"
+    elif invalid in ("future", "old_plan"):
+        payload["issued_at"] += 60000 if invalid == "future" else 1
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    signature = hmac.new(key, body, hashlib.sha256).hexdigest()
+    path.write_text(json.dumps({**payload, "signature": "invalid" if invalid == "signature" else signature}))
+    assert not qualification_valid(path, key)
+    assert operator_authorized(path, key, plan) is (invalid is None)
+    assert not operator_authorized(path, key + b"wrong", plan)
+    assert live_permission(trading, plan) is (invalid is None)
+    assert live_authority(trading, plan) == ("operator" if invalid is None else None)
+    path.unlink()
+    assert not live_permission(trading, plan)
+
+
 def test_depth_is_not_inferred_beyond_observed_levels():
     stamp = now_ms()
     quote = PriceSnapshot(market="BTC", bid=99, ask=100, mid=Decimal("99.5"), stop_reference=100,
