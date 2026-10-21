@@ -121,7 +121,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
 
     @asynccontextmanager
     async def lifespan(_):
-        await trading.recover()
+        # Serve MCP while the first maintenance pass reconciles; entry guards still require successful recovery.
         task = asyncio.create_task(maintenance(), name="aqla-protection")
         async def report_evidence():
             while True:

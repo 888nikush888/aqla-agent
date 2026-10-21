@@ -149,6 +149,34 @@ async def test_shutdown_cancels_all_recovery_accounts_and_releases_locks(setup, 
 
 
 @pytest.mark.asyncio
+async def test_startup_serves_status_while_recovery_still_gates_entries(setup, signal, monkeypatch):
+    settings, state, fake, exchange, trading = setup
+    source, interpretation = signal
+    plan = await trading.preview(source.event_id, interpretation)
+    server = create_server(settings, state=state, exchange=exchange)
+    router = server.aqla_trading
+    entered = asyncio.Event()
+    async def hanging(engine):
+        async with engine.lock:
+            entered.set()
+            await asyncio.Event().wait()
+    monkeypatch.setattr(router, "_recover_account", hanging)
+    async with asyncio.timeout(2):
+        async with server.settings.lifespan(server):
+            await entered.wait()
+            status = await server.call_tool("status", {"view": "summary"})
+            assert not status.is_error
+            entry = asyncio.create_task(router.execute(plan["plan_id"]))
+            try:
+                await asyncio.sleep(0)
+                assert not entry.done() and not router.engines["hyperliquid"].recovery_checked
+                assert fake.actions == []
+            finally:
+                entry.cancel()
+                await asyncio.gather(entry, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_status_recovery_diagnostics_are_bounded_and_discard_untrusted_extra_fields(setup):
     settings, state, _, exchange, _ = setup
     record = {"last_attempt_at": 100, "last_success_at": 90, "duration_ms": 5, "category": "complete", "error_count": 0,
