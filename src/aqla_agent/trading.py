@@ -723,6 +723,9 @@ class Trading:
             self.validate_admission(self.state.snapshot(), plan, account, owned=True, allowed_prepared=allowed, allowed_sending=(dispatch_operation,))
             try:
                 quote.fresh()
+                # Leave time for atomic preparation; the transport's 2 s limit stays unchanged.
+                if not attempt and now_ms() - min(quote.exchange_time, quote.started_at, quote.observed_at) > 1000:
+                    raise TemporaryObservation("price_stale", "price")
                 return account, quote
             except TemporaryObservation:
                 if attempt:

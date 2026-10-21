@@ -21,6 +21,33 @@ def entries(fake):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_age", [0, 2501])
+async def test_entry_guard_refreshes_a_nearly_expired_book_before_atomic_preparation(setup, signal, monkeypatch, replacement_age):
+    from aqla_hyperliquid_mcp.models import TradePlan
+    _, state, fake, exchange, engine = setup
+    source, value = signal
+    raw = await engine.preview(source.event_id, value)
+    plan = TradePlan.model_validate(raw)
+    trade = engine.new_trade(state.snapshot(), state.snapshot()["plans"][plan.plan_id], plan)
+    state.update(lambda data: data["trades"].__setitem__(plan.trade_id, trade))
+    original = exchange.price_snapshot
+    reads = 0
+    async def quote(market):
+        nonlocal reads
+        reads += 1
+        result = await original(market)
+        return result.model_copy(update={"exchange_time": now_ms() - (1500 if reads == 1 else replacement_age)})
+    monkeypatch.setattr(exchange, "price_snapshot", quote)
+    if replacement_age:
+        with pytest.raises(TemporaryObservation, match="stale"):
+            await engine.live_entry_guard(plan, dispatch_operation=trade["entry_operation_id"])
+    else:
+        _, observed = await engine.live_entry_guard(plan, dispatch_operation=trade["entry_operation_id"])
+        assert now_ms() - observed.exchange_time < 1000
+    assert reads == 2 and not fake.actions
+
+
+@pytest.mark.asyncio
 async def test_terminal_rejection_completes_retry_and_updates_current_target(setup, signal, monkeypatch):
     from aqla_agent.messages import telegram_view
     _, state, fake, exchange, engine = setup
