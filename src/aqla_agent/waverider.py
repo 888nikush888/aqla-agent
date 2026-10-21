@@ -15,7 +15,7 @@ from aqla_hyperliquid_mcp.rules import quantity_grid, slippage_price
 
 from .entry import passive_entry_price
 from .managed_entries import position_basis
-from .observations import read_observation
+from .observations import TemporaryObservation, read_observation
 
 VERSION = "waverider-v1"
 COST_MODEL = "fees-funding-profile-v2"
@@ -337,7 +337,12 @@ async def tick(engine, trade_id, quote):
         if not facts or not 0 <= now_ms() - facts["observed_at"] < 60000:
             facts = await read_observation(lambda: market_facts(engine.exchange, plan.market), "waverider_market")
             state["market_facts"] = facts
-        if not quote.bids or not quote.asks:
+        stale = False
+        try:
+            quote.fresh()
+        except TemporaryObservation:
+            stale = True
+        if stale or not quote.bids or not quote.asks:
             reader = getattr(engine.exchange, "depth_snapshot", engine.exchange.price_snapshot)
             quote = await read_observation(lambda: reader(plan.market), "price")
         own_quantity, basis, realized, fees = position_basis(trade)

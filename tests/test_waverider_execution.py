@@ -66,6 +66,33 @@ async def wave_trade(setup, signal, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("available", [True, False])
+async def test_tick_refreshes_book_aged_by_ordinary_protection_before_optional_wave(setup, signal, monkeypatch, available):
+    from aqla_agent.observations import TemporaryObservation
+    from aqla_agent.waverider import tick
+    from aqla_hyperliquid_mcp.models import now_ms
+    state, boundary, exchange, trading, raw, trade = await wave_trade(setup, signal, monkeypatch)
+    original = exchange.price_snapshot
+    market = Market.model_validate(raw["market"])
+    quote = await original(market)
+    quote = quote.model_copy(update={"exchange_time": now_ms() - 3000})
+    reads = 0
+    async def fresh(market):
+        nonlocal reads
+        reads += 1
+        if not available:
+            raise TemporaryObservation("read_unavailable", "price", "transport")
+        return await original(market)
+    monkeypatch.setattr(exchange, "price_snapshot", fresh)
+    sent = len(boundary.actions)
+    await tick(trading, trade["trade_id"], quote)
+    observed = trading._waverider_observations[trade["trade_id"]][1]
+    assert observed["phase"] == ("waiting_rise" if available else "paused")
+    assert reads == 1 and len(boundary.actions) == sent
+    assert Decimal(state.snapshot()["trades"][trade["trade_id"]]["remaining_quantity"]) == boundary.position
+
+
+@pytest.mark.asyncio
 async def test_operator_authorization_uses_guarded_orders_and_revocation_stops_new_waves(setup, signal, monkeypatch):
     from aqla_agent.waverider import VERSION, live_authority, profile_hash, software_hash
     from aqla_hyperliquid_mcp.models import AqlaError, TradePlan
