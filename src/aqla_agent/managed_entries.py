@@ -32,6 +32,12 @@ def enabled(plan):
     return bool(plan.entry_legs or plan.policy.entry_range_choice == "split" or plan.policy.management_mode == "waverider")
 
 
+def entry_targets(quantity, targets, policy, market, leg_quantities=()):
+    # Reuse the configured adaptive rule at every stage, including the first protected fill.
+    count = min(len(executable_targets(size, targets, policy, market)[0]) for size in (quantity, *leg_quantities))
+    return executable_targets(quantity, targets[:count], policy, market)
+
+
 def make_entry_plan(signal, market, account, policy, revision, source_time, binding,
                     reserved_risk, stamp, principal, backup, backup_revision, maker_price):
     if signal.kind != "new_signal":
@@ -63,16 +69,13 @@ def make_entry_plan(signal, market, account, policy, revision, source_time, bind
     weights = [leg.weight_percent or Decimal(50) for leg in legs]
     quantities = [quantity_grid(base.quantity * weights[0] / 100, base.market)]
     quantities.append(base.quantity - quantities[0])
-    planned, count = [], len(base.take_profits)
+    planned = []
     for (index, leg, selected), size in zip(selections, quantities, strict=True):
         if size <= 0 or size < base.market.min_quantity or size * selected.limit < base.market.min_notional:
             raise ExchangeMinimum("A source entry leg is below the exchange minimum; neither leg may be dropped or enlarged")
         if not (base.stop_loss < selected.price < min(base.take_profits) if base.side == "long"
                 else base.stop_loss > selected.price > max(base.take_profits)):
             raise AqlaError("Both source entries must have valid common SL/TP structure")
-        sizes = split_targets(size, len(base.take_profits), policy, base.market)
-        if any(amount < base.market.min_quantity or amount * price < base.market.min_notional for amount, price in zip(sizes, base.take_profits, strict=True)):
-            raise ExchangeMinimum("A TP leg on an individual entry is below the exchange minimum")
         planned.append(EntryLegPlan(index=index, kind=selected.kind, price=selected.price,
             limit=selected.limit, quantity=size, timing=leg.timing))
     # Market intent first; otherwise the near limit fills before the far limit.
@@ -80,9 +83,10 @@ def make_entry_plan(signal, market, account, policy, revision, source_time, bind
     values = base.model_dump()
     if backup_entry and "entry" not in base.backup_fields:
         values.update(backup_fields=[*base.backup_fields, "entry"], backup_values=backup.model_copy(deep=True), backup_profile_revision=backup_revision)
+    targets, quantities = entry_targets(base.quantity, base.take_profits, policy, base.market, [leg.quantity for leg in planned])
+    count = len(targets)
     values.update(entry_legs=planned, entry_price=sum(leg.price * leg.quantity for leg in planned) / base.quantity,
-                  take_profits=base.take_profits[:count])
-    values["tp_quantities"] = executable_targets(base.quantity, values["take_profits"], policy, base.market)[1]
+                  take_profits=targets, tp_quantities=quantities)
     if base.source_tp:
         values["source_tp"] = {**base.source_tp, "values": base.source_tp["values"][:count],
                                "preview_prices": base.source_tp["preview_prices"][:count]}
@@ -97,18 +101,19 @@ def cap_quantity(plan, ceiling):
     if quantity <= 0 or quantity < plan.market.min_quantity or quantity * plan.entry_limit < plan.market.min_notional:
         raise ExchangeMinimum("Rerouted quantity is below the exchange minimum")
     values = plan.model_dump()
-    values.update(quantity=quantity, risk_usdc=plan.risk_usdc * quantity / plan.quantity,
-                  tp_quantities=split_targets(quantity, len(plan.take_profits), plan.policy, plan.market))
+    values.update(quantity=quantity, risk_usdc=plan.risk_usdc * quantity / plan.quantity)
+    legs = []
     if plan.entry_legs:
         first = quantity_grid(quantity * plan.entry_legs[0].quantity / plan.quantity, plan.market)
         legs = [leg.model_copy(update={"quantity": size}) for leg, size in zip(plan.entry_legs, [first, quantity - first], strict=True)]
         if any(leg.quantity <= 0 or leg.quantity < plan.market.min_quantity or leg.quantity * leg.limit < plan.market.min_notional for leg in legs):
             raise ExchangeMinimum("Rerouted source entry leg is below the exchange minimum")
-        for leg in legs:
-            sizes = split_targets(leg.quantity, len(plan.take_profits), plan.policy, plan.market)
-            if any(size < plan.market.min_quantity or size * price < plan.market.min_notional for size, price in zip(sizes, plan.take_profits, strict=True)):
-                raise ExchangeMinimum("Rerouted TP is below the exchange minimum")
         values["entry_legs"] = legs
+    values["take_profits"], values["tp_quantities"] = entry_targets(quantity, plan.take_profits, plan.policy, plan.market, [leg.quantity for leg in legs])
+    if plan.source_tp:
+        count = len(values["take_profits"])
+        values["source_tp"] = {**plan.source_tp, "values": plan.source_tp["values"][:count],
+                               "preview_prices": plan.source_tp["preview_prices"][:count]}
     values.pop("plan_id")
     return TradePlan(plan_id=digest(values), **values)
 

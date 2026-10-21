@@ -16,6 +16,12 @@ und bestätigtem Schutz der vorhandenen eigenen Position. Ein Teilfill beendet
 den Rest dieses Legs. Die übrigen ursprünglich geplanten Entries behalten
 ihre eigenen Identitäten.
 
+Bei ausdrücklich konfigurierter adaptiver TP-Verteilung wird dieselbe native
+Mindestgrößenregel auch auf jede Teilposition angewendet. Beide Entries
+verwenden den längsten gemeinsamen ausführbaren Zielpräfix. Das gilt ebenso
+für eine spätere Mengenbegrenzung beim Börsenwechsel. Andere konfigurierte
+TP-Verteilungen werden dabei nicht in adaptive Verteilungen geändert.
+
 Bestehende gespeicherte Pläne behalten ihren bisherigen Ablauf. Neue Profile
 verwenden `split`; bestehende Profile behalten ihren ausdrücklich gespeicherten
 Wert, bis der Betreiber ihn ändert. Ein Quellen-Edit setzt weder Frist noch
