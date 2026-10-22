@@ -286,47 +286,8 @@ def test_native_styles_default_axes_and_8bit_colors_publish_after_verified_data_
     assert publish(client, snapshot, clock=60)["status"] == "unchanged" and writes(google) == []
 
 
-def test_native_empty_bar_omits_series_and_numeric_axis_only_without_net_r_evidence(workbook):
-    google, client, source = workbook
-    google.normalize_charts = True
-    source["trades"]["aster"]["execution_incident"] = True
-    source["source_ranks"] = {identity: {"tier": "C", "origin": "manual"}
-                              for identity in ["-1001", *[f"synthetic-{index}" for index in range(13)]]}
-    snapshot = build_presentation(source, clock=CLOCK)
-    assert len(snapshot.channels) == 14 and all(row.net_r is None for row in snapshot.channels)
-    assert snapshot.net_pnl.value == Decimal("15.1") and snapshot.funding.value == 0
-    assert publish(client, snapshot, clock=0)["status"] == "published"
-    chart = google.charts[0][3]
-    assert "series" not in chart["spec"]["basicChart"]
-    assert chart["spec"]["basicChart"]["axis"] == [{"position": "LEFT_AXIS", "viewWindowOptions": {}}]
-    assert chart["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"][0]["startColumnIndex"] == 32
-    assert "R je Setup" in chart["spec"]["title"] and chart["spec"]["hiddenDimensionStrategy"] == "SHOW_ALL"
-    assert all(google.tables["Dashboard"][index][33] == "" for index in range(1, 15))
-    google.calls.clear()
-    assert publish(client, snapshot, clock=60)["status"] == "unchanged" and writes(google) == []
-    # A missing default axis or a moved domain is damage, rather than canonical empty-series output.
-    chart["spec"]["basicChart"]["axis"] = []
-    assert publish(client, snapshot, clock=120)["status"] == "published"
-    chart["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"][0]["startColumnIndex"] = 30
-    assert publish(client, snapshot, clock=180)["status"] == "published"
 
 
-def test_known_zero_net_r_requires_series_and_unit_axis_and_can_repair_missing_series(workbook):
-    google, client, source = workbook
-    google.normalize_charts = True
-    trade = source["trades"]["aster"]
-    trade["funding_events"] = {"synthetic-funding": {"amount": "-15.1"}}
-    trade["funding_coverage"]["payments_fingerprint"] = digest(trade["funding_events"])
-    snapshot = build_presentation(source, clock=CLOCK)
-    assert snapshot.net_pnl.value == 0 and snapshot.channels[0].net_r == 0
-    publish(client, snapshot, clock=0)
-    assert google.tables["Dashboard"][1][33] == 0
-    channel = google.charts[0][3]
-    channel["spec"]["basicChart"].pop("series")
-    channel["spec"]["basicChart"]["axis"] = [{"position": "LEFT_AXIS"}]
-    assert publish(client, snapshot, clock=60)["status"] == "published"
-    assert channel["spec"]["basicChart"]["series"][0]["targetAxis"] == "BOTTOM_AXIS"
-    assert next(row for row in channel["spec"]["basicChart"]["axis"] if row["position"] == "BOTTOM_AXIS")["title"] == "R"
 
 
 def test_charts_created_before_cells_are_reapplied_after_data_and_confirmed(workbook):
@@ -670,3 +631,46 @@ def test_chart_units_ranges_and_positions_are_distinct(workbook):
     assert charts[3]["spec"]["basicChart"]["axis"][0]["title"] == "R"
     assert "Kontoequity" not in charts[0]["spec"]["title"]
     assert all(chart["spec"]["hiddenDimensionStrategy"] == "SHOW_ALL" for chart in charts)
+
+
+def test_native_empty_bar_omits_series_and_numeric_axis_only_without_net_r_evidence(workbook):
+    google, client, source = workbook
+    google.normalize_charts = True
+    source["trades"]["aster"]["execution_incident"] = True
+    source["source_ranks"] = {identity: {"tier": "C", "origin": "manual"}
+                              for identity in ["-1001", *[f"synthetic-{index}" for index in range(13)]]}
+    snapshot = build_presentation(source, clock=CLOCK)
+    assert len(snapshot.channels) == 14 and all(row.net_r is None for row in snapshot.channels)
+    assert snapshot.net_pnl.value == Decimal("15.1") and snapshot.funding.value == 0
+    assert publish(client, snapshot, clock=0)["status"] == "published"
+    chart = google.charts[0][3]
+    assert "series" not in chart["spec"]["basicChart"]
+    assert chart["spec"]["basicChart"]["axis"] == [{"position": "LEFT_AXIS", "viewWindowOptions": {}}]
+    assert chart["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"][0]["startColumnIndex"] == 32
+    assert "R je Setup" in chart["spec"]["title"] and chart["spec"]["hiddenDimensionStrategy"] == "SHOW_ALL"
+    assert all(google.tables["Dashboard"][index][33] == "" for index in range(1, 15))
+    google.calls.clear()
+    assert publish(client, snapshot, clock=60)["status"] == "unchanged" and writes(google) == []
+    # A missing default axis or a moved domain is damage, rather than canonical empty-series output.
+    chart["spec"]["basicChart"]["axis"] = []
+    assert publish(client, snapshot, clock=120)["status"] == "published"
+    chart["spec"]["basicChart"]["domains"][0]["domain"]["sourceRange"]["sources"][0]["startColumnIndex"] = 30
+    assert publish(client, snapshot, clock=180)["status"] == "published"
+
+
+def test_known_zero_net_r_requires_series_and_unit_axis_and_can_repair_missing_series(workbook):
+    google, client, source = workbook
+    google.normalize_charts = True
+    trade = source["trades"]["aster"]
+    trade["funding_events"] = {"synthetic-funding": {"amount": "-15.1"}}
+    trade["funding_coverage"]["payments_fingerprint"] = digest(trade["funding_events"])
+    snapshot = build_presentation(source, clock=CLOCK)
+    assert snapshot.net_pnl.value == 0 and snapshot.channels[0].net_r == 0
+    publish(client, snapshot, clock=0)
+    assert google.tables["Dashboard"][1][33] == 0
+    channel = google.charts[0][3]
+    channel["spec"]["basicChart"].pop("series")
+    channel["spec"]["basicChart"]["axis"] = [{"position": "LEFT_AXIS"}]
+    assert publish(client, snapshot, clock=60)["status"] == "published"
+    assert channel["spec"]["basicChart"]["series"][0]["targetAxis"] == "BOTTOM_AXIS"
+    assert next(row for row in channel["spec"]["basicChart"]["axis"] if row["position"] == "BOTTOM_AXIS")["title"] == "R"

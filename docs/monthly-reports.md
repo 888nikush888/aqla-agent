@@ -91,8 +91,8 @@ Datensätze. Netto-Geldbeträge werden pro Währung summiert; USDT wird nicht in
 umgerechnet. Fehlende Gebührenwährung, Exit-Fills oder Funding-Abdeckung lassen
 Netto-PnL und ROE leer; die Anzahl ausgeschlossener Ergebnisse wird angezeigt.
 
-Funding stammt aus `userFunding` (Hyperliquid), `/fapi/v3/income` mit
-`FUNDING_FEE` (Aster) beziehungsweise `/api/v1/positionFunding` (Lighter).
+Aktuelle Funding-Zahlungen stammen ausschließlich aus Hyperliquid `userFunding`.
+Bereits gespeicherte historische Zahlungen bleiben unverändert erhalten.
 Der Abgleich verwendet begrenzte Zeitfenster, sichere Pagination und unveränderliche
 Zahlungsidentitäten. Vollständige eigene Fills müssen mit der Börsenhistorie
 übereinstimmen. Zusätzliche manuelle Fills, widersprüchliche Positionsmengen,

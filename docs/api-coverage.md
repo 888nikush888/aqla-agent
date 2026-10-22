@@ -2,7 +2,7 @@
 
 Vertragsstand: 2026-10-02. Die Matrix beschreibt implementierte, typisierte Verträge; keine behauptete Live-Börsenabnahme.
 
-Der eingefrorene Upstream-Snapshot bleibt vom lokalen Prüflauf getrennt: zusätzliche Remediation-Regressionen wurden am 2026-10-09 offline geprüft. Dieses Prüfdatum behauptet keine neuere Live-API oder ausgeführte Mainnet-Orders. Die öffentliche Info-Abdeckung und ihre Raw-Payloads bleiben unverändert; marktbezogene Fillreads und begrenzte Orderindizes sind interne Belegverträge. Reserved, signed, sent und nativ consumed sind verschiedene Nonce-Zustände; insbesondere darf eine belegbar ungesendete Lighter-Nonce ohne native Fortschaltung wieder verwendet werden. Unknown verlangt Abgleich, keinen Skip/NoOp.
+Der eingefrorene Upstream-Snapshot bleibt vom lokalen Prüflauf getrennt: zusätzliche Remediation-Regressionen wurden am 2026-10-09 offline geprüft. Dieses Prüfdatum behauptet keine neuere Live-API oder ausgeführte Mainnet-Orders. Die öffentliche Info-Abdeckung und ihre Raw-Payloads bleiben unverändert; marktbezogene Fillreads und begrenzte Orderindizes sind interne Belegverträge. Reserved, signed, sent und nativ consumed sind verschiedene Nonce-Zustände; eine belegbar ungesendete Anfrage wird nicht als ausgeführte Börsenoperation behandelt. Unknown verlangt Abgleich, keinen Skip/NoOp.
 
 Documented public HyperCore Info, Exchange, HIP-3/HIP-4 and WebSocket API; official Python SDK public operations
 

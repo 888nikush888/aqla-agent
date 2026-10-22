@@ -9,9 +9,7 @@ from typing import Literal, NotRequired, TypedDict
 
 from aqla_hyperliquid_mcp.models import (
     AqlaError,
-    ExchangeMinimum,
     Market,
-    SymbolUnavailable,
     TradePlan,
     digest,
     now_ms,
@@ -21,7 +19,7 @@ from .accounting import inventory_view
 from .observations import TemporaryObservation, diagnostic, retry_due, retry_marker
 from .pipelines import ConfigurationChanged, VenueState, validate_ranking_binding
 from .trading import OPEN, PendingStopUpdate, StopUpdatePhase, Trading
-from .venues import VenueAdapter, adapter_settings, execution_settings
+from .venues import execution_settings, public_operation
 
 RecoveryCategory = Literal["complete", "incomplete", "unavailable", "timeout", "cancelled"]
 
@@ -37,7 +35,7 @@ class RecoveryDiagnostic(TypedDict):
 def recovery_diagnostics(data) -> dict[str, RecoveryDiagnostic]:
     """Bounded safe metadata; no source text, exception or provider payload."""
     result = {}
-    for venue in ("hyperliquid", "aster", "lighter"):
+    for venue in ("hyperliquid",):
         for network in ("mainnet", "testnet"):
             key = venue + ":" + network
             row = data.get("account_recovery", {}).get(key, {})
@@ -71,35 +69,20 @@ class Router:
         self.engines = {}
         self.errors = {}
         adapters = adapters or {}
-        for venue in ("hyperliquid", "aster", "lighter"):
-            selected = settings if venue == "hyperliquid" else adapter_settings(settings, venue)
-            adapter = hyperliquid if venue == "hyperliquid" else adapters.get(venue)
-            if adapter is not None and selected is None:
-                selected = adapter.settings
-            if selected is None:
-                self.errors[venue] = "Dedicated account and API credentials are not configured"
-                continue
-            view = VenueState(state, venue, selected)
-            try:
-                if adapter is None:
-                    from .aster import Aster
-                    from .lighter import Lighter
-
-                    adapter = (Aster if venue == "aster" else Lighter)(selected, view)
-                adapter.state = view
-                adapter.fail_closed_protection = True
-                view.assert_binding(selected)
-                binding = {"network": selected.network, "account": selected.account.lower()}
-                if venue not in state.snapshot()["venue_accounts"]:
-                    state.update(lambda data, name=venue, account=binding: data["venue_accounts"].__setitem__(name, account))
-                self.engines[venue] = Trading(adapter, view)
-                self.register_account(view, selected)
-            except Exception as error:
-                self.errors[venue] = str(error) if isinstance(error, AqlaError) else "Exchange initialization unavailable"
+        if any(key not in ("hyperliquid", "hyperliquid:mainnet", "hyperliquid:testnet") for key in adapters):
+            raise AqlaError("Only Hyperliquid execution adapters are supported")
+        view = VenueState(state, "hyperliquid", settings)
+        hyperliquid.state = view
+        hyperliquid.fail_closed_protection = True
+        view.assert_binding(settings)
+        if "hyperliquid" not in state.snapshot()["venue_accounts"]:
+            state.update(lambda data: data["venue_accounts"].__setitem__("hyperliquid", {"network": settings.network, "account": settings.account.lower()}))
+        self.engines["hyperliquid"] = Trading(hyperliquid, view)
+        self.register_account(view, settings)
         for key in settings.execution_accounts:
             venue, network = key.split(":", 1) if ":" in key else ("", "")
-            if venue not in ("hyperliquid", "aster", "lighter") or network not in ("mainnet", "testnet"):
-                raise AqlaError("Execution account keys must be exchange:network")
+            if venue != "hyperliquid" or network not in ("mainnet", "testnet"):
+                raise AqlaError("Execution account keys must be hyperliquid:network")
             selected = execution_settings(settings, key)
             if selected is None:
                 self.errors[key] = "Dedicated execution account/API credentials are not configured"
@@ -107,15 +90,12 @@ class Router:
             existing = self.engine_for(venue, network)
             if existing:
                 if selected.account.lower() != existing.exchange.settings.account.lower():
-                    raise AqlaError("An existing exchange/network account cannot be rebound")
+                    raise AqlaError("An existing Hyperliquid/network account cannot be rebound")
                 continue
             try:
                 from aqla_hyperliquid_mcp.api import Hyperliquid
-
-                from .aster import Aster
-                from .lighter import Lighter
                 view = VenueState(state, venue, selected, legacy=False)
-                adapter = adapters.get(key) or {"hyperliquid": Hyperliquid, "aster": Aster, "lighter": Lighter}[venue](selected, view)
+                adapter = adapters.get(key) or Hyperliquid(selected, view)
                 adapter.state = view
                 adapter.fail_closed_protection = True
                 view.assert_binding(selected)
@@ -123,11 +103,6 @@ class Router:
                 self.engines[key] = Trading(adapter, view)
             except Exception as error:
                 self.errors[key] = str(error) if isinstance(error, AqlaError) else "Execution account initialization unavailable"
-
-        self.public_feeds = {}
-        for engine in self.engines.values():
-            if hasattr(engine.exchange, "public_feeds"):
-                engine.exchange.public_feeds, engine.exchange.owns_public_feeds = self.public_feeds, False
 
     def register_account(self, view, selected):
         snapshot = self.state.snapshot()
@@ -154,7 +129,7 @@ class Router:
     def accounts_ready(self, data=None):
         data = self.state.snapshot() if data is None else data
         result = {}
-        for venue in ("hyperliquid", "aster", "lighter"):
+        for venue in ("hyperliquid",):
             for network in ("mainnet", "testnet"):
                 key = venue + ":" + network
                 engine = self.engine_for(venue, network)
@@ -201,7 +176,7 @@ class Router:
         return {name: {"configured": name in self.engines, "enabled": data["venue_enabled"].get(name, False),
                        "network": self.engines[name].exchange.settings.network if name in self.engines else "mainnet",
                        "account": self.engines[name].exchange.account if name in self.engines else None,
-                       "limits": data["venue_limits"].get(name), "reason": self.errors.get(name)} for name in ("hyperliquid", "aster", "lighter")}
+                       "limits": data["venue_limits"].get(name), "reason": self.errors.get(name)} for name in ("hyperliquid",)}
 
     async def inventory_status(self):
         engine = self.engines.get("hyperliquid")
@@ -328,47 +303,7 @@ class Router:
                 if ranked:
                     target = {**target, "requested_exchange": requested, "network": network, "rank_snapshot": rank,
                               "setup_id": digest([rank["source_id"], sorted(interpretation.source_refs)])[:32], "leg_id": identity}
-                    try:
-                        plan = await preview_on(engine, target)
-                    except (SymbolUnavailable, ExchangeMinimum) as missing:
-                        if requested != "hyperliquid" or self.target_started(self.state.snapshot(), target):
-                            raise
-                        pipeline_target = next(row for row in preview_basis["pipelines"][target["pipeline_id"]]["targets"] if row["exchange"] == requested)
-                        replacements = pipeline_target.get("fallback_exchanges")
-                        replacements = ["aster", "lighter"] if replacements is None else replacements
-                        reasons = []
-                        replacement = None
-                        readiness = self.accounts_ready(preview_basis)
-                        for venue in replacements:
-                            candidate = self.engine_for(venue, network)
-                            key = venue + ":" + network
-                            if candidate is None or not readiness[key]["enabled"] or not readiness[key]["limits"]:
-                                reasons.append(venue + ": account/permissions/limits unavailable")
-                                continue
-                            if (key, interpretation.symbol.upper()) in reserved:
-                                reasons.append(venue + ": explicit pipeline target already reserves this market")
-                                continue
-                            try:
-                                target = {**target, "exchange": venue, "fallback_reason": str(missing), "skipped_replacements": reasons.copy()}
-                                engine = candidate
-                                plan = await preview_on(candidate, target)
-                            except (SymbolUnavailable, ExchangeMinimum) as error:
-                                reasons.append(venue + ": " + str(error))
-                                continue
-                            replacement = candidate
-                            break
-                        if replacement is None:
-                            raise AqlaError("No replacement market/account in " + network + ": " + str(missing) + "; " + "; ".join(reasons)) from missing
-                        engine = replacement
-                else:
-                    plan = await preview_on(engine, target)
-                if ranked and requested == "hyperliquid" and not self.target_started(self.state.snapshot(), target):
-                    from .liquidity import select
-                    pipeline_target = next(row for row in preview_basis["pipelines"][target["pipeline_id"]]["targets"] if row["exchange"] == requested)
-                    replacements = pipeline_target.get("fallback_exchanges")
-                    replacements = ["aster", "lighter"] if replacements is None else replacements
-                    engine, target, plan = await select(self, plan, target, requested, network, replacements,
-                                                        preview_on, reserved, preview_basis)
+                plan = await preview_on(engine, target)
                 row = {**target, "status": "planned", "plan_id": plan["plan_id"]}
                 if marker:
                     row["observation_retry"] = {**marker, "completed": True, "exhausted": True}
@@ -736,10 +671,9 @@ class Router:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        await asyncio.gather(*(feed.close() for feed in self.public_feeds.values()))
         for engine in self.engines.values():
             await engine.exchange.close()
 
     @staticmethod
     def public_operation(row):
-        return VenueAdapter.public_operation(row)
+        return public_operation(row)

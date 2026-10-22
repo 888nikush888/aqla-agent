@@ -5,9 +5,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from aqla_agent.aster import Aster
-from aqla_agent.funding import aster_funding, hyperliquid_funding, lighter_funding
-from aqla_agent.lighter import Lighter
+from aqla_agent.funding import hyperliquid_funding
 from aqla_agent.read_budget import (
     ReadBudget,
     ReadBudgetExceeded,
@@ -17,42 +15,6 @@ from aqla_agent.read_budget import (
 )
 from aqla_hyperliquid_mcp.api import Hyperliquid
 from aqla_hyperliquid_mcp.models import Market
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("venue", ["hyperliquid", "aster", "lighter"])
-async def test_budget_counts_actual_history_pagination_transport_calls(venue):
-    calls = []
-    def transport(request):
-        calls.append(request)
-        if venue == "hyperliquid":
-            body = json.loads(request.content)
-            rows = [{"hash": str(index), "time": index, "delta": {"coin": "BTC", "type": "funding", "usdc": "1", "szi": "1"}}
-                    for index in range(body["startTime"], body["endTime"] + 1)]
-            return httpx.Response(200, json=rows * 500 if len(rows) > 1 else rows)
-        if venue == "aster":
-            start, end = int(request.url.params["startTime"]), int(request.url.params["endTime"])
-            rows = [{"tranId": str(index), "time": index, "incomeType": "FUNDING_FEE", "symbol": "BTCUSDT", "income": "1", "asset": "USDC"}
-                    for index in range(start, end + 1)]
-            return httpx.Response(200, json=rows * 1000 if len(rows) > 1 else rows)
-        return httpx.Response(200, json={"position_fundings": [], "next_cursor": str(len(calls))})
-    async with httpx.AsyncClient(base_url="https://synthetic.invalid", transport=httpx.MockTransport(transport)) as client:
-        adapter = object.__new__({"hyperliquid": Hyperliquid, "aster": Aster, "lighter": Lighter}[venue])
-        adapter.client = client
-        adapter.settings = SimpleNamespace(account="owner", vault_address=None)
-        if venue != "hyperliquid":
-            adapter.account = "owner"
-        if venue == "aster":
-            adapter.signed = lambda method, path, params: {"method": method, "path": path, "params": params}
-        elif venue == "lighter":
-            adapter.auth = lambda: "synthetic-token"
-        budget = ReadBudget("tick", 3, 100, clock=lambda: 0)
-        market = Market(symbol="BTC", native_symbol="BTCUSDT", asset_id=1, product="perp", size_decimals=2, max_leverage=20, mid="100")
-        fetch = {"hyperliquid": hyperliquid_funding, "aster": aster_funding, "lighter": lighter_funding}[venue]
-        with read_limits(budget), pytest.raises(ReadBudgetExceeded, match="tick_request_limit"):
-            await fetch(adapter, market, 0, 3)
-        assert budget.requests == len(calls) == 3
-        assert all(request.method == ("POST" if venue == "hyperliquid" else "GET") for request in calls)
 
 
 @pytest.mark.asyncio
@@ -154,3 +116,24 @@ async def test_parallel_read_contexts_are_isolated_and_time_is_checked_after_slo
         with read_limits(slow), pytest.raises(ReadBudgetExceeded, match="job_time_limit"), observed_request(client, "GET", "/slow"):
             await client.get("/slow")
         assert slow.requests == 1
+
+
+@pytest.mark.asyncio
+async def test_budget_counts_actual_history_pagination_transport_calls():
+    calls = []
+    def transport(request):
+        calls.append(request)
+        body = json.loads(request.content)
+        rows = [{"hash": str(index), "time": index, "delta": {"coin": "BTC", "type": "funding", "usdc": "1", "szi": "1"}}
+                for index in range(body["startTime"], body["endTime"] + 1)]
+        return httpx.Response(200, json=rows * 500 if len(rows) > 1 else rows)
+    async with httpx.AsyncClient(base_url="https://synthetic.invalid", transport=httpx.MockTransport(transport)) as client:
+        adapter = object.__new__(Hyperliquid)
+        adapter.client = client
+        adapter.settings = SimpleNamespace(account="owner", vault_address=None)
+        budget = ReadBudget("tick", 3, 100, clock=lambda: 0)
+        market = Market(symbol="BTC", asset_id=1, product="perp", size_decimals=2, max_leverage=20, mid="100")
+        with read_limits(budget), pytest.raises(ReadBudgetExceeded, match="tick_request_limit"):
+            await hyperliquid_funding(adapter, market, 0, 3)
+        assert budget.requests == len(calls) == 3
+        assert all(request.method == "POST" for request in calls)

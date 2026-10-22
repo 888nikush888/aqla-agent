@@ -2,8 +2,6 @@ import copy
 from decimal import Decimal
 
 import pytest
-from test_aster_adapter import aster  # noqa: F401 -- native contract fixture
-from test_lighter_adapter import lighter  # noqa: F401 -- native contract fixture
 from test_pipelines import routed  # noqa: F401 -- multi-target fixture
 
 from aqla_agent.pipelines import Parameters, Pipeline, TradingProfile, route_control
@@ -230,30 +228,8 @@ async def test_lost_backup_sl_reply_reconciles_exact_identity(setup,signal,monke
     assert fake.actions==before
 
 
-@pytest.mark.asyncio
-async def test_backup_prices_work_with_aster_contract(aster,setup,signal):  # noqa: F811 -- fixture
-    adapter,boundary,engine=aster
-    _,state,*_=setup
-    configure(state,stop='1',targets=['1','2'])
-    source,value=signal
-    plan=await engine.preview(source.event_id,missing(value,'stop_loss','take_profits'))
-    trade=await engine.execute(plan['plan_id'])
-    assert trade['status']=='open' and trade['backup_finalization']['phase']=='applied'
-    assert all(row['reduceOnly'] for row in boundary.orders.values() if row['clientOrderId']!=trade['entry_cloid'])
-    await adapter.close()
 
 
-@pytest.mark.asyncio
-async def test_backup_prices_work_with_lighter_native_integer_contract(lighter,setup,signal):  # noqa: F811 -- fixture
-    adapter,boundary,signer,engine=lighter
-    _,state,*_=setup
-    configure(state,stop='1',targets=['1','2'])
-    source,value=signal
-    plan=await engine.preview(source.event_id,missing(value,'stop_loss','take_profits'))
-    trade=await engine.execute(plan['plan_id'])
-    assert trade['status']=='open' and trade['backup_finalization']['phase']=='applied'
-    assert all(isinstance(values['base_amount'],int) for kind,values in signer.calls if kind=='order')
-    await adapter.close()
 
 
 @pytest.mark.asyncio
@@ -264,7 +240,7 @@ async def test_multi_target_backup_keeps_each_profile_and_shared_limits(routed,s
     source,value=signal
     previews=await router.preview(source.event_id,missing(value,'stop_loss','take_profits'))
     plans=[row['plan'] for row in previews['targets']]
-    assert {plan['policy']['risk_percent'] for plan in plans}=={'0.25','1'}
+    assert {plan['policy']['risk_percent'] for plan in plans}=={'0.25'}
     results=await router.execute_many([plan['plan_id'] for plan in plans])
     assert all(row.get('status')=='open' for row in results['targets'])
     assert all(row['backup_finalization']['phase']=='applied' for row in state.snapshot()['trades'].values())

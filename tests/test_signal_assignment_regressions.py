@@ -3,8 +3,6 @@ import copy
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
-from test_aster_adapter import aster  # noqa: F401 -- actual adapter fixture
-from test_lighter_adapter import lighter  # noqa: F401 -- actual adapter fixture
 
 from aqla_agent.semantic_contract import supported_action_failure
 from aqla_hyperliquid_mcp.api import Hyperliquid
@@ -13,22 +11,13 @@ from aqla_hyperliquid_mcp.server import close_server, create_server
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("symbol", ["BTCUSDT.P", "BTC/USDT.P", "btcusdc.p"])
-@pytest.mark.parametrize("venue", ["hyperliquid", "aster", "lighter"])
-async def test_source_perpetual_ticker_resolves_its_existing_market(setup, request, venue, symbol):
-    aster_fixture, lighter_fixture = request.getfixturevalue("aster"), request.getfixturevalue("lighter")
-    adapter = {"hyperliquid": setup[3], "aster": aster_fixture[0], "lighter": lighter_fixture[0]}[venue]
-    if venue == "aster" and "usdc" in symbol.lower():
-        with pytest.raises(AqlaError):
-            await adapter.market(symbol)  # Aster must preserve the requested settlement pair.
-    else:
-        market = await adapter.market(symbol)
-        assert market.symbol == "BTC"
-        if venue == "aster":
-            assert market.native_symbol == "BTCUSDT"
-        else:
-            assert market.asset_id == (1 if venue == "lighter" else 0)
-    assert not aster_fixture[1].posts and not lighter_fixture[1].posts and not setup[2].actions
+@pytest.mark.parametrize('symbol', ['BTCUSDT.P', 'BTC/USDT.P', 'btcusdc.p'])
+@pytest.mark.parametrize('venue', ['hyperliquid'])
+async def test_source_perpetual_ticker_resolves_its_existing_market(setup, venue, symbol):
+    market = await setup[3].market(symbol)
+    assert market.symbol == 'BTC' and market.asset_id == 0
+    assert not setup[2].actions
+
 
 
 def test_perpetual_suffix_does_not_rewrite_spot_or_hip3_identity():
@@ -38,20 +27,17 @@ def test_perpetual_suffix_does_not_rewrite_spot_or_hip3_identity():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("venue", ["hyperliquid", "aster", "lighter"])
+@pytest.mark.parametrize('venue', ['hyperliquid'])
 async def test_perpetual_ticker_update_still_binds_only_its_original_trade(setup, signal, request, venue):
-    engine = {"hyperliquid": setup[4], "aster": request.getfixturevalue("aster")[2], "lighter": request.getfixturevalue("lighter")[3]}[venue]
+    engine = setup[4]
     source, value = signal
     plan = await engine.preview(source.event_id, value)
-    trade = await engine.execute(plan["plan_id"])
-    reply = SourceEvent(chat_id="channel", message_id=700, sent_at=now_ms(), reply_to_id=source.message_id,
-                        text="BTCUSDT.P close now")
+    trade = await engine.execute(plan['plan_id'])
+    reply = SourceEvent(chat_id='channel', message_id=700, sent_at=now_ms(), reply_to_id=source.message_id, text='BTCUSDT.P close now')
     setup[4].ingest(reply)
-    update = Interpretation(kind="trade_update", source_refs=[reply.source_id], symbol="BTCUSDT.P", update_action="close",
-        evidence=[Evidence(field="symbol", source_id=reply.source_id, quote="BTCUSDT.P"),
-                  Evidence(field="update_action", source_id=reply.source_id, quote="close now")])
-    assert [t["trade_id"] for t in engine.update_candidates(reply.event_id, update)] == [trade["trade_id"]]
-    assert not engine.update_candidates(reply.event_id, update.model_copy(update={"symbol": "ETHUSDT.P"}))
+    update = Interpretation(kind='trade_update', source_refs=[reply.source_id], symbol='BTCUSDT.P', update_action='close', evidence=[Evidence(field='symbol', source_id=reply.source_id, quote='BTCUSDT.P'), Evidence(field='update_action', source_id=reply.source_id, quote='close now')])
+    assert [t['trade_id'] for t in engine.update_candidates(reply.event_id, update)] == [trade['trade_id']]
+    assert not engine.update_candidates(reply.event_id, update.model_copy(update={'symbol': 'ETHUSDT.P'}))
 
 
 @pytest.mark.asyncio

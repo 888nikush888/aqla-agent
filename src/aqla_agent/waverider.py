@@ -26,8 +26,8 @@ MIN_CASES, MIN_WAVES = 30, 10
 def software_hash():
     root = Path(__file__).parent
     files = [root / name for name in ("waverider.py", "waverider_replay.py", "managed_entries.py", "trading.py", "entry.py", "inventory_stream.py",
-        "entry_watch.py", "liquidity.py", "aster.py", "lighter.py", "pipelines.py", "monthly.py", "percent_targets.py",
-        "account_work.py", "lighter_book.py", "lighter_feed.py", "management_sequences.py", "interpretation_contract.py", "source_candidates.py", "semantic_contract.py", "conflict_review.py", "target_recovery.py")]
+        "entry_watch.py", "pipelines.py", "monthly.py", "percent_targets.py",
+        "account_work.py", "management_sequences.py", "interpretation_contract.py", "source_candidates.py", "semantic_contract.py", "conflict_review.py", "target_recovery.py")]
     files += [root.parent / "aqla_hyperliquid_mcp" / name for name in ("models.py", "rules.py", "api.py", "streams.py", "state.py", "storage.py")]
     return digest({path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in files})
 
@@ -229,19 +229,8 @@ async def market_facts(exchange, market):
         fee_observed_at = now_ms()
         raw = await exchange.info("candleSnapshot", req={"coin": market.symbol, "interval": "1m", "startTime": stamp - 3600000, "endTime": stamp})
         candles = [{"start": row["t"], "end": row["T"], "high": row["h"], "low": row["l"], "close": row["c"]} for row in raw]
-    elif venue == "aster":
-        fee = await exchange.read("commissionRate", {"symbol": market.native_symbol}, private=True)
-        if fee.get("symbol") != market.native_symbol:
-            raise AqlaError("Waverider fees belong to another market")
-        rate = Decimal(fee["takerCommissionRate"])
-        fee_observed_at = now_ms()
-        raw = await exchange.read("klines", {"symbol": market.native_symbol, "interval": "1m", "limit": 60})
-        candles = [{"start": row[0], "end": row[6], "high": row[2], "low": row[3], "close": row[4]} for row in raw]
     else:
-        reader = getattr(exchange, "waverider_facts", None)
-        if reader is None:
-            raise AqlaError("Waverider account fees and closed candles are not verified on this venue")
-        return await reader(market)
+        raise AqlaError("Waverider supports Hyperliquid only")
     if not rate.is_finite() or not 0 <= rate <= Decimal(".1"):
         raise AqlaError("Waverider fee observation is invalid")
     evidence = {"exchange": venue, "network": exchange.settings.network, "account": exchange.account,

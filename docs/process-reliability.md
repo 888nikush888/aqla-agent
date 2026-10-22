@@ -7,12 +7,12 @@ Ausführungscode mit Fake-Börsen; keine realen Testorders.
 | Bereich | Änderung | Nachweis |
 | --- | --- | --- |
 | Close-Recovery | Gespeicherte Close-Intents werden vor normaler Verwaltung für beide Lifecycle-Versionen fortgesetzt. Unklare bestehende Identitäten werden nie ersetzt. | Zustandsneustart bei vollständigem Close und Teilreduktion, einschließlich Split-Entry und Waverider |
-| Lighter | Ein gemeinsamer Buchaufbau verarbeitet Snapshot, einseitige Deltas, Löschungen und Nonce-Kontinuität. Fehler löschen den Beleg und verlangen einen neuen Snapshot. | Tiefe Preisstufen ändern nicht den BBO; Lücken, Replay, ungültige Werte und veraltete Zeitstempel werden gesperrt |
+| Marktdaten | Der native Hyperliquid-Beobachter teilt öffentliche L2-Snapshots je Netzwerk und Markt. Veraltete Belege erlauben keine neue Exposition. | Identität, Tiefe, Frische und unabhängige Kontosperren |
 | Managed-Refresh | Der Dispatcher unterscheidet `unchanged`, `sent`, `cancelled` und `unknown`. Nur mögliche finanzielle Änderungen erfordern einen zweiten Abgleich. | Ohne wartenden Entry genau ein Durchlauf; bestehende Storno-/Zwischenfill-Tests bleiben erhalten |
 | Kontoarbeit | Kurze, exklusive Arbeitspakete statt einer Sperre über den gesamten Kontodurchlauf; priorisierte Schließungen und Abgleich unklarer Operationen. Unabhängige Update-Ziele laufen begrenzt parallel. | Prioritäts-, Abbruch-, Sperr- und Mehrkontentests |
 | Ereignisse | Die vorhandene dauerhafte Outbox und der native Hermes-Adapter versenden in Legacy, Shadow und Hybrid. Eine reine Meldung weckt kein Modell. | Echter MCP-Outboxpfad mit gesperrten Modellaufrufen; verlorene Versandbestätigung bleibt ausdrücklich ungewiss |
 | Zustand | Zusammenfassung und Kontoprojektionen filtern vor dem Kopieren. Metadaten werden in derselben SQLite-Zeile atomar mit `json_set` aktualisiert; leere Outbox-Polls schreiben nichts. | Neustart, Schreibfehler, exklusive Writer-Lease und `synchronous=FULL` |
-| Marktfeeds und Replay | Beobachter teilen öffentliche Feeds je Börse/Netzwerk/Markt. Lighter-Kursleser nutzen denselben Buch-/Mark-Feed. Replay hat genau einen asynchronen Schreibpfad mit Budget, Aufbewahrung und Gesundheitsstatus. | Geteilte Verbindung, unveränderte Frischegrenzen, deaktivierte Aufzeichnung, Budget und Schutz aktiver Aufzeichnungen |
+| Marktfeeds und Replay | Beobachter teilen öffentliche Feeds je Börse/Netzwerk/Markt. Replay hat genau einen asynchronen Schreibpfad mit Budget, Aufbewahrung und Gesundheitsstatus. | Geteilte Verbindung, unveränderte Frischegrenzen, deaktivierte Aufzeichnung, Budget und Schutz aktiver Aufzeichnungen |
 | Kombinierte Verwaltung | Ein typisierter Plan reduziert zuerst eine belegte Menge und ändert danach den Stop des nachgewiesenen Restes. | Neustart nach Reduktion, unbekannter Versand, Source-Edit und feste Mengenbasis |
 
 ## Grenzen der finanziellen Ausführung
@@ -106,4 +106,21 @@ weder ein neues Datenbankschema noch zusätzliche Serverdienste eingeführt.
 Reale Kontorunden und Wartezeiten lassen sich über `account_recovery` und
 `status(view=summary).account_work` prüfen.
 
-Lighter-Protokoll: [offizielle WebSocket-Referenz](https://apidocs.lighter.xyz/docs/websocket-reference).
+
+## Unterbrochene optionale Wellen und fehlende Ziele
+
+Nach einem Abbruch vor Versand einer optionalen Waverider-Reduktion wird zuerst
+der tatsächliche eigene Bestand festgestellt. Bestätigt stornierte Quellziele
+werden über eine neue dauerhafte Generation wiederhergestellt. Dafür wird kein
+neuer Entry freigegeben; die übrigen Kurs- und Risikoprüfungen bleiben bestehen.
+Ein temporär fehlender optionaler Kursbeleg darf die Wiederherstellung bereits
+freigegebener Reduce-only-Ziele nicht verhindern.
+
+Für eine ungeklärte feste TP-Limitorder ist Abwesenheit allein kein Nachweis.
+Der signierte Request muss nachweislich abgelaufen sein; zwei native Statusreads,
+alle offenen und historischen Orders sowie die vollständigen Fills müssen die
+Abwesenheit bestätigen. Sättigung der begrenzten Historie, unbekannte Fills oder
+bereits beobachtete native Order-IDs sperren die Auflösung. Der alte Vorgang
+bleibt mit seinem Absenzbeleg im Journal. Nur diese geprüfte Generation darf
+ersetzt und beim späteren Cleanup ausgelassen werden. Trigger, Entries und
+andere unklare Operationen werden darüber nicht wiederholt.

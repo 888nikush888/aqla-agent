@@ -8,7 +8,6 @@ import pytest
 from test_pipelines import routed  # noqa: F401
 from test_token_efficiency import call, efficiency_server  # noqa: F401
 
-from aqla_agent.aster import Aster
 from aqla_agent.observations import TemporaryObservation
 from aqla_agent.source_disposition import verify_disposition
 from aqla_agent.tool_outputs import PAGE_BYTES, OutputStore, reader_text
@@ -90,32 +89,32 @@ def test_usage_stage_timings_are_opaque_and_do_not_claim_exchange_fills(tmp_path
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('venue', ['hyperliquid', 'aster'])
+@pytest.mark.parametrize('venue', ['hyperliquid'])
 @pytest.mark.parametrize('invalid', [None, 'identity', 'stale'])
 async def test_price_identity_and_freshness_validation_stay_strict(monkeypatch, venue, invalid):
-    for module in ('aqla_agent.entry', 'aqla_hyperliquid_mcp.api', 'aqla_agent.aster'):
-        monkeypatch.setattr(module+'.now_ms', lambda: 10000)
-    adapter = object.__new__(Hyperliquid if venue == 'hyperliquid' else Aster)
+    for module in ('aqla_agent.entry', 'aqla_hyperliquid_mcp.api'):
+        monkeypatch.setattr(module + '.now_ms', lambda: 10000)
+    adapter = object.__new__(Hyperliquid)
     market = Market(symbol='BTC', native_symbol='BTCUSDT', asset_id=1, product='perp', size_decimals=2, max_leverage=20, mid='100')
     started = []
+
     async def read(kind, *args, **kwargs):
         started.append(kind)
         stamp = 7999 if invalid == 'stale' else 10000
-        if venue == 'hyperliquid':
-            if kind == 'metaAndAssetCtxs':
-                return [{'universe': [{'name': 'BTC'}]}, [{'markPx': '100'}]]
-            return {'coin': 'ETH' if invalid == 'identity' else 'BTC', 'time': stamp,
-                    'levels': [[{'px': '99'}], [{'px': '101'}]]}
-        return {'symbol': 'ETHUSDT' if invalid == 'identity' else 'BTCUSDT', 'time': stamp,
-                'price': '100', 'bidPrice': '99', 'askPrice': '101'}
-    monkeypatch.setattr(adapter, 'info' if venue == 'hyperliquid' else 'read', read)
+        if kind == 'metaAndAssetCtxs':
+            return [{'universe': [{'name': 'BTC'}]}, [{'markPx': '100'}]]
+        return {'coin': 'ETH' if invalid == 'identity' else 'BTC', 'time': stamp, 'levels': [[{'px': '99'}], [{'px': '101'}]]}
+        return {'symbol': 'ETHUSDT' if invalid == 'identity' else 'BTCUSDT', 'time': stamp, 'price': '100', 'bidPrice': '99', 'askPrice': '101'}
+    monkeypatch.setattr(adapter, 'info', read)
     if invalid:
         with pytest.raises(TemporaryObservation if invalid == 'stale' else AqlaError):
             await adapter.price_snapshot(market)
     else:
         quote = await adapter.price_snapshot(market)
         assert quote.market == 'BTC' and quote.mid == quote.stop_reference == 100
-    assert len(started) == (4 if venue == 'hyperliquid' and invalid == 'stale' else 2)
+    assert len(started) == (4 if 'hyperliquid' == 'hyperliquid' and invalid == 'stale' else 2)
+
+
 
 
 @pytest.mark.asyncio
@@ -132,7 +131,7 @@ async def test_ranked_preview_resolves_once_under_lock_and_execute_resolves_agai
             return await _original(*args, **kwargs)
         monkeypatch.setattr(engine.exchange, 'market', counted)
     source, value = signal
-    lock = router.engines['aster'].lock
+    lock = router.engines['hyperliquid'].lock
     async with lock:
         pending = asyncio.create_task(router.preview(source.event_id, value))
         await asyncio.sleep(.01)

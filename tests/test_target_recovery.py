@@ -63,6 +63,12 @@ async def test_expired_target_absence_retires_exact_generation_then_restores_onc
         if row["cloid"] in {r["c"] for r in staged["action"]["orders"]}
     )
     assert all(order.get("r") for action in fake.actions[len(before) :] for order in action.get("orders", []))
+    for order in current["orders"]:
+        if order["kind"] == "tp" and not order.get("retired"):
+            fake.fill(order["cloid"], order["quantity"], order["price"])
+    await trading.refresh_trade(trade["trade_id"])
+    closed = state.read("trades")["trades"][trade["trade_id"]]
+    assert closed["status"] == "closed" and closed["cleanup_complete"] and closed["remaining_quantity"] == "0"
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,7 @@ Default fields are omitted from serialization so old standard plan IDs and JSON
 remain compatible.
 
 Maker entries and normal targets use the native post-only limit instruction:
-Hyperliquid `Alo`, Aster `GTX`, and Lighter `POST_ONLY` (`2`). Unsupported native
+Hyperliquid uses native `Alo`. Unsupported native
 instructions fail closed. Stops, triggers and emergency/authorized position
 reductions retain their existing trigger or IOC instruction.
 
@@ -34,8 +34,7 @@ notifications remain intact. Closed/closing cards do not present a TP rejection
 as current or claim a live stop; active cards claim retained stop protection only
 when the latest own stop observation covers the remaining quantity and price.
 
-Actual fill role is native evidence: strict Hyperliquid `crossed`, Aster `maker`,
-or Lighter `is_maker_ask` combined with the owning account side. Planned mode and
+Actual fill role is native evidence: strict Hyperliquid `crossed`. Planned mode and
 fee amount do not prove role. The additive `trade.fill_execution_roles` map uses
 the existing stable `fill_events` identity, with `maker`, `taker`, or `unknown`.
 Missing later role evidence preserves a known role. Contradictory known evidence
@@ -49,4 +48,4 @@ Regression evidence includes 72 complete frozen standard plans from release
 freeze all plan JSON, IDs and Decimal representations; independent wire,
 side/tick, slippage, partial quantity and risk assertions check their execution
 meaning. All verification is offline using generated test signers and local mock
-transports, including the installed Lighter native signer.
+Hyperliquid transports.

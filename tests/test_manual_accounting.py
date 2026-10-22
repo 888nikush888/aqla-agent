@@ -19,6 +19,7 @@ from aqla_sheets_mcp.journal import HEADERS, acknowledge, batch, project, record
 
 async def manual_trade(setup, signal, monkeypatch, *, mixed=False):
     settings, state, fake, exchange, _ = setup
+    state.update(lambda data: [target.update(fallback_exchanges=[]) for pipeline in data['pipelines'].values() for target in pipeline['targets']])
     original = fake.handle
     def with_fee_currency(request):
         result = original(request)

@@ -8,7 +8,7 @@ from .execution_outcome import execution_counts, retry_view, trade_outcome
 from .execution_roles import observed_roles
 from .source_queue import is_source_row
 
-VENUES = {"hyperliquid": "Hyperliquid", "aster": "Aster", "lighter": "Lighter"}
+VENUES = {"hyperliquid": "Hyperliquid"}
 OPEN = {"waiting_entry", "entry_pending", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
 ERRORS = {
     "SL, entry and TPs have invalid direction/ordering after rounding": "Preisordnung nach Rundung unzulässig; auch die Slippage-Ordergrenze wird geprüft.",
@@ -158,14 +158,14 @@ def profile_name(data, identity):
 def context(data, plan):
     venue = plan.get("exchange", "hyperliquid")
     network = plan.get("network") or data.get("venue_accounts", {}).get(venue, {}).get("network") or (data.get("network") if venue == "hyperliquid" else "mainnet")
-    text = f"**Börse:** {VENUES.get(venue, literal(venue))} · {literal(network).capitalize()}\n**Profil:** {profile_name(data, plan.get('profile_id', 'standard'))}"
+    text = f"**Börse:** {VENUES.get(venue, literal(venue).title())} · {literal(network).capitalize()}\n**Profil:** {profile_name(data, plan.get('profile_id', 'standard'))}"
     rank = plan.get("rank_snapshot")
     if rank:
         text += f"\n**Kanalrang:** {literal(rank['tier'])} · **Risikofaktor:** {number(rank['factor'])}×"
         if rank.get("bootstrap") and rank.get("provisional"):
             text += " · Startfreigabe"
     if plan.get("fallback_reason"):
-        text += "\n**Börsenersatz:** " + VENUES.get(plan.get("requested_exchange"), literal(plan.get("requested_exchange"))) + " → " + VENUES[venue]
+        text += "\n**Börsenersatz:** " + VENUES.get(plan.get("requested_exchange"), literal(plan.get("requested_exchange"))) + " → " + VENUES.get(venue, literal(venue).title())
         text += " · " + literal(ERRORS.get(plan["fallback_reason"], plan["fallback_reason"]))
     return text
 

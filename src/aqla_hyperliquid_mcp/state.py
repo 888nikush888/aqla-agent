@@ -85,7 +85,7 @@ class State:
                     "namespace": settings.google_sheets.tab_namespace, "network": settings.network, "account": target,
                     "ranking": settings.ranking_enabled, "accounts": self.data.get("venue_accounts", {}),
                     "execution_accounts": {key: {"network": row.network,
-                        "account": getattr(row, "vault_address", None) or row.account or str(row.account_index)}
+                        "account": getattr(row, "vault_address", None) or row.account or ""}
                         for key, row in settings.execution_accounts.items()}}))
             self._store = SQLiteStore(self.path, create=not existing)
             if not existing or migrated or legacy or self.journal_enabled:

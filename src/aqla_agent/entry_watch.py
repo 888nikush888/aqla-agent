@@ -11,10 +11,9 @@ from websockets.exceptions import WebSocketException
 from aqla_hyperliquid_mcp.models import AqlaError, Market, now_ms
 
 from .entry import BookSnapshot
-from .lighter_book import LighterBook
 
 
-def parse_book(venue, market, frame, *, lighter_book=None):
+def parse_book(venue, market, frame):
     if venue == "hyperliquid":
         if frame.get("channel") != "l2Book" or frame.get("data", {}).get("coin") != market.symbol:
             return None
@@ -22,15 +21,8 @@ def parse_book(venue, market, frame, *, lighter_book=None):
         bids, asks, stamp = row["levels"][0], row["levels"][1], row["time"]
         bid, ask = Decimal(bids[0]["px"]), Decimal(asks[0]["px"])
         depth = [[(level["px"], level["sz"]) for level in side if Decimal(level["sz"]) > 0] for side in (bids, asks)]
-    elif venue == "aster":
-        row = frame.get("data", frame)
-        if row.get("s") != market.native_symbol:
-            return None
-        bids, asks, stamp = row.get("b", row.get("bids")), row.get("a", row.get("asks")), row["E"]
-        bid, ask = Decimal(bids[0][0]), Decimal(asks[0][0])
-        depth = [bids, asks]
     else:
-        return (lighter_book or LighterBook(market)).apply(frame)
+        raise AqlaError("Entry watcher supports Hyperliquid only")
     if type(stamp) is not int or not 0 <= now_ms() - stamp <= 2000 or not bid.is_finite() or not ask.is_finite() or not 0 < bid <= ask:
         raise AqlaError("Entry watcher has no fresh consistent native book")
     return BookSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
@@ -43,7 +35,6 @@ class EntryWatch:
         self.tasks, self.groups = {}, {}
         self.closed = False
         self.changed = asyncio.Event()
-        self.reroute_task = None
         for engine in router.engines.values():
             engine.entry_wake = self.changed.set
 
@@ -73,13 +64,9 @@ class EntryWatch:
     async def observe(self, engine, identity, market):
         venue = getattr(engine.exchange.settings, "venue", "hyperliquid")
         base = str(engine.exchange.client.base_url).rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
-        if venue == "hyperliquid":
-            url, subscribe = base + "/ws", {"method": "subscribe", "subscription": {"type": "l2Book", "coin": market.symbol, "fast": True}}
-        elif venue == "aster":
-            url = ("wss://fstream.asterdex-testnet.com" if engine.exchange.settings.network == "testnet" else "wss://fstream.asterdex.com") + f"/ws/{market.native_symbol.lower()}@depth20@100ms"
-            subscribe = None
-        else:
-            url, subscribe = base + "/stream", {"type": "subscribe", "channel": f"order_book/{market.asset_id}"}
+        if venue != "hyperliquid":
+            raise AqlaError("Entry watcher supports Hyperliquid only")
+        url, subscribe = base + "/ws", {"method": "subscribe", "subscription": {"type": "l2Book", "coin": market.symbol, "fast": True}}
         wake = asyncio.Event()
         latest_book = None
         group_key = (venue, engine.exchange.settings.network, base, market.asset_id, market.symbol)
@@ -131,23 +118,9 @@ class EntryWatch:
         manager = asyncio.create_task(manage(), name="aqla-entry-events")
         delay = 1
         try:
-            if venue == "lighter" and hasattr(engine.exchange, "market_feed"):
-                feed = engine.exchange.market_feed(market)
-                feed.listeners.add(receive)
-                try:
-                    if feed.book is not None:
-                        try:
-                            receive(feed.book.fresh())
-                        except AqlaError:
-                            pass
-                    await asyncio.Event().wait()
-                finally:
-                    feed.listeners.discard(receive)
-                return
             while not self.closed:
                 try:
                     async with self.connector(url, max_size=1_000_000, open_timeout=5) as socket:
-                        lighter_book = LighterBook(market)
                         if subscribe:
                             await socket.send(json.dumps(subscribe))
                         delay = 1
@@ -156,7 +129,7 @@ class EntryWatch:
                             if frame.get("type") == "ping":
                                 await socket.send(json.dumps({"type": "pong"}))
                                 continue
-                            book = parse_book(venue, market, frame, lighter_book=lighter_book)
+                            book = parse_book(venue, market, frame)
                             if book:
                                 receive(book)
                 except (OSError, TimeoutError, AqlaError, ValueError, KeyError, IndexError, WebSocketException):
@@ -189,8 +162,6 @@ class EntryWatch:
                     if key not in self.tasks or self.tasks[key].done():
                         engine, identity, market = rows[0]
                         self.tasks[key] = asyncio.create_task(self.observe(engine, identity, market), name="aqla-book-" + market.symbol)
-                if self.reroute_task is None or self.reroute_task.done():
-                    self.reroute_task = asyncio.create_task(self.reroute(), name="aqla-zero-fill-handoff")
                 try:
                     async with asyncio.timeout(10):
                         await self.changed.wait()
@@ -201,19 +172,9 @@ class EntryWatch:
             for task in self.tasks.values():
                 task.cancel()
             tasks = list(self.tasks.values())
-            if self.reroute_task:
-                self.reroute_task.cancel()
-                tasks.append(self.reroute_task)
             for engine in self.router.engines.values():
                 for task in getattr(engine, "_waverider_capture_tasks", {}).values():
                     task.cancel()
                     tasks.append(task)
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def reroute(self):
-        try:
-            from .liquidity import reroute_waiting
-            await reroute_waiting(self.router)
-        except Exception:
-            import logging
-            logging.getLogger(__name__).warning("Zero-fill venue handoff awaits reconciliation")

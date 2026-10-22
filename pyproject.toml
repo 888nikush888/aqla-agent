@@ -22,7 +22,6 @@ dependencies = [
 [project.optional-dependencies]
 sources = ["Telethon>=1.42,<2"]
 sheets = ["google-auth[requests]>=2.38,<3"]
-exchanges = ["lighter-sdk==1.1.6"]
 dev = [
     "pytest>=8.3,<10",
     "pytest-asyncio>=1,<2",
@@ -55,11 +54,6 @@ exclude = ["**/__pycache__/**", "**/*.pyc"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = ["llm_eval: explicit real model evaluation (requires configured Hermes/model)"]
-
-[tool.uv]
-# Lighter's generated metadata caps urllib3 at a vulnerable historical release;
-# its asynchronous transport uses aiohttp. Keep the audited shared runtime version.
-override-dependencies = ["urllib3==2.8.0"]
 
 [tool.ruff]
 target-version = "py312"

@@ -1,19 +1,14 @@
 """Backup ROE is measured against original deployed margin, before costs."""
 import copy
 import json
-from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from oracles.rules_9ce4972 import make_plan as legacy_plan
-from test_aster_adapter import aster  # noqa: F401 -- native fixture
 from test_backup_and_names import missing
-from test_lighter_adapter import lighter  # noqa: F401 -- native fixture
 
 from aqla_agent.pipelines import Parameters, TradingProfile, route_control
-from aqla_agent.router import Router
-from aqla_agent.setup import SetupBinding, write_password_hash
 from aqla_agent.trading import Trading
 from aqla_hyperliquid_mcp.models import (
     AccountSnapshot,
@@ -26,8 +21,6 @@ from aqla_hyperliquid_mcp.models import (
     TradePlan,
 )
 from aqla_hyperliquid_mcp.rules import backup_prices, make_plan
-from aqla_hyperliquid_mcp.server import close_server, create_server
-from aqla_sheets_mcp.parameters import parameter_values
 
 
 def backup(**changes):
@@ -246,69 +239,3 @@ async def test_final_roe_risk_budget_failure_closes_and_pauses(setup, signal):
     assert "budget" in state.snapshot()["trades"][trade["trade_id"]]["execution_incident"]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("venue", ["hyperliquid", "aster", "lighter"])
-async def test_profile_mcp_router_plan_reaches_native_roe_prices(setup, signal, aster, lighter, tmp_path, monkeypatch, venue):  # noqa: F811 -- fixtures
-    settings, state, fake, exchange, _ = setup
-    adapter, boundary = (exchange, fake) if venue == "hyperliquid" else (aster if venue == "aster" else lighter)[:2]
-    original_market = adapter.market
-    async def capped_market(*args):
-        return (await original_market(*args)).model_copy(update={"max_leverage": 10})
-    monkeypatch.setattr(adapter, "market", capped_market)
-    verifier = tmp_path / "synthetic-roe-verifier.json"
-    write_password_hash(verifier, "synthetic-roe-fixture")
-    settings.setup_password_hash_file, settings.telegram_owner_id = verifier, "12345"
-    monkeypatch.setattr("aqla_hyperliquid_mcp.server.Router", lambda *args: Router(*args, adapters={} if venue == "hyperliquid" else {venue: adapter}))
-    server = create_server(settings, state=state, exchange=exchange)
-    binding = SetupBinding("12345", "12345", "roe-gateway", "roe-session")
-    gate = server._aqla_setup_gate
-    gate.register(binding, "d" * 64, None, gate.bind(binding))
-    auth = server.aqla_authority.sign("operator", "native-roe-command", setup={"identity": "d" * 64, "binding": asdict(binding)})
-    for identity, changes in (("standard", {"leverage_mode": "signal"}), ("backup", backup().model_dump(mode="json"))):
-        before = state.snapshot()["profiles"][identity]["parameters"]
-        result = await server.call_tool("control", {"action": "set_profile", "context_auth": auth,
-            "expected_revision": state.snapshot()["configuration_revision"],
-            "profile": {"id": identity, "name": identity.title(), "parameters": {**before, **changes}}})
-        assert not result.is_error
-    result = await server.call_tool("control", {"action": "set_pipeline", "context_auth": auth,
-        "expected_revision": state.snapshot()["configuration_revision"], "pipeline": {
-            "id": "legacy", "name": "ROE fixture", "sources": ["channel"], "enabled": True,
-            "targets": [{"exchange": venue, "profile_id": "standard"}]}})
-    assert not result.is_error
-    source, value = signal
-    source = source.model_copy(update={"message_id": 2, "text": source.text + " 12.78x"})
-    server.aqla_trading.ingest(source)
-    value = missing(value, "stop_loss", "take_profits")
-    value = value.model_copy(update={"source_refs": [source.source_id], "leverage": Decimal("12.78"),
-        "evidence": [row.model_copy(update={"source_id": source.source_id}) for row in value.evidence]
-            + [Evidence(field="leverage", source_id=source.source_id, quote="12.78x")]})
-    preview = await server.aqla_trading.preview(source.event_id, value)
-    plan = preview["targets"][0]["plan"]
-    assert plan["effective_leverage"] == 10 and Decimal(plan["stop_loss"]) == 96
-    assert list(map(Decimal, plan["take_profits"])) == [Decimal("102.5"), Decimal(105)]
-    assert plan["backup_values"]["fallback_take_profit_percentages"] == ["25", "50"]
-    trade = await server.aqla_trading.execute(plan["plan_id"])
-    assert trade["status"] == "open" and trade["backup_finalization"]["phase"] == "applied"
-    tick = Decimal(".1") if venue != "hyperliquid" else Decimal(".01")
-    margin_ratios(Decimal(trade["entry_vwap"]), Decimal(trade["stop_price"]), list(map(Decimal, trade["targets"])),
-        Decimal(trade["filled_quantity"]), 10, tick)
-    if venue == "hyperliquid":
-        assert all(row["order"]["reduceOnly"] for identity, row in boundary.orders.items() if identity != trade["entry_cloid"])
-        assert {Decimal(row["order"]["limitPx"]) for row in boundary.orders.values() if row["order"]["reduceOnly"] and not row["order"]["isTrigger"]} == {Decimal("102.5"), Decimal(105)}
-    elif venue == "aster":
-        assert all(row["reduceOnly"] for identity, row in boundary.orders.items() if identity != trade["entry_cloid"])
-        assert Decimal(trade["entry_vwap"]) == Decimal("100.3")
-        assert {Decimal(row["price"]) for row in boundary.orders.values() if row["reduceOnly"] and row["type"] == "LIMIT"} == {Decimal("102.9"), Decimal("105.4")}
-    else:
-        targets = [row for kind, row in lighter[2].calls if kind == "order" and row["reduce_only"] and row["order_type"] != 2]
-        assert {row["price"] for row in targets} == {1029, 1054}
-        assert all(isinstance(row["client_order_index"], int) for row in targets)
-        assert [row["nonce"] for _, row in lighter[2].calls] == list(range(boundary.nonce))
-    rows = {row[0]: row for row in parameter_values(state.snapshot())}
-    assert rows["profile:backup:fallback_stop_loss_percent"][4] == "% Marginverlust"
-    assert rows["profile:backup:fallback_take_profit_percentages"][4] == "% ROE"
-    assert state.snapshot()["trades"][trade["trade_id"]]["plan"] == plan
-    await close_server(server)
-    for unused in (aster[0], lighter[0]):
-        if unused is not adapter:
-            await unused.close()

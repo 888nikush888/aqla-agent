@@ -13,87 +13,17 @@ def accounts(setup, **options):
     settings, state, _, exchange, _ = setup
     async def close():
         pass
-    adapter = SimpleNamespace(settings=settings.model_copy(update={"account": "0x" + "9" * 40}),
+    adapter = SimpleNamespace(settings=settings.model_copy(update={"network": "mainnet", "account": "0x" + "9" * 40}),
         market_cache={}, close=close)
-    return Router(settings, state, exchange, adapters={"aster": adapter}, **options)
+    from aqla_hyperliquid_mcp.models import ExecutionSettings
+    settings.execution_accounts['hyperliquid:mainnet'] = ExecutionSettings(exchange='hyperliquid',network='mainnet',account=adapter.settings.account,private_key_file=settings.private_key_file)
+    return Router(settings, state, exchange, adapters={"hyperliquid:mainnet": adapter}, **options)
 
 
-@pytest.mark.asyncio
-async def test_hanging_account_does_not_block_independent_protection_check(setup, monkeypatch):
-    router = accounts(setup)
-    entered, protected, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    async def slow():
-        entered.set()
-        await release.wait()
-        router.engines["hyperliquid"].recovery_checked = True
-        return []
-    async def fast():
-        engine = router.engines["aster"]
-        engine.state.assert_binding(engine.exchange.settings)
-        engine.recovery_checked = True
-        protected.set()
-        return []
-    monkeypatch.setattr(router.engines["hyperliquid"], "recover", slow)
-    monkeypatch.setattr(router.engines["aster"], "recover", fast)
-    task = asyncio.create_task(router.recover())
-    await entered.wait()
-    try:
-        await asyncio.wait_for(protected.wait(), timeout=1)
-    finally:
-        release.set()
-        await task
-    assert protected.is_set()
-    await router.close()
 
 
-@pytest.mark.asyncio
-async def test_recovery_parallelism_is_bounded_without_holding_the_whole_account_lock(setup, monkeypatch):
-    router = accounts(setup, recovery_concurrency=1)
-    entered, protected, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    async def slow():
-        assert not router.engines["hyperliquid"].lock.locked()
-        entered.set()
-        await release.wait()
-        return []
-    async def fast():
-        assert not router.engines["aster"].lock.locked()
-        protected.set()
-        return []
-    monkeypatch.setattr(router.engines["hyperliquid"], "recover", slow)
-    monkeypatch.setattr(router.engines["aster"], "recover", fast)
-    task = asyncio.create_task(router.recover())
-    await entered.wait()
-    await asyncio.sleep(0)
-    assert not protected.is_set()
-    release.set()
-    await task
-    assert protected.is_set()
-    await router.close()
 
 
-@pytest.mark.asyncio
-async def test_account_timeout_and_fault_preserve_facts_and_emit_only_safe_diagnostics(setup, monkeypatch):
-    router = accounts(setup, recovery_timeout_seconds=.02)
-    state = setup[1]
-    state.update(lambda data: data.update(account_recovery={"hyperliquid:testnet": {"last_success_at": 123}}))
-    before = copy.deepcopy(state.snapshot())
-    async def hanging():
-        await asyncio.Event().wait()
-    async def faulty():
-        raise RuntimeError("untrusted-provider-payload")
-    monkeypatch.setattr(router.engines["hyperliquid"], "recover", hanging)
-    monkeypatch.setattr(router.engines["aster"], "recover", faulty)
-    rows = await router.recover()
-    after = state.snapshot()
-    diagnostic = after["account_recovery"]
-    assert diagnostic["hyperliquid:testnet"]["category"] == "timeout"
-    assert diagnostic["hyperliquid:testnet"]["last_success_at"] == 123
-    assert diagnostic["aster:testnet"]["category"] == "unavailable"
-    assert all(row["duration_ms"] >= 0 for row in diagnostic.values())
-    assert "untrusted-provider-payload" not in str(diagnostic) and "untrusted-provider-payload" not in str(rows)
-    assert after["trades"] == before["trades"] and after["operations"] == before["operations"]
-    assert router.engines["hyperliquid"].recovery_checked is False
-    await router.close()
 
 
 @pytest.mark.asyncio
@@ -193,3 +123,81 @@ async def test_status_recovery_diagnostics_are_bounded_and_discard_untrusted_ext
         assert state.snapshot() == before
     finally:
         await close_server(server)
+
+
+@pytest.mark.asyncio
+async def test_hanging_account_does_not_block_independent_protection_check(setup, monkeypatch):
+    router = accounts(setup)
+    entered, protected, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    async def slow():
+        entered.set()
+        await release.wait()
+        router.engines["hyperliquid"].recovery_checked = True
+        return []
+    async def fast():
+        engine = router.engines["hyperliquid:mainnet"]
+        engine.state.assert_binding(engine.exchange.settings)
+        engine.recovery_checked = True
+        protected.set()
+        return []
+    monkeypatch.setattr(router.engines["hyperliquid"], "recover", slow)
+    monkeypatch.setattr(router.engines["hyperliquid:mainnet"], "recover", fast)
+    task = asyncio.create_task(router.recover())
+    await entered.wait()
+    try:
+        await asyncio.wait_for(protected.wait(), timeout=1)
+    finally:
+        release.set()
+        await task
+    assert protected.is_set()
+    await router.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_parallelism_is_bounded_without_holding_the_whole_account_lock(setup, monkeypatch):
+    router = accounts(setup, recovery_concurrency=1)
+    entered, protected, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    async def slow():
+        assert not router.engines["hyperliquid"].lock.locked()
+        entered.set()
+        await release.wait()
+        return []
+    async def fast():
+        assert not router.engines["hyperliquid:mainnet"].lock.locked()
+        protected.set()
+        return []
+    monkeypatch.setattr(router.engines["hyperliquid"], "recover", slow)
+    monkeypatch.setattr(router.engines["hyperliquid:mainnet"], "recover", fast)
+    task = asyncio.create_task(router.recover())
+    await entered.wait()
+    await asyncio.sleep(0)
+    assert not protected.is_set()
+    release.set()
+    await task
+    assert protected.is_set()
+    await router.close()
+
+
+@pytest.mark.asyncio
+async def test_account_timeout_and_fault_preserve_facts_and_emit_only_safe_diagnostics(setup, monkeypatch):
+    router = accounts(setup, recovery_timeout_seconds=.02)
+    state = setup[1]
+    state.update(lambda data: data.update(account_recovery={"hyperliquid:testnet": {"last_success_at": 123}}))
+    before = copy.deepcopy(state.snapshot())
+    async def hanging():
+        await asyncio.Event().wait()
+    async def faulty():
+        raise RuntimeError("untrusted-provider-payload")
+    monkeypatch.setattr(router.engines["hyperliquid"], "recover", hanging)
+    monkeypatch.setattr(router.engines["hyperliquid:mainnet"], "recover", faulty)
+    rows = await router.recover()
+    after = state.snapshot()
+    diagnostic = after["account_recovery"]
+    assert diagnostic["hyperliquid:testnet"]["category"] == "timeout"
+    assert diagnostic["hyperliquid:testnet"]["last_success_at"] == 123
+    assert diagnostic["hyperliquid:mainnet"]["category"] == "unavailable"
+    assert all(row["duration_ms"] >= 0 for row in diagnostic.values())
+    assert "untrusted-provider-payload" not in str(diagnostic) and "untrusted-provider-payload" not in str(rows)
+    assert after["trades"] == before["trades"] and after["operations"] == before["operations"]
+    assert router.engines["hyperliquid"].recovery_checked is False
+    await router.close()

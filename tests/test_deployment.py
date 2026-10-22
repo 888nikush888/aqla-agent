@@ -70,7 +70,7 @@ def test_linux_install_uses_separate_managed_interpreters_and_pinned_hermes(tmp_
         commands.append((args, kwargs))
     monkeypatch.setattr(install.subprocess, "run", run)
     install.install_runtime(tmp_path)
-    assert commands[0][0] == ["uv", "sync", "--frozen", "--extra", "sources", "--extra", "sheets", "--extra", "exchanges", "--python", "3.12", "--python-preference", "only-managed"]
+    assert commands[0][0] == ["uv", "sync", "--frozen", "--extra", "sources", "--extra", "sheets", "--python", "3.12", "--python-preference", "only-managed"]
     assert any("3.14" in args and "only-managed" in args for args, _ in commands)
     assert any(args[-1] == install.HERMES_COMMIT and "--detach" in args for args, _ in commands)
     assert all(options["env"]["UV_PYTHON_INSTALL_DIR"] == str(tmp_path / ".python") for _, options in commands)

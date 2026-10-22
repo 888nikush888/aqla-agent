@@ -15,12 +15,11 @@ from .ranking import TIERS, Tier, outcomes, source_key
 
 MAX_PRESENTATION_BYTES = 600_000
 Money = Annotated[Decimal, Field(allow_inf_nan=False)]
-Exchange = Literal["hyperliquid", "aster", "lighter"]
 Execution = Literal["standard", "maker_only"]
 
 
 class PresentationScope(Model):
-    exchange: Literal["all", "hyperliquid", "aster", "lighter"] = "all"
+    exchange: Literal["all", "hyperliquid"] = "all"
     network: Literal["mainnet", "testnet"] = "mainnet"
     currency: Annotated[str, Field(pattern=r"^[A-Z][A-Z0-9_]{0,15}$")] = "USDC"
     period: str = "current"
@@ -64,7 +63,7 @@ class PresentationTrade(Model):
     fees: Money | None = None
     funding: Money | None = None
     currency: str
-    exchange: Exchange
+    exchange: str
     network: Literal["mainnet", "testnet"]
     entry_execution: Execution = "standard"
     take_profit_execution: Execution = "standard"

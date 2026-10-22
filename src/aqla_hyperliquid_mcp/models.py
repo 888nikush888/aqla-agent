@@ -164,8 +164,7 @@ class Settings(Model):
     telegram_api_hash_file: Path | None = None
     telegram_owner_id: str | None = None
     google_sheets: GoogleSheetsSettings = Field(default_factory=GoogleSheetsSettings)
-    venues: dict[Literal["aster", "lighter"], VenueSettings] = Field(default_factory=dict)
-    execution_accounts: dict[str, ExecutionSettings] = Field(default_factory=dict)
+    execution_accounts: dict[Annotated[str, Field(pattern=r"^hyperliquid:(mainnet|testnet)$")], ExecutionSettings] = Field(default_factory=dict)
     ranking_enabled: bool = False
     express: ExpressSettings = Field(default_factory=ExpressSettings)
     waverider_replay: ReplaySettings = Field(default_factory=ReplaySettings)
@@ -174,6 +173,8 @@ class Settings(Model):
     def journal_network(self):
         if self.google_sheets.tab_namespace not in ("legacy", self.network):
             raise ValueError("Journal namespace must match its execution network")
+        if any(key != "hyperliquid:" + value.network for key, value in self.execution_accounts.items()):
+            raise ValueError("Hyperliquid execution account key and network differ")
         return self
 
     @property
@@ -199,27 +200,19 @@ class Settings(Model):
         if sheets.get("credentials_file"):
             sheets["credentials_file"] = str((path.parent / sheets["credentials_file"]).resolve())
             raw["google_sheets"] = sheets
-        for venue in raw.get("venues", {}).values():
-            for key in ("private_key_file",):
-                if venue.get(key):
-                    venue[key] = str((path.parent / venue[key]).resolve())
         for execution in raw.get("execution_accounts", {}).values():
             if execution.get("private_key_file"):
                 execution["private_key_file"] = str((path.parent / execution["private_key_file"]).resolve())
         return cls.model_validate(raw)
 
 
-class VenueSettings(Model):
+class ExecutionSettings(Model):
+    exchange: Literal["hyperliquid"]
     network: Literal["mainnet", "testnet"] = "mainnet"
     account: Address | None = None
-    signer: Address | None = None
-    account_index: int | None = Field(default=None, ge=0)
-    api_key_index: int | None = Field(default=None, ge=4, le=254)
     private_key_file: Path | None = None
 
 
-class ExecutionSettings(VenueSettings):
-    exchange: Literal["hyperliquid", "aster", "lighter"]
     signer_role: Literal["api_wallet", "master"] = "api_wallet"
     vault_address: Address | None = None
     shared_account: bool = False
@@ -571,7 +564,7 @@ class TradePlan(Model):
     ranking_policy_revision: int | None = Field(default=None, ge=1, strict=True)
     ranking_enabled: bool | None = Field(default=None, strict=True)
     base_parameters: dict | None = None
-    requested_exchange: Literal["hyperliquid", "aster", "lighter"] | None = None
+    requested_exchange: str | None = None
     routing_leg_id: str | None = None
     setup_id: str | None = None
     fallback_reason: str | None = None
@@ -587,7 +580,7 @@ class TradePlan(Model):
     risk_usdc: Positive
     deadline_at: int
     created_at: int
-    exchange: Literal["hyperliquid", "aster", "lighter"] = "hyperliquid"
+    exchange: str = "hyperliquid"
     pipeline_id: str | None = None
     profile_id: str | None = None
     profile_revision: int | None = None

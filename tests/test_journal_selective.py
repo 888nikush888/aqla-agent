@@ -57,6 +57,9 @@ def financial_data(setup, monkeypatch):
     from test_monthly import trade
 
     snapshot = setup[1].snapshot()
+    for pipeline in snapshot["pipelines"].values():
+        for target in pipeline["targets"]:
+            target["fallback_exchanges"] = []
     monkeypatch.setattr(journal, "now_ms", lambda: 1_800_000_000_000)
     monkeypatch.setattr(financial_oracle, "now_ms", lambda: 1_800_000_000_000)
     row = trade()
@@ -71,6 +74,23 @@ def financial_data(setup, monkeypatch):
         "wire_action": {"type": "order", "orders": [{"c": "target", "p": "105", "s": ".5"}]},
         "request": {"type": "synthetic"}, "result": {"status": "ok"}}}
     return snapshot
+
+
+def test_retired_finance_keeps_its_history_without_republishing_an_inactive_scope(financial_data):
+    from aqla_agent.pipelines import migrate
+    financial_data["trades"]["trade"]["plan"]["exchange"] = "aster"
+    financial_data["operations"]["operation"]["exchange"] = "aster"
+    financial_data["execution_accounts"]["aster:mainnet"] = {"exchange": "aster", "network": "mainnet", "account": "historical"}
+    records = journal.project(financial_data)
+    retired = {key: row["fingerprint"] for key, row in records.items() if row["table"] in ("Trades", "Orders", "Fills", "Vorgänge")}
+    financial_data["journal_pending"] = dict(retired)
+    before = copy.deepcopy(financial_data)
+    assert migrate(financial_data)
+    journal.seed(financial_data)
+    assert financial_data["trades"] == before["trades"] and financial_data["operations"] == before["operations"]
+    assert financial_data["retired_execution_configuration"]["journal_pending"] == retired
+    assert not set(journal.project(financial_data)).intersection(retired)
+    assert not {journal.record_key(row) for row in journal.batch(financial_data)["records"]}.intersection(retired)
 
 
 @pytest.mark.parametrize("table", ["Trades", "Orders", "Fills", "Vorgänge"])
@@ -180,6 +200,9 @@ def journal_data(setup, monkeypatch):
         trading.ingest(SourceEvent(chat_id="channel", message_id=index + 1, sent_at=1_800_000_000_000 + index,
                                    received_at=1_800_000_000_000 + index, text="独立😀" * 70, historical=True))
     data = state.snapshot()
+    for pipeline in data["pipelines"].values():
+        for target in pipeline["targets"]:
+            target["fallback_exchanges"] = []
     history = oracle.record("Ereignisse", "history", "now", 1, "Signale", "one", "before", "after")
     data["journal_history"] = {"history": history}
     data["journal_pending"] = {key: row["fingerprint"] for key, row in oracle.project(data).items()}
@@ -303,6 +326,9 @@ async def test_trade_order_fill_operation_rank_mixed_ack_complete_state_oracle(s
 
     monkeypatch.setattr(oracle, "project", additive_oracle)
     data = state.snapshot()
+    for pipeline in data["pipelines"].values():
+        for target in pipeline["targets"]:
+            target["fallback_exchanges"] = []
     data["ranking_history"] = {"rank-history": {"source_id": "channel", "time": 1_800_000_000_000, "old": "F", "new": "E",
         "metrics": {"score": "40", "drawdown_r": "0"}, "network": "testnet", "revision": 2}}
     records = oracle.project(data)

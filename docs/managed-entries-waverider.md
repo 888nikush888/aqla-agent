@@ -162,8 +162,8 @@ Hyperliquid-Kontogebühr berücksichtigt den aktiven Referral-Rabatt einmal.
 
 `funding` enthält tatsächliche native Abrechnungen mit `time`, `rate`,
 `reference_price`, `reference_kind`, `market`, `exchange`, `network`, `currency`
-und `settled=true`. Für Hyperliquid ist die Preisbasis `oracle`, für Aster
-`mark`. `funding_coverage` dokumentiert Start, Ende, die Herkunft
+und `settled=true`. Die Hyperliquid-Preisbasis ist `oracle`.
+`funding_coverage` dokumentiert Start, Ende, die Herkunft
 `native_settled_funding_history` und die Prüfsumme des Originalbelegs. Die
 stündlichen Hyperliquid-Abrechnungen müssen vollständig sein. Nur eine Rate
 ohne belegten Abrechnungspreis ist noch kein vollständiger Funding-Beleg.

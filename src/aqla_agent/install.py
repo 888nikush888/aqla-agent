@@ -145,7 +145,7 @@ def install_runtime(destination: Path):
     def run(args):
         environment = dict(os.environ, UV_PYTHON_INSTALL_DIR=str(destination / ".python"))
         return subprocess.run(args, cwd=destination, check=True, env=environment)
-    run([uv, "sync", "--frozen", "--extra", "sources", "--extra", "sheets", "--extra", "exchanges", "--python", "3.12", "--python-preference", "only-managed"])
+    run([uv, "sync", "--frozen", "--extra", "sources", "--extra", "sheets", "--python", "3.12", "--python-preference", "only-managed"])
     source = destination / "hermes-source"
     run([git, "clone", "--filter=blob:none", "https://github.com/NousResearch/hermes-agent.git", str(source)])
     run([git, "-C", str(source), "checkout", "--detach", HERMES_COMMIT])

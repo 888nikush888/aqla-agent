@@ -71,45 +71,5 @@ async def hyperliquid_funding(exchange, market, start, end) -> list[FundingPayme
     return result
 
 
-async def aster_funding(exchange, market, start, end) -> list[FundingPayment]:
-    async def fetch(low, high):
-        return await exchange.read("income", {"symbol": market.native_symbol, "incomeType": "FUNDING_FEE",
-                                              "startTime": str(low), "endTime": str(high), "limit": "1000"}, private=True)
-    rows = await bounded_history(fetch, start, end, limit=1000)
-    result = []
-    for row in rows:
-        if row.get("incomeType") != "FUNDING_FEE" or row.get("symbol") != market.native_symbol or not start <= row["time"] <= end:
-            raise AqlaError("Aster income does not match the requested payment window")
-        result.append(payment(digest([row["incomeType"], row["tranId"], row["asset"], row["symbol"]]),
-                              row["time"], row["income"], row["asset"], market.symbol, raw=row))
-    return result
 
 
-async def lighter_funding(exchange, market, start, end) -> list[FundingPayment]:
-    result, cursor, seen = {}, None, set()
-    for _ in range(64):
-        raw = await exchange.read("positionFunding", {"account_index": exchange.account, "limit": 100,
-                                  "market_ids": market.asset_id, "start_timestamp": start // 1000,
-                                  "end_timestamp": (end + 999) // 1000, **({"cursor": cursor} if cursor else {})}, private=True)
-        if not isinstance(raw.get("position_fundings"), list):
-            raise AqlaError("Lighter returned no complete account funding list")
-        for row in raw["position_fundings"]:
-            timestamp = row["timestamp"] * 1000 if row["timestamp"] < 10**12 else row["timestamp"]
-            if row["market_id"] != market.asset_id or row["position_side"] not in ("long", "short"):
-                raise AqlaError("Lighter returned funding from another market")
-            # Timestamp filters are second-resolution, while fills are stored in ms.
-            if not start <= timestamp <= end:
-                continue
-            size = abs(Decimal(row["position_size"])) * (1 if row["position_side"] == "long" else -1)
-            fact = payment(digest([row["market_id"], row["funding_id"]]), timestamp, row["change"], "USDC", market.symbol, size=size, raw=row)
-            old = result.get(fact["identity"])
-            if old and old != fact:
-                raise AqlaError("Lighter funding identity changed between pages")
-            result[fact["identity"]] = fact
-        cursor = raw.get("next_cursor")
-        if not cursor:
-            return list(result.values())
-        if cursor in seen:
-            raise AqlaError("Lighter funding cursor repeated; coverage is incomplete")
-        seen.add(cursor)
-    raise AqlaError("Lighter funding exceeded the bounded cursor budget")

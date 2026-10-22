@@ -69,7 +69,7 @@ def replan_case(case, parameters):
 def funding_schedule(case, plan):
     rows = case.get("funding", [])
     previous = -1
-    expected_kind = {"hyperliquid": "oracle", "aster": "mark"}.get(plan.exchange)
+    expected_kind = "oracle" if plan.exchange == "hyperliquid" else None
     for row in rows:
         stamp, rate, price = int(row["time"]), Decimal(row["rate"]), Decimal(row["reference_price"])
         if (stamp <= previous or not rate.is_finite() or not price.is_finite() or price <= 0
@@ -102,7 +102,7 @@ def validate_native_evidence(case, plan):
         try:
             quote = PriceSnapshot.model_validate(record["quote"])
             quote.fresh(as_of=quote.observed_at)
-            if quote.stop_reference_kind != ("contract" if plan.exchange == "aster" else "mark"):
+            if quote.stop_reference_kind != "mark":
                 raise ReplayEvidenceError("The native stop reference uses another venue's price kind")
         except TemporaryObservation as error:
             raise ReplayEvidenceError("Native book or stop reference exceeds the unchanged two-second freshness limit") from error

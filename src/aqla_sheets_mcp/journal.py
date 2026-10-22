@@ -111,6 +111,18 @@ def _signal_record(data, identity, event, aliases):
 
 
 def _selected_record(data, key, fallback, history):
+    row = _selected_record_current(data, key, fallback, history)
+    return None if row is not None and _retired_record(data, row) else row
+
+
+def _retired_record(data, row):
+    if not data.get("retired_execution_configuration") or row["table"] not in ("Trades", "Orders", "Fills", "Vorgänge"):
+        return False
+    index = HEADERS[row["table"]].index("Börse")
+    return len(row["values"]) > index and row["values"][index] != "hyperliquid"
+
+
+def _selected_record_current(data, key, fallback, history):
     table, separator, identity = key.partition(":")
     if separator:
         row = history.get(key)
@@ -224,7 +236,7 @@ def project(data):
         for target in pipeline["targets"]:
             add(record("Pipelines", identity + ":" + target["exchange"], pipeline["name"], text(pipeline["sources"]), target["exchange"],
                        target["profile_id"], pipeline["enabled"], data["venue_enabled"].get(target["exchange"], False), pipeline["revision"],
-                       text(target.get("fallback_exchanges") if target.get("fallback_exchanges") is not None else ["aster", "lighter"] if target["exchange"] == "hyperliquid" else []), "Rang: C+ Mainnet, D/E/F Testnet"))
+                       text([]), "Rang: C+ Mainnet, D/E/F Testnet"))
     if data.get("ranking_policy"):
         from aqla_agent.ranking import FACTORS, source_key
         for source, rank in data.get("source_ranks", {}).items():
@@ -246,7 +258,7 @@ def project(data):
         rows.setdefault(record_key(row), row)
     for row in data.get("journal_history", {}).values():
         add(row)
-    return rows
+    return {key: row for key, row in rows.items() if not _retired_record(data, row)}
 
 
 def _target_record(data, row):
@@ -318,6 +330,12 @@ def enqueue_changes(previous, proposed):
 
 def seed(data, *, destination=None):
     pending = data.setdefault("journal_pending", {})
+    if data.get("retired_execution_configuration"):
+        cache = {}
+        for key in list(pending):
+            row = _selected_record_current(data, key, cache, {})
+            if row is not None and _retired_record(data, row):
+                data["retired_execution_configuration"].setdefault("journal_pending", {})[key] = pending.pop(key)
     rows = project(data)
     queued = data.get("journal_projection", {}) if destination == data.get("journal_destination") else {}
     for key, row in rows.items():

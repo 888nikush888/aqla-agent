@@ -2070,6 +2070,7 @@ class Trading:
         return await self.dispatch_close_intent(trade_id, intent)
 
     async def _cancel_owned_orders(self, trade_id, include_sl=False, operation_id=None):
+        from .target_recovery import absence_proved
         trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
         self.assert_plan_binding(self.state.snapshot(), plan)
@@ -2078,17 +2079,22 @@ class Trading:
             orders.extend(row for row in trade.get("exit_orders", []) if row["kind"] in ("waverider", "waverider_retirement") and not row.get("not_sent"))
         if trade.get("lifecycle_version") == 2:
             orders = [row for row in orders if not row.get("not_sent") and trade.get("order_observations", {}).get(row["cloid"], {}).get("status") not in TERMINAL_ORDER]
+        operations = self.state.read("operations")["operations"]
+        orders = [row for row in orders if not absence_proved(operations, row)]
         if not orders:
             return
         cancels = [{"asset": plan.market.asset_id, "cloid": order["cloid"]} for order in orders]
         return await self.exchange.mutate(operation_id or "cleanup:" + trade_id + ":" + str(trade["management_revision"]), {"type": "cancelByCloid", "cancels": cancels})
 
     def begin_cleanup(self, trade_id, terminal_status):
+        from .target_recovery import absence_proved
         snapshot = self.state.snapshot()
         trade = snapshot["trades"][trade_id]
         self.assert_plan_binding(self.state.snapshot(), TradePlan.model_validate(trade["plan"]))
         identities = []
         for order in [*trade["orders"], *(row for row in trade.get("exit_orders", []) if row["kind"] in ("waverider", "waverider_retirement"))]:
+            if absence_proved(snapshot["operations"], order):
+                continue
             if trade.get("lifecycle_version") == 2 and (order.get("not_sent") or trade.get("order_observations", {}).get(order["cloid"], {}).get("status") in TERMINAL_ORDER):
                 continue
             for operation in snapshot["operations"].values():
@@ -2100,12 +2106,16 @@ class Trading:
                     cleanup_cloids=sorted(set(identities)), cleanup_complete=False)
 
     async def finish_cleanup(self, trade_id):
+        from .target_recovery import absence_proved
         trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         self.assert_plan_binding(self.state.snapshot(), TradePlan.model_validate(trade["plan"]))
         if trade.get("cleanup_cloids"):
             await self._cancel_owned_orders(trade_id, include_sl=True)
-            observations = [await self.order_status(identity) for identity in trade["cleanup_cloids"]]
-            self.observe_orders(trade_id, dict(zip(trade["cleanup_cloids"], observations, strict=True)))
+            operations = self.state.read("operations")["operations"]
+            proved = {row["cloid"] for row in trade["orders"] if absence_proved(operations, row)}
+            identities = [identity for identity in trade["cleanup_cloids"] if identity not in proved]
+            observations = [await self.order_status(identity) for identity in identities]
+            self.observe_orders(trade_id, dict(zip(identities, observations, strict=True)))
             if any(row.get("order", {}).get("status") not in TERMINAL_ORDER for row in observations):
                 raise AqlaError("Owned exit cancellation is unconfirmed; market ownership remains reserved")
         self._patch(trade_id, status=trade["cleanup_target"], cleanup_complete=True, reserved_risk="0", cleanup_observed_at=now_ms())

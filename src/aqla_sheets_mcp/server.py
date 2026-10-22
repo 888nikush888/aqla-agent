@@ -29,16 +29,16 @@ def create_server(settings, *, client=None):
 
     def scoped_client(key, account=None):
         venue, network = key.split(":") if ":" in key else ("", "")
-        if venue not in ("hyperliquid", "aster", "lighter") or network not in ("mainnet", "testnet"):
+        if venue != "hyperliquid" or network not in ("mainnet", "testnet"):
             raise AqlaError("Select a known exchange:network journal scope")
         if venue == "hyperliquid" and network == settings.network:
             expected = (settings.vault_address or settings.account).lower()
             selected = client
         else:
-            execution = settings.execution_accounts.get(key) or settings.venues.get(venue)
+            execution = settings.execution_accounts.get(key)
             if execution is None or execution.network != network:
                 raise AqlaError("Journal execution account/network is not configured")
-            expected = str(execution.account_index) if venue == "lighter" else (getattr(execution, "vault_address", None) or execution.account or "").lower()
+            expected = (execution.vault_address or execution.account or "").lower()
             if not expected:
                 raise AqlaError("Journal account binding is incomplete")
             if key not in account_clients:

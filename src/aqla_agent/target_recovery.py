@@ -4,6 +4,14 @@ from __future__ import annotations
 from aqla_hyperliquid_mcp.models import digest, now_ms
 
 
+def absence_proved(operations, order):
+    record = operations.get(order.get("absence_operation"), {})
+    return (record.get("phase") == "reconciled" and record.get("outcome") == "absent_expired"
+            and any(row.get("kind") == "expired_target_absence" and order["cloid"] in row.get("cloids", [])
+                    and row.get("observed_at", 0) >= row.get("expires_after", 0) + 10_000
+                    for row in record.get("evidence", [])))
+
+
 async def expired_target(exchange, record, observations):
     action = record["wire_action"]
     orders = action.get("orders", [])

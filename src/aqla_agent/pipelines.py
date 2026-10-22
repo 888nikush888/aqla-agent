@@ -12,7 +12,7 @@ from pydantic import Field, model_serializer, model_validator
 
 from aqla_hyperliquid_mcp.models import AqlaError, Model, Policy, Positive, digest, now_ms
 
-Venue = Literal["hyperliquid", "aster", "lighter"]
+Venue = Literal["hyperliquid"]
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9_-]{1,64}$")]
 
 
@@ -99,20 +99,13 @@ class TradingProfile(Model):
 class PipelineTarget(Model):
     exchange: Venue
     profile_id: Identifier
-    fallback_exchanges: list[Venue] | None = Field(default=None, max_length=2)
-
-    @model_validator(mode="after")
-    def fallback_valid(self):
-        if self.fallback_exchanges is not None and (self.exchange != "hyperliquid" or len(set(self.fallback_exchanges)) != len(self.fallback_exchanges) or "hyperliquid" in self.fallback_exchanges):
-            raise ValueError("Only Hyperliquid targets support unique Aster/Lighter replacements")
-        return self
 
 
 class Pipeline(Model):
     id: Identifier
     name: str = Field(min_length=1, max_length=100)
     sources: list[str] = Field(min_length=1, max_length=200)
-    targets: list[PipelineTarget] = Field(min_length=1, max_length=3)
+    targets: list[PipelineTarget] = Field(min_length=1, max_length=1)
     enabled: bool = False
 
     @model_validator(mode="after")
@@ -127,7 +120,7 @@ class Pipeline(Model):
 def migrate(data):
     """Add routing without rehashing any existing trade, order or operation."""
     if "profiles" in data:
-        changed = False
+        changed = retire_execution_configuration(data)
         if "execution_accounts" not in data:
             from .ranking import RankingPolicy
             data.update(execution_accounts={}, account_limits={}, account_enabled={}, account_bindings={}, account_nonces={}, account_events={},
@@ -153,10 +146,47 @@ def migrate(data):
                 profiles={"standard": {"id": "standard", "name": "Standard", "parameters": parameters, "revision": data["policy_revision"]}},
                 pipelines={"legacy": {"id": "legacy", "name": "Bestehende Hyperliquid-Quellen", "sources": ["*"],
                                       "targets": [{"exchange": "hyperliquid", "profile_id": "standard"}], "enabled": True, "revision": 0}},
-                venue_limits={"hyperliquid": limits, "aster": None, "lighter": None},
-                venue_enabled={"hyperliquid": True, "aster": False, "lighter": False},
+                venue_limits={"hyperliquid": limits},
+                venue_enabled={"hyperliquid": True},
                 venue_bindings={}, venue_events={}, venue_accounts={})
     migrate(data)
+    return True
+
+
+def retire_execution_configuration(data):
+    """Keep historical finance intact while retiring unsupported execution configuration."""
+    for trade in data.get("trades", {}).values():
+        if (trade.get("plan", {}).get("exchange", "hyperliquid") != "hyperliquid"
+                and (trade["status"] not in ("closed", "rejected", "cancelled", "expired")
+                     or Decimal(trade.get("remaining_quantity") or "0") != 0)):
+            raise AqlaError("An unsupported account still has active trading work; retire it before migration")
+    if any(row.get("exchange", "hyperliquid") != "hyperliquid" and row["phase"] in ("prepared", "sending", "unknown")
+           for row in data.get("operations", {}).values()):
+        raise AqlaError("An unsupported account still has an unresolved operation")
+    retired = {}
+    for name in ("execution_accounts", "account_limits", "account_enabled", "account_recovery", "venue_accounts", "venue_limits", "venue_enabled"):
+        values = data.get(name, {})
+        removed = {key: value for key, value in values.items() if key != "hyperliquid" and not key.startswith("hyperliquid:")}
+        if removed:
+            retired[name] = copy.deepcopy(removed)
+            for key in removed:
+                values.pop(key)
+    for key, pipeline in list(data.get("pipelines", {}).items()):
+        original = copy.deepcopy(pipeline)
+        targets = [row for row in pipeline["targets"] if row["exchange"] == "hyperliquid"]
+        for target in targets:
+            target.pop("fallback_exchanges", None)
+        if not targets:
+            data["pipelines"].pop(key)
+        else:
+            pipeline["targets"] = targets
+        if not targets or original != pipeline:
+            retired.setdefault("pipelines", {})[key] = original
+    if not retired:
+        return False
+    for name, values in retired.items():
+        data.setdefault("retired_execution_configuration", {}).setdefault(name, {}).update(values)
+    data["configuration_revision"] = data.get("configuration_revision", 0) + 1
     return True
 
 
@@ -168,6 +198,10 @@ def sync_legacy_policy(data):
 
 
 def route_control(data, action, *, expected_revision, profile=None, pipeline=None, exchange=None, limits=None, enabled=None, identity=None):
+    if exchange is not None and exchange != "hyperliquid":
+        raise AqlaError("Only Hyperliquid exchange limits and activation are supported")
+    if action in ("set_account_limits", "set_account_enabled") and identity not in ("hyperliquid:mainnet", "hyperliquid:testnet"):
+        raise AqlaError("Only Hyperliquid execution accounts are supported")
     if expected_revision != data["configuration_revision"]:
         raise AqlaError("Read configuration_revision and submit a complete current configuration change")
     if action == "set_profile":

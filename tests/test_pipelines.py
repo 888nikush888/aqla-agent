@@ -1,4 +1,3 @@
-import asyncio
 import copy
 from decimal import Decimal
 
@@ -7,79 +6,36 @@ import pytest
 
 from aqla_agent.pipelines import AccountLimits, Parameters, Pipeline, TradingProfile, migrate, route_control
 from aqla_agent.router import Router
-from aqla_hyperliquid_mcp.api import Hyperliquid
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, Settings, SourceEvent, now_ms
-
-
-@pytest.mark.asyncio
-async def test_slow_update_on_one_account_does_not_delay_other_account_exit(routed, setup, signal, monkeypatch):
-    router, _ = routed
-    source, value = signal
-    previews = await router.preview(source.event_id, value)
-    await router.execute_many([row["plan_id"] for row in previews["targets"]])
-    update = SourceEvent(chat_id="channel", message_id=2, reply_to_id=source.message_id, sent_at=now_ms(), text="Close BTC now")
-    router.ingest(update)
-    instruction = Interpretation(kind="trade_update", source_refs=[update.source_id], update_action="close", symbol="BTC",
-        evidence=[Evidence(field=field, source_id=update.source_id, quote=quote) for field, quote in (("update_action", "Close"), ("symbol", "BTC"))])
-    entered, release, exited = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    slow, fast = router.engines["hyperliquid"].update_trade, router.engines["aster"].update_trade
-    async def delayed(*args):
-        entered.set()
-        await release.wait()
-        return await slow(*args)
-    async def independent(*args):
-        result = await fast(*args)
-        exited.set()
-        return result
-    monkeypatch.setattr(router.engines["hyperliquid"], "update_trade", delayed)
-    monkeypatch.setattr(router.engines["aster"], "update_trade", independent)
-    task = asyncio.create_task(router.update_trade(update.event_id, instruction))
-    try:
-        await asyncio.wait_for(entered.wait(), 2)
-        await asyncio.wait_for(exited.wait(), 2)
-        assert not task.done()
-    finally:
-        release.set()
-        await task
+from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, now_ms
 
 
 @pytest.fixture
 def routed(setup):
-    from conftest import FakeExchange
-
     settings, state, fake, exchange, _ = setup
-    adapters, boundaries = {}, {"hyperliquid": fake}
-    for name, address in (("aster", "0x" + "1" * 40), ("lighter", "0x" + "2" * 40)):
-        selected = Settings(network="testnet", account=address, private_key_file=settings.private_key_file)
-        boundary = FakeExchange(address)
-        adapters[name] = Hyperliquid(selected, state, httpx.AsyncClient(base_url=selected.base_url, transport=httpx.MockTransport(boundary.handle)))
-        boundaries[name] = boundary
-    router = Router(settings, state, exchange, adapters=adapters)
+    boundaries = {"hyperliquid": fake}
+    router = Router(settings, state, exchange)
     profiles = [TradingProfile(id=name, name=name.upper(), parameters=Parameters(risk_percent=risk, max_notional_quote=notional))
                 for name, risk, notional in (("a", "0.25", "500"), ("b", "1", "1000"))]
     for selected in profiles:
         state.update(lambda data, selected=selected: route_control(data, "set_profile", expected_revision=data["configuration_revision"], profile=selected))
-    for name in adapters:
-        state.update(lambda data, name=name: route_control(data, "set_exchange_limits", expected_revision=data["configuration_revision"], exchange=name, limits=AccountLimits(max_open_trades=3, max_total_risk_percent="1.5")))
-        state.update(lambda data, name=name: route_control(data, "set_exchange_enabled", expected_revision=data["configuration_revision"], exchange=name, enabled=True))
     pipeline = Pipeline(id="source-one", name="Quelle Eins", sources=["channel"], enabled=True,
-                        targets=[{"exchange": "hyperliquid", "profile_id": "a"}, {"exchange": "aster", "profile_id": "b"}, {"exchange": "lighter", "profile_id": "a"}])
+                        targets=[{"exchange": "hyperliquid", "profile_id": "a"}])
     state.update(lambda data: route_control(data, "set_pipeline", expected_revision=data["configuration_revision"], pipeline=pipeline))
     return router, boundaries
 
 
-@pytest.mark.parametrize("exchange", ["hyperliquid", "aster", "lighter"])
+@pytest.mark.parametrize('exchange', ['hyperliquid'])
 def test_projected_snapshots_never_share_mutable_profiles_with_writer_or_preview_basis(routed, setup, exchange):
     router, _ = routed
-    view = router.engines[exchange].state
+    view = router.engines['hyperliquid'].state
     original = setup[1].snapshot()
     selected = view.snapshot()
-    selected["profiles"]["a"]["parameters"]["risk_percent"] = "99"
-    assert setup[1].snapshot()["profiles"] == original["profiles"]
-    with view.scope({"pipeline_id": "source-one", "profile_id": "a"}, preview_snapshot=original):
+    selected['profiles']['a']['parameters']['risk_percent'] = '99'
+    assert setup[1].snapshot()['profiles'] == original['profiles']
+    with view.scope({'pipeline_id': 'source-one', 'profile_id': 'a'}, preview_snapshot=original):
         preview = view.preview_snapshot()
-        preview["profiles"]["a"]["parameters"]["risk_percent"] = "98"
-    assert original["profiles"]["a"]["parameters"]["risk_percent"] == "0.25"
+        preview['profiles']['a']['parameters']['risk_percent'] = '98'
+    assert original['profiles']['a']['parameters']['risk_percent'] == '0.25'
 
 
 @pytest.mark.asyncio
@@ -98,42 +54,18 @@ async def test_admission_checks_the_current_transaction_snapshot(routed, setup, 
         engine.validate_configuration(current, plan)
 
 
-@pytest.mark.parametrize("exchange", ["hyperliquid", "aster", "lighter"])
+@pytest.mark.parametrize('exchange', ['hyperliquid'])
 def test_fresh_account_limits_do_not_copy_financial_and_source_history(routed, setup, monkeypatch, exchange):
     router, _ = routed
     root = setup[1]
-    view = router.engines[exchange].state
+    view = router.engines['hyperliquid'].state
     before = view.limits()
-    monkeypatch.setattr(root, "snapshot", lambda: pytest.fail("Reading limits copied the complete financial state"))
+    monkeypatch.setattr(root, 'snapshot', lambda: pytest.fail('Reading limits copied the complete financial state'))
     assert view.limits() == before
-    root.update(lambda data: data["venue_limits"][exchange].update(max_open_trades=before.max_open_trades + 1))
+    root.update(lambda data: data['venue_limits']['hyperliquid'].update(max_open_trades=before.max_open_trades + 1))
     assert view.limits().max_open_trades == before.max_open_trades + 1
 
 
-@pytest.mark.asyncio
-async def test_ranked_fallback_preserves_leg_profile_network_and_explicit_priority(routed, setup, signal, monkeypatch):
-    from aqla_hyperliquid_mcp.models import SymbolUnavailable
-    router, boundaries = routed
-    state = setup[1]
-    state.update(lambda data: data["ranking_policy"].update(enabled=True))
-    state.update(lambda data: data["source_ranks"]["channel"].update(tier="D"))
-    # Explicit Aster wins its slot; only the Hyperliquid leg moves to Lighter.
-    state.update(lambda data: data["pipelines"]["source-one"].update(targets=data["pipelines"]["source-one"]["targets"][:2]))
-    async def missing(*_):
-        raise SymbolUnavailable("Fresh metadata confirms missing BTC market")
-    monkeypatch.setattr(router.engines["hyperliquid"].exchange, "market", missing)
-    source, interpretation = signal
-    result = await router.preview(source.event_id, interpretation)
-    assert [row["exchange"] for row in result["targets"]] == ["lighter", "aster"]
-    replacement = result["targets"][0]["plan"]
-    assert replacement["requested_exchange"] == "hyperliquid"
-    assert replacement["profile_id"] == "a" and replacement["network"] == "testnet"
-    assert replacement["routing_leg_id"] == "source-one:hyperliquid" and replacement["fallback_reason"]
-    assert replacement["setup_id"] == result["targets"][1]["plan"]["setup_id"]
-    executed = await router.execute_many([row["plan_id"] for row in result["targets"]])
-    assert all(row["status"] == "open" for row in executed["targets"])
-    assert not boundaries["hyperliquid"].actions and boundaries["aster"].actions and boundaries["lighter"].actions
-    await router.close()
 
 
 @pytest.mark.asyncio
@@ -163,11 +95,10 @@ async def test_fresh_fallback_signal_cannot_inherit_unquoted_old_channel_context
     assert "deadline expired" not in str(failure.value)
     assert state.snapshot() == before and not reads
     result = await router.preview(source.event_id, value)
-    plan = result["targets"][0]["plan"]
-    assert plan["exchange"] == "aster" and plan["requested_exchange"] == "hyperliquid"
-    assert plan["source_refs"] == [source.source_id]
-    assert plan["deadline_at"] == source.sent_at + 14400 * 1000
-    assert plan["profile_id"] == "a" and plan["policy"]["max_signal_age_seconds"] == 14400
+    target = result["targets"][0]
+    assert target["status"] == "rejected" and target["exchange"] == "hyperliquid"
+    assert target["error"] == "Fresh metadata confirms missing BTC market"
+    assert not state.snapshot()["plans"] and not state.snapshot()["operations"]
     assert state.snapshot()["events"][old.event_id] == before["events"][old.event_id]
     assert reads == ["hyperliquid"] and all(not boundary.actions for boundary in boundaries.values())
     await router.close()
@@ -195,50 +126,19 @@ async def test_ranked_fallback_no_mainnet_escape_when_testnet_unavailable(routed
     from aqla_hyperliquid_mcp.models import SymbolUnavailable
     router, _ = routed
     setup[1].update(lambda data: data["ranking_policy"].update(enabled=True))
-    setup[1].update(lambda data: data["venue_enabled"].update(aster=False, lighter=False))
     async def missing(*_):
         raise SymbolUnavailable("Confirmed absent")
     monkeypatch.setattr(router.engines["hyperliquid"].exchange, "market", missing)
     source, interpretation = signal
     result = await router.preview(source.event_id, interpretation)
     assert result["targets"][0]["status"] == "rejected"
-    assert "testnet" in result["targets"][0]["error"] and "account/permissions/limits" in result["targets"][0]["error"]
+    assert result["targets"][0]["network"] == "testnet" and result["targets"][0]["error"] == "Confirmed absent"
     assert not setup[1].snapshot()["operations"]
     await router.close()
 
 
-@pytest.mark.asyncio
-async def test_same_signal_routes_independently_with_shared_profiles(routed, setup, signal):
-    router, boundaries = routed
-    source, interpretation = signal
-    result = await router.preview(source.event_id, interpretation)
-    assert len(result["targets"]) == 3
-    plans = {target["exchange"]: target["plan"] for target in result["targets"]}
-    assert len({plan["trade_id"] for plan in plans.values()}) == 3
-    assert plans["hyperliquid"]["profile_id"] == plans["lighter"]["profile_id"] == "a"
-    assert Decimal(plans["aster"]["quantity"]) > Decimal(plans["lighter"]["quantity"])
-    executed = await router.execute_many([row["plan_id"] for row in result["targets"]])
-    assert all(row["status"] == "open" for row in executed["targets"])
-    assert len(setup[1].snapshot()["trades"]) == 3
-    before = {name: len(boundary.actions) for name, boundary in boundaries.items()}
-    await router.execute_many([row["plan_id"] for row in result["targets"]])
-    assert before == {name: len(boundary.actions) for name, boundary in boundaries.items()}
-    await router.close()
 
 
-@pytest.mark.asyncio
-async def test_target_preview_failure_does_not_block_other_exchanges(routed, signal, monkeypatch):
-    router, _ = routed
-    async def unavailable(*_):
-        raise AqlaError("Symbol unavailable")
-    monkeypatch.setattr(router.engines["aster"].exchange, "market", unavailable)
-    source, interpretation = signal
-    result = await router.preview(source.event_id, interpretation)
-    assert result["targets"][1]["status"] == "rejected"
-    plans = [row["plan_id"] for row in result["targets"] if row.get("plan_id")]
-    assert len(plans) == 2
-    assert all(row["status"] == "open" for row in (await router.execute_many(plans))["targets"])
-    await router.close()
 
 
 @pytest.mark.asyncio
@@ -246,44 +146,23 @@ async def test_profile_edit_blocks_unsent_plan_but_preserves_open_policy(routed,
     router, _ = routed
     source, interpretation = signal
     result = await router.preview(source.event_id, interpretation)
+    other = source.model_copy(update={"message_id": 77})
+    router.ingest(other)
+    second = await router.preview(other.event_id, interpretation.model_copy(update={"source_refs": [other.source_id],
+        "evidence": [row.model_copy(update={"source_id": other.source_id}) for row in interpretation.evidence]}))
     first = await router.execute(result["targets"][0]["plan_id"])
     state = setup[1]
     changed = TradingProfile(id="a", name="A", parameters=Parameters(risk_percent="0.9"))
     state.update(lambda data: route_control(data, "set_profile", expected_revision=data["configuration_revision"], profile=changed))
     assert state.snapshot()["trades"][first["trade_id"]]["plan"]["policy"]["risk_percent"] == "0.25"
-    outcome = await router.execute(result["targets"][2]["plan_id"])
+    outcome = await router.execute(second["targets"][0]["plan_id"])
     assert "changed" in outcome["error"]
     assert len(state.snapshot()["trades"]) == 1
     await router.close()
 
 
-@pytest.mark.asyncio
-async def test_missing_venue_credentials_never_change_hyperliquid(setup, signal):
-    settings, state, _, exchange, _ = setup
-    router = Router(settings, state, exchange)
-    assert router.ready()["aster"]["configured"] is False
-    source, interpretation = signal
-    preview = await router.preview(source.event_id, interpretation)
-    assert preview["plan_id"]
-    assert (await router.execute(preview["plan_id"]))["status"] == "open"
-    await router.close()
 
 
-def test_migration_keeps_existing_execution_identifiers_and_requires_no_new_limits(setup):
-    _, state, *_ = setup
-    data = state.snapshot()
-    for key in ("profiles", "pipelines", "venue_limits", "venue_enabled", "venue_bindings", "venue_events", "venue_accounts"):
-        data.pop(key)
-    data["schema"] = 1
-    data["operations"]["old-operation"] = {"nonce": 99, "wire_action": {"orders": [{"c": "existing-order"}]}}
-    before = copy.deepcopy(data)
-    assert migrate(data)
-    assert data["operations"] == before["operations"]
-    assert data["bindings"] == before["bindings"]
-    assert data["profiles"]["standard"]["name"] == "Standard"
-    assert data["venue_enabled"] == {"hyperliquid": True, "aster": False, "lighter": False}
-    assert data["venue_limits"]["aster"] is None
-    assert migrate(data) is False
 
 
 def test_routing_changes_are_revision_guarded_and_profiles_do_not_set_account_limits(setup):
@@ -294,7 +173,7 @@ def test_routing_changes_are_revision_guarded_and_profiles_do_not_set_account_li
         Parameters(max_open_trades=100)
     with pytest.raises(ValueError):
         Pipeline(id="p", name="P", sources=["channel"], targets=[{"exchange": "aster", "profile_id": "a"}] * 2)
-    with pytest.raises(AqlaError, match="limits"):
+    with pytest.raises(AqlaError, match="Hyperliquid"):
         state.update(lambda data: route_control(data, "set_exchange_enabled", expected_revision=data["configuration_revision"], exchange="aster", enabled=True))
 
 
@@ -309,8 +188,7 @@ async def test_reply_update_reaches_original_setup_family_on_all_venues(routed, 
     classified = Interpretation(kind="trade_update", update_action="move_stop", stop_loss="95", source_refs=[update.source_id],
                                 evidence=[Evidence(field="stop_loss", source_id=update.source_id, quote="SL 95")])
     result = await router.update_trade(update.event_id, classified)
-    assert len(result["targets"]) == 3
-    assert not any(row.get("error") for row in result["targets"])
+    assert result.get("trade_id") and not result.get("error")
     assert all(Decimal(trade["stop_price"]) == 95 for trade in setup[1].snapshot()["trades"].values())
     before = len(setup[1].snapshot()["operations"])
     await router.update_trade(update.event_id, classified)
@@ -318,21 +196,6 @@ async def test_reply_update_reaches_original_setup_family_on_all_venues(routed, 
     await router.close()
 
 
-@pytest.mark.asyncio
-async def test_account_limits_apply_to_other_profiles_and_unknown_reservations(routed, setup, signal):
-    router, _ = routed
-    state = setup[1]
-    source, interpretation = signal
-    def reserved(data):
-        data["venue_limits"]["aster"]["max_open_trades"] = 1
-        data["trades"]["other-profile-reservation"] = {"trade_id": "other-profile-reservation", "chat_id": "another-source", "status": "unknown", "reserved_risk": "20",
-            "plan": {"exchange": "aster", "market": {"asset_id": 999, "quote_token": "USDT"}, "source_refs": []}}
-    state.update(reserved)
-    result = await router.preview(source.event_id, interpretation)
-    aster = next(row for row in result["targets"] if row["exchange"] == "aster")
-    assert "Maximum open trade count" in aster["error"]
-    assert len([row for row in result["targets"] if row.get("plan_id")]) == 2
-    await router.close()
 
 
 @pytest.mark.parametrize("entry,tp", [("standard", "standard"), ("maker_only", "standard"), ("standard", "maker_only"), ("maker_only", "maker_only")])
@@ -389,3 +252,37 @@ async def test_profile_maker_modes_through_real_mcp_control_router_plan_and_nati
     assert all((order["t"].get("limit", {}).get("tif") == "Alo") == (tp == "maker_only") for order in target_wire)
     assert snapshot["trades"][trade["trade_id"]]["plan"] == plan["targets"][0]["plan"]
     await close_server(server)
+
+
+def test_migration_keeps_existing_execution_identifiers_and_requires_no_new_limits(setup):
+    _, state, *_ = setup
+    data = state.snapshot()
+    for key in ("profiles", "pipelines", "venue_limits", "venue_enabled", "venue_bindings", "venue_events", "venue_accounts"):
+        data.pop(key)
+    data["schema"] = 1
+    data["operations"]["old-operation"] = {"nonce": 99, "wire_action": {"orders": [{"c": "existing-order"}]}}
+    before = copy.deepcopy(data)
+    assert migrate(data)
+    assert data["operations"] == before["operations"]
+    assert data["bindings"] == before["bindings"]
+    assert data["profiles"]["standard"]["name"] == "Standard"
+    assert data["venue_enabled"] == {"hyperliquid": True}
+    assert set(data["venue_limits"]) == {"hyperliquid"}
+    assert migrate(data) is False
+
+
+@pytest.mark.asyncio
+async def test_account_limits_apply_to_other_profiles_and_unknown_reservations(routed, setup, signal):
+    router, _ = routed
+    state = setup[1]
+    source, interpretation = signal
+    def reserved(data):
+        data["venue_limits"]["hyperliquid"]["max_open_trades"] = 1
+        data["trades"]["other-profile-reservation"] = {"trade_id": "other-profile-reservation", "chat_id": "another-source", "status": "unknown", "reserved_risk": "20",
+            "plan": {"exchange": "hyperliquid", "network": setup[0].network, "account": setup[0].account.lower(), "market": {"asset_id": 999, "quote_token": "USDC"}, "source_refs": []}}
+    state.update(reserved)
+    result = await router.preview(source.event_id, interpretation)
+    target = next(row for row in result["targets"] if row["exchange"] == "hyperliquid")
+    assert "Maximum open trade count" in target["error"]
+    assert not any(row.get("plan_id") for row in result["targets"])
+    await router.close()

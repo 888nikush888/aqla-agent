@@ -12,7 +12,7 @@ from aqla_hyperliquid_mcp.models import AqlaError, Market, TradePlan, digest, no
 
 from .evidence import FundingCoverage, market_fills, order_observations, verified_coverage_matches
 from .funding import bounded_history
-from .monthly import CLOSED, accounting_facts, entry_quantity_evidence, fill_identity
+from .monthly import CLOSED, accounting_facts, entry_quantity_evidence, fill_identity, report_row
 from .read_budget import BudgetCode, ReadBudget, ReadBudgetExceeded, read_limits
 
 RefreshReason = Literal["complete", "missing_lifecycle", "history_unavailable", "evidence_conflict", "unavailable"]
@@ -110,7 +110,11 @@ class Reporting:
         self.state.update(save)
 
     async def refresh(self, trade_id) -> RefreshResult:
-        trade = self.state.snapshot()["trades"][trade_id]
+        snapshot = self.state.snapshot()
+        trade = snapshot["trades"][trade_id]
+        if snapshot.get("retired_execution_configuration") and trade["plan"].get("exchange", "hyperliquid") != "hyperliquid":
+            complete = report_row(snapshot, trade)["complete"]
+            return {"complete": complete, "reason": "complete" if complete else "unavailable"}
         engine = self.router.engine_for_plan(trade["plan"]) if hasattr(self.router, "engine_for_plan") else self.router.engines.get(trade["plan"].get("exchange", "hyperliquid"))
         if engine and (not trade.get("entry_accounting") or not trade.get("closed_at") or trade.get("entry_fill_quantity_confirmed") is None):
             try:
@@ -142,7 +146,7 @@ class Reporting:
                 raise EvidenceConflict("Funding bei manuellem/gemischtem Positionsverlauf nicht eindeutig zuordenbar")
             adapter = engine.exchange
             market = Market.model_validate(trade["plan"]["market"])
-            # Restore immutable native market identities for historical Aster/Lighter reads.
+            # Restore immutable native market identities for historical reads.
             if hasattr(adapter, "market_cache"):
                 adapter.market_cache.setdefault(market.symbol, market)
             fills = trade["fill_events"]

@@ -75,7 +75,7 @@ Beim tatsächlichen Debian-VPS-Start wurde zusätzlich eine außerhalb der Start
 
 Sieben weitere Befunde sind durch gemeinsame Korrekturen und Regressionen abgesichert:
 
-- Aster-Fillhistorien verwenden begrenzte Sieben-Tage-Fenster einschließlich vorhandener Sättigungs- und Requestgrenzen. Ältere eigene Positionen bleiben verwaltbar.
+- Hyperliquid-Fillhistorien bleiben zeitlich und nach Requests begrenzt; unvollständige Belege bleiben ausdrücklich unvollständig.
 - Kontoantworten tragen den Beginn ihrer Abfrage als `observed_at`; langsamer Transport erneuert die Zehn-Sekunden-Frischegrenze nicht.
 - Backup-ROE verwendet den tatsächlichen nativen Margin-Hebel, auch bei Lighters gerundeten Marginfraktionen. Gespeicherte und finalisierte Altpreise werden nicht umgeschrieben.
 - Ein angenommener TP-Ersatz speichert die aktuelle Generation vor jeder Börsenänderung. Wiederanlauf verwendet dieselben Operations- und Orderidentitäten. Neuere Ziele verdrängen ältere ungesendete Generationen; unbekannte Vorgänge werden ausschließlich abgeglichen. Nur vor der ersten Operationspersistierung darf eine nachgewiesene eigene Teilreduktion die ungesendeten Mengen verkleinern.

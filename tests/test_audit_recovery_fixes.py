@@ -5,8 +5,6 @@ from decimal import ROUND_CEILING, Decimal
 
 import httpx
 import pytest
-from test_aster_adapter import aster  # noqa: F401 -- adapter fixture
-from test_lighter_adapter import lighter  # noqa: F401 -- adapter fixture
 from test_source_worker import worker_boundary  # noqa: F401 -- real integration fixture
 from test_updates import update
 
@@ -25,56 +23,24 @@ from aqla_hyperliquid_mcp.state import State
 
 
 @pytest.mark.asyncio
-async def test_aster_eight_day_position_can_close_through_native_adapter(setup, signal, request, monkeypatch):
-    adapter, boundary, engine = request.getfixturevalue("aster")
-    source, value = signal
-    trade = await engine.execute((await engine.preview(source.event_id, value))["plan_id"])
-    stamp = now_ms() + 8 * 86400000
-    monkeypatch.setattr("time.time_ns", lambda: stamp * 1000000)
-    windows = []
-    original = boundary.handle
-    def bounded(request):
-        if request.url.path.endswith("/userTrades"):
-            low, high = int(request.url.params["startTime"]), int(request.url.params["endTime"])
-            windows.append((low, high))
-            if high - low > 7 * 86400000:
-                return httpx.Response(400, json={"code": -1127, "msg": "Synthetic window limit"})
-        return original(request)
-    monkeypatch.setattr(adapter.client, "_transport", httpx.MockTransport(bounded))
-    await engine.close_position(trade["trade_id"])
-    await engine.recover()
-    assert boundary.position == 0 and engine.state.snapshot()["trades"][trade["trade_id"]]["status"] == "closed"
-    assert len(windows) >= 2 and all(high - low < 7 * 86400000 for low, high in windows)
-    assert {params["symbol"] for method, path, params in boundary.requests if path.endswith("/userTrades")} == {"BTCUSDT"}
-    await adapter.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("venue", ["hyperliquid", "aster", "lighter"])
+@pytest.mark.parametrize('venue', ['hyperliquid'])
 async def test_slow_account_transport_cannot_authorize_entry(setup, signal, request, monkeypatch, venue):
-    fixture = request.getfixturevalue(venue) if venue != "hyperliquid" else None
+    fixture = None
     adapter, engine = (setup[3], setup[4]) if fixture is None else (fixture[0], fixture[-1])
     clock = [now_ms()]
-    monkeypatch.setattr("time.time_ns", lambda: clock[0] * 1000000)
-    if venue == "hyperliquid":
-        original = adapter.info
-        async def read(kind, **kwargs):
-            value = await original(kind, **kwargs)
-            if kind == "clearinghouseState":
-                clock[0] += 11001
-            return value
-        monkeypatch.setattr(adapter, "info", read)
-    else:
-        original = adapter.positions
-        async def read():
-            value = await original()
+    monkeypatch.setattr('time.time_ns', lambda: clock[0] * 1000000)
+    original = adapter.info
+
+    async def read(kind, **kwargs):
+        value = await original(kind, **kwargs)
+        if kind == 'clearinghouseState':
             clock[0] += 11001
-            return value
-        monkeypatch.setattr(adapter, "positions", read)
+        return value
+    monkeypatch.setattr(adapter, 'info', read)
     source, value = signal
-    with pytest.raises(AqlaError, match="stale"):
+    with pytest.raises(AqlaError, match='stale'):
         await engine.preview(source.event_id, value)
-    assert not setup[2].actions and not setup[1].snapshot()["operations"]
+    assert not setup[2].actions and (not setup[1].snapshot()['operations'])
     if fixture:
         assert not fixture[1].posts
         await adapter.close()

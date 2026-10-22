@@ -26,9 +26,7 @@ Ein Preis-Snapshot enthält Bid/Ask, Mid, Triggerreferenz, Börsenzeit und Lesez
 
 Nach einem Fill wird das eigene Stop-Risiko gegen den unveränderlichen Plan und die unmittelbar vor dem Versand genehmigte Kontoequity geprüft. Kursänderungen anderer Positionen während einer wartenden Limitorder ändern dieses bereits genehmigte Einzeltrade-Budget nicht rückwirkend. Ohne gespeicherten Freigabebeleg bleibt die konservative Prüfung gegen die aktuelle Equity bestehen. Preisstruktur, tatsächliche Fillmenge, Stop, Positionswert und das aktuelle gemeinsame Kontorisikolimit werden weiterhin geprüft.
 Alle Belege müssen frisch sein (maximal zwei Sekunden). Hyperliquid nutzt den
-Mark-Preis für SL, Aster den im bestehenden Adapter gewählten `CONTRACT_PRICE`.
-Lighter nutzt ausdrücklich zeitgestempelte REST-Daten oder die öffentlichen
-`market_stats`-/`order_book`-WebSocket-Snapshots mit Mark-Preis; fehlende Referenzen
+Mark-Preis für SL und bestätigte native L2-Snapshots; fehlende Referenzen
 werden nicht durch einen Last-Trade-/Mid-Schätzwert ersetzt.
 
 Vor dem Signieren und nach dem dauerhaften Vorbereiten, aber vor Versand, werden

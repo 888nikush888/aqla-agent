@@ -42,7 +42,7 @@ Direkte Beispiele:
 /aqla_maker standard tp standard
 /aqla_maker standard beide maker_only
 /aqla_limits hyperliquid:testnet "offene Trades" 5
-/aqla_limits aster:mainnet Gesamtrisiko 1,5
+/aqla_limits hyperliquid:mainnet Gesamtrisiko 1,5
 ```
 
 Profil-IDs und eindeutige exakte Profilnamen sind zulässig. Kanäle lassen sich über ihre vorhandene ID oder ihren eindeutigen Namen auswählen; ein mehrdeutiger Name führt zur Auswahl der konkreten ID. Konten sind immer `Börse:Netzwerk`. Parameterfelder verwenden die vorhandenen Schemanamen. `null` schaltet einen optionalen Wert aus. Dezimalwerte akzeptieren Punkt oder Komma; Zahlenlisten verwenden JSON, bei Dezimalkomma mit Strings, etwa `["1,5", "2,5"]`. Sämtliche vollständigen Profilregeln werden erneut validiert, ungewählte Werte bleiben erhalten.
@@ -51,6 +51,6 @@ Eine gültige letzte Eingabe wird unmittelbar gespeichert. Danach folgt eine kur
 
 Ein Dialog lebt nur im Arbeitsspeicher, höchstens 300 Sekunden und höchstens bis zum festen Setup-Ablauf. Aktivität verlängert keine dieser Zeiten. Er gehört zum Betreiber, privaten Chat und aktuellen Gateway-Session; neue Session, `/new`, `/reset`, `/stop`, `/restart`, Reconnect oder Plugin-Unload verwerfen ihn. Schaltflächen enthalten zufällige, einmal verwendbare Tokens. Ein Klick eines anderen Nutzers, ein Gruppenchat, ein abgelaufener oder wiederholter Token ändert nichts. Passwortabfang läuft vor allen Dialogen und nativen Befehlen. `/setup` beendet eine offene Werteingabe, bevor die Passwortnachfrage beginnt.
 
-Entry und TP besitzen unabhängige `standard`-/`maker_only`-Werte im Profil. Das vorhandene Routing übernimmt sie in neue unveränderliche Pläne und die nativen Hyperliquid-, Aster- und Lighter-Aufträge. Bestehende Pläne behalten ihre Identität und Ausführung. Standardprofile behalten ihre bisherige Serialisierung. Maker-Aufträge verlangen strikt Post-only; es gibt keine Taker-Ersatzorder. Schutzaufträge verwenden ihre bestehenden Regeln.
+Entry und TP besitzen unabhängige `standard`-/`maker_only`-Werte im Profil. Das vorhandene Routing übernimmt sie in neue unveränderliche Pläne und die nativen Hyperliquid-Aufträge. Bestehende Pläne behalten ihre Identität und Ausführung. Standardprofile behalten ihre bisherige Serialisierung. Maker-Aufträge verlangen strikt Post-only; es gibt keine Taker-Ersatzorder. Schutzaufträge verwenden ihre bestehenden Regeln.
 
 Die Runtime bindet ihre Anpassungen vor `connect()` an den tatsächlich vom nativen Gateway erzeugten Telegram-Adapter, einschließlich des Plugin-Registry-Factories. Verträge werden an dessen Klasse und tatsächlichen Methoden geprüft. Der früheste PTB-Handler läuft in Gruppe `-100`, bevor Text-, Foto-, Album- oder Busy-Batching. Eine fehlende private Bindung sperrt den Eingang, meldet bei Systembefehlen fehlende Bereitschaft und löscht weiter bekannte späte Passwortantworten. Der Startlog bestätigt ausschließlich Adaptermodul, Hook-/Handlerbereitschaft und Kataloganzahl; private Prüf- oder Freigabedaten werden nicht ausgegeben.

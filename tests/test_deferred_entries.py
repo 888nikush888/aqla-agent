@@ -1,11 +1,9 @@
 """Delayed LINK reproduction, executable-price guards and immutable lifecycle facts."""
-import asyncio
 import copy
 import json
 from decimal import Decimal
 
 import pytest
-from test_lighter_adapter import lighter  # noqa: F401 -- shared adapter fixture
 from test_pipelines import routed  # noqa: F401 -- shared independent-target fixture
 
 from aqla_agent.entry import PriceSnapshot
@@ -350,36 +348,6 @@ def test_close_reason_does_not_invent_unproved_exit():
     assert close_reason({"fill_events": {}})["kind"] == "unconfirmed"
 
 
-@pytest.mark.asyncio
-async def test_lighter_snapshot_stream_contract_is_timestamped_and_uses_mark(lighter, monkeypatch):  # noqa: F811 -- shared fixture
-    adapter, boundary, _, _ = lighter
-    market = await adapter.market("BTC")
-    original = adapter.read
-    async def without_rest_quote(path, *args, **kwargs):
-        result = await original(path, *args, **kwargs)
-        if path == "orderBookDetails":
-            result["order_book_details"][0].pop("timestamp")
-        return result
-    adapter.read = without_rest_quote
-    stamp = now_ms()
-    frames = [json.dumps({"type": "subscribed/market_stats", "channel": "market_stats:1", "timestamp": stamp,
-                         "market_stats": {"1": {"mark_price": "100"}}}),
-              json.dumps({"type": "subscribed/order_book", "channel": "order_book:1", "timestamp": stamp,
-                          "order_book": {"nonce": 10, "bids": [{"price": "99.9", "size": "3"}], "asks": [{"price": "100.1", "size": "3"}]}})]
-    class Socket:
-        async def __aenter__(self):return self
-        async def __aexit__(self, *_):pass
-        async def send(self, data):assert json.loads(data)["type"] == "subscribe"
-        async def recv(self):return frames.pop(0)
-        def __aiter__(self):return self
-        async def __anext__(self):
-            if frames:
-                return frames.pop(0)
-            await asyncio.Event().wait()
-    monkeypatch.setattr("aqla_agent.lighter_feed.connect", lambda *_, **__: Socket())
-    snapshot = await adapter.price_snapshot(market)
-    assert snapshot.stop_reference == 100 and snapshot.stop_reference_kind == "mark"
-    assert snapshot.bid == Decimal("99.9") and snapshot.ask == Decimal("100.1")
 
 
 @pytest.mark.asyncio
@@ -392,26 +360,6 @@ async def test_delayed_range_uses_saved_profile_range_choice(setup):
     assert (await trading.execute(plan["plan_id"]))["status"] == "waiting_entry"
 
 
-@pytest.mark.asyncio
-async def test_mixed_pipeline_waits_and_missing_target_price_does_not_stop_others(routed, monkeypatch):  # noqa: F811 -- fixture
-    router, boundaries = routed
-    for boundary in boundaries.values():
-        boundary.mid = "105"
-    source, value = delayed_source(router)
-    async def unavailable(*_):
-        raise AqlaError("No fresh native price feed")
-    monkeypatch.setattr(router.engines["aster"].exchange, "price_snapshot", unavailable)
-    result = await router.preview(source.event_id, value)
-    plans = [row["plan_id"] for row in result["targets"] if row.get("plan_id")]
-    assert len(plans) == 2 and result["targets"][1]["error"]
-    executed = await router.execute_many(plans)
-    assert not any(boundary.actions for boundary in boundaries.values())
-    assert "waiting_entry" in str(executed)
-    boundaries["hyperliquid"].mid = "100"
-    await router.recover()
-    assert any(action.get("grouping") == "normalTpsl" for action in boundaries["hyperliquid"].actions)
-    assert not boundaries["aster"].actions
-    await router.close()
 
 
 @pytest.mark.asyncio

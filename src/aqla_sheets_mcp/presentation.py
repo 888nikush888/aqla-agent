@@ -392,7 +392,7 @@ def _validation_requests(snapshot, dashboard):
                 "startColumnIndex": col, "endColumnIndex": col + 1}, "rule": {"condition": {"type": "ONE_OF_LIST",
                 "values": [{"userEnteredValue": value} for value in options]}, "strict": True,
                 "showCustomUi": True, "inputMessage": field + " · nur Auswertung"}}}
-            for col, field, options in ((1, "exchange", ["all", "hyperliquid", "aster", "lighter"]),
+            for col, field, options in ((1, "exchange", ["all", "hyperliquid"]),
                 (4, "network", ["mainnet", "testnet"]), (7, "currency", snapshot.available_currencies),
                 (10, "period", snapshot.available_periods))]
 

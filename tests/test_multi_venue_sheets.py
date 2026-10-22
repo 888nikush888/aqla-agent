@@ -1,10 +1,7 @@
-from decimal import Decimal
 
 import pytest
 from test_sheets import Google
 
-from aqla_hyperliquid_mcp.models import AccountSnapshot, Interpretation, Market, Policy, now_ms
-from aqla_hyperliquid_mcp.rules import make_plan
 from aqla_sheets_mcp.client import META_HEADERS, PREFIX, SheetsClient
 from aqla_sheets_mcp.journal import HEADERS, LEGACY_HEADERS, fingerprint, project, record
 
@@ -36,22 +33,22 @@ async def test_rank_journal_scopes_account_network_and_preserves_historical_id(s
     settings.ranking_enabled = True
     settings.google_sheets = GoogleSheetsSettings(enabled=True, spreadsheet_id="ci-spreadsheet-" + "0" * 25,
                                                 credentials_file=settings.state_path.parent / "google.secret")
-    settings.execution_accounts["aster:mainnet"] = ExecutionSettings(exchange="aster", network="mainnet", account="0x" + "1" * 40)
+    settings.execution_accounts["hyperliquid:mainnet"] = ExecutionSettings(exchange="hyperliquid", network="mainnet", account="0x" + "1" * 40)
     google = Google()
     client = SheetsClient(settings.google_sheets, session=google, scope=settings.network + ":" + settings.account.lower())
     server = create_server(settings, client=client)
     row = record("Trades", "unchanged-id", "channel", "BTC", "long", "closed", "now", 100, 100, 1, 1, 0, 90, "[]", 10, 0, 1, 0, 1, "[]")
     start = HEADERS["Trades"].index("Börse")
-    row["values"][start:start + 7] = ["aster", "mainnet", "0x" + "1" * 40, "pipeline", "profile", 1, "USDT"]
+    row["values"][start:start + 7] = ["hyperliquid", "mainnet", "0x" + "1" * 40, "pipeline", "profile", 1, "USDT"]
     row["fingerprint"] = fingerprint(row["values"])
     token = settings.integration_key_file.read_text()
     result = await server.call_tool("sync_internal", {"token": token, "records": [row]})
     assert not result.is_error
-    title = "aqla Aster Mainnet Trades"
+    title = "aqla Hyperliquid Mainnet Trades"
     assert google.tables[title][1][0] == "unchanged-id" and len(google.tables[title]) == 2
     await server.call_tool("sync_internal", {"token": token, "records": [row]})
     assert len(google.tables[title]) == 2
-    assert "aqla Aster Mainnet Ränge" not in google.tables
+    assert "aqla Hyperliquid Mainnet Ränge" not in google.tables
     row["values"][HEADERS["Trades"].index("Konto")] = "0x" + "2" * 40
     row["fingerprint"] = fingerprint(row["values"])
     with pytest.raises(ToolError, match="different configured"):
@@ -99,18 +96,10 @@ def test_trade_details_migrate_the_already_extended_multi_venue_schema():
     assert google.tables[title][1][len(body):-2] == [""] * (len(HEADERS["Trades"]) - len(old))
 
 
-def test_lighter_margin_fraction_rounding_reduces_size_and_aster_tiers_cap_signal():
-    signal = Interpretation(kind="new_signal", source_refs=["unit-test-source"], symbol="BTC", side="long", leverage=20, entry="market", stop_loss="90", take_profits=["110"])
-    market = Market(symbol="BTC", asset_id=1, product="perp", mid=100, size_decimals=5, quantity_step="0.00001", price_tick="0.1", max_leverage=50,
-                    margin_leverage_scale=10000, leverage_tiers=[{"notional_floor": "0", "notional_cap": "10000", "max_leverage": 3}])
-    account = AccountSnapshot(equity="10000", available_margin="10")
-    plan = make_plan(signal, market, account, Policy(leverage_mode="signal", max_notional_usdc="10000"), 1, now_ms(), ("testnet", "unit-test"))
-    assert plan.effective_leverage == 3
-    assert plan.quantity * plan.entry_limit <= Decimal(10) * Decimal(10000) / 3334
 
 
 def test_pipeline_and_profile_information_is_projected_without_credentials(setup):
     data = setup[1].snapshot()
     rows = project(data)
     assert rows["Pipelines:legacy:hyperliquid"]["values"][3:5] == ["hyperliquid", "standard"]
-    assert len([row for row in rows.values() if row["table"] == "Handelsparameter" and row["record_id"].startswith("limits:")]) == 6
+    assert len([row for row in rows.values() if row["table"] == "Handelsparameter" and row["record_id"].startswith("limits:")]) == 2

@@ -24,14 +24,6 @@ async def read_observation(call, stage):
         return await call()
     except TemporaryObservation:
         raise
-    except AqlaError as error:
-        # Adapter-owned fixed messages, and only inside a proven read call.
-        # A mutating transport with the same failure remains unknown/reconciled.
-        if str(error) == "Aster response is uncertain; reconcile before any further send":
-            raise TemporaryObservation("read_unavailable", stage, "transport") from None
-        if str(error) == "Lighter has no fresh timestamped mark-price/order-book pair":
-            raise TemporaryObservation("price_stale", stage) from None
-        raise
     except (httpx.TransportError, TimeoutError, ConnectionError, OSError):
         raise TemporaryObservation("read_unavailable", stage, "transport") from None
     except httpx.HTTPStatusError as error:

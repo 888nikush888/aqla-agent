@@ -23,14 +23,6 @@ def state_data(*trades):
     return result
 
 
-def test_default_currency_shows_primary_history_with_mainnet_berlin_month():
-    source = state_data(trade("primary"), trade("aster", currency="USDT"))
-    snapshot = build_presentation(source, clock=CLOCK)
-    assert snapshot.scope == PresentationScope(currency="USDC", network="mainnet", period="current")
-    assert snapshot.resolved_period == "2026-10"
-    assert [row.trade_id for row in snapshot.journal] == ["primary"]
-    assert snapshot.net_pnl.value == Decimal("15.1")
-    assert source["trades"]["aster"]["plan"]["market"]["quote_token"] == "USDT"
 
 
 def test_presentation_finance_oracle_separates_network_currency_and_missing_evidence():
@@ -118,7 +110,7 @@ def test_all_venues_networks_short_and_signed_funding_match_monthly_oracle(excha
     row["funding_events"] = {"payment": {"amount": funding}}
     row["funding_coverage"]["payments_fingerprint"] = digest(row["funding_events"])
     source = state_data(row)
-    snapshot = build_presentation(source, {"exchange": exchange, "currency": currency, "network": network}, CLOCK)
+    snapshot = build_presentation(source, {"exchange": exchange if exchange == "hyperliquid" else "all", "currency": currency, "network": network}, CLOCK)
     authoritative = report_row(source, row)
     expected_net = (Decimal("15.5") if side == "long" else Decimal("-15.5")) - Decimal(".4") + Decimal(funding)
     assert snapshot.net_pnl.value == expected_net
@@ -281,3 +273,13 @@ def test_rank_history_is_scanned_once_with_original_valid_time_semantics():
         "negative": {"source_id": "two", "time": -10}, "zero": {"source_id": "two", "time": 0}})
     result = build_presentation(source, clock=CLOCK)
     assert {row.source_id: row.last_change for row in result.channels} == {"one": CLOCK, "two": 0, "empty": None}
+
+
+def test_default_currency_shows_primary_history_with_mainnet_berlin_month():
+    source = state_data(trade("primary"), trade("aster", currency="USDT"))
+    snapshot = build_presentation(source, clock=CLOCK)
+    assert snapshot.scope == PresentationScope(currency="USDC", network="mainnet", period="current")
+    assert snapshot.resolved_period == "2026-10"
+    assert [row.trade_id for row in snapshot.journal] == ["primary"]
+    assert snapshot.net_pnl.value == Decimal("15.1")
+    assert source["trades"]["aster"]["plan"]["market"]["quote_token"] == "USDT"

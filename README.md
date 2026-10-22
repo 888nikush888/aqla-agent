@@ -2,7 +2,7 @@
 
 [![Quality](https://github.com/888nikush888/aqla-agent/actions/workflows/quality.yml/badge.svg)](https://github.com/888nikush888/aqla-agent/actions/workflows/quality.yml)
 
-Telegram-Quellen → Hermes versteht Signal/Update im Kontext → Python prüft Profile und Pipelines → Hyperliquid, Aster und/oder Lighter führen unabhängig aus → Hermes meldet das Ergebnis je Börse in Telegram.
+Telegram-Quellen → Hermes versteht Signal/Update im Kontext → Python prüft Profile und Pipelines → Hyperliquid Mainnet oder Testnet führt aus → Hermes meldet das Ergebnis je Börse in Telegram.
 
 Hyperliquid-Mainnet unterstützt manuelle Positionen neben Aqla auf freien Märkten. Gemeinsame Plätze und Unified-Account-Margin werden berücksichtigt; eigene Trades und fremde Orders bleiben getrennt verwaltet. [Mainnet und Parallelhandel](docs/mainnet-shared-account.md).
 
@@ -10,7 +10,7 @@ Gold/XAU wird auf Hyperliquid als `xyz:GOLD` erkannt; Dezimalhebel werden abgeru
 
 Eigenständiges Python-Projekt. Ein kontrollierter Handels-MCP, ein kurzer bearbeitbarer Master-Skill und ein read-only Telegram-Quellenleser für abonnierte Kanäle. SQLite speichert Handelszustand und Hermes-Gespräche. Keine eigene Bot-Anbindung, MiniApp oder autonome Strategieoptimierung. Manuell an den Hermes-Bot weitergeleitete Signale werden ebenfalls als Quellen erfasst.
 
-Kanalränge F–S gewichten das Profilrisiko und wählen Testnet oder Mainnet für neue Entries. Bei einem bestätigten fehlenden Hyperliquid-Markt können Pipelines auf Aster oder Lighter im selben Netzwerk ausweichen. Neue TP-Prozente sind verbindlich Margin-ROE: eigene Anfangsmargin vor Kosten, tatsächlich wirksamer Hebel und endgültiger eigener Entry-VWAP. Quellenwarteschlange und Benachrichtigungen sind getrennt; aktuelle Quellen benötigen belegte Entscheidungen. [Quellenverarbeitung](docs/source-processing.md). [Ranking, Konten, Börsenersatz und Prozentziele](docs/ranking-routing-roi.md).
+Kanalränge F–S gewichten das Profilrisiko und wählen Testnet oder Mainnet für neue Entries. Fehlende Hyperliquid-Märkte bleiben gesperrt; ein Börsen- oder Netzwerkausweichpfad existiert nicht. Neue TP-Prozente sind verbindlich Margin-ROE: eigene Anfangsmargin vor Kosten, tatsächlich wirksamer Hebel und endgültiger eigener Entry-VWAP. Quellenwarteschlange und Benachrichtigungen sind getrennt; aktuelle Quellen benötigen belegte Entscheidungen. [Quellenverarbeitung](docs/source-processing.md). [Ranking, Konten und Prozentziele](docs/ranking-routing-roi.md).
 
 Betreiberänderungen an Rang, Handelsregeln, Quellen/Pipelines, Limits und Aktivierung sind durch den [privaten Setup-Modus](docs/setup-mode.md) geschützt: `/setup`, native Passwortprüfung und bestätigtes Löschen, dann 300 Sekunden Freigabe. Status, Pause/Disable und Schutz bleiben verfügbar.
 
@@ -27,7 +27,7 @@ Voraussetzungen: Linux mit systemd, Git und uv. Der Installer richtet eigene Pyt
 1. Quellpaket in einen separaten Ordner entpacken, beispielsweise `/opt/aqla-source`. Im Quellordner:
 
    ```sh
-   uv sync --frozen --extra sources --extra sheets --extra exchanges
+   uv sync --frozen --extra sources --extra sheets
    uv run aqla-install-hermes --destination /opt/aqla --owner-id DEINE_TELEGRAM_USER_ID
    ```
 
@@ -90,7 +90,7 @@ Voraussetzungen: Linux mit systemd, Git und uv. Der Installer richtet eigene Pyt
 
 ## Bedienung
 
-Profile sind wiederverwendbare Handelsparameter; Pipelines verbinden abonnierte Quellen mit Börse und Profil. Beispiel: „Erstelle Profil A mit meinen bisherigen Handelsparametern und Profil B mit 0,25 Prozent Risiko. Nutze Quelle 1 auf Hyperliquid mit A und auf Aster mit B.“ Hermes liest vorher die aktuellen Profile und erhält ungenannte Werte. Kontolimits werden gemeinsam je Börse gesetzt, etwa „Auf Aster höchstens zwei offene Trades und ein Prozent Gesamtrisiko“. Aster und Lighter sind für Mainnet vorbereitet, bleiben aber bis zu eingerichteten API-Zugängen, expliziten Limits und deinem Aktivierungsauftrag deaktiviert.
+Profile sind wiederverwendbare Handelsparameter; Pipelines verbinden abonnierte Quellen mit Hyperliquid und einem Profil. Hermes liest vor Änderungen die aktuellen Profile und erhält ungenannte Werte. Mainnet und Testnet haben getrennte geschützte Konten, Freigaben und Risikolimits. Historische Finanzdaten früherer Konten bleiben archiviert lesbar; ausschließlich Hyperliquid ist ausführbar.
 
 Eine explizite aktive Pipeline ersetzt für ihre Quelle die migrierte Hyperliquid-Standardroute; andere Quellen behalten ihr bisheriges Verhalten. Ein Signal wird einmal interpretiert und erzeugt je Ziel einen eigenen unveränderlichen Plan. Fehler stoppen nur das betroffene Ziel. Prozentwerte beziehen sich auf das Konto der jeweiligen Börse; feste Beträge `_quote` werden in der Abrechnungswährung des jeweiligen Markts gerechnet. USDT, USDC und verschiedene Handelsnetzwerke werden in der Auswertung getrennt. Pro Börse und Markt ist ein eigener Trade gleichzeitig erlaubt. Ohne bestätigten SL versucht Aqla, die eigene Position zu schließen, pausiert weitere Entries dieser Börse und meldet den Vorfall.
 

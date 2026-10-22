@@ -8,7 +8,7 @@ import pytest
 from test_sheets import Google
 
 from aqla_agent import monthly as jobs
-from aqla_agent.funding import aster_funding, bounded_history, hyperliquid_funding, lighter_funding, payment
+from aqla_agent.funding import bounded_history, hyperliquid_funding, payment
 from aqla_agent.messages import monthly_message, telegram_view
 from aqla_agent.monthly import (
     BERLIN,
@@ -113,18 +113,6 @@ def test_missing_evidence_is_not_zero_and_excluded(damage):
     assert result["summary"]["roe_sum_percent"] == "0"
 
 
-def test_entry_freezes_only_after_remainder_terminal_and_lighter_rounding():
-    row = trade(leverage=3)
-    row.pop("entry_accounting")
-    row["plan"]["market"]["margin_leverage_scale"] = 10000
-    row["order_observations"]["entry"]["status"] = "open"
-    assert "entry_accounting" not in accounting_facts(row)
-    row["order_observations"]["entry"]["status"] = "canceled"
-    facts = accounting_facts(row)["entry_accounting"]
-    assert Decimal(facts["margin_leverage"]) == Decimal(10000) / 3334
-    assert Decimal(facts["initial_margin"]) == Decimal(202) / (Decimal(10000) / 3334)
-    row["entry_accounting"] = facts
-    assert "entry_accounting" not in accounting_facts(row)
 
 
 def test_delayed_entry_fills_do_not_freeze_partial_margin():
@@ -862,33 +850,8 @@ async def test_hyperliquid_actual_payment_contract_and_hip3():
     assert seen == [("userFunding", {"user": "owner", "startTime": 1000, "endTime": 2000})]
 
 
-@pytest.mark.asyncio
-async def test_aster_actual_signed_income_contract():
-    seen = []
-    market = Market(symbol="BTC", native_symbol="BTCUSDT", asset_id=0, product="perp", size_decimals=2, max_leverage=20, mid="100", quote_token="USDT")
-    async def read(path, args, **kwargs):
-        seen.append((path, args, kwargs))
-        return [{"tranId": "1", "time": 1500, "incomeType": "FUNDING_FEE", "symbol": "BTCUSDT", "income": "2", "asset": "USDT"}]
-    result = await aster_funding(SimpleNamespace(read=read), market, 1000, 2000)
-    assert result[0]["amount"] == "2" and result[0]["signed_size"] is None
-    assert seen[0][0] == "income" and seen[0][1]["incomeType"] == "FUNDING_FEE" and seen[0][2] == {"private": True}
 
 
-@pytest.mark.asyncio
-async def test_lighter_actual_position_funding_pagination_short_and_repeat_cursor():
-    market = Market(symbol="BTC", asset_id=1, product="perp", size_decimals=2, max_leverage=20, mid="100")
-    calls = []
-    async def read(path, args, **kwargs):
-        calls.append(args)
-        return {"position_fundings": [{"timestamp": 2, "market_id": 1, "funding_id": 9, "change": "1", "position_size": "2", "position_side": "short"}], "next_cursor": "next" if len(calls) == 1 else None}
-    adapter = SimpleNamespace(account="123", read=read)
-    result = await lighter_funding(adapter, market, 1000, 3000)
-    assert len(result) == 1 and result[0]["signed_size"] == "-2" and result[0]["time"] == 2000
-    assert calls[0]["start_timestamp"] == 1 and calls[1]["cursor"] == "next"
-    async def repeated(*args, **kwargs):
-        return {"position_fundings": [], "next_cursor": "same"}
-    with pytest.raises(AqlaError, match="cursor repeated"):
-        await lighter_funding(SimpleNamespace(account="123", read=repeated), market, 1000, 3000)
 
 
 def test_telegram_month_summary_only_after_publication_and_no_fabricated_numbers():
@@ -1101,3 +1064,17 @@ async def test_actual_monthly_failure_and_ack_reject_stale_generations(setup, mo
         assert fake.actions == []
     finally:
         await close_server(server)
+
+
+def test_entry_freezes_only_after_remainder_terminal_and_lighter_rounding():
+    row = trade(leverage=3)
+    row.pop("entry_accounting")
+    row["plan"]["market"]["margin_leverage_scale"] = 10000
+    row["order_observations"]["entry"]["status"] = "open"
+    assert "entry_accounting" not in accounting_facts(row)
+    row["order_observations"]["entry"]["status"] = "canceled"
+    facts = accounting_facts(row)["entry_accounting"]
+    assert Decimal(facts["margin_leverage"]) == Decimal(10000) / 3334
+    assert Decimal(facts["initial_margin"]) == Decimal(202) / (Decimal(10000) / 3334)
+    row["entry_accounting"] = facts
+    assert "entry_accounting" not in accounting_facts(row)

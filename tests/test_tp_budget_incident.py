@@ -279,16 +279,12 @@ async def test_refreshed_plan_is_rejected_before_save_if_it_changes_original_int
 
 
 @pytest.mark.asyncio
-async def test_ranked_fallback_budget_refresh_preserves_venue_profile_and_reason(routed,setup,signal,monkeypatch):  # noqa: F811
-    from aqla_hyperliquid_mcp.models import SymbolUnavailable
+async def test_ranked_budget_refresh_preserves_profile_network_and_reason(routed,setup,signal,monkeypatch):  # noqa: F811
     router,_=routed
     state=setup[1]
     state.update(lambda data:data['ranking_policy'].update(enabled=True))
     state.update(lambda data:data['source_ranks']['channel'].update(tier='D'))
     state.update(lambda data:data['pipelines']['source-one'].update(targets=data['pipelines']['source-one']['targets'][:1]))
-    async def missing_market(*args):
-        raise SymbolUnavailable('Confirmed unavailable market')
-    monkeypatch.setattr(router.engines['hyperliquid'].exchange,'market',missing_market)
     source,value=signal
     target=(await router.preview(source.event_id,value))['targets'][0]
     original=target['plan']
@@ -299,8 +295,9 @@ async def test_ranked_fallback_budget_refresh_preserves_venue_profile_and_reason
     monkeypatch.setattr(engine.exchange,'account_snapshot',reduced)
     result=await router.execute(target['plan_id'])
     assert result['status']=='open', result
-    for field in ('exchange','requested_exchange','profile_id','pipeline_id','routing_leg_id','fallback_reason','rank_snapshot'):
+    for field in ('exchange','requested_exchange','profile_id','pipeline_id','routing_leg_id','rank_snapshot'):
         assert result['plan'][field]==original[field]
+    assert not result['plan'].get('fallback_reason')
     assert Decimal(result['plan']['quantity'])<Decimal(original['quantity'])
     await router.close()
 

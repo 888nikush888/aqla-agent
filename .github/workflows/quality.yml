@@ -72,7 +72,7 @@ jobs:
           .cache/tools/gitleaks git . --redact=100 --no-banner
       - name: Audit locked runtime and Telegram dependencies
         run: |
-          uv export --quiet --frozen --no-emit-project --no-dev --extra sources --extra sheets --extra exchanges --format requirements-txt --output-file .cache/runtime-requirements.txt
+          uv export --quiet --frozen --no-emit-project --no-dev --extra sources --extra sheets --format requirements-txt --output-file .cache/runtime-requirements.txt
           uvx --from pip-audit==2.10.1 pip-audit -r .cache/runtime-requirements.txt --disable-pip --require-hashes --strict --progress-spinner off
 
   native-hermes:

@@ -4,9 +4,7 @@
 def native_role(venue, row):
     if venue == "hyperliquid":
         return "taker" if row.get("crossed") is True else "maker" if row.get("crossed") is False else "unknown"
-    if venue in ("aster", "lighter"):
-        return row.get("execution_role") if row.get("execution_role") in ("maker", "taker") else "unknown"
-    return "unknown"
+    return row.get("execution_role") if row.get("execution_role") in ("maker", "taker") else "unknown"
 
 
 def merge_role(roles, conflicts, identity, role):

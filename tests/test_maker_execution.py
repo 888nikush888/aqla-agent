@@ -27,7 +27,7 @@ from aqla_hyperliquid_mcp.models import (
 )
 from aqla_hyperliquid_mcp.rules import make_plan
 
-pytest_plugins = ["test_aster_adapter", "test_lighter_adapter"]
+pytest_plugins = []
 
 ORACLES = Path(__file__).parent / "oracles"
 STANDARD = json.loads((ORACLES / "maker_standard_4253019.json").read_text())
@@ -541,106 +541,13 @@ def test_role_enrichment_and_conflict_preserve_complete_financial_report_fingerp
     assert row["fill_events"] == facts and row["entry_accounting"] == entry and row["funding_coverage"] == coverage
 
 
-@pytest.mark.asyncio
-async def test_aster_signed_native_gtx_entry_and_reduce_only_tp(aster):
-    adapter, boundary, _ = aster
-    market = await adapter.market("BTC")
-    orders = [{"a": market.asset_id, "b": buy, "p": price, "s": "1", "r": reduce,
-               "t": {"limit": {"tif": "Alo"}}, "c": adapter.cloid("maker-test", index)}
-              for index, (buy, price, reduce) in enumerate(((True, "99.9", False), (False, "110", True)))]
-    result = await adapter.mutate("maker-test", {"type": "order", "orders": orders, "grouping": "na"})
-    assert result["phase"] == "acknowledged"
-    native = [params for path, params in boundary.posts if path == "order"]
-    assert [(row["timeInForce"], row["price"], row["reduceOnly"]) for row in native] == [("GTX", "99.9", "false"), ("GTX", "110", "true")]
-    assert result["signed_requests"][0]["params"]["timeInForce"] == "GTX"
 
 
-@pytest.mark.asyncio
-async def test_aster_maker_role_and_missing_fee_remain_independent(aster):
-    adapter, boundary, _ = aster
-    await adapter.market("BTC")
-    base = {"orderId": 1, "id": 1, "qty": "1", "price": "100", "time": now_ms()}
-    boundary.trades = [{**base, "maker": True}, {**base, "id": 2, "maker": False}, {**base, "id": 3, "maker": "true"}]
-    rows = await adapter.fills(base["time"], base["time"])
-    assert [row["execution_role"] for row in rows] == ["maker", "taker", "unknown"]
-    assert all(row["fee"] is None and row["feeToken"] is None for row in rows)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("grouped", [False, True])
-async def test_lighter_native_post_only_signer_parameter_and_trigger_safety(lighter, monkeypatch, grouped):
-    adapter, _, signer, _ = lighter
-    monkeypatch.setattr(signer, "ORDER_TIME_IN_FORCE_POST_ONLY", 2, raising=False)
-    market = await adapter.market("BTC")
-    order = {"a": market.asset_id, "b": True, "p": "99.9", "s": "1", "r": False,
-             "t": {"limit": {"tif": "Alo"}}, "c": adapter.cloid("maker-test")}
-    stop = {**order, "b": False, "p": "85.5", "r": True, "t": {"trigger": {"isMarket": True, "tpsl": "sl", "triggerPx": "90"}}, "c": adapter.cloid("maker-test", 1)}
-    result = await adapter.mutate("maker-test", {"type": "order", "orders": [order, stop], "grouping": "normalTpsl" if grouped else "na"})
-    assert result["phase"] == "acknowledged"
-    if grouped:
-        native = signer.calls[-1][1]["orders"]
-        assert [row["TimeInForce"] for row in native] == [2, 0]
-        assert native[0]["Price"] == 999 and native[1]["ReduceOnly"] == 1
-        assert native[0]["OrderExpiry"] == native[1]["OrderExpiry"] > now_ms()
-    else:
-        native = [values for kind, values in signer.calls if kind == "order"]
-        assert [row["time_in_force"] for row in native] == [2, 0]
-        assert native[0]["price"] == 999 and native[1]["reduce_only"]
 
 
-@pytest.mark.asyncio
-async def test_lighter_missing_native_post_only_capability_does_not_downgrade(lighter):
-    adapter, boundary, signer, _ = lighter
-    market = await adapter.market("BTC")
-    action = {"type": "order", "orders": [{"a": market.asset_id, "b": True, "p": "99.9", "s": "1", "r": False,
-        "t": {"limit": {"tif": "Alo"}}, "c": adapter.cloid("maker-test")}], "grouping": "na"}
-    with pytest.raises(AqlaError, match="post-only"):
-        await adapter.mutate("maker-test", action)
-    assert signer.calls == [] and boundary.posts == []
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("own_ask,is_maker,role", [(False, True, "taker"), (False, False, "maker"), (True, True, "maker"), (True, False, "taker"), (True, None, "unknown")])
-async def test_lighter_role_uses_native_account_side_not_zero_fees(lighter, own_ask, is_maker, role):
-    adapter, boundary, _, _ = lighter
-    await adapter.market("BTC")
-    stamp = now_ms()
-    boundary.trades = [{"trade_id": 1, "market_id": 1, "ask_account_id": 42 if own_ask else 99, "bid_account_id": 99 if own_ask else 42,
-        "ask_id": 10, "bid_id": 20, "timestamp": stamp, "size": "1", "price": "100", "maker_fee": None, "taker_fee": None, "is_maker_ask": is_maker}]
-    rows = await adapter.fills(stamp, stamp)
-    assert rows[0]["execution_role"] == role and rows[0]["fee"] is None
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("tif", ["Alo", "Gtc", "Ioc"])
-async def test_installed_lighter_native_signer_accepts_parent_and_reduce_only_target(lighter, tif):
-    from lighter import SignerClient
-    from lighter.signer_client import CreateOrderTxReq, create_api_key
-
-    adapter, boundary, _, _ = lighter
-    market = await adapter.market("BTC")
-    key, _, error = create_api_key()
-    assert error is None
-    signer = SignerClient(url="https://testnet.zklighter.elliot.ai", account_index=42, api_private_keys={4: key})
-    adapter.signer, adapter.grouped_order_type = signer, CreateOrderTxReq
-    try:
-        parent = {"a": market.asset_id, "b": True, "p": "99.9", "s": "1", "r": False,
-            "t": {"limit": {"tif": tif}}, "c": adapter.cloid("native-parent")}
-        stop = {**parent, "b": False, "p": "85", "r": True,
-            "t": {"trigger": {"isMarket": True, "tpsl": "sl", "triggerPx": "90"}}, "c": adapter.cloid("native-stop")}
-        started = now_ms()
-        grouped, = await adapter.build_requests({"type": "order", "orders": [parent, stop], "grouping": "normalTpsl"}, None)
-        body = json.loads(grouped["tx_info"])
-        assert body["Orders"][0]["TimeInForce"] == {"Alo": 2, "Gtc": 1, "Ioc": 0}[tif]
-        expiry = body["Orders"][0]["OrderExpiry"]
-        assert expiry == 0 if tif == "Ioc" else started < expiry <= now_ms() + 28 * 24 * 60 * 60 * 1000
-        assert body["Orders"][1]["ReduceOnly"] == 1 and body["Orders"][1]["OrderExpiry"] > started
-        if tif != "Ioc":
-            assert expiry == body["Orders"][1]["OrderExpiry"]
-        target = {**parent, "b": False, "p": "110", "r": True, "c": adapter.cloid("native-target")}
-        signed, = await adapter.build_requests({"type": "order", "orders": [target], "grouping": "na"}, None)
-        body = json.loads(signed["tx_info"])
-        assert body["TimeInForce"] == {"Alo": 2, "Gtc": 1, "Ioc": 0}[tif] and body["ReduceOnly"] == 1
-        assert boundary.posts == []
-    finally:
-        await adapter.close()

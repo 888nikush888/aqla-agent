@@ -1,4 +1,3 @@
-import asyncio
 import json
 
 import pytest
@@ -324,172 +323,12 @@ async def test_changed_accepted_source_cancels_pending_preview(native_processor,
     assert fake.actions == []
 
 
-@pytest.mark.asyncio
-async def test_partial_execution_resumes_only_pending_preview_leg_after_restart(routed, setup, signal, monkeypatch):  # noqa: F811
-    router, boundaries = routed
-    state = setup[1]
-    _, interpretation = signal
-    processor = SourceProcessor(state, router)
-    processor.configure("hybrid", "worker")
-    aster = router.engines["aster"]
-    original, attempts = aster.preview, []
-
-    async def temporary(event_id, value):
-        attempts.append(event_id)
-        if len(attempts) == 1:
-            raise TemporaryObservation("read_unavailable", "preview", "transport")
-        return await original(event_id, value)
-
-    monkeypatch.setattr(aster, "preview", temporary)
-    job = processor.prepare("worker", "p")["job"]
-    result = DecisionResult(model="inception/mercury-decide:free", interpretation=interpretation, verified=True)
-    processor.record("worker", job["job_id"], result)
-    first = await processor.apply("worker", job["job_id"])
-    assert first["status"] == "waiting_preview"
-    assert boundaries["hyperliquid"].position > 0 and boundaries["lighter"].position > 0
-    assert boundaries["aster"].position == 0
-    healthy_calls = {name: len(boundaries[name].actions) for name in ("hyperliquid", "lighter")}
-    def make_due(data):
-        for target in data["events"][job["event_id"]]["targets"].values():
-            if target["status"] == "pending":
-                target["observation_retry"]["next_retry_at"] = 0
-    state.update(make_due)
-    restarted = SourceProcessor(state, router)
-    restarted.configure("hybrid", "worker")
-    assert restarted.prepare("worker", "p")["job"]["job_id"] == job["job_id"]
-    final = await restarted.apply("worker", job["job_id"])
-    assert final["status"] == "done" and boundaries["aster"].position > 0
-    assert all(len(boundaries[name].actions) == count for name, count in healthy_calls.items())
-    await router.close()
 
 
-@pytest.mark.asyncio
-async def test_restart_before_first_dispatch_retains_healthy_saved_plans(routed, setup, signal, monkeypatch):  # noqa: F811
-    router, boundaries = routed
-    processor = SourceProcessor(setup[1], router)
-    processor.configure("hybrid", "worker")
-    _, interpretation = signal
-
-    async def unavailable(*args):
-        raise TemporaryObservation("read_unavailable", "preview", "transport")
-
-    async def interrupted(*args):
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(router.engines["aster"], "preview", unavailable)
-    execute = router.execute_many
-    monkeypatch.setattr(router, "execute_many", interrupted)
-    job = processor.prepare("worker", "p")["job"]
-    processor.record("worker", job["job_id"], DecisionResult(model="inception/mercury-decide:free", interpretation=interpretation, verified=True))
-    with pytest.raises(asyncio.CancelledError):
-        await processor.apply("worker", job["job_id"])
-    assert all(not boundary.actions for boundary in boundaries.values())
-    monkeypatch.setattr(router, "execute_many", execute)
-    restarted = SourceProcessor(setup[1], router)
-    restarted.configure("hybrid", "worker")
-    assert restarted.prepare("worker", "p")["job"]["job_id"] == job["job_id"]
-    await restarted.apply("worker", job["job_id"])
-    assert boundaries["hyperliquid"].position > 0 and boundaries["lighter"].position > 0
-    assert boundaries["aster"].position == 0
-    await router.close()
 
 
-@pytest.mark.asyncio
-async def test_restart_during_resumed_preview_retains_pending_leg(routed, setup, signal, monkeypatch):  # noqa: F811
-    router, boundaries = routed
-    state = setup[1]
-    processor = SourceProcessor(state, router)
-    processor.configure("hybrid", "worker")
-    _, interpretation = signal
-    aster = router.engines["aster"]
-    original, attempts = aster.preview, []
-
-    async def interrupted_preview(event_id, value):
-        attempts.append(event_id)
-        if len(attempts) == 1:
-            raise TemporaryObservation("read_unavailable", "preview", "transport")
-        if len(attempts) == 2:
-            raise asyncio.CancelledError
-        return await original(event_id, value)
-
-    monkeypatch.setattr(aster, "preview", interrupted_preview)
-    job = processor.prepare("worker", "p")["job"]
-    processor.record("worker", job["job_id"], DecisionResult(model="inception/mercury-decide:free", interpretation=interpretation, verified=True))
-    await processor.apply("worker", job["job_id"])
-    healthy_calls = {name: len(boundaries[name].actions) for name in ("hyperliquid", "lighter")}
-    assert all(boundaries[name].position > 0 for name in healthy_calls)
-
-    def make_due(data):
-        for target in data["events"][job["event_id"]]["targets"].values():
-            if target["status"] == "pending":
-                target["observation_retry"]["next_retry_at"] = 0
-    state.update(make_due)
-    assert processor.prepare("worker", "p")["job"]["job_id"] == job["job_id"]
-    with pytest.raises(asyncio.CancelledError):
-        await processor.apply("worker", job["job_id"])
-    assert state.snapshot()["source_jobs"][job["job_id"]]["status"] == "waiting_preview"
-    assert any(target.get("preview_inflight_until", 0) > now_ms()
-               for target in state.snapshot()["events"][job["event_id"]]["targets"].values())
-
-    restarted = SourceProcessor(state, router)
-    restarted.configure("hybrid", "worker")
-    recovered = restarted.prepare("worker", "p")["job"]
-    assert recovered["job_id"] == job["job_id"] and recovered["result"] == state.snapshot()["source_jobs"][job["job_id"]]["result"]
-    assert (await restarted.apply("worker", job["job_id"]))["status"] == "done"
-    assert boundaries["aster"].position > 0 and len(attempts) == 3
-    assert all(len(boundaries[name].actions) == count for name, count in healthy_calls.items())
-    await router.close()
 
 
-@pytest.mark.asyncio
-async def test_restart_after_final_preview_submits_only_saved_missing_plan(routed, setup, signal, monkeypatch):  # noqa: F811
-    router, boundaries = routed
-    state = setup[1]
-    processor = SourceProcessor(state, router)
-    processor.configure("hybrid", "worker")
-    _, interpretation = signal
-    aster = router.engines["aster"]
-    original, attempts = aster.preview, []
-
-    async def temporary(event_id, value):
-        attempts.append(event_id)
-        if len(attempts) == 1:
-            raise TemporaryObservation("read_unavailable", "preview", "transport")
-        return await original(event_id, value)
-
-    monkeypatch.setattr(aster, "preview", temporary)
-    job = processor.prepare("worker", "p")["job"]
-    processor.record("worker", job["job_id"], DecisionResult(model="inception/mercury-decide:free", interpretation=interpretation, verified=True))
-    await processor.apply("worker", job["job_id"])
-    healthy_calls = {name: len(boundaries[name].actions) for name in ("hyperliquid", "lighter")}
-
-    def make_due(data):
-        for target in data["events"][job["event_id"]]["targets"].values():
-            if target["status"] == "pending":
-                target["observation_retry"]["next_retry_at"] = 0
-    state.update(make_due)
-    execute = router.execute_many
-
-    async def interrupted(*args):
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(router, "execute_many", interrupted)
-    assert processor.prepare("worker", "p")["job"]["job_id"] == job["job_id"]
-    with pytest.raises(asyncio.CancelledError):
-        await processor.apply("worker", job["job_id"])
-    saved = state.snapshot()["source_jobs"][job["job_id"]]
-    assert saved["status"] == "waiting_preview" and len(saved["plan_ids"]) == 3
-    assert not processor.pending_previews(state.snapshot(), processor.read_job("worker", job["job_id"]))
-    assert boundaries["aster"].position == 0
-
-    monkeypatch.setattr(router, "execute_many", execute)
-    restarted = SourceProcessor(state, router)
-    restarted.configure("hybrid", "worker")
-    assert restarted.prepare("worker", "p")["job"]["job_id"] == job["job_id"]
-    assert (await restarted.apply("worker", job["job_id"]))["status"] == "done"
-    assert boundaries["aster"].position > 0 and len(attempts) == 2
-    assert all(len(boundaries[name].actions) == count for name, count in healthy_calls.items())
-    await router.close()
 
 
 @pytest.mark.asyncio
@@ -504,32 +343,6 @@ async def test_raw_collection_is_rejected_at_hybrid_record_boundary(native_proce
     assert not fake.actions and not state.snapshot()["plans"]
 
 
-@pytest.mark.asyncio
-async def test_policy_revocation_stops_unsent_legs_and_preserves_already_sent_operations(routed, setup, signal, monkeypatch):  # noqa: F811
-    router, boundaries = routed
-    state = setup[1]
-    processor = SourceProcessor(state, router)
-    processor.configure("hybrid", "worker")
-    _, interpretation = signal
-    async def unavailable(*args):
-        raise TemporaryObservation("read_unavailable", "preview", "transport")
-    monkeypatch.setattr(router.engines["aster"], "preview", unavailable)
-    job = processor.prepare("worker", "approved-profile")["job"]
-    processor.record("worker", job["job_id"], DecisionResult(model="inception/mercury-decide:free", interpretation=interpretation, verified=True))
-    await processor.apply("worker", job["job_id"])
-    assert boundaries["hyperliquid"].position > 0 and boundaries["lighter"].position > 0
-    before = {name: len(boundary.actions) for name, boundary in boundaries.items()}
-    operations = state.snapshot()["operations"]
-    restarted = SourceProcessor(state, router)
-    restarted.configure("hybrid", "worker")
-    restarted.prepare("worker", "revoked-profile")
-    assert state.snapshot()["source_jobs"][job["job_id"]]["failure_code"] == "source_policy_changed"
-    with pytest.raises(Exception, match="not a validated"):
-        await restarted.apply("worker", job["job_id"])
-    assert state.snapshot()["operations"] == operations
-    assert all(len(boundary.actions) == before[name] for name, boundary in boundaries.items())
-    assert boundaries["aster"].position == 0
-    await router.close()
 
 
 @pytest.mark.asyncio

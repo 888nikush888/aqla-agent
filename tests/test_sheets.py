@@ -519,9 +519,9 @@ async def test_journal_read_mcp_forwards_scoped_cursor_and_rejects_nonzero_offse
     selected, google, client = sheets
     settings.google_sheets = selected
     account = "0x" + "1" * 40
-    settings.execution_accounts["aster:mainnet"] = ExecutionSettings(exchange="aster", network="mainnet", account=account)
+    settings.execution_accounts["hyperliquid:mainnet"] = ExecutionSettings(exchange="hyperliquid", network="mainnet", account=account)
     scoped = SheetsClient(selected, session=google, scope="mainnet:" + account)
-    scoped.prefix, scoped.scope_key = "aqla Aster Mainnet ", "aqla.scope.aster.mainnet"
+    scoped.prefix, scoped.scope_key = "aqla Hyperliquid Mainnet ", "aqla.scope.hyperliquid.mainnet"
     scoped.allowed_tables = {"Trades", "Orders", "Fills", "Vorgänge"}
     scoped.layout()
     expected = [f"scoped-trade-{index:04d}" for index in range(1205)]
@@ -537,7 +537,7 @@ async def test_journal_read_mcp_forwards_scoped_cursor_and_rejects_nonzero_offse
 
     monkeypatch.setattr(SheetsClient, "read", observe_read)
     server = create_server(settings, client=client)
-    args = {"table": "Trades", "offset": 1200, "filters": {"Quelle": "channel"}, "account_key": "aster:mainnet"}
+    args = {"table": "Trades", "offset": 1200, "filters": {"Quelle": "channel"}, "account_key": "hyperliquid:mainnet"}
     first = json.loads((await server.call_tool("journal_read", args)).content[0].text)
     assert first["rows"] == [] and first["next_scan_cursor"] is not None
     args.update(offset=0, limit=2, scan_cursor=first["next_scan_cursor"])
