@@ -8,3 +8,5 @@ mcp==2.2.0
 # Compromised CA removal and native image-decoder security fixes.
 certifi==2026.10.19
 Pillow==13.0.0
+# CVE-2026-114603: keep native and MCP telemetry on the patched API.
+opentelemetry-api==1.45.1
