@@ -376,6 +376,37 @@ def target_allocations(plan, quantity, previous=None, consumed=None, completed=(
     return budgets, completed
 
 
+async def restore_targets(engine, trade_id):
+    """Restore only confirmed owned protection before optional market-price reads."""
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+    if trade.get("suspended_wave_targets") or any(row["phase"] in ("prepared", "sending", "unknown") for row in engine.state.read("operations")["operations"].values()):
+        return False
+    plan = TradePlan.model_validate(trade["plan"])
+    await engine.capture_fills(trade_id)
+    remaining = engine.owned_remaining(trade_id, engine.position_size(await engine.positions(plan.market), plan.market))
+    engine._patch(trade_id, remaining_quantity=str(remaining))
+    if not remaining:
+        return True
+    for order in trade["orders"]:
+        if order["kind"] != "tp" or order.get("retired"):
+            continue
+        raw = await engine.order_status(order["cloid"])
+        if raw.get("order", {}).get("status") not in ({"open"} | TERMINAL_ORDER):
+            return False
+        if raw["order"]["status"] in TERMINAL_ORDER:
+            def retire(data, cloid=order["cloid"]):
+                next(row for row in data["trades"][trade_id]["orders"] if row["cloid"] == cloid)["retired"] = True
+            engine.state.update(retire)
+    engine._patch(trade_id, managed_target_fingerprint=None)
+    if not await sync_targets(engine, trade_id):
+        return False
+    await engine.ensure_protection(trade_id)
+    if engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]["status"] != "open":
+        return False
+    engine._patch(trade_id, protection_repair_pending=None)
+    return True
+
+
 async def sync_targets(engine, trade_id):
     trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
@@ -719,6 +750,10 @@ async def refresh(engine, trade_id, *, dispatch=True):
             trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     signed = engine.position_size(await engine.positions(plan.market), plan.market)
     remaining = engine.owned_remaining(trade_id, signed)
+    if remaining and trade.get("protection_repair_pending"):
+        if not await restore_targets(engine, trade_id):
+            return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
     reached = (quote.bid >= Decimal(trade["targets"][0]) if plan.side == "long" else quote.ask <= Decimal(trade["targets"][0]))
     if total:

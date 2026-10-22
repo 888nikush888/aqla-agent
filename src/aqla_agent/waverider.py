@@ -27,7 +27,7 @@ def software_hash():
     root = Path(__file__).parent
     files = [root / name for name in ("waverider.py", "waverider_replay.py", "managed_entries.py", "trading.py", "entry.py", "inventory_stream.py",
         "entry_watch.py", "liquidity.py", "aster.py", "lighter.py", "pipelines.py", "monthly.py", "percent_targets.py",
-        "account_work.py", "lighter_book.py", "lighter_feed.py", "management_sequences.py", "interpretation_contract.py", "source_candidates.py", "semantic_contract.py", "conflict_review.py")]
+        "account_work.py", "lighter_book.py", "lighter_feed.py", "management_sequences.py", "interpretation_contract.py", "source_candidates.py", "semantic_contract.py", "conflict_review.py", "target_recovery.py")]
     files += [root.parent / "aqla_hyperliquid_mcp" / name for name in ("models.py", "rules.py", "api.py", "streams.py", "state.py", "storage.py")]
     return digest({path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in files})
 
@@ -497,6 +497,7 @@ async def resume_exit(engine, trade_id):
                 if row.get("operation_id") == identity:
                     row.update(not_sent=True, retired=True)
             current.update(suspended_wave_targets=None, managed_target_fingerprint=None,
+                           protection_repair_pending=identity,
                            waverider={**reset_phase(state, "waiting_rise"), "cycle": state.get("cycle", 0) + 1})
         engine.state.update(abort)
         return True
@@ -524,7 +525,7 @@ async def resume_exit(engine, trade_id):
             state = {**reset_phase(state, "waiting_rebound"), "sale_price": str(sale), "sold_quantity": str(amount)}
     else:
         state = {**reset_phase(state, "waiting_rise"), "cycle": state.get("cycle", 0) + 1}
-    engine._patch(trade_id, suspended_wave_targets=None, managed_target_fingerprint=None, waverider=state)
+    engine._patch(trade_id, suspended_wave_targets=None, managed_target_fingerprint=None, protection_repair_pending=identity, waverider=state)
     return True
 
 
@@ -615,7 +616,13 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
                 if target["kind"] == "tp":
                     target["retired"] = True
         engine.state.update(retire)
-        quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
+        try:
+            quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
+        except BaseException:
+            if await resume_exit(engine, trade_id):
+                from .managed_entries import restore_targets
+                await restore_targets(engine, trade_id)
+            raise
         if not corrective and (ended(plan, latest, quote) or (limit - available["flex_basis"]) * (1 if plan.side == "long" else -1) <= cycle_cost):
             await resume_exit(engine, trade_id)
             return

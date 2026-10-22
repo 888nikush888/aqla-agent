@@ -688,6 +688,9 @@ class Hyperliquid:
         if not record:
             raise AqlaError("Unknown operation")
         self.state.assert_operation_binding(self.settings, record)
+        if record["phase"] == "reconciled" and record.get("outcome") == "absent_expired":
+            return {"operation": record, "evidence": record["evidence"], "resolved": True,
+                    "resubmitted": False, "absence_is_proof": True}
         action = record["wire_action"]
         identities = [order["c"] for order in action.get("orders", []) if order.get("c")]
         if action.get("type") == "cancelByCloid":
@@ -704,6 +707,12 @@ class Hyperliquid:
         proven = bool(identities) and all(proves(identity, row) for identity, row in zip(identities, observations, strict=True))
         if proven:
             self.state.update(lambda state: state["operations"][operation_id].update(phase="reconciled", evidence=observations))
+        elif record["phase"] in ("sending", "unknown"):
+            from aqla_agent.target_recovery import expired_target
+            evidence = await expired_target(self, record, observations)
+            if evidence:
+                return {"operation": self.state.read("operations")["operations"][operation_id], "evidence": [evidence],
+                        "resolved": True, "resubmitted": False, "absence_is_proof": True}
         return {"operation": self.state.snapshot()["operations"][operation_id], "evidence": observations,
                 "resolved": proven, "resubmitted": False, "absence_is_proof": False}
 

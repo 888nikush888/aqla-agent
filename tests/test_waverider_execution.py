@@ -66,6 +66,32 @@ async def wave_trade(setup, signal, monkeypatch, lifetime="signal_deadline"):
 
 
 @pytest.mark.asyncio
+async def test_price_failure_after_target_cancel_restores_native_targets_without_wave_send(setup, signal, monkeypatch):
+    from aqla_agent.observations import TemporaryObservation
+    state, boundary, exchange, _, plan, trade = await wave_trade(setup, signal, monkeypatch)
+    boundary.mid = "104"
+    original = exchange.price_snapshot
+    reads = 0
+    async def interrupted(market):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise TemporaryObservation("read_unavailable", "price", "transport")
+        return await original(market)
+    quote = await original(Market.model_validate(plan["market"]))
+    monkeypatch.setattr(exchange, "price_snapshot", interrupted)
+    with pytest.raises(TemporaryObservation):
+        await execute(setup[-1], trade["trade_id"], trade["waverider"], "reduce", Decimal(trade["remaining_quantity"]) / 2, quote, Decimal(".2"))
+    current = state.read("trades")["trades"][trade["trade_id"]]
+    assert not current["suspended_wave_targets"] and current["protection_repair_pending"] is None
+    assert not any(row["kind"] == "waverider" for row in current["fill_events"].values())
+    assert not any(key.startswith("waverider:") for key in state.read("operations")["operations"])
+    targets = [row for row in current["orders"] if row["kind"] == "tp" and not row.get("retired")]
+    assert targets and all(boundary.orders[row["cloid"]]["status"] == "open" for row in targets)
+    assert sum(Decimal(row["quantity"]) for row in targets) == Decimal(current["remaining_quantity"])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("lifetime", ["signal_deadline", "until_target"])
 async def test_lifetime_controls_waves_but_never_revives_finished_setups(setup, signal, monkeypatch, lifetime):
     from aqla_hyperliquid_mcp import models
