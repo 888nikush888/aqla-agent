@@ -742,7 +742,8 @@ async def refresh(engine, trade_id, *, dispatch=True):
         trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         engine._patch(trade_id, source_tp_observed_fingerprint=source_tp_fingerprint)
     if remaining:
-        engine._patch(trade_id, filled_quantity=str(total), entry_vwap=str(cost / total), remaining_quantity=str(remaining), status="protecting")
+        engine._patch(trade_id, filled_quantity=str(total), entry_vwap=str(cost / total), remaining_quantity=str(remaining),
+                      status="open" if trade["status"] == "open" else "protecting")
         current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         originals_done = all(row.get("not_sent") or row["phase"] == "terminal" for row in current["entry_orders"] if row["kind"] == "original")
         if originals_done and not current.get("initial_sl_risk"):
@@ -787,7 +788,7 @@ async def refresh(engine, trade_id, *, dispatch=True):
                     return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
                 await tick(engine, trade_id, quote)
         except TemporaryObservation as error:
-            engine._patch(trade_id, protection_observation_pending=error.diagnostic())
+            engine._patch(trade_id, status="protecting", protection_observation_pending=error.diagnostic())
             raise
         except AqlaError as error:
             engine._patch(trade_id, execution_incident="Managed protection failed: " + str(error))

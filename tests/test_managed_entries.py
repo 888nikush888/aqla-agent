@@ -130,6 +130,42 @@ async def test_open_managed_position_without_pending_entries_has_one_reconciliat
     await trading.refresh_trade(trade["trade_id"])
     assert counts["capture_fills"] == counts["positions"] == counts["ensure_protection"] == 1
     assert counts["validate_actual"] == counts["sync_targets"] == 1 and fake.actions == before
+    state.update(lambda data: data["notifications"].clear())
+    for _ in range(3):
+        await trading.refresh_trade(trade["trade_id"])
+        assert state.read("trades")["trades"][trade["trade_id"]]["status"] == "open"
+        assert state.read("notifications")["notifications"] == {}
+    assert counts["ensure_protection"] == 4 and fake.actions == before
+
+
+@pytest.mark.asyncio
+async def test_real_managed_protection_read_failure_still_notifies_and_recovers(setup, monkeypatch):
+    from aqla_agent.observations import TemporaryObservation
+
+    state, fake, trading, _, trade = await opened_zone(setup)
+    first = trade["entry_orders"][0]
+    fake.fill(first["cloid"], first["quantity"], first["price"])
+    await trading.refresh_trade(trade["trade_id"])
+    assert state.read("trades")["trades"][trade["trade_id"]]["status"] == "open"
+    state.update(lambda data: data["notifications"].clear())
+    before = list(fake.actions)
+    original = trading.ensure_protection
+
+    async def unavailable(*_):
+        raise TemporaryObservation("read_unavailable", "protection", "transport")
+
+    monkeypatch.setattr(trading, "ensure_protection", unavailable)
+    with pytest.raises(TemporaryObservation):
+        await trading.refresh_trade(trade["trade_id"])
+    current = state.read("trades")["trades"][trade["trade_id"]]
+    assert current["status"] == "protecting" and current["protection_observation_pending"]
+    assert any(row.get("change", {}).get("status") == "protecting" for row in state.read("notifications")["notifications"].values())
+    assert fake.actions == before
+    monkeypatch.setattr(trading, "ensure_protection", original)
+    await trading.refresh_trade(trade["trade_id"])
+    current = state.read("trades")["trades"][trade["trade_id"]]
+    assert current["status"] == "open" and current["protection_observation_pending"] is None
+    assert fake.actions == before
 
 
 @pytest.mark.asyncio
