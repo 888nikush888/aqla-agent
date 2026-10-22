@@ -328,13 +328,29 @@ def enqueue_changes(previous, proposed):
         proposed["journal_projection"] = {key: row["fingerprint"] for key, row in after.items() if row["table"] != "Ereignisse"}
 
 
+def _retired_configuration_key(data, key):
+    retired = data.get("retired_execution_configuration", {})
+    table, _, identity = key.partition(":")
+    if table == "Handelsparameter":
+        kind, _, remainder = identity.partition(":")
+        if kind == "limits":
+            return remainder.partition(":")[0] in retired.get("venue_limits", {})
+        if kind == "account":
+            return remainder.rpartition(":")[0] in retired.get("account_limits", {})
+    if table == "Pipelines":
+        pipeline, _, exchange = identity.rpartition(":")
+        return exchange != "hyperliquid" and any(row["exchange"] == exchange
+            for row in retired.get("pipelines", {}).get(pipeline, {}).get("targets", []))
+    return False
+
+
 def seed(data, *, destination=None):
     pending = data.setdefault("journal_pending", {})
     if data.get("retired_execution_configuration"):
         cache = {}
         for key in list(pending):
             row = _selected_record_current(data, key, cache, {})
-            if row is not None and _retired_record(data, row):
+            if _retired_configuration_key(data, key) or row is not None and _retired_record(data, row):
                 data["retired_execution_configuration"].setdefault("journal_pending", {})[key] = pending.pop(key)
     rows = project(data)
     queued = data.get("journal_projection", {}) if destination == data.get("journal_destination") else {}

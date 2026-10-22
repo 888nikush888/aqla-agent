@@ -93,6 +93,36 @@ def test_retired_finance_keeps_its_history_without_republishing_an_inactive_scop
     assert not {journal.record_key(row) for row in journal.batch(financial_data)["records"]}.intersection(retired)
 
 
+def test_retired_account_limits_and_pipeline_rows_are_archived_without_delivery_receipts(financial_data):
+    financial_data["retired_execution_configuration"] = {"venue_limits": {"aster": None},
+        "account_limits": {"aster:mainnet": {}}, "pipelines": {"old": {"targets": [{"exchange": "aster"}]}}}
+    records = journal.project(financial_data)
+    financial_data["journal_destination"] = "unchanged"
+    financial_data["journal_projection"] = {key: row["fingerprint"] for key, row in records.items()}
+    retired = {key: "original-version" for key in (
+        "Handelsparameter:account:aster:mainnet:max_open_trades",
+        "Handelsparameter:account:aster:mainnet:max_total_risk_percent",
+        "Handelsparameter:limits:aster:max_open_trades", "Pipelines:old:aster")}
+    active = "Handelsparameter:limits:hyperliquid:max_open_trades"
+    financial_data["journal_pending"] = {**retired, active: records[active]["fingerprint"]}
+    original = copy.deepcopy(financial_data)
+    journal.seed(financial_data, destination="unchanged")
+    assert financial_data["retired_execution_configuration"]["journal_pending"] == retired
+    assert not set(retired).intersection(financial_data["journal_pending"])
+    assert active in financial_data["journal_pending"]
+    assert financial_data["trades"] == original["trades"] and financial_data["operations"] == original["operations"]
+    assert financial_data.get("journal_synced_at") == original.get("journal_synced_at")
+
+
+def test_missing_journal_key_without_a_retired_scope_is_not_silently_discarded(financial_data):
+    financial_data["retired_execution_configuration"] = {"venue_limits": {"aster": None}}
+    key = "Handelsparameter:account:unknown:mainnet:max_open_trades"
+    financial_data["journal_pending"] = {key: "unknown-version"}
+    journal.seed(financial_data, destination="unchanged")
+    assert financial_data["journal_pending"][key] == "unknown-version"
+    assert key not in financial_data["retired_execution_configuration"].get("journal_pending", {})
+
+
 @pytest.mark.parametrize("table", ["Trades", "Orders", "Fills", "Vorgänge"])
 @pytest.mark.parametrize("damage", [None, "missing_fee", "fee_currency", "partial_exit"])
 def test_financial_selected_batch_and_ack_match_frozen_projection_without_source_scan(financial_data, monkeypatch, table, damage):
