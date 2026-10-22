@@ -421,9 +421,24 @@ async def retain_retry(engine, trade_id, error):
     trade = engine.state.snapshot()["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
     previous = trade.get("managed_entry_retry")
-    marker = {**retry_marker(previous, error, plan.deadline_at, "execute"), "completed": False}
+    wave = trade.get("waverider", {})
+    wave_row = next((row for row in trade["entry_orders"] if row["kind"] == "waverider" and row["phase"] == "pending" and not row.get("not_sent")
+                     and row["operation_id"] == wave.get("operation_id")), None)
+    wave_retry = wave_row is not None and plan.policy.waverider_lifetime == "until_target"
+    if previous and (previous.get("completed") or previous.get("wave_cycle") != (wave.get("cycle", 0) if wave_retry else None)):
+        previous = None
+    deadline = (previous["deadline_at"] if previous else now_ms() + 300000) if wave_retry else plan.deadline_at
+    marker = {**retry_marker(previous, error, deadline, "execute"), "completed": False}
+    if wave_retry:
+        marker["wave_cycle"] = wave.get("cycle", 0)
     engine._patch(trade_id, managed_entry_retry=marker, entry_diagnostic=error.diagnostic())
     if marker["exhausted"]:
+        if wave_retry:
+            from .waverider import reset_phase
+            await cancel(engine, trade_id, [wave_row], permanent=False)
+            engine._patch(trade_id, managed_entry_retry={**marker, "completed": True},
+                waverider={**reset_phase(wave, "waiting_rebound"), "cycle": wave.get("cycle", 0) + 1})
+            return engine.state.snapshot()["trades"][trade_id]
         await cancel(engine, trade_id)
         if not Decimal(trade["filled_quantity"]):
             engine._patch(trade_id, status="rejected", reserved_risk="0", unsent_reason="Original managed entry read budget exhausted")
@@ -544,16 +559,18 @@ def entry_missed(trade, quote):
 async def _dispatch_next(engine, trade_id):
     trade = engine.state.snapshot()["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
-    if trade.get("entries_disabled") or now_ms() >= plan.deadline_at:
+    if trade.get("entries_disabled"):
         return False
     pending = [row for row in trade["entry_orders"] if row["phase"] == "pending" and not row.get("not_sent")]
     if not pending:
         return False
     row = pending[0]
+    if now_ms() >= plan.deadline_at and not (row["kind"] == "waverider" and plan.policy.waverider_lifetime == "until_target"):
+        return False
     if row["kind"] == "waverider":
-        from .waverider import live_permission
+        from .waverider import ended, live_permission
         wave = trade["waverider"]
-        if (not live_permission(engine, plan) or wave.get("finished") or wave.get("phase") != "pending_reenter"
+        if (not live_permission(engine, plan) or ended(plan, trade) or wave.get("phase") != "pending_reenter"
                 or wave.get("cycle", 0) != row.get("cycle", 0)):
             await cancel(engine, trade_id, [row], permanent=False)
             return False
@@ -589,14 +606,20 @@ async def _dispatch_next(engine, trade_id):
         if state == "missed":
             await cancel(engine, trade_id)
             return False
-    validate_entry_prices(view, quote, stop=trade["stop_price"], targets=trade["targets"])
+    targets = [value for index, value in enumerate(trade["targets"]) if index not in trade.get("completed_target_indices", [])]
+    validate_entry_prices(view, quote, stop=trade["stop_price"], targets=targets)
+    if row["kind"] == "waverider" and ended(plan, trade, quote):
+        await cancel(engine, trade_id, [row], permanent=False)
+        return False
     latest_account, latest_quote = None, None
     async def guard():
         nonlocal latest_account, latest_quote
-        latest_account, latest_quote = await engine.live_entry_guard(view, dispatch_operation=row["operation_id"], account=latest_account, audit=latest_quote is None)
+        latest_account, latest_quote = await engine.live_entry_guard(view, dispatch_operation=row["operation_id"], account=latest_account, audit=latest_quote is None, waverider=row["kind"] == "waverider")
         current = engine.state.snapshot()["trades"][trade_id]
         if row["kind"] == "original" and entry_missed(current, latest_quote):
             raise AqlaError("Original entry target/stop was reached before dispatch")
+        if row["kind"] == "waverider" and ended(plan, current, latest_quote):
+            raise AqlaError("Waverider endpoint was reached before reentry")
         if current.get("entries_disabled") or current["status"] in ("closing", "cleanup", "closed", "conflicted", "rejected", "cancelled"):
             raise AqlaError("Managed entry was terminated before dispatch")
     def invalidate_account():
@@ -609,10 +632,12 @@ async def _dispatch_next(engine, trade_id):
             if not live_permission(engine, plan):
                 raise AqlaError("Waverider authorization changed before reentry transport")
         engine.validate_admission(data, view, latest_account, owned=True,
-            allowed_prepared=(row["operation_id"],), allowed_sending=(row["operation_id"],))
+            allowed_prepared=(row["operation_id"],), allowed_sending=(row["operation_id"],), waverider=row["kind"] == "waverider")
         latest_quote.fresh()
         if row["kind"] == "original" and entry_missed(data["trades"][trade_id], latest_quote):
             raise AqlaError("Original entry target/stop was reached before transport")
+        if row["kind"] == "waverider" and ended(plan, data["trades"][trade_id], latest_quote):
+            raise AqlaError("Waverider endpoint was reached before reentry transport")
         if data["trades"][trade_id].get("entries_disabled"):
             raise AqlaError("Managed entry was terminated before transport")
     entry = engine.order(view, view.quantity, execution_limit(view), cloid=row["cloid"])
@@ -634,7 +659,8 @@ async def _dispatch_next(engine, trade_id):
         current["status"] = "opening" if not Decimal(current["filled_quantity"]) else "protecting"
     # Stage the leg atomically with its request; failed early reads leave it retryable.
     result = await engine.exchange.mutate(row["operation_id"], {"type": "order", "orders": [entry, protective], "grouping": "normalTpsl"},
-        deadline=plan.deadline_at, async_prepare_guard=guard, prepare_guard=stage)
+        deadline=None if row["kind"] == "waverider" and plan.policy.waverider_lifetime == "until_target" else plan.deadline_at,
+        async_prepare_guard=guard, prepare_guard=stage)
     if result.get("outcome") == "not_sent":
         patch_row(engine, trade_id, row["cloid"], not_sent=True, phase="terminal", confirmed_filled="0")
         def prepare_retry(data):
@@ -644,6 +670,8 @@ async def _dispatch_next(engine, trade_id):
             replacement = {key: value for key, value in row.items() if key not in ("not_sent", "confirmed_filled")}
             replacement.update(operation_id=identity, cloid=engine.exchange.cloid(identity), phase="pending")
             current["entry_orders"].insert(current["entry_orders"].index(next(item for item in current["entry_orders"] if item["cloid"] == row["cloid"])) + 1, replacement)
+            if row["kind"] == "waverider":
+                current["waverider"]["operation_id"] = identity
             for order in current["orders"]:
                 if order["cloid"] == protective["c"]:
                     order.update(retired=True, not_sent=True)
@@ -704,7 +732,8 @@ async def refresh(engine, trade_id, *, dispatch=True):
         await cancel(engine, trade_id, [row for row in trade["entry_orders"] if row["kind"] == "original"], permanent=False)
         if new_source_tp:
             await cancel(engine, trade_id, [row for row in trade["entry_orders"] if row["kind"] == "waverider"], permanent=False)
-        if plan.policy.management_mode != "waverider" or now_ms() >= plan.deadline_at or invalid or any(fill["kind"] in ("sl", "close") for fill in trade["fill_events"].values()):
+        from .waverider import ended
+        if plan.policy.management_mode != "waverider" or ended(plan, trade, quote) or invalid or any(fill["kind"] in ("sl", "close") for fill in trade["fill_events"].values()):
             await cancel(engine, trade_id)
         total, cost = await engine.capture_fills(trade_id)
         signed = engine.position_size(await engine.positions(plan.market), plan.market)

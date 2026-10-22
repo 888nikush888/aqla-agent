@@ -40,6 +40,7 @@ class Parameters(Model):
     management_mode: Literal["standard", "waverider"] = "standard"
     waverider_flex_percent: Positive = Field(default=Decimal(50), lt=100)
     waverider_until_tp: Annotated[int, Field(ge=1, le=20, strict=True)] | Literal["last"] = 1
+    waverider_lifetime: Literal["signal_deadline", "until_target"] = "signal_deadline"
     entry_execution: Literal["standard", "maker_only"] = "standard"
     take_profit_execution: Literal["standard", "maker_only"] = "standard"
     max_slippage_percent: Positive = Field(default=Decimal("0.3"), le=10)
@@ -55,7 +56,7 @@ class Parameters(Model):
     @model_serializer(mode="wrap")
     def compatible_execution_defaults(self, handler):
         values = handler(self)
-        for key, default in (("management_mode", "standard"), ("waverider_flex_percent", Decimal(50)), ("waverider_until_tp", 1)):
+        for key, default in (("management_mode", "standard"), ("waverider_flex_percent", Decimal(50)), ("waverider_until_tp", 1), ("waverider_lifetime", "signal_deadline")):
             if getattr(self, key) == default:
                 values.pop(key, None)
         for key in ("entry_execution", "take_profit_execution"):

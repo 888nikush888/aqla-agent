@@ -3,6 +3,7 @@ import asyncio
 import json
 
 from websockets.asyncio.client import connect
+from websockets.exceptions import WebSocketException
 
 from aqla_hyperliquid_mcp.models import AqlaError, now_ms
 from aqla_hyperliquid_mcp.streams import Streams
@@ -133,6 +134,6 @@ async def observe(adapter, names, *, connector=connect):
             raise
         if isinstance(error, AqlaError):
             raise
-        if isinstance(error, (TimeoutError, ConnectionError, OSError)):
+        if isinstance(error, (TimeoutError, ConnectionError, OSError, WebSocketException)):
             raise TemporaryObservation("read_unavailable", "inventory", "transport") from None
         raise AqlaError("Complete large-DEX account snapshot is invalid; no entry permitted") from None

@@ -60,11 +60,10 @@ class Hyperliquid:
         for attempt in range(2):
             started = now_ms()
             try:
-                # Both independent reads must fit the unchanged 2 s proof window.
+                # Read the book last: a slow mark response must not age the executable quote.
                 async with asyncio.timeout(2):
-                    raw, book = await asyncio.gather(
-                        self.info("metaAndAssetCtxs", **({"dex": market.dex} if market.dex else {})),
-                        self.info("l2Book", coin=market.symbol))
+                    raw = await self.info("metaAndAssetCtxs", **({"dex": market.dex} if market.dex else {}))
+                    book = await self.info("l2Book", coin=market.symbol)
                 context = next((context for item, context in zip(raw[0]["universe"], raw[1], strict=True) if item["name"] == market.symbol), None)
                 if context is None:
                     raise AqlaError("Target market has no verified mark-price context")

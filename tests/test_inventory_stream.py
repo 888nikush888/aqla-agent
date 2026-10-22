@@ -114,6 +114,29 @@ async def test_disconnect_during_rest_details_cannot_return_a_cached_budget():
 
 
 @pytest.mark.asyncio
+async def test_disconnect_during_aggregate_refresh_is_retryable_and_clears_all_proofs():
+    from websockets.exceptions import ConnectionClosedError
+
+    from aqla_agent.observations import TemporaryObservation
+    adapter, names, frames = inputs()
+    socket = Socket(frames)
+    await observe(adapter, names, connector=lambda *args, **kwargs: socket)
+    previous = adapter._inventory_feed
+    async def disconnected(_):
+        raise ConnectionClosedError(None, None)
+    socket.send = disconnected
+    with pytest.raises(TemporaryObservation) as error:
+        await observe(adapter, names, connector=lambda *args, **kwargs: socket)
+    assert error.value.stage == "inventory" and error.value.category == "transport"
+    assert previous.closed and adapter._inventory_feed is None
+    _, _, restored = inputs()
+    restored[0]["data"]["clearinghouseStates"][0][1]["marginSummary"]["accountValue"] = "42"
+    result = await observe(adapter, names, connector=lambda *args, **kwargs: Socket(restored))
+    assert result[0][1]["marginSummary"]["accountValue"] == "42"
+    await adapter._inventory_feed.close()
+
+
+@pytest.mark.asyncio
 async def test_inventory_memory_limit_discards_all_prior_proofs():
     adapter, names, frames = inputs()
     await observe(adapter, names, connector=lambda *args, **kwargs: Socket(frames))

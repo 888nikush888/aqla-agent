@@ -53,6 +53,7 @@ UNITS = {
     "take_profit_weights": "Gewichte (JSON-Liste)", "allowed_updates": "JSON-Liste",
     "break_even_after_tp": "TP-Nummer",
     "waverider_flex_percent": "% der eigenen Entry-Menge", "waverider_until_tp": "TP-Nummer 1–20 oder last",
+    "waverider_lifetime": "signal_deadline = Entry-Frist; until_target = bis gewähltem TP",
 }
 BACKUP_UNIT_LABELS = {"course_percent": "% Kursbewegung", "roe_percent": "% ROE (ursprüngliche Margin)"}
 LIMIT_FIELDS = {"offene_trades": "max_open_trades", "offene trades": "max_open_trades",

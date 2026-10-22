@@ -309,6 +309,16 @@ async def collect_evidence(engine, trade_id, quote):
         return
 
 
+def ended(plan, trade, quote=None):
+    endpoint = len(trade["targets"]) if plan.policy.waverider_until_tp == "last" else min(plan.policy.waverider_until_tp, len(trade["targets"]))
+    state = trade.get("waverider", {})
+    target = Decimal(trade["targets"][endpoint - 1])
+    return bool(state.get("finished") or state.get("endpoint_reached_at")
+        or Decimal(trade.get("tp_filled", ["0"] * len(trade["targets"]))[endpoint - 1]) > 0
+        or plan.policy.waverider_lifetime == "signal_deadline" and now_ms() >= plan.deadline_at
+        or quote is not None and (quote.bid >= target if plan.side == "long" else quote.ask <= target))
+
+
 async def tick(engine, trade_id, quote):
     trade = engine.state.snapshot()["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
@@ -318,9 +328,7 @@ async def tick(engine, trade_id, quote):
     state = dict(memory[trade_id][1]) if trade_id in memory and memory[trade_id][0] == marker else dict(persisted)
     if state.get("finished"):
         return
-    endpoint = len(trade["targets"]) if plan.policy.waverider_until_tp == "last" else min(plan.policy.waverider_until_tp, len(trade["targets"]))
-    target = Decimal(trade["targets"][endpoint - 1])
-    if now_ms() >= plan.deadline_at or state.get("endpoint_reached_at") or (quote.bid >= target if plan.side == "long" else quote.ask <= target):
+    if ended(plan, trade, quote):
         state.update(finished=True, phase="finished", reason="Configured TP or original signal deadline reached")
         engine._patch(trade_id, waverider=state)
         return
@@ -504,8 +512,7 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
     stops = [(row, await engine.order_status(row["cloid"])) for row in trade["orders"] if row["kind"] == "sl" and not row.get("retired")]
     if not protected(engine, trade, stops):
         raise AqlaError("Optional Waverider management requires a freshly confirmed covering stop")
-    endpoint = len(trade["targets"]) if plan.policy.waverider_until_tp == "last" else min(plan.policy.waverider_until_tp, len(trade["targets"]))
-    if action != "retire" and (now_ms() >= plan.deadline_at or (quote.bid >= Decimal(trade["targets"][endpoint - 1]) if plan.side == "long" else quote.ask <= Decimal(trade["targets"][endpoint - 1]))):
+    if action != "retire" and ended(plan, trade, quote):
         engine._patch(trade_id, waverider={**state, "finished": True, "phase": "finished"})
         return
     cycle = state.get("cycle", 0)
@@ -540,7 +547,7 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
                 engine.validate_configuration(data, plan)
             if current["status"] != "open" or not corrective and (current.get("entries_disabled") or current["waverider"].get("finished")):
                 raise AqlaError("Waverider reduction no longer owns its setup")
-            if not corrective and (current["waverider"].get("endpoint_reached_at") or now_ms() >= plan.deadline_at):
+            if not corrective and ended(plan, current, quote):
                 raise AqlaError("Waverider endpoint was reached before transport")
             quote.fresh()
         def stage(data):
@@ -574,8 +581,7 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
                     target["retired"] = True
         engine.state.update(retire)
         quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
-        ended = now_ms() >= plan.deadline_at or (quote.bid >= Decimal(trade["targets"][endpoint - 1]) if plan.side == "long" else quote.ask <= Decimal(trade["targets"][endpoint - 1]))
-        if not corrective and (ended or (limit - available["flex_basis"]) * (1 if plan.side == "long" else -1) <= cycle_cost):
+        if not corrective and (ended(plan, latest, quote) or (limit - available["flex_basis"]) * (1 if plan.side == "long" else -1) <= cycle_cost):
             await resume_exit(engine, trade_id)
             return
         result = await engine.exchange.mutate(identity, {"type": "order", "orders": [order], "grouping": "na"}, prepare_guard=guard)

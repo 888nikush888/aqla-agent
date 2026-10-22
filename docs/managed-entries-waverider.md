@@ -70,6 +70,7 @@ Die Profilparameter sind:
 | `management_mode` | `standard` oder `waverider` | `standard` |
 | `waverider_flex_percent` | Flex-Anteil je tatsächlich ursprünglichem Fill | `50` |
 | `waverider_until_tp` | TP-Nummer 1–20 oder `last`; höchstens vorhandenes letztes TP | `1` |
+| `waverider_lifetime` | `until_target`: Wellen bis zum gewählten TP; `signal_deadline`: zusätzlich an ursprünglicher Entry-Frist beenden | `signal_deadline` (Bestandskompatibilität) |
 
 Kern und Flex werden bereits nach dem ersten Fill getrennt geführt. Long
 wird ausschließlich reduziert und günstiger zurückgekauft, Short reduziert
@@ -97,8 +98,18 @@ wieder her. Der Stop bleibt bestehen. Ein unbekannter Versand wird anhand
 seiner ursprünglichen Identität abgeglichen; er erzeugt keine Ersatzorder.
 Auch ein Maker-Wellenauftrag darf keine unbegrenzt wartende Restmenge halten.
 
-Am gewählten TP, bei der ursprünglichen Signalfrist, Stop beziehungsweise
-einer übergeordneten Schließung enden neue Wellen. Es gibt keinen erzwungenen
+Mit `waverider_lifetime=until_target` bleiben Wellen nach dem ersten echten
+Entry bis zum gewählten TP aktiv, standardmäßig TP1. Ein bestätigter Teilfill
+dieses TP oder eine beobachtete Berührung beendet Wellen dauerhaft. Die
+ursprüngliche Signalfrist storniert weiterhin alle ungefüllten ursprünglichen
+Entries; sie verlängert keine Entry-Zone. Nur belegte Flex-Verkäufe dürfen
+danach innerhalb desselben Budgets wieder aufgebaut werden. Vorübergehende
+Lesefehler erhalten je Wellenauftrag höchstens fünf Versuche in fünf Minuten;
+ein erschöpfter, nachweislich ungesendeter Auftrag wird verworfen.
+
+`signal_deadline` behält das bisherige zusätzliche Zeitlimit. Stop oder eine
+übergeordnete Schließung beenden beide Modi. Bereits beendete Waverider werden
+durch eine Profiländerung nicht wieder aufgenommen. Es gibt keinen erzwungenen
 Wiederaufbau. Bestehende Positionen behalten ihre normale Absicherung.
 
 ## Shadow und Qualitätsfreigabe

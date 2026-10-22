@@ -12,6 +12,42 @@ from aqla_hyperliquid_mcp.state import State
 
 
 @pytest.mark.asyncio
+async def test_inventory_socket_refresh_disconnect_holds_managed_protection_without_orders(setup, monkeypatch):
+    from test_inventory_stream import Socket, inputs
+    from test_managed_entries import opened_zone
+    from websockets.exceptions import ConnectionClosedError
+
+    from aqla_agent.inventory_stream import observe
+    state, fake, engine, plan, trade = await opened_zone(setup)
+    first = trade["entry_orders"][0]
+    fake.fill(first["cloid"], first["quantity"], first["price"])
+    await engine.refresh_trade(trade["trade_id"])
+    before, actions = copy.deepcopy(state.snapshot()), copy.deepcopy(fake.actions)
+    adapter, names, frames = inputs()
+    socket = Socket(frames)
+    await observe(adapter, names, connector=lambda *_, **__: socket)
+    async def disconnect(_):
+        raise ConnectionClosedError(None, None)
+    socket.send = disconnect
+    original = engine.exchange.account_snapshot
+    async def unavailable(_):
+        return await observe(adapter, names, connector=lambda *_, **__: socket)
+    monkeypatch.setattr(engine.exchange, "account_snapshot", unavailable)
+    with pytest.raises(TemporaryObservation) as error:
+        await engine.refresh_trade(trade["trade_id"])
+    assert error.value.stage == "inventory" and error.value.category == "transport"
+    held = state.snapshot()["trades"][trade["trade_id"]]
+    assert held["protection_observation_pending"]["retryable"] and not held.get("execution_incident")
+    assert not held.get("exit_orders") and not held.get("entries_disabled")
+    assert state.snapshot()["paused"] == before["paused"] and state.snapshot()["operations"] == before["operations"]
+    assert fake.actions == actions
+    monkeypatch.setattr(engine.exchange, "account_snapshot", original)
+    await engine.refresh_trade(trade["trade_id"])
+    assert not state.snapshot()["trades"][trade["trade_id"]].get("protection_observation_pending")
+    assert fake.actions == actions
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('kind,nth', [('sl', 2), ('sl', 3), ('tp', 2)])
 @pytest.mark.parametrize('failure', ['timeout', 'rate_limit'])
 async def test_protection_read_outage_recovers_without_close_or_disabling_account(setup, signal, kind, nth, failure):

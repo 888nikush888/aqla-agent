@@ -87,9 +87,17 @@ def validate_native_evidence(case, plan):
     if len(records) < 5:
         raise ReplayEvidenceError("Native replay has too few executable observations")
     stamps = [row["quote"]["observed_at"] for row in records]
-    if (abs(stamps[0] - plan.created_at) > 2000 or abs(stamps[-1] - plan.deadline_at) > 2000
+    until_target = plan.policy.waverider_lifetime == "until_target"
+    if (abs(stamps[0] - plan.created_at) > 2000 or not until_target and abs(stamps[-1] - plan.deadline_at) > 2000
             or any(not 0 < right - left <= 2000 for left, right in zip(stamps, stamps[1:], strict=False))):
         raise ReplayEvidenceError("Native observations do not continuously cover the original setup window")
+    if until_target:
+        endpoint = len(plan.take_profits) if plan.policy.waverider_until_tp == "last" else min(plan.policy.waverider_until_tp, len(plan.take_profits))
+        target = plan.take_profits[endpoint - 1]
+        if not any((Decimal(row["quote"]["bid"]) >= target or Decimal(row["quote"]["stop_reference"]) <= plan.stop_loss)
+                   if plan.side == "long" else (Decimal(row["quote"]["ask"]) <= target or Decimal(row["quote"]["stop_reference"]) >= plan.stop_loss)
+                   for row in records):
+            raise ReplayEvidenceError("Until-target replay needs observations through its TP or stop; the entry deadline is insufficient")
     for record in records:
         try:
             quote = PriceSnapshot.model_validate(record["quote"])
@@ -239,7 +247,8 @@ def simulate(case, *, wave):
         endpoint = plan.take_profits[target_end - 1]
         reached_end = quote.bid >= endpoint if sign == 1 else quote.ask <= endpoint
         target_one = quote.bid >= plan.take_profits[0] if sign == 1 else quote.ask <= plan.take_profits[0]
-        active = stamp < plan.deadline_at and not stopped and not reached_end
+        within_lifetime = stamp < plan.deadline_at or plan.policy.waverider_lifetime == "until_target"
+        active = within_lifetime and not stopped and not reached_end
         if not original_events and not target_one and stamp < plan.deadline_at and not stopped:
             for index, leg in enumerate(entries):
                 if index in entered or index and index - 1 not in entered:
@@ -284,7 +293,7 @@ def simulate(case, *, wave):
                     take_profit_unit=plan.backup_values.fallback_take_profit_unit, leverage=plan.effective_leverage)
         target_one = quote.bid >= target_prices[0] if sign == 1 else quote.ask <= target_prices[0]
         endpoint = target_prices[target_end - 1]
-        active = stamp < plan.deadline_at and not stopped and not (quote.bid >= endpoint if sign == 1 else quote.ask <= endpoint)
+        active = within_lifetime and not stopped and not (quote.bid >= endpoint if sign == 1 else quote.ask <= endpoint)
         if own:
             allocations, completed = target_allocations(plan, own, target_budgets, target_spent, completed)
             if allocations:

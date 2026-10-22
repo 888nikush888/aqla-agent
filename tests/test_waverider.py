@@ -112,7 +112,24 @@ def test_invalid_profile_endpoints_are_not_saved(value):
 def test_old_profile_wire_has_no_new_default_fields():
     assert "management_mode" not in Policy().model_dump()
     assert "waverider_flex_percent" not in Parameters().model_dump()
+    assert "waverider_lifetime" not in Policy().model_dump() and "waverider_lifetime" not in Parameters().model_dump()
+    assert "waverider_lifetime" not in repr(Policy())
     assert Parameters(management_mode="waverider", waverider_until_tp="last").management_mode == "waverider"
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("endpoint", [1, 2, "last"])
+def test_endpoint_is_latched_by_actual_partial_fill_after_price_rebound(side, endpoint):
+    from types import SimpleNamespace
+
+    from aqla_agent.waverider import ended
+    policy = Policy(management_mode="waverider", waverider_lifetime="until_target", waverider_until_tp=endpoint)
+    plan = SimpleNamespace(policy=policy, side=side, deadline_at=0)
+    trade = {"targets": ["110", "120"] if side == "long" else ["90", "80"], "tp_filled": ["0", "0"], "waverider": {}}
+    quote = SimpleNamespace(bid=Decimal(100), ask=Decimal(100))
+    assert not ended(plan, trade, quote)
+    trade["tp_filled"][0 if endpoint == 1 else 1] = ".001"
+    assert ended(plan, trade, quote)
 
 
 def test_live_gate_requires_authenticated_complete_comparison(tmp_path):

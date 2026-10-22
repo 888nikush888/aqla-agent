@@ -49,7 +49,7 @@ class WaveExchange(FakeExchange):
         return response
 
 
-async def wave_trade(setup, signal, monkeypatch):
+async def wave_trade(setup, signal, monkeypatch, lifetime="signal_deadline"):
     _, state, old, exchange, trading = setup
     boundary = WaveExchange(old.signer)
     monkeypatch.setattr(exchange.client, "_transport", httpx.MockTransport(boundary.handle))
@@ -58,11 +58,92 @@ async def wave_trade(setup, signal, monkeypatch):
         from aqla_hyperliquid_mcp.models import now_ms
         return {"atr": "1", "fee_rate": ".0004", "observed_at": now_ms()}
     monkeypatch.setattr(waverider, "market_facts", facts)
-    state.update(lambda data: data["policy"].update(management_mode="waverider"))
+    state.update(lambda data: data["policy"].update(management_mode="waverider", waverider_lifetime=lifetime))
     source, value = signal
     plan = await trading.preview(source.event_id, value)
     trade = await trading.execute(plan["plan_id"])
     return state, boundary, exchange, trading, plan, trade
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifetime", ["signal_deadline", "until_target"])
+async def test_lifetime_controls_waves_but_never_revives_finished_setups(setup, signal, monkeypatch, lifetime):
+    from aqla_hyperliquid_mcp import models
+    state, boundary, exchange, trading, plan, trade = await wave_trade(setup, signal, monkeypatch, lifetime)
+    identity, original = trade["trade_id"], Decimal(trade["remaining_quantity"])
+    monkeypatch.setattr(models.time, "time_ns", lambda: (plan["deadline_at"] + 1000) * 1000000)
+    await trading.refresh_trade(identity)
+    current = state.snapshot()["trades"][identity]
+    assert bool(current["waverider"].get("finished")) == (lifetime == "signal_deadline")
+    assert not current.get("entries_disabled") if lifetime == "until_target" else current["entries_disabled"]
+    boundary.mid = "104"
+    market = Market.model_validate(plan["market"])
+    await execute(trading, identity, current["waverider"], "reduce", original / 2,
+                  await exchange.price_snapshot(market), Decimal(".2"))
+    if lifetime == "signal_deadline":
+        assert boundary.position == original
+        return
+    assert boundary.position == original / 2
+    boundary.mid = "101"
+    await execute(trading, identity, state.snapshot()["trades"][identity]["waverider"], "reenter", original / 2,
+                  await exchange.price_snapshot(market), Decimal(".2"))
+    await trading.refresh_trade(identity)
+    current = state.snapshot()["trades"][identity]
+    assert original / 2 < boundary.position <= original
+    assert current["plan"] == plan and Decimal(current["stop_price"]) == 90
+    assert pools(current, Decimal(50))["spent"] > 0
+    state.update(lambda data: data["trades"][identity]["waverider"].update(finished=True, phase="finished"))
+    actions = list(boundary.actions)
+    boundary.mid = "104"
+    await execute(trading, identity, state.snapshot()["trades"][identity]["waverider"], "reduce", original / 2,
+                  await exchange.price_snapshot(market), Decimal(".2"))
+    assert actions == boundary.actions
+
+
+@pytest.mark.asyncio
+async def test_until_target_never_admits_a_new_entry_after_its_original_deadline(setup, signal, monkeypatch):
+    from aqla_hyperliquid_mcp import models
+    _, state, fake, _, trading = setup
+    state.update(lambda data: data["policy"].update(management_mode="waverider", waverider_lifetime="until_target"))
+    source, value = signal
+    plan = await trading.preview(source.event_id, value)
+    monkeypatch.setattr(models.time, "time_ns", lambda: plan["deadline_at"] * 1000000)
+    with pytest.raises(models.AqlaError, match="deadline"):
+        await trading.execute(plan["plan_id"])
+    assert not fake.actions
+
+
+@pytest.mark.asyncio
+async def test_until_target_read_budget_discards_only_a_proved_unsent_wave(setup, signal, monkeypatch):
+    from aqla_agent.managed_entries import retain_retry
+    from aqla_agent.observations import TemporaryObservation
+    from aqla_hyperliquid_mcp import models
+    state, boundary, exchange, trading, plan, trade = await wave_trade(setup, signal, monkeypatch, "until_target")
+    identity, original = trade["trade_id"], Decimal(trade["remaining_quantity"])
+    boundary.mid = "104"
+    market = Market.model_validate(plan["market"])
+    await execute(trading, identity, trade["waverider"], "reduce", original / 2,
+                  await exchange.price_snapshot(market), Decimal(".2"))
+    boundary.mid = "101"
+    snapshot = exchange.account_snapshot
+    async def unavailable(*_):
+        raise TemporaryObservation("read_unavailable", "inventory", "transport")
+    monkeypatch.setattr(exchange, "account_snapshot", unavailable)
+    monkeypatch.setattr(models.time, "time_ns", lambda: (plan["deadline_at"] + 1000) * 1000000)
+    await execute(trading, identity, state.snapshot()["trades"][identity]["waverider"], "reenter", original / 2,
+                  await exchange.price_snapshot(market), Decimal(".2"))
+    marker = state.snapshot()["trades"][identity]["managed_entry_retry"]
+    assert marker["attempts"] == 1 and not marker["exhausted"]
+    for attempt in range(2, 6):
+        current = await retain_retry(trading, identity, TemporaryObservation("read_unavailable", "inventory", "transport"))
+        assert current["managed_entry_retry"]["attempts"] == attempt
+    assert not current.get("entries_disabled") and not current["waverider"].get("finished")
+    assert current["waverider"]["phase"] == "waiting_rebound" and current["waverider"]["cycle"] == 1
+    assert all(row["phase"] == "terminal" and row.get("not_sent") for row in current["entry_orders"] if row["kind"] == "waverider")
+    assert boundary.position == original / 2
+    monkeypatch.setattr(exchange, "account_snapshot", snapshot)
+    await trading.refresh_trade(identity)
+    assert not state.snapshot()["trades"][identity].get("execution_incident")
 
 
 @pytest.mark.asyncio

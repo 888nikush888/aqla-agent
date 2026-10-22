@@ -63,6 +63,8 @@ class Policy(Model):
     management_mode: Literal["standard", "waverider"] = Field(default="standard", repr=False)
     waverider_flex_percent: Positive = Field(default=Decimal(50), lt=100, repr=False)
     waverider_until_tp: Annotated[int, Field(ge=1, le=20, strict=True)] | Literal["last"] = Field(default=1, repr=False)
+    waverider_lifetime: Literal["signal_deadline", "until_target"] = Field(default="signal_deadline", repr=False,
+        description="until_target keeps an already filled setup's waves active until its selected TP; original entry deadlines never change")
     max_slippage_percent: Positive = Field(default=Decimal("0.3"), le=10)
     max_signal_age_seconds: int = Field(default=300, ge=1, le=86400)
     take_profit_allocation: Literal["equal", "halving", "custom", "adaptive", "first_target"] = "equal"
@@ -81,14 +83,14 @@ class Policy(Model):
                 continue
             if name not in ("fallback_stop_loss_unit", "fallback_take_profit_unit") or value != "course_percent":
                 yield name, value
-        for name, default in (("management_mode", "standard"), ("waverider_flex_percent", Decimal(50)), ("waverider_until_tp", 1)):
+        for name, default in (("management_mode", "standard"), ("waverider_flex_percent", Decimal(50)), ("waverider_until_tp", 1), ("waverider_lifetime", "signal_deadline")):
             if (value := getattr(self, name)) != default:
                 yield name, value
 
     @model_serializer(mode="wrap")
     def compatible_execution_fields(self, handler):
         result = handler(self)
-        for key, default in (("management_mode", "standard"), ("waverider_flex_percent", Decimal(50)), ("waverider_until_tp", 1)):
+        for key, default in (("management_mode", "standard"), ("waverider_flex_percent", Decimal(50)), ("waverider_until_tp", 1), ("waverider_lifetime", "signal_deadline")):
             if getattr(self, key) == default:
                 result.pop(key, None)
         for key in ("entry_execution", "take_profit_execution"):

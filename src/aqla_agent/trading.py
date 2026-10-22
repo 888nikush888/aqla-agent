@@ -448,7 +448,7 @@ class Trading:
         except AqlaError as error:
             raise ConfigurationChanged(str(error)) from error
 
-    def validate_admission(self, snapshot, plan, account=None, *, owned=False, allowed_prepared=(), allowed_sending=()):
+    def validate_admission(self, snapshot, plan, account=None, *, owned=False, allowed_prepared=(), allowed_sending=(), waverider=False):
         self.assert_plan_binding(snapshot, plan)
         saved = snapshot["plans"].get(plan.plan_id, {})
         if saved.get("liquidity_candidate") and not saved.get("liquidity_selected"):
@@ -473,7 +473,17 @@ class Trading:
         self.validate_configuration(snapshot, plan)
         if any(row.get("quantity_evidence_pending") and row["status"] in OPEN for row in snapshot["trades"].values()):
             raise AqlaError("Own entry quantity evidence requires reconciliation before new exposure")
-        if now_ms() >= plan.deadline_at:
+        if waverider:
+            from .waverider import ended
+            trade = snapshot["trades"].get(plan.trade_id, {})
+            wave = trade.get("waverider", {})
+            if (not owned or trade.get("lifecycle_version") != 2 or plan.policy.management_mode != "waverider"
+                    or trade.get("entries_disabled") or wave.get("phase") != "pending_reenter"
+                    or ended(plan, trade) or not any(row["kind"] == "waverider" and not row.get("not_sent")
+                        and row["operation_id"] == wave.get("operation_id") and row.get("cycle", 0) == wave.get("cycle", 0)
+                        and row["operation_id"] in (*allowed_prepared, *allowed_sending) for row in trade["entry_orders"])):
+                raise AqlaError("Waverider reentry has no active owned cycle")
+        if now_ms() >= plan.deadline_at and not (waverider and plan.policy.waverider_lifetime == "until_target"):
             raise AqlaError("Entry plan deadline expired")
         if self.source_revisions(snapshot, plan.source_refs) != plan.source_revisions:
             raise AqlaError("Source changed after preview; the old unsent plan cannot execute")
@@ -696,7 +706,7 @@ class Trading:
                 return self.state.snapshot()["trades"][trade_id]
             raise
 
-    async def live_entry_guard(self, plan, *, dispatch_operation=None, account=None, audit=False):
+    async def live_entry_guard(self, plan, *, dispatch_operation=None, account=None, audit=False, waverider=False):
         # Refresh before the remaining checks can consume the existing 10 s account window.
         if account is None or not 0 <= now_ms() - account.observed_at <= 7000:
             account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
@@ -704,7 +714,7 @@ class Trading:
         allowed = (snapshot["trades"][plan.trade_id].get("leverage_operation_id", "leverage:" + plan.trade_id), snapshot["trades"][plan.trade_id]["entry_operation_id"])
         if dispatch_operation is not None:
             allowed = (*allowed, dispatch_operation)
-        self.validate_admission(snapshot, plan, account, owned=True, allowed_prepared=allowed, allowed_sending=(dispatch_operation,))
+        self.validate_admission(snapshot, plan, account, owned=True, allowed_prepared=allowed, allowed_sending=(dispatch_operation,), waverider=waverider)
         # Costly local persistence precedes the final price read. A quote audit
         # is retained, but its write cannot invalidate the final observation.
         if audit:
@@ -721,7 +731,7 @@ class Trading:
         if audit:
             self.state.update(lambda data: data["trades"][plan.trade_id].setdefault("price_checks", []).append({"phase": "before_send", "snapshot": quote.model_dump(mode="json"), "result": result}))
         for attempt in range(2):
-            self.validate_admission(self.state.snapshot(), plan, account, owned=True, allowed_prepared=allowed, allowed_sending=(dispatch_operation,))
+            self.validate_admission(self.state.snapshot(), plan, account, owned=True, allowed_prepared=allowed, allowed_sending=(dispatch_operation,), waverider=waverider)
             try:
                 quote.fresh()
                 # Leave time for atomic preparation; the transport's 2 s limit stays unchanged.
@@ -735,6 +745,10 @@ class Trading:
                 quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
                 trade = self.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
                 validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=targets)
+                if waverider:
+                    from .waverider import ended
+                    if ended(plan, trade, quote):
+                        raise AqlaError("Waverider endpoint was reached before reentry") from None
 
     async def guarded_entry_steps(self, plan, trade):
         try:

@@ -148,6 +148,34 @@ def clocked(setup, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_slow_mark_read_does_not_age_the_book_before_local_preparation(setup, clocked, monkeypatch):
+    exchange = setup[3]
+    market = await exchange.market("BTC")
+    original = exchange.info
+    mark_finished = False
+    async def info(kind, **params):
+        nonlocal mark_finished
+        result = await original(kind, **params)
+        if kind == "metaAndAssetCtxs":
+            await asyncio.sleep(0)
+            clocked[0] += 800
+            mark_finished = True
+        elif kind == "l2Book":
+            assert mark_finished, "The executable book must be requested after the mark response"
+            result["time"] = clocked[0] - 900
+        return result
+    monkeypatch.setattr(exchange, "info", info)
+    quote = await exchange.price_snapshot(market)
+    assert clocked[0] - quote.exchange_time == 900
+    clocked[0] += 600
+    quote.fresh()
+    clocked[0] += 600
+    with pytest.raises(TemporaryObservation):
+        quote.fresh()
+    assert not setup[2].actions
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("change", [None, "pause", "always_slow"])
 async def test_last_local_admission_can_refresh_once_without_skipping_rechecks(setup, signal, clocked, monkeypatch, change):
     from test_trade_guard_regressions import admitted_without_entry

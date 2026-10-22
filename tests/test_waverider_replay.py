@@ -140,6 +140,16 @@ def native_case():
     return case
 
 
+def test_until_target_cannot_qualify_a_recording_ending_only_at_the_entry_deadline():
+    from aqla_hyperliquid_mcp.models import TradePlan
+    case = native_case()
+    case["plan"]["policy"]["waverider_lifetime"] = "until_target"
+    case["plan"]["base_parameters"]["waverider_lifetime"] = "until_target"
+    plan = TradePlan.model_validate(case["plan"])
+    with pytest.raises(ReplayEvidenceError, match="Until-target replay"):
+        validate_native_evidence(case, plan)
+
+
 @pytest.mark.parametrize("change", ["maker", "account", "backdated", "fee_gap", "funding_absent", "quote_gap"])
 def test_native_evidence_rejects_incomplete_or_relabelled_cost_proofs(change):
     from aqla_hyperliquid_mcp.models import TradePlan

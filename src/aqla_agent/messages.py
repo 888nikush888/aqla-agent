@@ -287,7 +287,8 @@ def trade_block(data, trade, notices):
             wave = trade.get("waverider", {})
             mode = "Shadow" if wave.get("shadow", True) else "Live"
             lines.append(f"**Waverider:** {mode} · {literal(wave.get('phase', 'warming_up'))} · Flex {number(plan['policy'].get('waverider_flex_percent', 50))} %")
-            lines.append(f"**Waverider-Ende:** TP {literal(plan['policy'].get('waverider_until_tp', 1))} oder ursprüngliche Signalfrist")
+            lifetime = " oder ursprüngliche Signalfrist" if plan["policy"].get("waverider_lifetime", "signal_deadline") == "signal_deadline" else " · unabhängig von der Entry-Frist"
+            lines.append(f"**Waverider-Ende:** TP {literal(plan['policy'].get('waverider_until_tp', 1))}" + lifetime)
             if wave.get("reason"):
                 lines.append("**Waverider-Prüfung:** " + literal(wave["reason"]))
         targets = trade.get("targets", plan.get("take_profits", []))
