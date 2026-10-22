@@ -124,6 +124,11 @@ class Router:
             except Exception as error:
                 self.errors[key] = str(error) if isinstance(error, AqlaError) else "Execution account initialization unavailable"
 
+        self.public_feeds = {}
+        for engine in self.engines.values():
+            if hasattr(engine.exchange, "public_feeds"):
+                engine.exchange.public_feeds, engine.exchange.owns_public_feeds = self.public_feeds, False
+
     def register_account(self, view, selected):
         snapshot = self.state.snapshot()
         expected = {"exchange": view.exchange, "network": selected.network, "account": selected.account.lower()}
@@ -479,14 +484,16 @@ class Router:
         families = {tuple(sorted(row["plan"]["source_refs"])) for rows in candidates.values() for row in rows}
         if len(families) != 1 or any(len(rows) != 1 for rows in candidates.values()):
             raise AqlaError("Update matches multiple independent setups; specify its original source/reply")
-        results = []
-        for name in candidates:
+        limiter = asyncio.Semaphore(2)
+        async def apply(name):
             engine = self.engines[name]
             try:
-                result = await engine.update_trade(event_id, interpretation)
-                results.append({"exchange": name, "result": self.public_operation(result)})
+                async with limiter:
+                    result = await engine.update_trade(event_id, interpretation)
+                return {"exchange": name, "result": self.public_operation(result)}
             except Exception as error:
-                results.append({"exchange": name, "error": str(error) if isinstance(error, AqlaError) else "Trade update unavailable"})
+                return {"exchange": name, "error": str(error) if isinstance(error, AqlaError) else "Trade update unavailable"}
+        results = await asyncio.gather(*(apply(name) for name in candidates))
         def finish_update(data):
             event = data["events"][event_id]
             event["update_targets"] = results
@@ -504,6 +511,9 @@ class Router:
     def stop_event_statuses(data) -> dict[str, Literal["needs_reconciliation", "updated", "superseded", "rejected"]]:
         phases: dict[str, list[StopUpdatePhase]] = {}
         for trade in data["trades"].values():
+            for event_id, sequence in trade.get("management_sequences", {}).items():
+                phase = sequence["phase"] if sequence.get("completed") else "unknown"
+                phases.setdefault(event_id, []).append(phase)
             for operation, saved in trade.get("target_updates", {}).items():
                 if not operation.startswith("update:") or "completed" not in saved and "superseded" not in saved:
                     continue
@@ -629,23 +639,25 @@ class Router:
 
     async def _recover_account(self, engine):
         reports = []
-        async with engine.lock:
-            for row in engine.state.read("trades")["trades"].values():
-                market = Market.model_validate(row["plan"]["market"])
-                engine.exchange.market_cache[market.symbol] = market
-            for row in engine.state.read("trades")["trades"].values():
-                if row["status"] not in OPEN or Decimal(row["filled_quantity"]) > 0:
-                    continue
+        engine.recovery_packet_timeout = min(30, self._recovery_timeout)
+        for row in engine.state.read("trades")["trades"].values():
+            market = Market.model_validate(row["plan"]["market"])
+            engine.exchange.market_cache[market.symbol] = market
+        for row in engine.state.read("trades")["trades"].values():
+            if row["status"] not in OPEN or Decimal(row["filled_quantity"]) > 0:
+                continue
+            try:
+                validate_ranking_binding(self.state.snapshot(), TradePlan.model_validate(row["plan"]))
+            except AqlaError:
                 try:
-                    validate_ranking_binding(self.state.snapshot(), TradePlan.model_validate(row["plan"]))
-                except AqlaError:
-                    try:
-                        await engine.cancel_entry(row["trade_id"])
-                        if engine.state.snapshot()["trades"][row["trade_id"]]["status"] in OPEN:
-                            await engine.refresh_trade(row["trade_id"])
-                    except Exception:
-                        reports.append({"trade_id": row["trade_id"], "error": "Rank-changed entry cancellation/fill reconciliation is unconfirmed"})
-            reports.extend(await engine.recover())
+                    async with engine.lock.work(0):
+                        async with asyncio.timeout(engine.recovery_packet_timeout):
+                            await engine.cancel_entry(row["trade_id"])
+                            if engine.state.read("trades", entries={"trades": [row["trade_id"]]})["trades"][row["trade_id"]]["status"] in OPEN:
+                                await engine.refresh_trade(row["trade_id"])
+                except Exception:
+                    reports.append({"trade_id": row["trade_id"], "error": "Rank-changed entry cancellation/fill reconciliation is unconfirmed"})
+        reports.extend(await engine.recover())
         return reports
 
     async def activate(self, venue):
@@ -664,7 +676,7 @@ class Router:
         engine = self.engine_for_plan(row["plan"])
         if engine is None:
             raise AqlaError("This trade's original exchange account is unavailable")
-        async with engine.lock:
+        async with engine.lock.work(1):
             return self.public_operation(await engine.close_position(trade_id, Decimal(100), "operator-close:" + request_id))
 
     def conflict_engine(self, trade_id):
@@ -724,6 +736,7 @@ class Router:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*(feed.close() for feed in self.public_feeds.values()))
         for engine in self.engines.values():
             await engine.exchange.close()
 

@@ -166,7 +166,8 @@ def test_exact_proofs_do_not_authorize_omitting_original_instruction(form):
     packet, interpretation, code = unsupported_probe(form)
     with pytest.raises(DecisionFailure, match=code):
         validate_interpretation(packet, interpretation)
-    assert unsupported_structure(packet) == code
+    # The original two-step reduction/stop is representable, while this partial draft still fails.
+    assert unsupported_structure(packet) == (None if form == "reduce" else code)
 
 
 @pytest.mark.asyncio
@@ -406,7 +407,7 @@ def test_original_only_guard_agrees_with_new_entry_for_fixed_future_be_footer(fo
 
 def test_a_future_be_rule_does_not_hide_another_unsupported_action_in_the_same_clause():
     packet = packet_for("BTC LONG. Entry: 100. After TP1 reduce half and move stop to break-even.")
-    assert unsupported_structure(packet) == "management_actions_not_representable"
+    assert unsupported_structure(packet) == "scheduled_management_not_representable"
 
 
 @pytest.mark.parametrize("text,accepted", [

@@ -1,4 +1,5 @@
 """Delayed LINK reproduction, executable-price guards and immutable lifecycle facts."""
+import asyncio
 import copy
 import json
 from decimal import Decimal
@@ -364,13 +365,18 @@ async def test_lighter_snapshot_stream_contract_is_timestamped_and_uses_mark(lig
     frames = [json.dumps({"type": "subscribed/market_stats", "channel": "market_stats:1", "timestamp": stamp,
                          "market_stats": {"1": {"mark_price": "100"}}}),
               json.dumps({"type": "subscribed/order_book", "channel": "order_book:1", "timestamp": stamp,
-                          "order_book": {"bids": [{"price": "99.9"}], "asks": [{"price": "100.1"}]}})]
+                          "order_book": {"nonce": 10, "bids": [{"price": "99.9", "size": "3"}], "asks": [{"price": "100.1", "size": "3"}]}})]
     class Socket:
         async def __aenter__(self):return self
         async def __aexit__(self, *_):pass
         async def send(self, data):assert json.loads(data)["type"] == "subscribe"
         async def recv(self):return frames.pop(0)
-    monkeypatch.setattr("websockets.connect", lambda *_, **__: Socket())
+        def __aiter__(self):return self
+        async def __anext__(self):
+            if frames:
+                return frames.pop(0)
+            await asyncio.Event().wait()
+    monkeypatch.setattr("aqla_agent.lighter_feed.connect", lambda *_, **__: Socket())
     snapshot = await adapter.price_snapshot(market)
     assert snapshot.stop_reference == 100 and snapshot.stop_reference_kind == "mark"
     assert snapshot.bid == Decimal("99.9") and snapshot.ask == Decimal("100.1")

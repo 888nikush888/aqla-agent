@@ -126,7 +126,12 @@ class State:
                 raise AqlaError("Saved SDK operation has mismatched principal or signing scope")
 
     def _write(self, data):
-        self._store.save(data)
+        # Metadata transactions preserve every financial root's object identity.
+        changed = {name: value for name, value in data.items() if name not in self.data or value is not self.data[name]}
+        if data is not self.data and changed and set(changed) <= {*METADATA_ROOTS, "sequence", "journal_pending", "journal_history"}:
+            self._store.save_roots(changed)
+        else:
+            self._store.save(data)
 
     def _initialize_journal_roots(self, proposed):
         if self.journal_enabled:
@@ -136,6 +141,35 @@ class State:
     def snapshot(self):
         with self._thread_lock:
             return copy.deepcopy(self.data)
+
+    def status_summary(self):
+        from aqla_agent.execution_outcome import execution_counts
+        from aqla_agent.source_queue import queue_overview
+        from aqla_agent.trading import OPEN
+
+        with self._thread_lock:
+            data = self.data
+            result = {key: data.get(key) for key in ("paused", "configuration_revision", "policy_revision", "network", "venue_accounts",
+                "venue_enabled", "account_enabled", "venue_limits", "account_limits", "account_recovery", "journal_synced_at")}
+            result["account_recovery"] = data.get("account_recovery", {})
+            result.update(execution_counts=execution_counts(data), source_queue=queue_overview(data, limit=8),
+                notification_pending=len(data["notifications"]), journal_pending=len(data.get("journal_pending", {})),
+                active_trade_count=sum(row["status"] in OPEN for row in data["trades"].values()),
+                conflicted_trade_count=sum(row["status"] == "conflicted" for row in data["trades"].values()))
+            return copy.deepcopy(result)
+
+    def venue_snapshot(self, view, *, roots=None, needed=None, entries=None):
+        """Filter this account before copying; shared originals remain immutable."""
+        with self._thread_lock:
+            data = dict(self.data) if needed is None else {key: self.data[key] for key in needed if key in self.data}
+            for root, identities in (entries or {}).items():
+                if root in data:
+                    data[root] = {key: data[root][key] for key in identities if key in data[root]}
+            for root in ("trades", "plans", "operations", "events", "bindings", "nonces", "account_nonces", "venue_nonces",
+                         "account_bindings", "venue_bindings", "account_events", "venue_events"):
+                data.setdefault(root, {})
+            value = view.project(data)
+            return copy.deepcopy(value if roots is None else {key: value[key] for key in roots if key in value})
 
     def presentation_snapshot(self, selection=None):
         """Fixed bounded projection; source text/history never leaves the state lock."""
@@ -170,6 +204,12 @@ class State:
             return key in value
 
     def update_metadata(self, roots, callback):
+        return self._update_metadata(roots, callback, conditional=False)
+
+    def update_metadata_if_changed(self, roots, callback):
+        return self._update_metadata(roots, callback, conditional=True)
+
+    def _update_metadata(self, roots, callback, *, conditional):
         """Persist detached allowlisted metadata, preserving the generic journal path."""
         roots = tuple(roots)
         if not roots or len(set(roots)) != len(roots) or any(root not in METADATA_ROOTS for root in roots):
@@ -180,6 +220,8 @@ class State:
             if set(part) != set(roots) or any(not isinstance(part[root], METADATA_ROOTS[root]) for root in roots):
                 raise AqlaError("Metadata transaction changed undeclared roots or root types")
             normalized = json.loads(json.dumps(part, allow_nan=False))
+            if conditional and all(normalized[root] == self.data.get(root, METADATA_ROOTS[root]()) for root in roots):
+                return copy.deepcopy(result)
             proposed = {**self.data, **normalized, "sequence": self.data["sequence"] + 1}
             self._initialize_journal_roots(proposed)
             self._write(proposed)

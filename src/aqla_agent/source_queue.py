@@ -65,6 +65,10 @@ def recovery_ids(snapshot, event_rows=None):
     identities = {row["event_id"] for row in (event_rows if event_rows is not None else snapshot["events"].values())
                   if is_source_row(row) and row.get("status") == "needs_reconciliation"}
     for trade in snapshot.get("trades", {}).values():
+        for sequence in trade.get("management_sequences", {}).values():
+            if not sequence.get("completed"):
+                identities.add(sequence["event_id"])
+                identities.update(sequence.get("source_revisions", {}).values())
         if trade.get("status") not in ("closed", "cancelled", "rejected"):
             identities.update(trade.get("plan", {}).get("source_revisions", {}).values())
             if trade.get("event_id"):

@@ -47,16 +47,16 @@ async def test_hanging_account_does_not_block_independent_protection_check(setup
 
 
 @pytest.mark.asyncio
-async def test_recovery_parallelism_respects_constructor_limit_and_account_lock(setup, monkeypatch):
+async def test_recovery_parallelism_is_bounded_without_holding_the_whole_account_lock(setup, monkeypatch):
     router = accounts(setup, recovery_concurrency=1)
     entered, protected, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     async def slow():
-        assert router.engines["hyperliquid"].lock.locked()
+        assert not router.engines["hyperliquid"].lock.locked()
         entered.set()
         await release.wait()
         return []
     async def fast():
-        assert router.engines["aster"].lock.locked()
+        assert not router.engines["aster"].lock.locked()
         protected.set()
         return []
     monkeypatch.setattr(router.engines["hyperliquid"], "recover", slow)

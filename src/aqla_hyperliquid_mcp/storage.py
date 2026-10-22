@@ -60,6 +60,20 @@ class SQLiteStore:
         except sqlite3.Error as error:
             raise AqlaError("Durable state write failed; no exchange action may be sent") from error
 
+    def save_roots(self, changed: dict):
+        """Patch metadata in the same FULL transaction without serializing financial history."""
+        arguments, values = [], []
+        for name, value in changed.items():
+            arguments.append("?,json(?)")
+            values.extend(("$." + json.dumps(name), json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)))
+        try:
+            with self.connection:
+                updated = self.connection.execute("UPDATE state SET body=json_set(body," + ",".join(arguments) + ") WHERE id=1", values)
+                if updated.rowcount != 1:
+                    raise sqlite3.DatabaseError("Authoritative state row is missing")
+        except sqlite3.Error as error:
+            raise AqlaError("Durable state write failed; no exchange action may be sent") from error
+
     def seal(self):
         # Survives accidental DB deletion. Never resurrect stale orders from the
         # retained JSON import or create an empty trading account on restart.

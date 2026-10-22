@@ -501,11 +501,11 @@ async def test_rebinding_replaces_handler_without_duplicate_workers(extension):
                               session_store=SimpleNamespace(_generate_session_key=lambda _: "owner"))
     extension.attach(message(), gateway)
     extension.attach(message(), gateway)
-    assert len(ctx.tasks) == 2
+    assert len(ctx.tasks) == 3
     extension.attach(message(), gateway, adapter=second)
     assert first._message_handler is handler
     assert second._message_handler is not handler
-    assert len(ctx.tasks) == 2
+    assert len(ctx.tasks) == 3
     await second._message_handler(message())
     for task in ctx.tasks:
         task.cancel()
@@ -740,10 +740,15 @@ async def test_reader_and_wake_continue_with_notification_backlog(extension, tmp
     extension.call, ctx.inject_message = snapshot, inject
     tasks = [asyncio.create_task(extension.reader_worker()), asyncio.create_task(extension.worker())]
     try:
-        await asyncio.wait_for(woke.wait(), 1)
-        assert wakes
-        if not blocked_start:
-            assert "reader_session_unauthorized" in wakes[0]
+        if notification_only:
+            await asyncio.wait_for(started.wait(), 1)
+            await asyncio.sleep(.05)
+            assert not wakes  # Native outbox delivers the notice; no model wake is required.
+        else:
+            await asyncio.wait_for(woke.wait(), 1)
+            assert wakes
+            if not blocked_start:
+                assert "reader_session_unauthorized" in wakes[0]
     finally:
         for task in tasks:
             task.cancel()
@@ -805,6 +810,9 @@ async def test_wake_observed_source_work_independent_of_zero_notifications(exten
     ctx.inject_message = lambda text, **kwargs: wakes.append(text) or True
     with pytest.raises(asyncio.CancelledError):
         await ext.worker()
+    if mode == "blocked":
+        assert not wakes  # The versioned conflict notice belongs to native delivery.
+        return
     assert len(wakes) == 1 and '"notification_pending": 0' in wakes[0]
     assert f'"{mode}_total": {queue[mode + "_total"]}' in wakes[0]
     assert "reader_recovered" not in wakes[0]

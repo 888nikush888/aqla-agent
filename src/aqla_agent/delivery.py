@@ -32,7 +32,7 @@ class NotificationOutbox:
                 for row in data["notification_outbox"].values():
                     if row["status"] == "sending":
                         row.update(status="exhausted" if row["attempts"] >= 5 else "pending", uncertain=True, next_attempt_at=0)
-            self.state.update_metadata(("notification_outbox",), recover)
+            self.state.update_metadata_if_changed(("notification_outbox",), recover)
             self.generation = generation
 
     def prepare(self):
@@ -84,7 +84,7 @@ class NotificationOutbox:
                     text = "⚠️ Wiederhergestellte Zustellung – diese Meldung könnte bereits angekommen sein.\n\n" + text
                 return {"delivery_id": row["delivery_id"], "part": part, "text": text}
             return {"delivery_id": None}
-        return self.state.update_metadata(("notification_outbox",), select)
+        return self.state.update_metadata_if_changed(("notification_outbox",), select)
 
     def complete(self, generation, identity, part, success):
         if generation != self.generation:

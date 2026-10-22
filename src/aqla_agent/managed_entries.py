@@ -197,7 +197,7 @@ def patch_row(engine, trade_id, cloid, **values):
 
 
 async def cancel(engine, trade_id, rows=None, *, permanent=True):
-    trade = engine.state.snapshot()["trades"][trade_id]
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
     engine.assert_plan_binding(engine.state.snapshot(), plan)
     if permanent:
@@ -209,7 +209,7 @@ async def cancel(engine, trade_id, rows=None, *, permanent=True):
             continue
         if row.get("phase") == "terminal" and trade.get("order_observations", {}).get(row["cloid"], {}).get("status") in TERMINAL_ORDER:
             continue
-        operation = engine.state.snapshot()["operations"].get(row["operation_id"])
+        operation = engine.state.read("operations")["operations"].get(row["operation_id"])
         if operation is None and row["phase"] == "pending" or operation and operation.get("outcome") == "not_sent":
             patch_row(engine, trade_id, row["cloid"], not_sent=True, confirmed_filled="0", phase="terminal")
             continue
@@ -245,7 +245,7 @@ def protected(engine, trade, status_rows):
 
 
 def finalize_prices(engine, trade_id):
-    trade = engine.state.snapshot()["trades"][trade_id]
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
     reference = source_reference(trade)
     if reference is None:
@@ -314,7 +314,7 @@ def current_reference(trade):
 
 
 async def validate_actual(engine, trade_id):
-    trade = engine.state.snapshot()["trades"][trade_id]
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
     size, average, _, _ = position_basis(trade)
     if size != Decimal(trade["remaining_quantity"]):
@@ -377,7 +377,7 @@ def target_allocations(plan, quantity, previous=None, consumed=None, completed=(
 
 
 async def sync_targets(engine, trade_id):
-    trade = engine.state.snapshot()["trades"][trade_id]
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
     remaining = Decimal(trade["remaining_quantity"])
     if remaining <= 0:
@@ -418,7 +418,7 @@ async def sync_targets(engine, trade_id):
 
 
 async def retain_retry(engine, trade_id, error):
-    trade = engine.state.snapshot()["trades"][trade_id]
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
     previous = trade.get("managed_entry_retry")
     wave = trade.get("waverider", {})
@@ -438,11 +438,11 @@ async def retain_retry(engine, trade_id, error):
             await cancel(engine, trade_id, [wave_row], permanent=False)
             engine._patch(trade_id, managed_entry_retry={**marker, "completed": True},
                 waverider={**reset_phase(wave, "waiting_rebound"), "cycle": wave.get("cycle", 0) + 1})
-            return engine.state.snapshot()["trades"][trade_id]
+            return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         await cancel(engine, trade_id)
         if not Decimal(trade["filled_quantity"]):
             engine._patch(trade_id, status="rejected", reserved_risk="0", unsent_reason="Original managed entry read budget exhausted")
-    return engine.state.snapshot()["trades"][trade_id]
+    return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
 
 
 async def start(engine, plan, trade):
@@ -464,11 +464,11 @@ async def _start(engine, plan, trade):
     if entry_missed(trade, quote):
         await cancel(engine, plan.trade_id)
         engine._patch(plan.trade_id, status="rejected", reserved_risk="0", unsent_reason="Source target or stop was reached before the first entry")
-        return engine.state.snapshot()["trades"][plan.trade_id]
+        return engine.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
     identity = trade.get("leverage_operation_id", "leverage:" + plan.trade_id)
-    existing = engine.state.snapshot()["operations"].get(identity)
+    existing = engine.state.read("operations")["operations"].get(identity)
     parent = trade.get("configuration_parent_id", identity)
-    configuration = engine.state.snapshot()["operations"].get(parent, {})
+    configuration = engine.state.read("operations")["operations"].get(parent, {})
     if configuration.get("configuration_retry_needed") and configuration["phase"] in ("prepared", "sending", "unknown"):
         return await engine.repair_unsent_configuration(plan, parent)
     if existing and existing["phase"] == "rejected" and existing.get("outcome") == "not_sent" and not existing.get("legs"):
@@ -509,7 +509,7 @@ async def _start(engine, plan, trade):
             if state == "missed":
                 await cancel(engine, plan.trade_id)
                 engine._patch(plan.trade_id, status="cancelled", reserved_risk="0", unsent_reason="Deferred source entry was missed")
-                return engine.state.snapshot()["trades"][plan.trade_id]
+                return engine.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
         latest_account, latest_quote = None, None
         async def guard():
             nonlocal latest_account, latest_quote
@@ -530,22 +530,23 @@ async def _start(engine, plan, trade):
         if existing["phase"] == "rejected" and (existing.get("outcome") == "rejected" or existing.get("outcome") == "not_sent" and not existing.get("legs")):
             await cancel(engine, plan.trade_id)
             engine._patch(plan.trade_id, status="rejected", reserved_risk="0", unsent_reason=existing.get("result", {}).get("error", "Configuration guard rejected before transport"))
-            return engine.state.snapshot()["trades"][plan.trade_id]
+            return engine.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
         engine._patch(plan.trade_id, status="unknown" if existing["phase"] == "unknown" else "protecting", waiting_error="Leverage configuration requires exact reconciliation")
-        return engine.state.snapshot()["trades"][plan.trade_id]
+        return engine.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
     await dispatch_next(engine, plan.trade_id)
-    current = engine.state.snapshot()["trades"][plan.trade_id]
+    current = engine.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
     if not any(row["phase"] != "pending" and not row.get("not_sent") for row in current["entry_orders"]):
         return current
     return await refresh(engine, plan.trade_id, dispatch=False)
 
 
 async def dispatch_next(engine, trade_id):
+    """Only a send or cancellation with possible fills requires another reconciliation."""
     try:
         return await _dispatch_next(engine, trade_id)
     except TemporaryObservation as error:
-        await retain_retry(engine, trade_id, error)
-        return False
+        current = await retain_retry(engine, trade_id, error)
+        return "cancelled" if current["managed_entry_retry"]["exhausted"] else "unchanged"
 
 
 def entry_missed(trade, quote):
@@ -557,33 +558,33 @@ def entry_missed(trade, quote):
 
 
 async def _dispatch_next(engine, trade_id):
-    trade = engine.state.snapshot()["trades"][trade_id]
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
     if trade.get("entries_disabled"):
-        return False
+        return "unchanged"
     pending = [row for row in trade["entry_orders"] if row["phase"] == "pending" and not row.get("not_sent")]
     if not pending:
-        return False
+        return "unchanged"
     row = pending[0]
     if now_ms() >= plan.deadline_at and not (row["kind"] == "waverider" and plan.policy.waverider_lifetime == "until_target"):
-        return False
+        return "unchanged"
     if row["kind"] == "waverider":
         from .waverider import ended, live_permission
         wave = trade["waverider"]
         if (not live_permission(engine, plan) or ended(plan, trade) or wave.get("phase") != "pending_reenter"
                 or wave.get("cycle", 0) != row.get("cycle", 0)):
             await cancel(engine, trade_id, [row], permanent=False)
-            return False
+            return "cancelled"
     marker = trade.get("managed_entry_retry")
     if marker and not marker.get("completed") and not retry_due(marker):
-        return False
+        return "unchanged"
     prior = [item for item in trade["entry_orders"] if item is not row and item["kind"] == "original"
              and not item.get("not_sent") and item["phase"] != "pending"]
     if any(item["phase"] != "terminal" for item in prior):
-        return False
+        return "unchanged"
     if prior and not Decimal(trade["filled_quantity"]):
         await cancel(engine, trade_id)
-        return False
+        return "cancelled"
     view = leg_view(plan, row)
     current_market = await read_observation(lambda: engine.exchange.market(plan.market.symbol, plan.market.product), "market")
     identity_fields = ("asset_id", "size_decimals", "quote_token", "price_tick", "quantity_step", "margin_leverage_scale")
@@ -598,24 +599,24 @@ async def _dispatch_next(engine, trade_id):
     quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
     if row["kind"] == "original" and entry_missed(trade, quote):
         await cancel(engine, trade_id, [item for item in trade["entry_orders"] if item["kind"] == "original"], permanent=plan.policy.management_mode != "waverider")
-        return False
+        return "cancelled"
     if view.entry_timing == "deferred":
         state = gate_state(view, quote)
         if state == "waiting":
-            return False
+            return "unchanged"
         if state == "missed":
             await cancel(engine, trade_id)
-            return False
+            return "cancelled"
     targets = [value for index, value in enumerate(trade["targets"]) if index not in trade.get("completed_target_indices", [])]
     validate_entry_prices(view, quote, stop=trade["stop_price"], targets=targets)
     if row["kind"] == "waverider" and ended(plan, trade, quote):
         await cancel(engine, trade_id, [row], permanent=False)
-        return False
+        return "cancelled"
     latest_account, latest_quote = None, None
     async def guard():
         nonlocal latest_account, latest_quote
         latest_account, latest_quote = await engine.live_entry_guard(view, dispatch_operation=row["operation_id"], account=latest_account, audit=latest_quote is None, waverider=row["kind"] == "waverider")
-        current = engine.state.snapshot()["trades"][trade_id]
+        current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         if row["kind"] == "original" and entry_missed(current, latest_quote):
             raise AqlaError("Original entry target/stop was reached before dispatch")
         if row["kind"] == "waverider" and ended(plan, current, latest_quote):
@@ -689,11 +690,11 @@ async def _dispatch_next(engine, trade_id):
         engine._patch(trade_id, managed_entry_retry={**marker, "completed": True})
     if row["kind"] == "waverider" and view.entry_execution == "maker_only" and result["phase"] in ("acknowledged", "reconciled"):
         await cancel(engine, trade_id, [row], permanent=False)
-    return True
+    return "unknown" if result["phase"] == "unknown" else "sent"
 
 
 async def refresh(engine, trade_id, *, dispatch=True):
-    trade = engine.state.snapshot()["trades"][trade_id]
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     if trade["status"] == "cleanup":
         return await engine.finish_cleanup(trade_id)
     plan = TradePlan.model_validate(trade["plan"])
@@ -704,10 +705,10 @@ async def refresh(engine, trade_id, *, dispatch=True):
         if now_ms() >= plan.deadline_at:
             await cancel(engine, trade_id)
             engine._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Original signal deadline expired")
-            return engine.state.snapshot()["trades"][trade_id]
+            return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         return await start(engine, plan, trade)
     total, cost = await engine.capture_fills(trade_id)
-    trade = engine.state.snapshot()["trades"][trade_id]
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     for row in trade["entry_orders"]:
         status = trade.get("order_observations", {}).get(row["cloid"], {}).get("status")
         oid = trade.get("order_observations", {}).get(row["cloid"], {}).get("oid")
@@ -715,7 +716,7 @@ async def refresh(engine, trade_id, *, dispatch=True):
         if status == "open" and quantity:
             await cancel(engine, trade_id, [row], permanent=False)
             total, cost = await engine.capture_fills(trade_id)
-            trade = engine.state.snapshot()["trades"][trade_id]
+            trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     signed = engine.position_size(await engine.positions(plan.market), plan.market)
     remaining = engine.owned_remaining(trade_id, signed)
     quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
@@ -738,11 +739,11 @@ async def refresh(engine, trade_id, *, dispatch=True):
         total, cost = await engine.capture_fills(trade_id)
         signed = engine.position_size(await engine.positions(plan.market), plan.market)
         remaining = engine.owned_remaining(trade_id, signed)
-        trade = engine.state.snapshot()["trades"][trade_id]
+        trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         engine._patch(trade_id, source_tp_observed_fingerprint=source_tp_fingerprint)
     if remaining:
         engine._patch(trade_id, filled_quantity=str(total), entry_vwap=str(cost / total), remaining_quantity=str(remaining), status="protecting")
-        current = engine.state.snapshot()["trades"][trade_id]
+        current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         originals_done = all(row.get("not_sent") or row["phase"] == "terminal" for row in current["entry_orders"] if row["kind"] == "original")
         if originals_done and not current.get("initial_sl_risk"):
             reference = source_reference(current)
@@ -755,25 +756,25 @@ async def refresh(engine, trade_id, *, dispatch=True):
                 from .waverider import resume_exit
                 if not await resume_exit(engine, trade_id):
                     await engine.ensure_protection(trade_id)
-                    return engine.state.snapshot()["trades"][trade_id]
+                    return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
                 await engine.capture_fills(trade_id)
-                trade = engine.state.snapshot()["trades"][trade_id]
+                trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
                 remaining = engine.owned_remaining(trade_id, engine.position_size(await engine.positions(plan.market), plan.market))
                 engine._patch(trade_id, remaining_quantity=str(remaining))
                 if not remaining:
                     return await refresh(engine, trade_id, dispatch=False)
-            pending = engine.state.snapshot()["trades"][trade_id].get("pending_stop_update")
+            pending = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("pending_stop_update")
             if pending and pending["phase"] in ("waiting_fill", "replacing", "unknown"):
                 await engine.resume_pending_stop(trade_id)
-                if engine.state.snapshot()["trades"][trade_id].get("pending_stop_update", {}).get("phase") in ("waiting_fill", "replacing", "unknown"):
-                    return engine.state.snapshot()["trades"][trade_id]
+                if engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("pending_stop_update", {}).get("phase") in ("waiting_fill", "replacing", "unknown"):
+                    return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
             finalize_prices(engine, trade_id)
             await validate_actual(engine, trade_id)
             if not await sync_targets(engine, trade_id):
                 await cancel(engine, trade_id)
                 return await engine.close_position(trade_id, Decimal(100), "managed-target-complete:" + trade_id)
             await engine.ensure_protection(trade_id)
-            trade = engine.state.snapshot()["trades"][trade_id]
+            trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
             stops = [(row, await engine.order_status(row["cloid"])) for row in trade["orders"] if row["kind"] == "sl" and not row.get("retired")]
             if not protected(engine, trade, stops):
                 raise AqlaError("No confirmed stop covers the managed position")
@@ -783,7 +784,7 @@ async def refresh(engine, trade_id, *, dispatch=True):
                 excess = quantity_grid(max(Decimal(0), inventory["flex"] - inventory["rights"]), plan.market)
                 if excess:
                     await execute(engine, trade_id, trade["waverider"], "retire", excess, quote, Decimal(0))
-                    return engine.state.snapshot()["trades"][trade_id]
+                    return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
                 await tick(engine, trade_id, quote)
         except TemporaryObservation as error:
             engine._patch(trade_id, protection_observation_pending=error.diagnostic())
@@ -796,16 +797,16 @@ async def refresh(engine, trade_id, *, dispatch=True):
                 return await engine.close_position(trade_id, Decimal(100), "protection-failure:" + trade_id)
             raise
         engine._patch(trade_id, protection_observation_pending=None)
-        if dispatch and engine.state.snapshot()["trades"][trade_id]["status"] == "open":
-            await dispatch_next(engine, trade_id)
-            return await refresh(engine, trade_id, dispatch=False)
+        if dispatch and engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]["status"] == "open":
+            if await dispatch_next(engine, trade_id) != "unchanged":
+                return await refresh(engine, trade_id, dispatch=False)
     elif total:
         await cancel(engine, trade_id)
         await engine.capture_fills(trade_id)
-        if entry_final(engine.state.snapshot()["trades"][trade_id]):
+        if entry_final(engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]):
             engine.begin_cleanup(trade_id, "closed")
             return await engine.finish_cleanup(trade_id)
-    elif entry_final(engine.state.snapshot()["trades"][trade_id]):
+    elif entry_final(engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]):
         engine.begin_cleanup(trade_id, "rejected")
         return await engine.finish_cleanup(trade_id)
-    return engine.state.snapshot()["trades"][trade_id]
+    return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]

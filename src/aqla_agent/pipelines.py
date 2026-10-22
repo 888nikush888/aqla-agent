@@ -261,8 +261,8 @@ class VenueState:
         for key in ("trades", "plans", "operations"):
             result[key] = {identity: row for identity, row in data[key].items() if self.record_key(row, operation=key == "operations", default_network=self.settings.network) == self.account_key}
         legacy = self.legacy_context(data)
-        result["bindings"] = data["bindings"] if self.exchange == "hyperliquid" and legacy else data["account_bindings"].setdefault(self.account_key, copy.deepcopy(data["venue_bindings"].get(self.exchange, {})) if legacy else {})
-        result["nonces"] = data["nonces"] if self.exchange == "hyperliquid" and legacy else data["account_nonces"].setdefault(self.account_key, copy.deepcopy(data.get("venue_nonces", {}).get(self.exchange, {})) if legacy else {})
+        result["bindings"] = data["bindings"] if self.exchange == "hyperliquid" and legacy else data["account_bindings"].get(self.account_key, data["venue_bindings"].get(self.exchange, {}) if legacy else {})
+        result["nonces"] = data["nonces"] if self.exchange == "hyperliquid" and legacy else data["account_nonces"].get(self.account_key, data.get("venue_nonces", {}).get(self.exchange, {}) if legacy else {})
         event_states = data["account_events"].get(self.account_key, data["venue_events"].get(self.exchange, {}) if legacy else {})
         result["events"] = {key: {**value, **event_states.get(key, {})} for key, value in data["events"].items()}
         route = self.route.get()
@@ -294,7 +294,7 @@ class VenueState:
         return bool(binding and binding["network"] == self.settings.network) or not binding and (self.exchange != "hyperliquid" or data["network"] == self.settings.network)
 
     def snapshot(self):
-        return self.project(self.root.snapshot())
+        return self.root.venue_snapshot(self)
 
     def read(self, *roots, entries=None):
         dependencies = {"network", "venue_accounts", "profiles", "venue_limits", "account_limits", "paused",
@@ -306,21 +306,20 @@ class VenueState:
         for root, extra in groups.items():
             if root in roots:
                 needed |= extra
-        data = self.root.read(*needed, entries=entries)
-        for root in ("trades", "plans", "operations", "events", "bindings", "nonces", "account_nonces",
-                     "venue_nonces", "account_bindings", "venue_bindings", "account_events", "venue_events"):
-            data.setdefault(root, {})
-        projected = self.project(data)
-        return copy.deepcopy({root: projected[root] for root in roots if root in projected})
+        return self.root.venue_snapshot(self, roots=roots, needed=needed, entries=entries)
 
     def preview_snapshot(self):
         basis = self.preview_basis.get()
-        result = self.project(copy.deepcopy(basis) if basis is not None else self.root.snapshot())
+        result = copy.deepcopy(self.project(basis)) if basis is not None else self.snapshot()
         result["preview_route"] = copy.deepcopy(self.route.get())
         return result
 
     def update(self, callback):
         def change(data):
+            legacy = self.legacy_context(data)
+            if not (self.exchange == "hyperliquid" and legacy):
+                data["account_bindings"].setdefault(self.account_key, copy.deepcopy(data["venue_bindings"].get(self.exchange, {})) if legacy else {})
+                data["account_nonces"].setdefault(self.account_key, copy.deepcopy(data.get("venue_nonces", {}).get(self.exchange, {})) if legacy else {})
             local = self.project(data)
             original_events = copy.deepcopy(local["events"])
             result = callback(local)

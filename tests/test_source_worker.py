@@ -53,6 +53,21 @@ async def worker_boundary(setup, tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["legacy", "shadow", "hybrid"])
+async def test_frozen_notifications_use_native_transport_without_any_model_in_every_mode(worker_boundary, mode):
+    extension, _, state, fake, calls, sent = worker_boundary
+    async def forbidden(*_, **__):
+        raise AssertionError("A ready notification must not call a model")
+    worker = SourceWorker(extension, {"mode": mode}, adapter=SimpleNamespace(decide=forbidden), fallback=forbidden)
+    state.update_metadata(("notifications",), lambda data: data["notifications"].__setitem__("protection:test", {"error": "Native protection observation unavailable"}))
+    await worker.deliver()
+    await worker.deliver()
+    assert len(sent) == 1 and sent[0][0] == "42" and "protection observation" in sent[0][1]
+    assert state.read("notifications")["notifications"] == {} and not fake.actions
+    assert any(action == "delivery_complete" for _, action in calls)
+
+
+@pytest.mark.asyncio
 async def test_short_fallback_runs_once_and_empty_queue_uses_no_model(worker_boundary):
     extension, server, state, fake, calls, _ = worker_boundary
     source = SourceEvent(chat_id="channel", message_id=8, sent_at=now_ms(), text="BTC result report.")
@@ -431,7 +446,7 @@ def test_rejected_oversized_fresh_source_is_not_removed_from_the_efficiency_deno
 @pytest.mark.parametrize("provider_down", [False, True])
 @pytest.mark.parametrize("text,code", [
     ("BTC entry half market 100 and half limit 95. Long. SL 90.", "entry_legs_not_representable"),
-    ("BTC close half position and move stop to entry.", "management_actions_not_representable"),
+    ("BTC close half position and move stop to entry and cancel remaining entry orders.", "management_actions_not_representable"),
     ("BTC close tomorrow.", "scheduled_management_not_representable"),
     ("BTC long entry market 100. Stop after 1h candle close below 90.", "conditional_stop_not_representable"),
     ("BTC LONG. An expected correction will provide an opportunity to open a long position with potential growth 49.33%.", "future_entry_opportunity_requires_review"),
@@ -658,7 +673,7 @@ async def test_only_the_actual_model_route_must_fit_its_input_budget(worker_boun
     ("Earlier we agreed to close half and move stop to95 and cancel entry", "report", None),
     ("BTC close half and move stop to95", "ambiguous", None),
     ("BTC close half and move stop to95", "incomplete", None),
-    ("BTC close half and move stop to95", "report", "management_actions_not_representable"),
+    ("BTC close half and move stop to95 and cancel entry", "report", "management_actions_not_representable"),
     ("Earlier we agreed to close half and now move stop to95 and cancel entry", "unrelated", "management_actions_not_representable"),
 ])
 async def test_common_nonaction_contract_matches_native_worker_and_offline_replay(worker_boundary, text, kind, failure):

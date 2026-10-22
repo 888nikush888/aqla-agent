@@ -137,6 +137,13 @@ class ExpressSettings(Model):
     master_path: Path | None = None
 
 
+class ReplaySettings(Model):
+    enabled: bool = True
+    max_bytes: int = Field(default=512 * 1024 * 1024, ge=1024 * 1024, le=16 * 1024 * 1024 * 1024)
+    retention_days: int | None = Field(default=None, ge=1, le=3650,
+        description="Only complete expired/finished setup recordings may expire; None retains data until the explicit size budget")
+
+
 class Settings(Model):
     network: Literal["mainnet", "testnet"]
     account: Address
@@ -161,6 +168,7 @@ class Settings(Model):
     execution_accounts: dict[str, ExecutionSettings] = Field(default_factory=dict)
     ranking_enabled: bool = False
     express: ExpressSettings = Field(default_factory=ExpressSettings)
+    waverider_replay: ReplaySettings = Field(default_factory=ReplaySettings)
 
     @model_validator(mode="after")
     def journal_network(self):
@@ -252,6 +260,7 @@ EVIDENCE_FIELDS = (
     "entry_timing", "source_exchange", "take_profit_unit", "update_action", "bound_trade_id", "margin_mode",
     *(f"entry_prices.{index}" for index in range(2)), *(f"take_profits.{index}" for index in range(20)),
     *(f"entry_legs.{index}.{field}" for index in range(2) for field in ("kind", "price", "weight_percent", "timing")),
+    *(f"management_steps.{index}.{field}" for index in range(2) for field in ("action", "reduce_percent", "stop_loss")),
 )
 ClassificationReason = Literal["percentage_basis", "missing_market", "missing_direction", "missing_reference",
     "contradictory_source", "missing_entry_price", "missing_source_text", "non_trade", "result_report", "other"]
@@ -304,6 +313,22 @@ class SourceEntryLeg(Model):
         return self
 
 
+class ManagementStep(Model):
+    action: Literal["reduce", "move_stop", "break_even"]
+    reduce_percent: Positive | None = Field(default=None, lt=100)
+    stop_loss: Positive | None = None
+
+    @model_validator(mode="after")
+    def changed_fields(self):
+        if self.action == "reduce" and (self.reduce_percent is None or self.stop_loss is not None):
+            raise ValueError("A reduction needs its original position fraction and no stop field")
+        if self.action == "move_stop" and (self.stop_loss is None or self.reduce_percent is not None):
+            raise ValueError("A stop move needs its original stop price and no reduction field")
+        if self.action == "break_even" and (self.stop_loss is not None or self.reduce_percent is not None):
+            raise ValueError("Break-even uses proved own entry, never invented source values")
+        return self
+
+
 class Interpretation(Model):
     """Use only declared fields. Python owns risk and margin policy; source risk_percent,
     margin_mode and deposit allocations are not Interpretation parameters.
@@ -330,9 +355,11 @@ class Interpretation(Model):
     take_profits: list[Positive] = Field(default_factory=list, max_length=20,
         description="Positive JSON numbers or dot-decimal strings (e.g. [1.3, 1.33]), never comma decimals. Each value needs its own indexed evidence path take_profits.0, take_profits.1, etc.")
     take_profit_unit: Literal["price", "course_percent", "roi_percent", "roe_percent"] = Field(default="price", description="Absolute targets without a source % marker use price. Explicit new source TP percentages use roe_percent: nominal profit on own initial margin before fees/funding, effective executed leverage and final own fill VWAP. Rule source-roe-v1. Legacy course_percent/roi_percent remain readable only.")
-    update_action: Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"] | None = Field(default=None,
+    update_action: Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry", "sequence"] | None = Field(default=None,
         description="For trade_update emit only changed action fields: move_stop needs stop_loss; replace_targets needs take_profits; reduce needs reduce_percent. Leave unrelated prices/targets null or empty; do not restate the whole original setup.")
     reduce_percent: Positive | None = Field(default=None, le=100)
+    management_steps: list[ManagementStep] = Field(default_factory=list, max_length=2,
+        description="Only for trade_update/update_action=sequence: exactly [reduce, break_even|move_stop] in original order. Fraction is of own position before the WHOLE instruction. Each action needs its complete original clause in management_steps.i.action evidence, plus its own .reduce_percent or .stop_loss proof. No conditional/future actions; never omit a separate instruction.")
     bound_trade_id: str | None = None
     evidence: list[Evidence] = Field(default_factory=list, max_length=60,
         description="Original evidence for each populated field. For non-actionable results: " + SourceClassification.model_fields["evidence"].description)
@@ -343,6 +370,8 @@ class Interpretation(Model):
     @model_serializer(mode="wrap")
     def compatible_entry_fields(self, handler):
         result = handler(self)
+        if not self.management_steps:
+            result.pop("management_steps", None)
         if not self.entry_legs:
             result.pop("entry_legs", None)
         if self.entry_timing == "standard":
@@ -354,6 +383,17 @@ class Interpretation(Model):
         if not self.reason_codes:
             result.pop("reason_codes", None)
         return result
+
+    @model_validator(mode="after")
+    def valid_management_sequence(self):
+        if self.update_action == "sequence":
+            if (self.kind != "trade_update" or len(self.management_steps) != 2
+                    or self.management_steps[0].action != "reduce" or self.management_steps[1].action not in ("move_stop", "break_even")
+                    or self.reduce_percent is not None or self.stop_loss is not None or self.take_profits or self.entry_prices or self.entry_legs):
+                raise ValueError("A sequence contains exactly a partial reduction followed by a stop instruction; values belong only to their own steps")
+        elif self.management_steps:
+            raise ValueError("Management steps require update_action=sequence")
+        return self
 
     @field_validator("entry_prices", "take_profits", "stop_loss", "reduce_percent", mode="before")
     @classmethod

@@ -107,6 +107,32 @@ async def opened_zone(setup):
 
 
 @pytest.mark.asyncio
+async def test_open_managed_position_without_pending_entries_has_one_reconciliation(setup, monkeypatch):
+    from collections import Counter
+
+    from aqla_agent import managed_entries
+    _, state, fake, _, trading = setup
+    state.update(lambda data: data["policy"].update(entry_range_choice="split"))
+    from conftest import SourceEvent, now_ms
+    source = SourceEvent(chat_id="channel", message_id=9, sent_at=now_ms(), text="BTC LONG Entry 100 SL 90 TP 110 120")
+    trading.ingest(source)
+    value = Interpretation(kind="new_signal", source_refs=[source.source_id], symbol="BTC", side="long", entry="market", stop_loss=90, take_profits=[110,120], evidence=[Evidence(field=field, source_id=source.source_id, quote=quote) for field,quote in (("symbol","BTC"),("side","LONG"),("stop_loss","90"),("take_profits.0","110"),("take_profits.1","120"))])
+    plan = await trading.preview(source.event_id, value)
+    trade = await trading.execute(plan["plan_id"])
+    counts = Counter()
+    for owner, name in ((trading,"capture_fills"),(trading,"positions"),(trading.exchange,"price_snapshot"),(trading,"ensure_protection"),(managed_entries,"validate_actual"),(managed_entries,"sync_targets")):
+        original = getattr(owner,name)
+        async def count(*args, _original=original, _name=name, **kwargs):
+            counts[_name] += 1
+            return await _original(*args,**kwargs)
+        monkeypatch.setattr(owner,name,count)
+    before = list(fake.actions)
+    await trading.refresh_trade(trade["trade_id"])
+    assert counts["capture_fills"] == counts["positions"] == counts["ensure_protection"] == 1
+    assert counts["validate_actual"] == counts["sync_targets"] == 1 and fake.actions == before
+
+
+@pytest.mark.asyncio
 async def test_second_entry_waits_for_first_fill_and_confirmed_protection(setup):
     state, fake, trading, plan, trade = await opened_zone(setup)
     assert trade["lifecycle_version"] == 2

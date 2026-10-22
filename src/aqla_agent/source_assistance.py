@@ -7,17 +7,16 @@ import re
 from aqla_hyperliquid_mcp.models import EVIDENCE_FIELDS, AqlaError, Interpretation, digest
 from aqla_hyperliquid_mcp.rules import number_is_ordinal, numeric_evidence_values, quoted_numbers
 
-from .decisions import (
-    DecisionFailure,
+from .interpretation_contract import DecisionFailure, validate_interpretation
+from .source_candidates import (
     build_packet,
     candidates,
     linked_candidate_refs,
     questions_for,
-    validate_interpretation,
     verification_questions,
 )
 
-VERSION = "source-assistance-v6"
+VERSION = "source-assistance-v7"
 CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_action",
                    "source_exchange", "single_entry_form", "single_management_action")
 CONTEXT_CANDIDATE_LIMIT = 64
@@ -25,7 +24,7 @@ REPAIR_GUIDANCE = {
     "management_action_mismatch": "The selected action omits or changes the original current action. A partial exit is reduce, never close of the whole position. Keep its original fraction; when no fraction is stated this schema cannot execute it and requires ambiguous. Preserve every separate instruction; do not invent a fraction or discard an exit as past without original tense evidence.",
     "existing_target_catchup_requires_report_review": "The source discusses an existing target/result and catching up on a forgotten target order, with no separate current management instruction. Recheck report: this does not newly close the whole position or supply a reduction fraction. Use anchor-only classification evidence; do not borrow the parent's old setup fields. Preserve any genuinely separate new stop/exit instruction in other originals.",
     "scheduled_management_not_representable": "The original management is conditional or scheduled, including permission to take profit now IF not already done. This schema cannot represent that condition. Recheck ambiguous using anchor-only classification evidence; never erase the conditional action as optional background or execute only a separate stop instruction. Do not convert it into an unconditional exit.",
-    "management_actions_not_representable": "The original contains several distinct management actions. Recheck ambiguous using anchor-only classification evidence and omit unused trade fields. Never select just one action or discard a permitted/conditional instruction as optional background.",
+    "management_actions_not_representable": "The original contains several distinct management actions. Use sequence with exactly two management_steps for a current partial reduction followed by break_even or move_stop, with separate original clause/value evidence. Other combinations remain ambiguous with anchor-only classification evidence. Never select just one action or discard a permitted/conditional instruction as optional background.",
     "managed_position_direction_missing_or_changed": "The current anchor expressly identifies the position being managed as a purchase/buy holding or sale/short holding. Preserve that POSITION direction with an exact current-anchor side quote. Closing a purchase is long; an exit sale is not a new short. Do not infer direction from prices, profit, market commentary or old parent values.",
     "multiple_managed_position_directions_require_review": "The source manages different position directions. Re-read the full source; do not select one side or execute a partial instruction. A single supported unambiguous action is required.",
     "completed_stop_move_is_not_current_management": "The original reports an already completed stop move: the past-tense governor follows the destination. Recheck report, preserving any genuinely separate current instruction. An unconditional-looking stop phrase does not override its explicit past tense or prove our own stop changed. Never repeat a completed author action merely because our own position state differs.",
@@ -92,6 +91,8 @@ def source_assistance(context):
         spans, candidate_error = [], str(error)
     questions = questions_for(packet, spans)
     contract = {key: questions[key] for key in CONTRACT_FIELDS}
+    contract["management_steps"] = {"instructions": Interpretation.model_fields["management_steps"].description}
+    contract["update_action"]["criteria"]["sequence"] = "Exactly one current partial reduction followed by break_even or move_stop: emit both typed management_steps with separate original action/value evidence; never perform just one action."
     for key in ("symbol", "source_exchange"):
         contract[key] = {"instructions": contract[key]["instructions"]}
     entry = json.loads(contract["entry"]["instructions"])
@@ -99,13 +100,20 @@ def source_assistance(context):
     contract["entry"]["criteria"] = {**contract["entry"]["criteria"],
         "split": "Two discrete original entries of ONE setup: entry=split, entry_prices=[], parent entry_timing=standard, entry_legs=[{kind,price,weight_percent,timing},{kind,price,weight_percent,timing}]. ALL leg prices/timings belong INSIDE entry_legs, never in parent entry_prices. Preserve original forms/prices/weights; never flatten into range or select one leg."}
     contract["verification"] = verification_questions()
-    from .semantic_contract import supported_action_failure, unbound_setup_update_failure
+    from .semantic_contract import (
+        supported_action_failure,
+        unbound_setup_update_failure,
+        unsupported_structure,
+    )
     anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     vetoes = {}
     for kind in ("new_signal", "trade_update", "report", "unrelated"):
         draft = Interpretation(kind=kind, source_refs=[packet["anchor_source_id"]])
         failure = supported_action_failure(anchor["text"], draft) or unbound_setup_update_failure(packet, draft)
         if failure:
+            if kind == "trade_update" and failure == "management_actions_not_representable" and unsupported_structure(packet) is None:
+                vetoes["single_management_action"] = "Use the supported complete two-step sequence; no partial instruction is authorized"
+                continue
             if kind == "new_signal" and failure in ("entry_legs_not_representable", "additional_entry_legs_not_representable"):
                 vetoes["flattened_entry"] = failure
                 continue

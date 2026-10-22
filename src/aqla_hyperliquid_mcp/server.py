@@ -171,29 +171,33 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     async def status(context_auth: str = "", view: Literal["full", "compact", "summary"] = "full", offset: int = 0, limit: int = 20,
                      view_version: str | None = None) -> dict:
         """Read effective user rules, sources, pending work, owned trades and unresolved operations."""
-        snapshot = state.snapshot()
         if view == "summary":
+            snapshot = state.status_summary()
+            from aqla_agent.waverider import recorder_health
             claims = authorize(context_auth, operator=True) if context_auth else None
             lease_id, binding = setup_context(claims)
-            counts = execution_counts(snapshot)
+            counts = snapshot["execution_counts"]
             return {"view": "summary", "paused": snapshot["paused"], "network": settings.network,
                     "setup": setup_gate.status(binding, lease_id, owner_id=settings.telegram_owner_id),
-                    "source_queue": queue_overview(snapshot, limit=8), "notification_pending": len(snapshot["notifications"]),
-                    "source_processing": processor.overview(),
+                    "source_queue": snapshot["source_queue"], "notification_pending": snapshot["notification_pending"],
                     "open_trade_count": counts["known_own_open"],
                     "open_trade_count_meaning": "confirmed_own_positions_from_retained_receipts",
-                    "active_trade_count": sum(row["status"] in OPEN for row in snapshot["trades"].values()),
-                    "conflicted_trade_count": sum(row["status"] == "conflicted" for row in snapshot["trades"].values()),
+                    "active_trade_count": snapshot["active_trade_count"],
+                    "conflicted_trade_count": snapshot["conflicted_trade_count"],
                     "execution_counts": counts,
                     "execution_accounts": {key: {name: value for name, value in row.items() if name != "limits"}
                                            for key, row in trading.accounts_ready(snapshot).items()},
                     "account_recovery": recovery_diagnostics(snapshot),
-                    "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})),
+                    "journal": {"enabled": settings.google_sheets.enabled, "pending": snapshot["journal_pending"],
                                 "last_synced_at": snapshot.get("journal_synced_at")},
                     "configuration_revision": snapshot["configuration_revision"], "policy_revision": snapshot["policy_revision"],
                     "inventory_refreshed": False, "details": {"tool": "status", "view": "full"},
-                    **({"source_processing": {**processor.overview(), "delivery": outbox.overview()}}
-                       if processor.mode != "legacy" else {})}
+                    "source_processing": {**processor.overview(), "delivery": outbox.overview()},
+                    "replay_recorder": {key: recorder_health(engine) for key, engine in trading.engines.items()},
+                    "account_work": {key: {"waiting": sum(not future.done() for _, _, future, _ in engine.lock.waiters),
+                        "wait_metrics": dict(engine.lock.metrics), "packet_timeout_seconds": getattr(engine, "recovery_packet_timeout", 30)}
+                        for key, engine in trading.engines.items()}}
+        snapshot = state.snapshot()
         queue = queue_overview(snapshot)
         ready = trading.ready()
         inventory = await trading.inventory_status()
@@ -447,9 +451,9 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
 
     @server.tool(annotations=write)
     async def notifications_ack(notification_ids: list[str], context_auth: str = "", versions: dict[str, str] | None = None) -> NotificationAckResult:
-        """Acknowledge status facts processed for the native Hermes response; not a Telegram delivery receipt."""
+        """Standalone clients only before native outbox binding. In every bound gateway mode Python owns delivery and exact-version ACK; source agents must not acknowledge these notices."""
         authorize(context_auth)
-        if processor.mode == "hybrid":
+        if outbox.generation is not None:
             raise AqlaError("Notification acknowledgements are owned by the native outbox")
         def acknowledge(data):
             return acknowledge_notifications(data, notification_ids, versions)
@@ -633,9 +637,6 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             state.update_metadata(("notifications", "source_status"), notice)
             return {"recorded": True}
         if action in ("delivery_next", "delivery_complete", "delivery_retry"):
-            processor.require_owner(processing_owner)
-            if processor.mode != "hybrid":
-                raise AqlaError("Only hybrid processing owns deterministic delivery")
             if action == "delivery_next":
                 return outbox.next_part(processing_owner)
             if action == "delivery_retry":

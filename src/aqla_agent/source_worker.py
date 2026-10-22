@@ -94,7 +94,7 @@ class SourceWorker:
                              "validated": profile.validated and profile.master_hash == self.extension.skill_hash(),
                              "permissions": profile.source_permissions if profile.validated and profile.master_hash == self.extension.skill_hash() else {}})
         adapter = self.extension.binding[0] if self.extension.binding else None
-        if self.config.mode == "hybrid" and adapter is not None and adapter is not self.bound_adapter:
+        if adapter is not None and adapter is not self.bound_adapter:
             # A newly connected native transport may resume exhausted jobs; mere polling cannot.
             await self.internal("delivery_retry")
             self.bound_adapter = adapter
@@ -104,7 +104,7 @@ class SourceWorker:
         master = packet.get("approved_source_guidance") or self.extension.master_path.read_text(encoding="utf-8")
         instruction = master + "\nInterpretation only. No tools, no account/configuration changes. "
         instruction += "Return exactly one JSON Interpretation for the live anchor. Preserve original quotations. "
-        instruction += "If several current instructions cannot fit one update_action, return ambiguous/incomplete; never execute only one part or omit another instruction. "
+        instruction += "A current partial reduction followed by break_even or move_stop uses update_action=sequence and exactly two evidenced management_steps. Other combinations and conditional/future management remain ambiguous/incomplete; never omit a separate instruction. "
         instruction += "An unsupported future schedule/trigger for an update remains ambiguous; never turn a future close into an immediate one. "
         instruction += "Use source_id values from the original messages/candidates for source_refs and Evidence.source_id; "
         instruction += "never substitute event_id, chat_id, message_id or candidate_id. source_refs MUST include " + packet["anchor_source_id"] + ". "
@@ -394,7 +394,7 @@ class SourceWorker:
 
     async def deliver(self):
         await self.bind()
-        if self.config.mode != "hybrid" or self.extension.binding is None:
+        if self.extension.binding is None:
             return
         selected = await self.internal("delivery_next")
         if selected.get("delivery_id") is None:

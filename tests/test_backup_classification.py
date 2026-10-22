@@ -57,7 +57,7 @@ def test_missing_execution_fields_cannot_be_completed_as_semantic_ambiguity(setu
     (TEXT, "Missing SL; conflicting source directions", ["other"]),
     ("BTC SHORT\nEntry MARKET 100 and LIMIT 101", "SL fehlt; mehrere Einstiege", ["other"]),
     ("BTC SHORT\nTargets: 1%-2%", "Stop fehlt; verbindlicher Zielbereich", ["other"]),
-    ("BTC close half AND move stop to entry", "Missing SL; mehrere Verwaltungsanweisungen", ["other"]),
+    ("BTC close half AND move stop to entry AND cancel entry", "Missing SL; mehrere Verwaltungsanweisungen", ["other"]),
     (TEXT, "Stop is ambiguous, two incompatible original values", ["contradictory_source"]),
     ("BTC LONG (2-5x)\nEntry: 100", "The leverage interval must not be treated as missing", ["other"]),
     ("BTC LONG (2-5x)\nEntry: 100", "Hebel als Intervall; darf nicht als fehlend behandelt werden", ["other"]),

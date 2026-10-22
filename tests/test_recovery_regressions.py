@@ -191,8 +191,11 @@ async def test_crash_before_exit_cleanup_keeps_market_reserved_until_restart(set
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("percent", [Decimal(100), Decimal(50)])
-async def test_crash_before_close_dispatch_resumes_exact_saved_intent_once(setup, signal, monkeypatch, percent):
-    _, state, fake, exchange, trading = setup
+@pytest.mark.parametrize("mode", ["legacy", "split", "waverider"])
+async def test_crash_before_close_dispatch_resumes_exact_saved_intent_once(setup, signal, monkeypatch, percent, mode):
+    settings, state, fake, exchange, trading = setup
+    if mode != "legacy":
+        state.update(lambda data: data["policy"].update(entry_range_choice="split", management_mode="waverider" if mode == "waverider" else "standard"))
     source, interpretation = signal
     plan = await trading.preview(source.event_id, interpretation)
     trade = await trading.execute(plan["plan_id"])
@@ -214,11 +217,19 @@ async def test_crash_before_close_dispatch_resumes_exact_saved_intent_once(setup
     fake.mid = "115"  # Recovery must not recompute the saved price from a newer market read.
     state.update(lambda row: row.update(paused=True, sources=[], policy_revision=2))
     monkeypatch.setattr(exchange, "mutate", original)
-    await trading.recover()
-    await trading.recover()
-    assert fake.actions.count(intent["action"]) == 1
-    assert state.snapshot()["operations"]["saved-close"]["wire_action"] == intent["action"]
-    assert Decimal(str(fake.position)) == Decimal(trade["remaining_quantity"]) * (100 - percent) / 100
+    state.close()
+    recovered = State(settings)
+    exchange.state = recovered
+    trading = Trading(exchange, recovered)
+    try:
+        await trading.recover()
+        await trading.recover()
+        assert fake.actions.count(intent["action"]) == 1
+        assert recovered.snapshot()["operations"]["saved-close"]["wire_action"] == intent["action"]
+        assert recovered.snapshot()["trades"][trade["trade_id"]]["close_intents"]["saved-close"]["completed"]
+        assert Decimal(str(fake.position)) == Decimal(trade["remaining_quantity"]) * (100 - percent) / 100
+    finally:
+        recovered.close()
 
 
 @pytest.mark.asyncio

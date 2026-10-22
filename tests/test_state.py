@@ -52,6 +52,34 @@ def test_sqlite_transaction_failure_keeps_committed_state(setup):
     assert state.snapshot() == read_snapshot(state.path) == old
 
 
+def test_metadata_patch_never_serializes_financial_history_and_keeps_full_durability(setup, monkeypatch):
+    _, state, *_ = setup
+    before = state.snapshot()
+    def forbidden(_):
+        pytest.fail("Metadata update serialized the whole financial body")
+    monkeypatch.setattr(state._store, "save", forbidden)
+    state.update_metadata(("cursors",), lambda data: data["cursors"].update(stream=5))
+    assert read_snapshot(state.path) == state.snapshot()
+    assert state.snapshot()["trades"] == before["trades"]
+    assert state._store.connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+    committed = state.snapshot()
+    state._store.connection.execute("CREATE TRIGGER deny_metadata BEFORE UPDATE ON state BEGIN SELECT RAISE(ABORT, 'disk write failed'); END")
+    with pytest.raises(AqlaError, match="Durable state write failed"):
+        state.update_metadata(("cursors",), lambda data: data["cursors"].update(stream=6))
+    assert state.snapshot() == read_snapshot(state.path) == committed
+
+
+def test_empty_outbox_poll_has_no_persistent_write_or_sequence_change(setup, monkeypatch):
+    from aqla_agent.delivery import NotificationOutbox
+    _, state, *_ = setup
+    outbox = NotificationOutbox(state, "operator")
+    outbox.bind("native")
+    before = state.snapshot()
+    monkeypatch.setattr(state, "_write", lambda _: pytest.fail("No work must not cause a durable write"))
+    assert outbox.next_part("native")["delivery_id"] is None
+    assert state.snapshot() == before
+
+
 def test_json_migration_retains_all_identities_and_original_backup(setup, tmp_path):
     settings, state, *_ = setup
     data = state.snapshot()

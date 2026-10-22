@@ -84,6 +84,9 @@ class Lighter(VenueAdapter):
     async def price_snapshot(self, market):
         from .entry import PriceSnapshot
         started = now_ms()
+        key = (str(self.client.base_url), market.asset_id, market.symbol)
+        if key in self.public_feeds:
+            return await self.public_feeds[key].price()
         # Explicitly timestamped REST responses can be used; missing mark price or
         # timestamps require the exchange's fresh public WebSocket snapshots.
         raw = await self.read("orderBookDetails", {"market_id": market.asset_id})
@@ -93,34 +96,11 @@ class Lighter(VenueAdapter):
             return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
                                  stop_reference=row["mark_price"], stop_reference_kind="mark", exchange_time=row["timestamp"],
                                  started_at=started, observed_at=now_ms()).fresh()
-        import websockets
-        url = BASE_URLS[self.settings.network].replace("https://", "wss://") + "/stream"
-        async with asyncio.timeout(2):
-            async with websockets.connect(url, open_timeout=2, max_size=1_000_000) as socket:
-                for channel in ("market_stats", "order_book"):
-                    await socket.send(json.dumps({"type": "subscribe", "channel": f"{channel}/{market.asset_id}"}))
-                frames = {}
-                for _ in range(20):
-                    frame = json.loads(await socket.recv())
-                    if frame.get("type") == "ping":
-                        await socket.send(json.dumps({"type": "pong"}))
-                        continue
-                    kind = frame.get("type", "").removeprefix("subscribed/")
-                    if kind in ("market_stats", "order_book") and frame.get("channel") in (f"{kind}:{market.asset_id}", f"{kind}/{market.asset_id}"):
-                        frames[kind] = frame
-                    if set(frames) == {"market_stats", "order_book"}:
-                        stats = frames["market_stats"]["market_stats"]
-                        stats = stats.get(str(market.asset_id), stats)
-                        book = frames["order_book"]["order_book"]
-                        bid, ask = Decimal(book["bids"][0]["price"]), Decimal(book["asks"][0]["price"])
-                        timestamp = min(frames["order_book"]["timestamp"], frames["market_stats"]["timestamp"])
-                        timestamp = timestamp * 1000 if timestamp < 10**12 else timestamp
-                        return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
-                                             stop_reference=stats["mark_price"], stop_reference_kind="mark", exchange_time=timestamp,
-                                             started_at=started, observed_at=now_ms(),
-                                             bids=[(row["price"], row["size"]) for row in book["bids"] if Decimal(row["size"]) > 0] if all("size" in row for row in book["bids"]) else [],
-                                             asks=[(row["price"], row["size"]) for row in book["asks"] if Decimal(row["size"]) > 0] if all("size" in row for row in book["asks"]) else []).fresh()
-        raise AqlaError("Lighter has no fresh timestamped mark-price/order-book pair")
+        return await self.market_feed(market).price()
+
+    def market_feed(self, market):
+        from .lighter_feed import market_feed
+        return market_feed(self, market)
 
     async def funding_payments(self, market, start, end):
         from .funding import lighter_funding
@@ -132,6 +112,7 @@ class Lighter(VenueAdapter):
             raise AqlaError("Configure a dedicated Lighter API key index from 4 through 254")
         self.client = client or httpx.AsyncClient(base_url=BASE_URLS[settings.network], timeout=settings.timeout_seconds)
         self.signer = signer
+        self.public_feeds, self.owns_public_feeds = {}, True
         self._order_generation = 0
         self._order_context: ContextVar[TerminalOrderIndex | None] = ContextVar("lighter_order_observations", default=None)
 
@@ -469,6 +450,8 @@ class Lighter(VenueAdapter):
         raise AqlaError("Lighter fill history exceeded the bounded cursor budget")
 
     async def close(self):
+        if self.owns_public_feeds:
+            await asyncio.gather(*(feed.close() for feed in self.public_feeds.values()))
         await super().close()
         if self.signer is not None:
             await self.signer.close()

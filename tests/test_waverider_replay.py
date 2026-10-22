@@ -47,6 +47,40 @@ def test_replay_counts_stop_gap_in_pnl_without_inventing_a_new_admission():
     assert Decimal(result["net_pnl"]) < 0
 
 
+def test_recorder_budget_is_reported_and_retention_keeps_active_until_target_setups(tmp_path):
+    from aqla_agent.waverider import capture
+    from aqla_hyperliquid_mcp.models import now_ms
+    path = tmp_path / "replay.sqlite3"
+    stamp = now_ms()
+    old = stamp - 3 * 86400000
+    expired = {"plan": {"deadline_at": old + 1000, "policy": {}}, "family": "expired", "state": {}}
+    active = {"plan": {"deadline_at": old + 1000, "policy": {"waverider_lifetime": "until_target"}}, "family": "active", "state": {}}
+    assert capture(path, "expired", old, expired)
+    assert capture(path, "active", old, active)
+    assert capture(path, "recent", stamp, expired, retention_days=1)
+    with sqlite3.connect(path) as db:
+        assert {row[0] for row in db.execute("SELECT setup FROM setups")} == {"active", "recent"}
+    assert not capture(path, "over-budget", stamp + 1, {**active, "padding": "x" * 2 * 1024 * 1024}, max_bytes=1024 * 1024)
+    with sqlite3.connect(path) as db:
+        assert not db.execute("SELECT 1 FROM observations WHERE setup='over-budget'").fetchone()
+
+
+@pytest.mark.asyncio
+async def test_disabled_recorder_does_not_read_extra_market_facts_or_write(setup, signal, monkeypatch):
+    from aqla_agent import waverider
+    settings, state, _, _, engine = setup
+    settings.waverider_replay.enabled = False
+    async def forbidden(*_):
+        pytest.fail("Disabled replay must not request account fees or candles")
+    monkeypatch.setattr(waverider, "market_facts", forbidden)
+    state.update(lambda data: data["policy"].update(entry_range_choice="split"))
+    source, value = signal
+    plan = await engine.preview(source.event_id, value)
+    await engine.execute(plan["plan_id"])
+    assert not (settings.state_path.parent / "waverider-replay.sqlite3").exists()
+    assert waverider.recorder_health(engine)["status"] == "disabled"
+
+
 def test_replay_cannot_restart_waves_after_tp1_and_a_price_rebound():
     case = replay_case([100, 100, 110, 105, 107, 106, 106, 106, 106, 104, 105, 105, 105, 105])
     case["plan"]["policy"]["waverider_lifetime"] = "until_target"

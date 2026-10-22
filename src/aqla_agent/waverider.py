@@ -10,7 +10,7 @@ from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 
-from aqla_hyperliquid_mcp.models import TERMINAL_ORDER, AqlaError, TradePlan, digest, now_ms
+from aqla_hyperliquid_mcp.models import TERMINAL_ORDER, AqlaError, ReplaySettings, TradePlan, digest, now_ms
 from aqla_hyperliquid_mcp.rules import quantity_grid, slippage_price
 
 from .entry import passive_entry_price
@@ -26,8 +26,9 @@ MIN_CASES, MIN_WAVES = 30, 10
 def software_hash():
     root = Path(__file__).parent
     files = [root / name for name in ("waverider.py", "waverider_replay.py", "managed_entries.py", "trading.py", "entry.py", "inventory_stream.py",
-        "entry_watch.py", "liquidity.py", "aster.py", "lighter.py", "pipelines.py", "monthly.py", "percent_targets.py")]
-    files += [root.parent / "aqla_hyperliquid_mcp" / name for name in ("models.py", "rules.py", "api.py", "streams.py")]
+        "entry_watch.py", "liquidity.py", "aster.py", "lighter.py", "pipelines.py", "monthly.py", "percent_targets.py",
+        "account_work.py", "lighter_book.py", "lighter_feed.py", "management_sequences.py", "interpretation_contract.py", "source_candidates.py", "semantic_contract.py", "conflict_review.py")]
+    files += [root.parent / "aqla_hyperliquid_mcp" / name for name in ("models.py", "rules.py", "api.py", "streams.py", "state.py", "storage.py")]
     return digest({path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in files})
 
 
@@ -251,16 +252,30 @@ async def market_facts(exchange, market):
             "version": VERSION, "market": market.symbol}
 
 
-def capture(path, setup_id, stamp, record):
+def capture(path, setup_id, stamp, record, *, max_bytes=512 * 1024 * 1024, retention_days=None):
     # Separate append-only diagnostics avoid copying market ticks into the financial state.
     path = Path(path)
-    if path.exists() and path.stat().st_size >= 512 * 1024 * 1024:
-        return False
     with sqlite3.connect(path, timeout=2) as db:
         path.chmod(0o600)
         db.execute("CREATE TABLE IF NOT EXISTS setups (setup TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS original_fills (setup TEXT NOT NULL, identity TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(setup,identity))")
         db.execute("CREATE TABLE IF NOT EXISTS observations (setup TEXT NOT NULL, stamp INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(setup,stamp))")
+        if retention_days is not None:
+            cutoff = stamp - retention_days * 86400000
+            expired = db.execute("SELECT setups.setup, setups.payload, MAX(observations.stamp) FROM setups JOIN observations ON setups.setup=observations.setup GROUP BY setups.setup HAVING MAX(observations.stamp)<? LIMIT 100", (cutoff,)).fetchall()
+            removed = False
+            for identity, raw, _ in expired:
+                plan = json.loads(raw)["plan"]
+                last = json.loads(db.execute("SELECT payload FROM observations WHERE setup=? ORDER BY stamp DESC LIMIT 1", (identity,)).fetchone()[0])
+                if last.get("state", {}).get("finished") or plan["policy"].get("waverider_lifetime", "signal_deadline") == "signal_deadline" and plan["deadline_at"] < cutoff:
+                    for table in ("observations", "original_fills", "setups"):
+                        db.execute("DELETE FROM " + table + " WHERE setup=?", (identity,))
+                    removed = True
+            if removed:
+                db.commit()
+                db.execute("VACUUM")
+        if path.stat().st_size >= max_bytes:
+            return False
         metadata = {key: record[key] for key in ("plan", "family", "software_hash") if key in record}
         metadata["initial_fills"] = [row for row in record.get("original_fills", []) if row["time"] <= stamp]
         db.execute("INSERT OR IGNORE INTO setups VALUES (?,?)", (setup_id, json.dumps(metadata, default=str, separators=(",", ":"))))
@@ -268,14 +283,34 @@ def capture(path, setup_id, stamp, record):
             db.execute("INSERT OR IGNORE INTO original_fills VALUES (?,?,?)", (setup_id, digest(row), json.dumps(row, default=str, separators=(",", ":"))))
         value = {key: value for key, value in record.items() if key not in ("plan", "original_fills", "family", "software_hash")}
         db.execute("INSERT OR IGNORE INTO observations VALUES (?,?,?)", (setup_id, stamp, json.dumps(value, default=str, separators=(",", ":"))))
+        if db.execute("PRAGMA page_count").fetchone()[0] * db.execute("PRAGMA page_size").fetchone()[0] > max_bytes:
+            db.rollback()
+            return False
     return True
+
+
+def replay_config(engine):
+    value = getattr(engine.exchange.settings, "waverider_replay", None)
+    return ReplaySettings.model_validate(value) if value is not None else ReplaySettings()
+
+
+def recorder_health(engine):
+    config = replay_config(engine)
+    path = Path(engine.exchange.settings.state_path).parent / "waverider-replay.sqlite3"
+    size = path.stat().st_size if path.exists() else 0
+    return {**getattr(engine, "_replay_health", {}), "enabled": config.enabled, "bytes": size, "max_bytes": config.max_bytes,
+            "retention_days": config.retention_days,
+            "status": "disabled" if not config.enabled else "saturated" if size >= config.max_bytes else getattr(engine, "_replay_health", {}).get("status", "idle")}
 
 
 def queue_evidence(engine, trade_id, quote):
     """Diagnostics only, also for Standard; never enables or dispatches a wave."""
+    if not replay_config(engine).enabled:
+        return
     tasks = getattr(engine, "_waverider_capture_tasks", {})
     task = tasks.get(trade_id)
     if task and not task.done():
+        engine._replay_health = {"status": "lagging", "reason": "previous_observation_still_pending"}
         return
     tasks[trade_id] = asyncio.create_task(collect_evidence(engine, trade_id, quote), name="aqla-wave-evidence")
     def discard(task):
@@ -287,6 +322,9 @@ def queue_evidence(engine, trade_id, quote):
 
 async def collect_evidence(engine, trade_id, quote):
     try:
+        config = replay_config(engine)
+        if not config.enabled:
+            return
         trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
         cache = getattr(engine, "_waverider_facts_cache", {})
@@ -300,12 +338,15 @@ async def collect_evidence(engine, trade_id, quote):
             engine._waverider_facts_cache = cache
         quote.fresh(as_of=quote.observed_at)
         from .managed_entries import original_fills
-        await asyncio.to_thread(capture, Path(engine.exchange.settings.state_path).parent / "waverider-replay.sqlite3", plan.trade_id, quote.observed_at,
+        captured = await asyncio.to_thread(capture, Path(engine.exchange.settings.state_path).parent / "waverider-replay.sqlite3", plan.trade_id, quote.observed_at,
             {"version": VERSION, "software_hash": software_hash(), "family": plan.setup_id or plan.trade_id,
              "plan": plan.model_dump(mode="json"), "quote": quote.model_dump(mode="json"), "facts": previous,
-                 "original_fills": original_fills(trade), "status": trade["status"],
-                 "evidence_error": "market_facts_unavailable" if previous.get("unavailable") else None})
+                 "original_fills": original_fills(trade), "status": trade["status"], "state": trade.get("waverider", {}),
+                 "evidence_error": "market_facts_unavailable" if previous.get("unavailable") else None},
+            max_bytes=config.max_bytes, retention_days=config.retention_days)
+        engine._replay_health = {"status": "recording" if captured else "saturated", "last_observed_at": quote.observed_at}
     except Exception:
+        engine._replay_health = {"status": "unavailable", "reason": "recording_failed"}
         return
 
 
@@ -320,7 +361,7 @@ def ended(plan, trade, quote=None):
 
 
 async def tick(engine, trade_id, quote):
-    trade = engine.state.snapshot()["trades"][trade_id]
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
     persisted = dict(trade.get("waverider", {}))
     marker = (persisted.get("checkpoint"), persisted.get("endpoint_reached_at"), persisted.get("finished"), persisted.get("operation_id"))
@@ -332,15 +373,13 @@ async def tick(engine, trade_id, quote):
         state.update(finished=True, phase="finished", reason="Configured TP or original signal deadline reached")
         engine._patch(trade_id, waverider=state)
         return
-    settings = engine.exchange.settings
-    root_path = Path(settings.state_path).parent
     authority = live_authority(engine, plan)
     permitted = authority is not None
     state.update(shadow=not permitted, live_authority=authority)
     try:
         if permitted and state.get("phase") in ("pending_reduce", "pending_reenter"):
             state = await resume_cycle(engine, trade_id, state)
-            trade = engine.state.snapshot()["trades"][trade_id]
+            trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         facts = state.get("market_facts")
         if not facts or not 0 <= now_ms() - facts["observed_at"] < 60000:
             facts = await read_observation(lambda: market_facts(engine.exchange, plan.market), "waverider_market")
@@ -377,11 +416,7 @@ async def tick(engine, trade_id, quote):
         state, action = advance(state, side=plan.side, price=price, basis=basis,
             volatility=Decimal(facts["atr"]), cycle_cost=cost, tick=plan.market.price_tick or Decimal(1).scaleb(-6 + plan.market.size_decimals), stamp=quote.observed_at)
         if now_ms() - state.get("last_captured_at", 0) >= 1000:
-            from .managed_entries import original_fills
-            await asyncio.to_thread(capture, root_path / "waverider-replay.sqlite3", plan.trade_id, quote.observed_at,
-                {"version": VERSION, "software_hash": software_hash(), "family": plan.setup_id or plan.trade_id,
-                 "plan": plan.model_dump(mode="json"), "original_fills": original_fills(trade), "quote": quote.model_dump(mode="json"),
-                 "facts": facts, "state": state, "quantity": str(quantity), "basis": str(basis), "action": action})
+            queue_evidence(engine, trade_id, quote)
             state["last_captured_at"] = now_ms()
         if action:
             if permitted:
@@ -415,9 +450,9 @@ def reset_phase(state, phase):
 
 
 async def resume_cycle(engine, trade_id, state):
-    trade = engine.state.snapshot()["trades"][trade_id]
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     identity = state["operation_id"]
-    operation = engine.state.snapshot()["operations"].get(identity)
+    operation = engine.state.read("operations")["operations"].get(identity)
     if operation and operation.get("outcome") == "not_sent":
         result = {**reset_phase(state, "waiting_retrace" if state["phase"] == "pending_reduce" else "waiting_rebound"), "cycle": state.get("cycle", 0) + 1}
         engine._patch(trade_id, waverider=result)
@@ -431,7 +466,7 @@ async def resume_cycle(engine, trade_id, state):
     if raw.get("order", {}).get("status") not in TERMINAL_ORDER:
         return state
     await engine.capture_fills(trade_id)
-    current = engine.state.snapshot()["trades"][trade_id]
+    current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     oid = raw["order"]["order"]["oid"]
     fills = [row for row in current["fill_events"].values() if row["oid"] == oid]
     quantity = sum((Decimal(row["sz"]) for row in fills), Decimal(0))
@@ -449,12 +484,12 @@ async def resume_cycle(engine, trade_id, state):
 
 async def resume_exit(engine, trade_id):
     """Restore source targets only after the optional exit's exact outcome is known."""
-    trade = engine.state.snapshot()["trades"][trade_id]
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     identity = trade.get("suspended_wave_targets")
     if not identity:
         return True
     state = dict(trade["waverider"])
-    operation = engine.state.snapshot()["operations"].get(identity)
+    operation = engine.state.read("operations")["operations"].get(identity)
     if operation is None or operation.get("outcome") == "not_sent":
         def abort(data):
             current = data["trades"][trade_id]
@@ -477,7 +512,7 @@ async def resume_exit(engine, trade_id):
     if status.get("order", {}).get("status") not in TERMINAL_ORDER:
         return False
     await engine.capture_fills(trade_id)
-    current = engine.state.snapshot()["trades"][trade_id]
+    current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     oid = status["order"]["order"]["oid"]
     fills = [row for row in current["fill_events"].values() if row["oid"] == oid]
     amount = sum((Decimal(row["sz"]) for row in fills), Decimal(0))
@@ -497,7 +532,7 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
     """Scoped internal management; source close/reduce keeps its original semantics."""
     from .managed_entries import dispatch_next, patch_row
     await engine.capture_fills(trade_id)
-    trade = engine.state.snapshot()["trades"][trade_id]
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
     if action != "retire":
         if not live_permission(engine, plan):
@@ -506,7 +541,7 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
     signed = engine.position_size(await engine.positions(plan.market), plan.market)
     engine.owned_remaining(trade_id, signed)
     quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
-    if any(row["phase"] in ("prepared", "sending", "unknown") for row in engine.state.snapshot()["operations"].values()):
+    if any(row["phase"] in ("prepared", "sending", "unknown") for row in engine.state.read("operations")["operations"].values()):
         raise AqlaError("Unresolved operations block optional Waverider management")
     from .managed_entries import protected
     stops = [(row, await engine.order_status(row["cloid"])) for row in trade["orders"] if row["kind"] == "sl" and not row.get("retired")]
@@ -517,7 +552,7 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
         return
     cycle = state.get("cycle", 0)
     identity = f"waverider:{trade_id}:{cycle}:{action}"
-    if identity in engine.state.snapshot()["operations"]:
+    if identity in engine.state.read("operations")["operations"]:
         return
     own, average, _, _ = position_basis(trade)
     inventory = pools(trade, plan.policy.waverider_flex_percent)
@@ -562,7 +597,7 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
             if raw.get("order", {}).get("status") not in TERMINAL_ORDER:
                 raise AqlaError("Source target cancellation is unconfirmed; optional exit remains unsent")
         await engine.capture_fills(trade_id)
-        latest = engine.state.snapshot()["trades"][trade_id]
+        latest = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         available = pools(latest, plan.policy.waverider_flex_percent)
         if corrective:
             quantity = min(quantity, max(Decimal(0), available["flex"] - available["rights"]))

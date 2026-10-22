@@ -115,7 +115,7 @@ def one_sided_entry_limit(text, start, end, side):
 def source_price_boundary_failure(text, interpretation):
     if interpretation.entry == "limit" or len(interpretation.entry_prices) != 1:
         return None
-    from .decisions import NUMBERS
+    from .source_candidates import NUMBERS
     for match in NUMBERS.finditer(text):
         if (set(quoted_numbers(match.group())) == {interpretation.entry_prices[0]}
                 and one_sided_entry_limit(text, match.start(), match.end(), interpretation.side)):
@@ -155,7 +155,7 @@ def update_identity_failure(packet, interpretation):
     if (interpretation.kind != "trade_update" or packet.get("anchor_setup_bound")
             or interpretation.bound_trade_id is not None):
         return None
-    from .decisions import linked_candidate_refs
+    from .source_candidates import linked_candidate_refs
     linked = linked_candidate_refs(packet)
     if not interpretation.symbol or not any(proof.field == "symbol" and proof.source_id in linked
                                             for proof in interpretation.evidence):
@@ -451,7 +451,7 @@ def split_entry_failure(text, interpretation):
     return None
 
 
-def management_structure_failure(text, *, ignore_tp_footers=False):
+def management_structure_failure(text, *, ignore_tp_footers=False, allow_sequence=False):
     for sentence in SENTENCES.split(matching_words(text).casefold().replace("ё", "е")):
         permission = CONDITIONAL_EXIT_PERMISSION.search(sentence)
         if permission and not any(matcher.search(sentence[:permission.start()]) for matcher in (PAST, PAST_WORD, HYPOTHETICAL)):
@@ -462,7 +462,8 @@ def management_structure_failure(text, *, ignore_tp_footers=False):
     immediate_actions = current_actions(text, include_tp_footers=False)
     if immediate_actions or ignore_tp_footers:
         actions = immediate_actions
-    if len(actions) > 1:
+    sequence = [action for action, _ in actions]
+    if len(actions) > 1 and not (allow_sequence and len(sequence) == 2 and sequence[0] == "reduce" and sequence[1] in ("move_stop", "break_even")):
         return "management_actions_not_representable"
     # One future update is still unsupported: Interpretation has no update
     # scheduler/trigger. Deferred ENTRY remains supported by its explicit field.
@@ -488,7 +489,7 @@ def unsupported_structure(packet):
         failure = entry_structure_failure(text)
         if failure:
             return failure
-    return management_structure_failure(text, ignore_tp_footers=bool(NEW_ENTRY.search(text) or SETUP_HEADING.search(text)))
+    return management_structure_failure(text, ignore_tp_footers=bool(NEW_ENTRY.search(text) or SETUP_HEADING.search(text)), allow_sequence=True)
 
 
 def source_percentage_target_failure(text, interpretation):
@@ -585,10 +586,19 @@ def supported_action_failure(text, interpretation):
         if current_actions(text, include_tp_footers=False):
             return "signal_contains_management_instruction"
         return None
-    failure = management_structure_failure(text)
+    failure = management_structure_failure(text, allow_sequence=interpretation.update_action == "sequence")
     if failure:
         return failure
     actions = current_actions(text, include_tp_footers=False) or current_actions(text)
+    if interpretation.update_action == "sequence":
+        if [step.action for step in interpretation.management_steps] != [action for action, _ in actions]:
+            return "management_action_mismatch"
+        from aqla_hyperliquid_mcp.rules import management_steps
+        for child in management_steps(interpretation):
+            if not any([action for action, _ in current_actions(proof.quote, include_tp_footers=False)] == [child.update_action]
+                       for proof in child.evidence if proof.field == "update_action"):
+                return "management_action_mismatch"
+        return None
     if actions and interpretation.update_action not in {action for action, _ in actions}:
         return "management_action_mismatch"
     return None

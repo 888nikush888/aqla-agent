@@ -21,6 +21,29 @@ from .models import (
 )
 
 UPDATE_VALUE_FIELDS = {"move_stop": "stop_loss", "replace_targets": "take_profits", "reduce": "reduce_percent"}
+
+
+def management_steps(signal):
+    """Project each typed step onto the existing single-action evidence contract."""
+    children = []
+    if any(proof.field not in EVIDENCE_FIELDS for proof in signal.evidence):
+        raise AqlaError("Unsupported source evidence fields in management sequence")
+    for index, step in enumerate(signal.management_steps):
+        prefix = f"management_steps.{index}."
+        proofs = []
+        for proof in signal.evidence:
+            if proof.field.startswith(prefix):
+                field = proof.field[len(prefix):]
+                proofs.append(proof.model_copy(update={"field": "update_action" if field == "action" else field}))
+            elif not proof.field.startswith("management_steps."):
+                proofs.append(proof.model_copy(deep=True))
+        if not any(proof.field == "update_action" for proof in proofs):
+            raise AqlaError("Each management step needs its original action clause")
+        children.append(signal.model_copy(update={"management_steps": [], "update_action": step.action,
+            "reduce_percent": step.reduce_percent, "stop_loss": step.stop_loss, "evidence": proofs}))
+    return children
+
+
 SOURCE_NUMBERS = re.compile(r"(?<![\w.])(?:[xх×]\s*)?\d+(?:[.,]\d+)*(?:[\u00a0\u202f]\d{3}(?:[.,]\d+)?)?(?:[xх×])?(?!\w|[.,]\d)", re.I)
 
 
@@ -249,12 +272,20 @@ def verify_update_shape(signal):
         return
     if signal.update_action is None:
         raise AqlaError("Trade update requires update_action")
+    if signal.update_action == "sequence":
+        for child in management_steps(signal):
+            verify_update_shape(child)
+        return
     required = UPDATE_VALUE_FIELDS.get(signal.update_action)
     if required and not getattr(signal, required):
         raise AqlaError("Trade update " + signal.update_action + " requires " + required + " with original source evidence; updates never use backup values")
 
 
 def verify_evidence(signal: Interpretation, events: dict):
+    if signal.management_steps:
+        for child in management_steps(signal):
+            verify_evidence(child, events)
+        return
     texts = {ref: row["source"]["text"] for ref, row in latest_sources(events, signal.source_refs).items()}
     if any(ref not in texts for ref in signal.source_refs):
         raise AqlaError("Unknown source reference")

@@ -1,3 +1,4 @@
+import asyncio
 import copy
 from decimal import Decimal
 
@@ -8,6 +9,38 @@ from aqla_agent.pipelines import AccountLimits, Parameters, Pipeline, TradingPro
 from aqla_agent.router import Router
 from aqla_hyperliquid_mcp.api import Hyperliquid
 from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, Settings, SourceEvent, now_ms
+
+
+@pytest.mark.asyncio
+async def test_slow_update_on_one_account_does_not_delay_other_account_exit(routed, setup, signal, monkeypatch):
+    router, _ = routed
+    source, value = signal
+    previews = await router.preview(source.event_id, value)
+    await router.execute_many([row["plan_id"] for row in previews["targets"]])
+    update = SourceEvent(chat_id="channel", message_id=2, reply_to_id=source.message_id, sent_at=now_ms(), text="Close BTC now")
+    router.ingest(update)
+    instruction = Interpretation(kind="trade_update", source_refs=[update.source_id], update_action="close", symbol="BTC",
+        evidence=[Evidence(field=field, source_id=update.source_id, quote=quote) for field, quote in (("update_action", "Close"), ("symbol", "BTC"))])
+    entered, release, exited = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    slow, fast = router.engines["hyperliquid"].update_trade, router.engines["aster"].update_trade
+    async def delayed(*args):
+        entered.set()
+        await release.wait()
+        return await slow(*args)
+    async def independent(*args):
+        result = await fast(*args)
+        exited.set()
+        return result
+    monkeypatch.setattr(router.engines["hyperliquid"], "update_trade", delayed)
+    monkeypatch.setattr(router.engines["aster"], "update_trade", independent)
+    task = asyncio.create_task(router.update_trade(update.event_id, instruction))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(exited.wait(), 2)
+        assert not task.done()
+    finally:
+        release.set()
+        await task
 
 
 @pytest.fixture

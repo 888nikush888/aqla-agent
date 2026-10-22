@@ -5,6 +5,29 @@ from itertools import groupby
 from aqla_hyperliquid_mcp.models import TERMINAL_ORDER, AqlaError, TradePlan, digest, now_ms
 
 
+def unsubmitted_entry(engine, snapshot, trade):
+    if (trade.get("lifecycle_version") != 2 or not engine.entry_not_sent(snapshot, trade)
+            or trade.get("fill_events") or trade.get("orders") or trade.get("exit_orders") or trade.get("close_intents")):
+        return False
+    entries = trade.get("entry_orders", [])
+    if not entries or any(row["kind"] != "original" for row in entries):
+        return False
+    identities = {row["operation_id"] for row in entries}
+    cloids = {row["cloid"] for row in entries}
+    def never_sent(operation):
+        return operation.get("phase") == "rejected" and operation.get("outcome") == "not_sent" and not operation.get("legs")
+    for row in entries:
+        operation = snapshot["operations"].get(row["operation_id"])
+        if operation is None and row.get("phase") != "pending" and not row.get("not_sent") or operation is not None and not never_sent(operation):
+            return False
+    for identity, operation in snapshot["operations"].items():
+        if operation["phase"] in ("prepared", "sending", "unknown"):
+            return False
+        if identity not in identities and any(row.get("c") in cloids for row in operation.get("wire_action", {}).get("orders", [])):
+            return False
+    return True
+
+
 def native_flat_closure(trade, plan, rows, order_ids):
     """Prove a native account-flat boundary after every original own fill."""
     if plan.market.product != "perp":
@@ -82,6 +105,17 @@ async def observe_conflict(engine, trade_id):
         raise AqlaError("Select one current conflicted trade ID")
     plan = TradePlan.model_validate(trade["plan"])
     engine.assert_plan_binding(snapshot, plan)
+    if unsubmitted_entry(engine, snapshot, trade):
+        statuses = {row["cloid"]: (await engine.order_status(row["cloid"])).get("status") for row in trade["entry_orders"]}
+        signed = engine.position_size(await engine.positions(plan.market), plan.market)
+        reasons = [] if all(value == "unknownOid" for value in statuses.values()) else ["unexpected_native_order_without_local_request"]
+        evidence = {"trade_hash": digest(trade), "operations_hash": digest(snapshot["operations"]), "fills": {}, "closed_at": None, "basis": "never_submitted_entry"}
+        facts = {"trade_id": trade_id, "account_key": plan.account_key or getattr(engine.state, "account_key", plan.exchange + ":" + plan.network),
+            "network": plan.network, "account": plan.account, "market": plan.market.symbol, "position_size": str(signed),
+            "order_statuses": statuses, "reasons": reasons, "resolvable": not reasons, "pnl_complete": False, "fill_count": 0,
+            "foreign_position_will_be_untouched": True}
+        facts["fingerprint"] = digest([facts, evidence])
+        return facts, evidence
     reasons = []
     identities = {} if trade.get("lifecycle_version") == 2 else {trade["entry_cloid"]: {"kind": "entry"}}
     identities.update({row["cloid"]: {"kind": "entry", "entry_role": row["kind"], "entry_leg": row["index"]}
@@ -217,6 +251,19 @@ def commit_conflict(engine, data, trade_id, review, evidence):
             or digest(engine.state.snapshot()["operations"]) != evidence["operations_hash"]):
         raise AqlaError("Trade changed during ownership review")
     engine.assert_plan_binding(engine.state.snapshot(), TradePlan.model_validate(current["plan"]))
+    if evidence.get("basis") == "never_submitted_entry":
+        if not unsubmitted_entry(engine, engine.state.snapshot(), current):
+            raise AqlaError("Unsubmitted-entry proof changed; no ownership release")
+        for row in current["entry_orders"]:
+            row.update(not_sent=True, confirmed_filled="0", phase="terminal")
+        if wave := current.get("waverider"):
+            wave.update(finished=True, phase="finished")
+        current.update(status="rejected", reserved_risk="0", entries_disabled=True, cleanup_complete=True,
+                       unsent_reason="Market occupied by foreign exposure; this own entry was never submitted",
+                       ownership_release={"basis": "never_submitted_entry", "review_fingerprint": review["fingerprint"], "confirmed_at": now_ms()})
+        data["notifications"].setdefault("ownership-resolved:" + review["fingerprint"],
+            {"trade_id": trade_id, "change": {"status": "rejected"}, "observed_at": now_ms()})
+        return {"resolved": True, "trade_id": trade_id, "own_orders_sent": 0, "foreign_position_untouched": True, "pnl_complete": False}
     current.update(status="closed", remaining_quantity="0", reserved_risk="0", cleanup_complete=True,
         fill_events=evidence["fills"], closed_at=evidence["closed_at"],
         manual_closure={"confirmed_at": now_ms(), "review_fingerprint": review["fingerprint"], "pnl_complete": False,
