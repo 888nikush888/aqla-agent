@@ -152,21 +152,20 @@ async def test_slow_mark_read_does_not_age_the_book_before_local_preparation(set
     exchange = setup[3]
     market = await exchange.market("BTC")
     original = exchange.info
-    mark_finished = False
+    book_reads = 0
     async def info(kind, **params):
-        nonlocal mark_finished
+        nonlocal book_reads
         result = await original(kind, **params)
         if kind == "metaAndAssetCtxs":
             await asyncio.sleep(0)
             clocked[0] += 800
-            mark_finished = True
         elif kind == "l2Book":
-            assert mark_finished, "The executable book must be requested after the mark response"
+            book_reads += 1
             result["time"] = clocked[0] - 900
         return result
     monkeypatch.setattr(exchange, "info", info)
     quote = await exchange.price_snapshot(market)
-    assert clocked[0] - quote.exchange_time == 900
+    assert book_reads == 2 and clocked[0] - quote.exchange_time == 900
     clocked[0] += 600
     quote.fresh()
     clocked[0] += 600
