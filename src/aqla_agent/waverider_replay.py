@@ -182,6 +182,7 @@ def simulate(case, *, wave):
     target_prices = list(plan.take_profits)
     target_budgets, target_spent = None, [Decimal(0)] * len(target_prices)
     stop = plan.stop_loss
+    reached_end = False
     venue_average, original_quantity, original_cost = Decimal(0), Decimal(0), Decimal(0)
     if len(records) < 5:
         raise AqlaError("Replay case has too few executable observations")
@@ -244,11 +245,8 @@ def simulate(case, *, wave):
             state["last_original_fill"] = event["time"]
             original_quantity, original_cost, grew = original_quantity + amount, original_cost + amount * price, True
         target_end = len(plan.take_profits) if plan.policy.waverider_until_tp == "last" else min(plan.policy.waverider_until_tp, len(plan.take_profits))
-        endpoint = plan.take_profits[target_end - 1]
-        reached_end = quote.bid >= endpoint if sign == 1 else quote.ask <= endpoint
         target_one = quote.bid >= plan.take_profits[0] if sign == 1 else quote.ask <= plan.take_profits[0]
         within_lifetime = stamp < plan.deadline_at or plan.policy.waverider_lifetime == "until_target"
-        active = within_lifetime and not stopped and not reached_end
         if not original_events and not target_one and stamp < plan.deadline_at and not stopped:
             for index, leg in enumerate(entries):
                 if index in entered or index and index - 1 not in entered:
@@ -293,7 +291,8 @@ def simulate(case, *, wave):
                     take_profit_unit=plan.backup_values.fallback_take_profit_unit, leverage=plan.effective_leverage)
         target_one = quote.bid >= target_prices[0] if sign == 1 else quote.ask <= target_prices[0]
         endpoint = target_prices[target_end - 1]
-        active = within_lifetime and not stopped and not (quote.bid >= endpoint if sign == 1 else quote.ask <= endpoint)
+        reached_end = reached_end or (quote.bid >= endpoint if sign == 1 else quote.ask <= endpoint)
+        active = within_lifetime and not stopped and not reached_end
         if own:
             allocations, completed = target_allocations(plan, own, target_budgets, target_spent, completed)
             if allocations:

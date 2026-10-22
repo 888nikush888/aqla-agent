@@ -47,6 +47,14 @@ def test_replay_counts_stop_gap_in_pnl_without_inventing_a_new_admission():
     assert Decimal(result["net_pnl"]) < 0
 
 
+def test_replay_cannot_restart_waves_after_tp1_and_a_price_rebound():
+    case = replay_case([100, 100, 110, 105, 107, 106, 106, 106, 106, 104, 105, 105, 105, 105])
+    case["plan"]["policy"]["waverider_lifetime"] = "until_target"
+    normal, wave = simulate(case, wave=False), simulate(case, wave=True)
+    assert wave["waves"] == 0 and wave["fees"] == normal["fees"]
+    assert wave["remaining_quantity"] == normal["remaining_quantity"]
+
+
 def test_quote_currencies_and_networks_are_never_added_as_one_balance():
     one = replay_case([100, 100, 102, 103, 104, 105])
     two = replay_case([100, 100, 102, 103, 104, 105], currency="USDT", venue="aster")
