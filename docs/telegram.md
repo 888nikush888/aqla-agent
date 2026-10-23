@@ -17,6 +17,8 @@
 
 Die bisherigen `/aqla_…`-Befehle bleiben Kurzwege. Das sichtbare Bot-Befehlsmenü konzentriert sich auf `/aqla`, `/aqla_pause` und `/setup`.
 
+Nach fünf Minuten ohne Menüaktion laufen die Buttons ab. Ein Klick erklärt dann, dass `/aqla` eine neue Menükarte öffnet. Die vorhandene Positionsverwaltung läuft weiter.
+
 ## Änderungen
 
 Ein gültiger letzter Wert wird sofort gespeichert. Zahlen akzeptieren Dezimalkomma; Listen verwenden `;` zwischen Werten. Jede Änderung validiert das vollständige Profil und die aktuelle Revision. Abhängige Werte müssen in gültiger Reihenfolge gesetzt werden, etwa erst der feste Positionswert, dann die Auswahl der festen Größenberechnung.

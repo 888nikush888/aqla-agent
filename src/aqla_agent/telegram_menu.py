@@ -628,14 +628,16 @@ class TelegramMenu:
     async def intercept(self, update, bot):
         query = getattr(update, "callback_query", None)
         if query and str(getattr(query, "data", "")).startswith(PREFIX):
-            await query.answer()
             user, message = query.from_user, query.message
             chat = getattr(message, "chat", None)
             if not (user and chat and not user.is_bot and str(user.id) == self.extension.owner and str(chat.id) == self.extension.owner and chat.type == "private"):
+                await query.answer()
                 return True
             selection = self.tokens.pop(query.data, None) if self.live() and message.message_id == self.message_id else None
             if selection is None:
+                await query.answer(text="Menü abgelaufen oder geändert. Mit /aqla neu öffnen.")
                 return True
+            await query.answer()
             action, args = selection
             self.tokens.clear()
             if action not in ("input", "manage_apply", "text_page"):

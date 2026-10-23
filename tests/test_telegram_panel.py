@@ -26,10 +26,11 @@ def panel(controls, tmp_path):  # noqa: F811 -- shared native fixture
 
 
 def callback(menu, token, *, owner="12345", chat_type="private", message_id=None):
-    async def answer():
-        pass
+    answers = []
+    async def answer(**kwargs):
+        answers.append(kwargs)
     message = SimpleNamespace(message_id=message_id or menu.message_id, chat=SimpleNamespace(id="12345", type=chat_type))
-    return SimpleNamespace(callback_query=SimpleNamespace(data=token, from_user=SimpleNamespace(id=owner, is_bot=False), message=message, answer=answer))
+    return SimpleNamespace(callback_query=SimpleNamespace(data=token, from_user=SimpleNamespace(id=owner, is_bot=False), message=message, answer=answer), answers=answers)
 
 
 def choose(bot, label):
@@ -123,6 +124,17 @@ async def test_menu_authenticates_actual_callback_actor(panel, owner, chat_type)
     token = choose(bot, "⚙️ Profile & Handelsregeln")
     await menu.intercept(callback(menu, token, owner=owner, chat_type=chat_type), bot)
     assert not bot.edits and not changes
+
+
+@pytest.mark.asyncio
+async def test_expired_menu_explains_reopen_without_extending_authority_or_writing(panel):
+    menu, bot, _, changes, now, *_ = panel
+    await menu.home(bot)
+    current = callback(menu, choose(bot, "⚙️ Profile & Handelsregeln"))
+    now[0] = menu.deadline + 1
+    await menu.intercept(current, bot)
+    assert current.answers == [{"text": "Menü abgelaufen oder geändert. Mit /aqla neu öffnen."}]
+    assert not bot.edits and not changes and not menu.live()
 
 
 @pytest.mark.asyncio
