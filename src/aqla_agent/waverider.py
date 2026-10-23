@@ -362,7 +362,8 @@ async def tick(engine, trade_id, quote):
         state.update(finished=True, phase="finished", reason="Configured TP or original signal deadline reached")
         engine._patch(trade_id, waverider=state)
         return
-    if trade.get("waverider_paused"):
+    from .trading import STOP_UPDATE_ACTIVE
+    if trade.get("waverider_paused") or trade.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE:
         return
     authority = live_authority(engine, plan)
     permitted = authority is not None
@@ -526,6 +527,9 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
     await engine.capture_fills(trade_id)
     trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
+    from .trading import STOP_UPDATE_ACTIVE
+    if action != "retire" and trade.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE:
+        raise AqlaError("A pending stop update blocks optional Waverider management")
     if action != "retire":
         if not live_permission(engine, plan):
             raise AqlaError("Waverider live management is not authorized")
@@ -569,6 +573,8 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
         def guard(data):
             current = data["trades"][trade_id]
             if not corrective:
+                if current.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE:
+                    raise AqlaError("A pending stop update blocks optional Waverider management")
                 if not live_permission(engine, plan):
                     raise AqlaError("Waverider authorization changed before transport")
                 engine.validate_configuration(data, plan)

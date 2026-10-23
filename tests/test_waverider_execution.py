@@ -10,7 +10,7 @@ from conftest import FakeExchange
 from aqla_agent import waverider
 from aqla_agent.managed_entries import position_basis
 from aqla_agent.waverider import execute, pools, resume_exit
-from aqla_hyperliquid_mcp.models import Market, digest
+from aqla_hyperliquid_mcp.models import Evidence, Interpretation, Market, SourceEvent, digest, now_ms
 
 
 class WaveExchange(FakeExchange):
@@ -63,6 +63,122 @@ async def wave_trade(setup, signal, monkeypatch, lifetime="signal_deadline"):
     plan = await trading.preview(source.event_id, value)
     trade = await trading.execute(plan["plan_id"])
     return state, boundary, exchange, trading, plan, trade
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["source", "edit", "break_even", "direct"])
+async def test_stop_change_preserves_waves_and_reentry_after_restart(setup, signal, monkeypatch, origin):
+    state, boundary, exchange, trading, plan, trade = await wave_trade(setup, signal, monkeypatch, "until_target")
+    identity, initial = trade["trade_id"], Decimal(trade["remaining_quantity"])
+    boundary.mid = "104"
+    before = list(boundary.fills)
+    if origin == "direct":
+        await trading.replace_stop(identity, Decimal(95), "operator:synthetic-stop")
+    else:
+        source = SourceEvent(chat_id="channel", message_id=signal[0].message_id if origin == "edit" else 2,
+            reply_to_id=None if origin == "edit" else signal[0].message_id,
+            edited_at=now_ms() if origin == "edit" else None, sent_at=signal[0].sent_at if origin == "edit" else now_ms(),
+            text="BTC Stop auf 95" if origin != "break_even" else "BTC Stop auf Einstand")
+        trading.ingest(source)
+        change = Interpretation(kind="trade_update", source_refs=[source.source_id], symbol="BTC",
+            update_action="break_even" if origin == "break_even" else "move_stop",
+            stop_loss=None if origin == "break_even" else 95,
+            evidence=[Evidence(field="symbol", source_id=source.source_id, quote="BTC"),
+                Evidence(field="update_action" if origin == "break_even" else "stop_loss", source_id=source.source_id,
+                    quote="Stop auf Einstand" if origin == "break_even" else "95")])
+        await trading.update_trade(source.event_id, change)
+        assert state.snapshot()["trades"][identity]["pending_stop_update"]["phase"] == "confirmed"
+    current = state.snapshot()["trades"][identity]
+    assert not current["waverider"]["finished"] and not current["entries_disabled"]
+    assert boundary.fills == before and current["plan"] == plan
+    trading = type(trading)(exchange, state)
+    await trading.recover()
+    market = Market.model_validate(plan["market"])
+    await execute(trading, identity, current["waverider"], "reduce", initial / 2,
+        await exchange.price_snapshot(market), Decimal(".2"))
+    boundary.mid = "101"
+    await execute(trading, identity, state.snapshot()["trades"][identity]["waverider"], "reenter", initial / 2,
+        await exchange.price_snapshot(market), Decimal(".2"))
+    await trading.recover()
+    current = state.snapshot()["trades"][identity]
+    assert initial / 2 < Decimal(current["remaining_quantity"]) <= initial
+    assert any(row.get("entry_role") == "waverider" for row in current["fill_events"].values())
+    assert current["plan"] == plan and Decimal(current["reserved_risk"]) <= Decimal(trade["reserved_risk"])
+    fills = list(boundary.fills)
+    await trading.recover()
+    assert boundary.fills == fills
+    await trading.cancel_entry(identity)
+    assert state.snapshot()["trades"][identity]["waverider"]["finished"]
+    await trading.replace_stop(identity, Decimal(current["stop_price"]), "operator:still-finished")
+    assert state.snapshot()["trades"][identity]["waverider"]["finished"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["waiting_fill", "replacing", "unknown"])
+async def test_pending_stop_blocks_optional_wave_without_finishing_it(setup, signal, monkeypatch, phase):
+    from aqla_hyperliquid_mcp.models import AqlaError
+    state, boundary, exchange, trading, plan, trade = await wave_trade(setup, signal, monkeypatch)
+    identity = trade["trade_id"]
+    state.update(lambda data: data["trades"][identity].update(pending_stop_update={"phase":phase}))
+    boundary.mid = "104"
+    quote = await exchange.price_snapshot(Market.model_validate(plan["market"]))
+    before = list(boundary.actions)
+    await waverider.tick(trading, identity, quote)
+    with pytest.raises(AqlaError, match="pending stop"):
+        await execute(trading, identity, trade["waverider"], "reduce", Decimal(trade["remaining_quantity"]) / 2, quote, Decimal(".2"))
+    assert boundary.actions == before
+    assert not state.snapshot()["trades"][identity]["waverider"]["finished"]
+
+
+@pytest.mark.asyncio
+async def test_unaccepted_edit_still_blocks_wave_reentry(setup, signal, monkeypatch):
+    from aqla_hyperliquid_mcp.models import AqlaError
+    state, boundary, exchange, trading, plan, trade = await wave_trade(setup, signal, monkeypatch)
+    identity = trade["trade_id"]
+    source = signal[0].model_copy(update={"edited_at":now_ms(), "text":"BTC Stop auf 95"})
+    trading.ingest(source)
+    boundary.mid = "104"
+    market = Market.model_validate(plan["market"])
+    await execute(trading, identity, trade["waverider"], "reduce", Decimal(trade["remaining_quantity"]) / 2,
+        await exchange.price_snapshot(market), Decimal(".2"))
+    before = list(boundary.fills)
+    boundary.mid = "101"
+    with pytest.raises(AqlaError, match="Source changed"):
+        await execute(trading, identity, state.snapshot()["trades"][identity]["waverider"], "reenter", Decimal(trade["remaining_quantity"]) / 2,
+            await exchange.price_snapshot(market), Decimal(".2"))
+    assert boundary.fills == before
+
+
+@pytest.mark.asyncio
+async def test_lost_stop_reply_recovers_once_and_keeps_wave_active(setup, signal, monkeypatch):
+    from test_updates import stop_update
+    state, boundary, exchange, trading, _, trade = await wave_trade(setup, signal, monkeypatch)
+    source, change = stop_update(trading)
+    cloid = exchange.cloid("update:" + source.event_id)
+    visible = False
+    original = boundary.handle
+    def hidden_stop(request):
+        payload = json.loads(request.content)
+        if request.url.path == "/info" and payload.get("type") == "orderStatus" and payload.get("oid") == cloid and not visible:
+            return httpx.Response(200, json={"status":"unknownOid"})
+        response = original(request)
+        if request.url.path == "/exchange" and payload["action"]["type"] == "order" and any(row.get("c") == cloid for row in payload["action"]["orders"]):
+            raise httpx.ReadTimeout("Stop accepted, response lost")
+        return response
+    monkeypatch.setattr(exchange.client, "_transport", httpx.MockTransport(hidden_stop))
+    await trading.update_trade(source.event_id, change)
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert current["pending_stop_update"]["phase"] == "unknown"
+    assert not current["waverider"]["finished"]
+    visible = True
+    trading = type(trading)(exchange, state)
+    await trading.recover()
+    await trading.recover()
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    assert current["pending_stop_update"]["phase"] == "confirmed"
+    assert not current["waverider"]["finished"] and not current["entries_disabled"]
+    submitted = [row for action in boundary.actions if action["type"] == "order" for row in action["orders"] if row.get("c") == cloid]
+    assert len(submitted) == 1
 
 
 @pytest.mark.asyncio

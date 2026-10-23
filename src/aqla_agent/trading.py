@@ -481,6 +481,8 @@ class Trading:
             from .waverider import ended
             trade = snapshot["trades"].get(plan.trade_id, {})
             wave = trade.get("waverider", {})
+            if trade.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE:
+                raise AqlaError("A pending stop update blocks Waverider reentry")
             if (not owned or trade.get("lifecycle_version") != 2 or plan.policy.management_mode != "waverider"
                     or trade.get("entries_disabled") or wave.get("phase") != "pending_reenter"
                     or ended(plan, trade) or not any(row["kind"] == "waverider" and not row.get("not_sent")
@@ -489,8 +491,17 @@ class Trading:
                 raise AqlaError("Waverider reentry has no active owned cycle")
         if now_ms() >= plan.deadline_at and not (waverider and plan.policy.waverider_lifetime == "until_target"):
             raise AqlaError("Entry plan deadline expired")
-        if self.source_revisions(snapshot, plan.source_refs) != plan.source_revisions:
-            raise AqlaError("Source changed after preview; the old unsent plan cannot execute")
+        revisions = self.source_revisions(snapshot, plan.source_refs)
+        if revisions != plan.source_revisions:
+            confirmed = {ref: event for request in snapshot["trades"].get(plan.trade_id, {}).get("stop_update_history", {}).values()
+                if request["phase"] == "confirmed" and request["source_binding"]["trade_id"] == plan.trade_id
+                and request["source_binding"]["kind"] in ("move_stop", "break_even")
+                and snapshot["bindings"].get(request["operation_id"]) == request["source_binding"]
+                for ref, event in request["source_revisions"].items() if snapshot["events"].get(event, {}).get("status") == "updated"}
+            # An acknowledged stop edit authorizes this owned wave, never an old original entry.
+            if not (waverider and revisions.keys() == plan.source_revisions.keys()
+                    and all(event == plan.source_revisions[ref] or confirmed.get(ref) == event for ref, event in revisions.items())):
+                raise AqlaError("Source changed after preview; the old unsent plan cannot execute")
         subscribed = {*snapshot["sources"], *snapshot.get("source_aliases", {}).values()}
         for row in latest_sources(snapshot["events"], plan.source_refs).values():
             source = row["source"]
@@ -1741,7 +1752,7 @@ class Trading:
         self.assert_plan_binding(self.state.snapshot(), plan)
         stop = price_grid(proposed, plan.market, up=plan.side == "long")
         if trade.get("lifecycle_version") == 2:
-            await self.cancel_entry(trade_id)
+            await self.cancel_entry(trade_id, keep_waves=plan.policy.management_mode == "waverider")
         await self.capture_fills(trade_id)
         size = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
         snapshot = self.state.snapshot()
@@ -1901,8 +1912,7 @@ class Trading:
                     or operation_id != final.get("stop_operation_id") or any(order["kind"] == "tp" for order in trade["orders"])):
                 raise AqlaError("Only the durable initial Backup SL may be finalized")
         self.validate_stop_budget(trade, plan, stop, initialize_backup=initialize_backup)
-        automatic = bool(operation_id and operation_id.startswith(("tp-ladder:", "break-even:")))
-        await self.cancel_entry(trade_id, keep_waves=automatic and plan.policy.management_mode == "waverider")
+        await self.cancel_entry(trade_id, keep_waves=plan.policy.management_mode == "waverider")
         await self.capture_fills(trade_id)
         signed = self.position_size(await self.positions(plan.market), plan.market)
         remaining = self.owned_remaining(trade_id, signed)
