@@ -476,8 +476,8 @@ async def test_missing_reader_session_reports_status_and_preserves_pending_wake(
 @pytest.mark.parametrize("mode", ["ready", "blocked", "recovery"])
 async def test_wake_observed_source_work_independent_of_zero_notifications(extension, monkeypatch, mode):
     ext, ctx = extension
-    queue = {"ready_total": 0, "blocked_total": 0, "recovery_total": 0}
-    queue[mode + "_total"] = 12 if mode == "ready" else 1
+    queue = {**dict.fromkeys(("ready_total", "blocked_total", "recovery_total"), 0),
+             mode + "_total": 12 if mode == "ready" else 1}
     if mode == "blocked":
         queue.update(blocked=["blocked-revision"], blocked_signature="signature")
     elif mode == "recovery":

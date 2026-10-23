@@ -75,14 +75,6 @@ def _source_timing_key(identity):
     return hashlib.sha256(identity.encode()).hexdigest()
 
 
-def _record_tool_duration(row, duration):
-    if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
-        if "duration_seconds" not in row:
-            row["duration_seconds"] = [duration]
-        elif len(row["duration_seconds"]) < 256:
-            row["duration_seconds"].append(duration)
-
-
 @dataclass
 class UsageRun:
     origin: str
@@ -110,7 +102,10 @@ class UsageRun:
         row["errors"] += int(bool(error))
         row["repeated_results"] += int(key in self.result_hashes)
         self.result_hashes.add(key)
-        _record_tool_duration(row, duration)
+        if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
+            samples = row.setdefault("duration_seconds", [])
+            if len(samples) < 256:
+                samples.append(duration)
         if not error and isinstance(content, str):
             self.observe_source(name, content)
         if isinstance(content, str) and not error and name.endswith(("interpret_source", "interpret_source_batch")):
@@ -191,9 +186,8 @@ class UsageRun:
                    "classified_source_count": len(self.classified_sources),
                    "api_calls_reported": result.get("api_calls"),
                    "failed": bool(result.get("failed", False)), "interrupted": bool(result.get("interrupted", False)),
-                   "completed": result.get("completed"), "compression_exhausted": bool(result.get("compression_exhausted", False))}
-            row["workflow"] = self.workflow
-            row["source_timings"] = self.source_timings
+                   "completed": result.get("completed"), "compression_exhausted": bool(result.get("compression_exhausted", False)),
+                   "workflow": self.workflow, "source_timings": self.source_timings}
             with sqlite3.connect(path, timeout=1) as connection:
                 connection.execute("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, started_at REAL NOT NULL, origin TEXT NOT NULL, metrics TEXT NOT NULL)")
                 connection.execute("INSERT INTO runs(started_at,origin,metrics) VALUES(?,?,?)", (self.started, self.origin, json.dumps(row, separators=(",", ":"))))
