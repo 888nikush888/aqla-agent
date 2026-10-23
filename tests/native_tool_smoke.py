@@ -96,6 +96,8 @@ def verify_recovery(home, agent, executor):
     assert json.loads(recovered)["source_time"] == "2026-10-11T17:39:00+02:00"
 
 
+# Sequential safety assertions; control flow (including test doubles): 13.
+# skipcq: PY-R1000
 async def verify_reload_and_agent(home, mcp_python):
     import yaml
     from gateway.config import GatewayConfig, Platform, PlatformConfig

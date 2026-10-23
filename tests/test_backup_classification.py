@@ -110,6 +110,8 @@ async def test_public_writes_recheck_policy_without_planning_or_ordering(setup, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backup_enabled", [False, True])
+# Sequential safety assertions; control flow (including test doubles): 7.
+# skipcq: PY-R1000
 async def test_corrected_source_uses_only_backup_stop_and_preserves_both_source_roe_targets(setup, backup_enabled):
     _, state, fake, _, trading = setup
     if backup_enabled:

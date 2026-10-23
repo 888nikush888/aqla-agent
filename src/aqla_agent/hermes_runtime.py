@@ -273,6 +273,7 @@ def install_strict_profile():
 
     async def trading_services_only(self, connected_count):
         # The pinned native ABI supplies this count; configured services govern startup.
+        # skipcq: PTC-W0043
         del connected_count
         # Preserve the native event-loop watchdog; unused room/kanban/heartbeat
         # products must not create their own storage or strategy work.

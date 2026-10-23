@@ -323,6 +323,8 @@ async def test_missing_text_is_deterministic_and_uses_no_model(worker_boundary):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("endpoint_changed,price_failed,bound_trade,route_switched", [(False, False, False, False), (True, False, False, False),
                                                                     (False, True, False, False), (False, False, True, False), (False, False, False, True)])
+# Sequential safety assertions; control flow (including test doubles): 11.
+# skipcq: PY-R1000
 async def test_fallback_cost_requires_observed_endpoint_and_cannot_block_interpretation(
         worker_boundary, monkeypatch, endpoint_changed, price_failed, bound_trade, route_switched):
     extension, server, _, fake, _, _ = worker_boundary

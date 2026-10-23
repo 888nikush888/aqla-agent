@@ -79,7 +79,7 @@ async def test_cost_blocked_reentry_keeps_rights_and_resumes_once_after_restart(
 
 @pytest.mark.parametrize("side", ["long", "short"])
 async def test_pending_reentry_never_counts_previous_exit_fills(setup, signal, monkeypatch, side):
-    state, boundary, exchange, trading, _, identity, quantity = await reduced_trade(setup, signal, monkeypatch, side)
+    state, boundary, _exchange, trading, _, identity, quantity = await reduced_trade(setup, signal, monkeypatch, side)
     trade = state.snapshot()["trades"][identity]
     phase = {**trade["waverider"], "phase": "pending_reenter", "operation_id": f"waverider:{identity}:0:reduce"}
     result = await waverider.resume_cycle(trading, identity, phase)
@@ -99,10 +99,10 @@ async def test_lost_reentry_response_reconciles_its_own_fill_without_resending(s
     def lost_reply(request):
         payload = json.loads(request.content)
         response = handle(request)
-        if request.url.path == "/exchange" and payload["action"]["type"] == "order":
-            if any(row.get("c") == cloid for row in payload["action"]["orders"]):
-                submissions.append(cloid)
-                raise httpx.ReadTimeout("Synthetic accepted reentry with a lost response")
+        if (request.url.path == "/exchange" and payload["action"]["type"] == "order"
+                and any(row.get("c") == cloid for row in payload["action"]["orders"])):
+            submissions.append(cloid)
+            raise httpx.ReadTimeout("Synthetic accepted reentry with a lost response")
         return response
     monkeypatch.setattr(exchange.client, "_transport", httpx.MockTransport(lost_reply))
     boundary.mid = "101" if side == "long" else "99"

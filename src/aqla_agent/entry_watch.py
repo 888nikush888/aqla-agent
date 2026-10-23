@@ -29,6 +29,14 @@ def parse_book(venue, market, frame):
         exchange_time=stamp, started_at=stamp, observed_at=now_ms(), bids=depth[0], asks=depth[1]).fresh()
 
 
+def record_endpoints(data, identity, initial, wave_end, stamp):
+    row = data["trades"][identity]
+    if initial:
+        row.setdefault("entry_tp1_reached_at", stamp)
+    if wave_end:
+        row["waverider"].setdefault("endpoint_reached_at", stamp)
+
+
 class EntryWatch:
     def __init__(self, router, *, connector=connect):
         self.router, self.connector = router, connector
@@ -54,13 +62,7 @@ class EntryWatch:
         endpoint = len(targets) if endpoint == "last" else min(endpoint, len(targets))
         wave_end = bool(wave and not wave.get("finished") and crossed(targets[endpoint - 1]))
         if initial and not trade.get("entry_tp1_reached_at") or wave_end and not wave.get("endpoint_reached_at"):
-            def record(data):
-                row = data["trades"][identity]
-                if initial:
-                    row.setdefault("entry_tp1_reached_at", stamp)
-                if wave_end:
-                    row["waverider"].setdefault("endpoint_reached_at", stamp)
-            engine.state.update(record)
+            engine.state.update(lambda data: record_endpoints(data, identity, initial, wave_end, stamp))
 
     async def observe(self, engine, identity, market):
         venue = getattr(engine.exchange.settings, "venue", "hyperliquid")

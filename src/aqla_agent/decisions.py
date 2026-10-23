@@ -205,6 +205,7 @@ class SourceProcessingConfig(Model):
 
 def checked_answers(response, questions, _profile, *, collect=False):
     # Retain the historical collector keyword; grading is shared for all callers.
+    # skipcq: PTC-W0043
     del collect
     answers = response.get("answers")
     if not isinstance(answers, dict) or set(answers) != set(questions):

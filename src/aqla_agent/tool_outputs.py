@@ -241,6 +241,7 @@ def current_store():
 
 def reader_handler(args, *, session_id=None, task_id=None):
     # Native dispatch supplies task metadata; the receipt is authorized by session.
+    # skipcq: PTC-W0043
     del task_id
     try:
         if not isinstance(args, dict) or set(args) - {"output_id", "offset", "limit", "sections", "record_ids"}:

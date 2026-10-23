@@ -8,7 +8,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from decimal import Decimal
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 
 from aqla_hyperliquid_mcp.models import (
@@ -684,12 +684,30 @@ async def suspend_cycle_targets(engine, context, action, quantity, order):
     if quantity > available["flex"] or not corrective and latest.get("entries_disabled"):
         await resume_exit(engine, trade_id)
         return
-    def retire(data):
-        for target in data["trades"][trade_id]["orders"]:
-            if target["kind"] == "tp":
-                target["retired"] = True
-    engine.state.update(retire)
+    engine.state.update(partial(retire_cycle_targets, trade_id))
     return latest, available
+
+
+def retire_cycle_targets(trade_id, data):
+    for target in data["trades"][trade_id]["orders"]:
+        if target["kind"] == "tp":
+            target["retired"] = True
+
+
+def validate_cycle_reduction(engine, context, quote, corrective, data):
+    trade_id, plan = context.trade_id, context.plan
+    current = data["trades"][trade_id]
+    if not corrective:
+        if current.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE:
+            raise AqlaError("A pending stop update blocks optional Waverider management")
+        if not live_permission(engine, plan):
+            raise AqlaError("Waverider authorization changed before transport")
+        engine.validate_configuration(data, plan)
+    if current["status"] != "open" or not corrective and (current.get("entries_disabled") or current["waverider"].get("finished")):
+        raise AqlaError("Waverider reduction no longer owns its setup")
+    if not corrective and ended(plan, current, quote):
+        raise AqlaError("Waverider endpoint was reached before transport")
+    quote.fresh()
 
 
 async def submit_cycle_reduction(engine, context, action, order, limit, latest, available, cycle_cost):
@@ -703,28 +721,14 @@ async def submit_cycle_reduction(engine, context, action, order, limit, latest, 
             from .managed_entries import restore_targets
             await restore_targets(engine, trade_id)
         raise
-    def guard(data):
-        current = data["trades"][trade_id]
-        if not corrective:
-            if current.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE:
-                raise AqlaError("A pending stop update blocks optional Waverider management")
-            if not live_permission(engine, plan):
-                raise AqlaError("Waverider authorization changed before transport")
-            engine.validate_configuration(data, plan)
-        if current["status"] != "open" or not corrective and (current.get("entries_disabled") or current["waverider"].get("finished")):
-            raise AqlaError("Waverider reduction no longer owns its setup")
-        if not corrective and ended(plan, current, quote):
-            raise AqlaError("Waverider endpoint was reached before transport")
-        quote.fresh()
     if not corrective and (ended(plan, latest, quote) or (limit - available["flex_basis"]) * (1 if plan.side == "long" else -1) <= cycle_cost):
         await resume_exit(engine, trade_id)
         return
-    result = await engine.exchange.mutate(identity, {"type": "order", "orders": [order], "grouping": "na"}, prepare_guard=guard)
+    result = await engine.exchange.mutate(identity, {"type": "order", "orders": [order], "grouping": "na"}, prepare_guard=partial(validate_cycle_reduction, engine, context, quote, corrective))
     engine.patch_trade(trade_id, waverider={**state, "phase": "pending_reduce", "operation_id": identity, "action": action})
-    if result["phase"] in ("acknowledged", "reconciled", "rejected"):
-        if await resume_exit(engine, trade_id):
-            from .managed_entries import refresh
-            await refresh(engine, trade_id, dispatch=False)
+    if result["phase"] in ("acknowledged", "reconciled", "rejected") and await resume_exit(engine, trade_id):
+        from .managed_entries import refresh
+        await refresh(engine, trade_id, dispatch=False)
     return
 
 

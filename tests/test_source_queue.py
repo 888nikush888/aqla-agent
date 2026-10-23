@@ -361,7 +361,6 @@ def test_receipt_concurrent_classification_cannot_overwrite_and_unrelated_arriva
 async def test_empty_photo_requires_receipt_and_only_incomplete_can_close_without_invented_quote(setup, kind):
     from mcp.server.mcpserver.exceptions import ToolError
 
-    from aqla_hyperliquid_mcp.models import now_ms
     from aqla_hyperliquid_mcp.server import close_server, create_server
     settings, state, fake, exchange, _ = setup
     server = create_server(settings, state=state, exchange=exchange)
@@ -387,7 +386,6 @@ async def test_empty_photo_requires_receipt_and_only_incomplete_can_close_withou
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["new_signal", "trade_update"])
 async def test_empty_photo_cannot_use_parent_only_quotes_to_authorize_action(setup, signal, kind):
-    from aqla_hyperliquid_mcp.models import now_ms
     _, state, fake, _, trading = setup
     parent, value = signal
     source = SourceEvent(chat_id="channel", message_id=20, reply_to_id=parent.message_id, sent_at=now_ms(), media="photo")

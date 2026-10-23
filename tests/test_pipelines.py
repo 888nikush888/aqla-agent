@@ -4,6 +4,8 @@ from decimal import Decimal
 
 import httpx
 import pytest
+
+# skipcq: PYL-C0414
 from routing_fixture import routed as routed
 
 from aqla_agent.pipelines import AccountLimits, Parameters, Pipeline, TradingProfile, migrate, route_control

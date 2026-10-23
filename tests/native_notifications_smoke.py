@@ -12,6 +12,8 @@ from types import SimpleNamespace
 from native_helpers import require_first
 
 
+# Sequential safety assertions; control flow (including test doubles): 14.
+# skipcq: PY-R1000
 async def produce(destination: Path):
     import socket
 

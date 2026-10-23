@@ -143,6 +143,8 @@ def stopped_mcp(destination):
         pass
 
 
+# Sequential safety assertions; control flow (including test doubles): 4.
+# skipcq: PY-R1000
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-root", default=str(Path(__file__).resolve().parents[1]))

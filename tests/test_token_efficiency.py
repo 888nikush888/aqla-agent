@@ -98,6 +98,8 @@ async def test_summary_never_requests_a_full_state_snapshot(efficiency_server, s
 
 
 @pytest.mark.asyncio
+# Sequential safety assertions; control flow (including test doubles): 13.
+# skipcq: PY-R1000
 async def test_decision_context_and_batch_keep_originals_quotes_replies_and_receipts(efficiency_server, setup):
     _, state, _, _, trading = setup
     sources = [SourceEvent(chat_id="channel", message_id=i + 1, sent_at=1000 + i,

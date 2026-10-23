@@ -188,19 +188,22 @@ class Hyperliquid:
         candidates = [market for key, market in markets.items() if key in (normalized, symbol)]
         unique = {item.asset_id: item for item in candidates}
         if len(unique) != 1:
-            if not unique and product == "perp":
-                from .models import SymbolUnavailable
-                meta = await self.info("meta", **({"dex": dex} if dex else {}))
-                if any(row["name"] == normalized and not row.get("isDelisted") for row in meta["universe"]):
-                    raise AqlaError("Listed market has no usable fresh price data; market absence is not proved")
-                raise SymbolUnavailable(f"Market {symbol} is unavailable/delisted on Hyperliquid {self.settings.network}")
-            if symbol == "xyz:GOLD":
-                raise AqlaError(f"Configured Gold market xyz:GOLD is unavailable on {self.settings.network}; no substitute is used")
-            raise AqlaError("Source market cannot be resolved uniquely; no substitute market is used")
+            await self.unavailable_market(symbol, product, dex, normalized, unique)
         market = require_first(iter(unique.values()))
         if market.quote_token != "USDC" or market.product == "perp" and market.collateral_token != 0:
             raise AqlaError("Automatic risk sizing currently requires USDC quote currency")
         return market
+
+    async def unavailable_market(self, symbol, product, dex, normalized, unique):
+        if not unique and product == "perp":
+            from .models import SymbolUnavailable
+            meta = await self.info("meta", **({"dex": dex} if dex else {}))
+            if any(row["name"] == normalized and not row.get("isDelisted") for row in meta["universe"]):
+                raise AqlaError("Listed market has no usable fresh price data; market absence is not proved")
+            raise SymbolUnavailable(f"Market {symbol} is unavailable/delisted on Hyperliquid {self.settings.network}")
+        if symbol == "xyz:GOLD":
+            raise AqlaError(f"Configured Gold market xyz:GOLD is unavailable on {self.settings.network}; no substitute is used")
+        raise AqlaError("Source market cannot be resolved uniquely; no substitute market is used")
 
     async def account_snapshot(self, market: Market):
         if self.settings.shared_account and market.product == "perp":

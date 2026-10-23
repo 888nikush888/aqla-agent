@@ -474,8 +474,7 @@ class Trading:
         except AqlaError as error:
             raise ConfigurationChanged(str(error)) from error
 
-    def validate_admission(self, snapshot, plan, account=None, *, owned=False, allowed_prepared=(), allowed_sending=(), waverider=False):
-        self.assert_plan_binding(snapshot, plan)
+    def validate_selected_execution(self, snapshot, plan):
         saved = snapshot["plans"].get(plan.plan_id, {})
         if saved.get("liquidity_candidate") and not saved.get("liquidity_selected"):
             raise AqlaError("Another venue owns this setup's selected execution")
@@ -486,11 +485,15 @@ class Trading:
                     or Decimal(parent.get("filled_quantity", "0")) or not parent.get("entries_disabled")
                     or parent.get("rerouted_to_plan_id") != plan.plan_id):
                 raise AqlaError("Previous venue has not released this setup with proved zero fills")
-        self.invoke_hook("express_admission", snapshot, plan)
+
+    @staticmethod
+    def validate_unsent_source_authority(snapshot, plan, owned):
         if not owned:
             from .express import require_source_access
             for event_id in plan.source_revisions.values():
                 require_source_access(snapshot, event_id)
+
+    def validate_entry_readiness(self, snapshot, plan, owned):
         if any(row.get("protection_observation_pending") and row["status"] in OPEN for row in snapshot["trades"].values()):
             raise TemporaryObservation("read_unavailable", "protection", "transport")
         if owned and snapshot["trades"][plan.trade_id]["status"] not in OPEN:
@@ -498,71 +501,115 @@ class Trading:
         self.validate_configuration(snapshot, plan)
         if any(row.get("quantity_evidence_pending") and row["status"] in OPEN for row in snapshot["trades"].values()):
             raise AqlaError("Own entry quantity evidence requires reconciliation before new exposure")
-        if waverider:
-            from .waverider import ended
-            trade = snapshot["trades"].get(plan.trade_id, {})
-            wave = trade.get("waverider", {})
-            if trade.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE:
-                raise AqlaError("A pending stop update blocks Waverider reentry")
-            if (not owned or trade.get("lifecycle_version") != 2 or plan.policy.management_mode != "waverider"
-                    or trade.get("entries_disabled") or wave.get("phase") != "pending_reenter"
-                    or ended(plan, trade) or not any(row["kind"] == "waverider" and not row.get("not_sent")
-                        and row["operation_id"] == wave.get("operation_id") and row.get("cycle", 0) == wave.get("cycle", 0)
-                        and row["operation_id"] in (*allowed_prepared, *allowed_sending) for row in trade["entry_orders"])):
-                raise AqlaError("Waverider reentry has no active owned cycle")
-        if now_ms() >= plan.deadline_at and not (waverider and plan.policy.waverider_lifetime == "until_target"):
-            raise AqlaError("Entry plan deadline expired")
+
+    @staticmethod
+    def entry_matches_cycle(row, wave, allowed_prepared, allowed_sending):
+
+        return (row["kind"] == "waverider" and not row.get("not_sent")
+                and row["operation_id"] == wave.get("operation_id")
+                and row.get("cycle", 0) == wave.get("cycle", 0)
+                and row["operation_id"] in (*allowed_prepared, *allowed_sending))
+
+    def validate_cycle_admission(self, snapshot, plan, owned, allowed_prepared, allowed_sending):
+        from .waverider import ended
+        trade = snapshot["trades"].get(plan.trade_id, {})
+        wave = trade.get("waverider", {})
+        if trade.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE:
+            raise AqlaError("A pending stop update blocks Waverider reentry")
+        if (not owned or trade.get("lifecycle_version") != 2 or plan.policy.management_mode != "waverider"
+                or trade.get("entries_disabled") or wave.get("phase") != "pending_reenter"
+                or ended(plan, trade) or not any(self.entry_matches_cycle(row, wave, allowed_prepared, allowed_sending) for row in trade["entry_orders"])):
+            raise AqlaError("Waverider reentry has no active owned cycle")
+
+    @staticmethod
+    def confirmed_stop_revisions(snapshot, plan):
+        return {ref: event for request in snapshot["trades"].get(plan.trade_id, {}).get("stop_update_history", {}).values()
+            if request["phase"] == "confirmed" and request["source_binding"]["trade_id"] == plan.trade_id
+            and request["source_binding"]["kind"] in ("move_stop", "break_even")
+            and snapshot["bindings"].get(request["operation_id"]) == request["source_binding"]
+            for ref, event in request["source_revisions"].items() if snapshot["events"].get(event, {}).get("status") == "updated"}
+
+    def validate_source_revision(self, snapshot, plan, waverider):
         revisions = self.source_revisions(snapshot, plan.source_refs)
         if revisions != plan.source_revisions:
-            confirmed = {ref: event for request in snapshot["trades"].get(plan.trade_id, {}).get("stop_update_history", {}).values()
-                if request["phase"] == "confirmed" and request["source_binding"]["trade_id"] == plan.trade_id
-                and request["source_binding"]["kind"] in ("move_stop", "break_even")
-                and snapshot["bindings"].get(request["operation_id"]) == request["source_binding"]
-                for ref, event in request["source_revisions"].items() if snapshot["events"].get(event, {}).get("status") == "updated"}
+            confirmed = self.confirmed_stop_revisions(snapshot, plan)
             # An acknowledged stop edit authorizes this owned wave, never an old original entry.
             if not (waverider and revisions.keys() == plan.source_revisions.keys()
                     and all(event == plan.source_revisions[ref] or confirmed.get(ref) == event for ref, event in revisions.items())):
                 raise AqlaError("Source changed after preview; the old unsent plan cannot execute")
+
+    def validate_source_subscription(self, snapshot, plan):
         subscribed = {*snapshot["sources"], *snapshot.get("source_aliases", {}).values()}
         for row in latest_sources(snapshot["events"], plan.source_refs).values():
             source = row["source"]
             forwarded = row.get("native_forward") and source["chat_id"] == self.exchange.settings.telegram_owner_id
             if source["chat_id"] not in subscribed and not forwarded:
                 raise AqlaError("Source is no longer subscribed; no unsent exposure may execute")
-        active = [trade for key, trade in snapshot["trades"].items() if trade["status"] in OPEN and (not owned or key != plan.trade_id)]
-        limits = self.state.limits(plan) if hasattr(self.state, "limits") else plan.policy
+
+    def validate_entry_reservations(self, snapshot, plan, owned, active, limits, allowed_prepared, allowed_sending):
         if len(active) >= limits.max_open_trades or any(trade["plan"]["market"]["asset_id"] == plan.market.asset_id for trade in active):
             raise AqlaError("Trade admission changed after preview")
         for ref in plan.source_refs:
             binding = snapshot["bindings"].get(ref)
             if binding and (not owned or binding["trade_id"] != plan.trade_id):
                 raise AqlaError("Source has already been consumed")
+        self.validate_unresolved_entry_operations(snapshot, allowed_prepared, allowed_sending)
+
+    @staticmethod
+    def validate_unresolved_entry_operations(snapshot, allowed_prepared, allowed_sending):
         if any(row["phase"] in ("prepared", "sending", "unknown") and not (identity in allowed_prepared and row["phase"] == "prepared" or identity in allowed_sending and row["phase"] == "sending")
                for identity, row in snapshot["operations"].items()):
             raise AqlaError("Unresolved exchange operations must be reconciled before new exposure")
+
+    def validate_entry_ownership(self, snapshot, plan, account, owned):
+        if account.position_size is None:
+            raise AqlaError("Current exchange position is unknown; no new exposure")
+        if account.position_size != 0:
+            trade = snapshot["trades"].get(plan.trade_id, {}) if owned else {}
+            if trade.get("lifecycle_version") != 2 or self.entry_not_sent(snapshot, trade):
+                raise AqlaError("Current exchange exposure has no free logical owner; no additional entry")
+            self.owned_remaining(plan.trade_id, account.position_size)
+
+    @staticmethod
+    def validate_entry_inventory(snapshot, plan, account, limits, owned):
+        if account.positions is not None:
+            markets = occupied_markets(snapshot, account, exclude_trade=plan.trade_id if owned else None)
+            if owned and snapshot["trades"][plan.trade_id].get("lifecycle_version") == 2:
+                markets.discard(plan.market.symbol)
+            if len(markets) >= limits.max_open_trades:
+                raise AqlaError("Combined manual/Aqla market limit changed before entry")
+            if foreign_entry_orders(snapshot, account, plan.market.symbol):
+                raise AqlaError("Manual entry orders now reserve this market")
+
+    def validate_entry_account(self, snapshot, plan, account, active, limits, owned):
+        reserved = sum(Decimal(trade["reserved_risk"]) for trade in active)
+        if not 0 <= now_ms() - account.observed_at <= 10000:
+            raise TemporaryObservation("account_stale", "account")
+        self.validate_entry_ownership(snapshot, plan, account, owned)
+        self.validate_entry_inventory(snapshot, plan, account, limits, owned)
+        if (plan.risk_usdc + reserved > account.equity * limits.max_total_risk_percent / 100
+                or plan.risk_usdc > account.equity * plan.policy.risk_percent / 100
+                or plan.quantity * plan.entry_limit / margin_leverage(plan.effective_leverage, plan.market) > account.available_margin):
+            raise EntryBudgetChanged("Current equity/margin no longer permits this exact plan")
+
+
+    def validate_admission(self, snapshot, plan, account=None, *, owned=False, allowed_prepared=(), allowed_sending=(), waverider=False):
+        self.assert_plan_binding(snapshot, plan)
+        self.validate_selected_execution(snapshot, plan)
+        self.invoke_hook("express_admission", snapshot, plan)
+        self.validate_unsent_source_authority(snapshot, plan, owned)
+        self.validate_entry_readiness(snapshot, plan, owned)
+        if waverider:
+            self.validate_cycle_admission(snapshot, plan, owned, allowed_prepared, allowed_sending)
+        if now_ms() >= plan.deadline_at and not (waverider and plan.policy.waverider_lifetime == "until_target"):
+            raise AqlaError("Entry plan deadline expired")
+        self.validate_source_revision(snapshot, plan, waverider)
+        self.validate_source_subscription(snapshot, plan)
+        active = [trade for key, trade in snapshot["trades"].items() if trade["status"] in OPEN and (not owned or key != plan.trade_id)]
+        limits = self.state.limits(plan) if hasattr(self.state, "limits") else plan.policy
+        self.validate_entry_reservations(snapshot, plan, owned, active, limits, allowed_prepared, allowed_sending)
         if account is not None:
-            reserved = sum(Decimal(trade["reserved_risk"]) for trade in active)
-            if not 0 <= now_ms() - account.observed_at <= 10000:
-                raise TemporaryObservation("account_stale", "account")
-            if account.position_size is None:
-                raise AqlaError("Current exchange position is unknown; no new exposure")
-            if account.position_size != 0:
-                trade = snapshot["trades"].get(plan.trade_id, {}) if owned else {}
-                if trade.get("lifecycle_version") != 2 or self.entry_not_sent(snapshot, trade):
-                    raise AqlaError("Current exchange exposure has no free logical owner; no additional entry")
-                self.owned_remaining(plan.trade_id, account.position_size)
-            if account.positions is not None:
-                markets = occupied_markets(snapshot, account, exclude_trade=plan.trade_id if owned else None)
-                if owned and snapshot["trades"][plan.trade_id].get("lifecycle_version") == 2:
-                    markets.discard(plan.market.symbol)
-                if len(markets) >= limits.max_open_trades:
-                    raise AqlaError("Combined manual/Aqla market limit changed before entry")
-                if foreign_entry_orders(snapshot, account, plan.market.symbol):
-                    raise AqlaError("Manual entry orders now reserve this market")
-            if (plan.risk_usdc + reserved > account.equity * limits.max_total_risk_percent / 100
-                    or plan.risk_usdc > account.equity * plan.policy.risk_percent / 100
-                    or plan.quantity * plan.entry_limit / margin_leverage(plan.effective_leverage, plan.market) > account.available_margin):
-                raise EntryBudgetChanged("Current equity/margin no longer permits this exact plan")
+            self.validate_entry_account(snapshot, plan, account, active, limits, owned)
 
     async def positions(self, market):
         if market.product == "spot":
@@ -1068,6 +1115,49 @@ class Trading:
             self.patch_trade(plan.trade_id, status="preparing")
         return self.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
 
+    @staticmethod
+    def preserve_stop_revision(state, row, old, changed, preserve_pending_stop):
+        pending = row.get("pending_stop_update")
+        original_pending = old.get("pending_stop_update")
+        if (preserve_pending_stop and "management_revision" in changed and pending and original_pending
+                and pending["phase"] in STOP_UPDATE_ACTIVE and pending["management_revision"] == row["management_revision"]
+                and all(pending[key] == original_pending[key] for key in ("stop", "source_binding", "operation_id"))
+                and state["bindings"].get(pending["operation_id"]) == pending["source_binding"]):
+            pending["management_revision"] = changed["management_revision"]
+
+    @staticmethod
+    def propagate_observation_retry(state, row, trade_id):
+        if row["status"] in ("rejected", "cancelled") and row.get("observation_retry"):
+            row["observation_retry"].update(exhausted=True, completed=True, attempt_inflight=False)
+        if row.get("observation_retry"):
+            state["plans"][row["plan"]["plan_id"]]["observation_retry"] = row["observation_retry"].copy()
+            for target in state["events"][row["event_id"]].get("targets", {}).values():
+                if target.get("trade_id") == trade_id or target.get("plan_id") == row["plan"]["plan_id"]:
+                    target.update(status=row["status"], observation_retry=row["observation_retry"].copy())
+
+    @staticmethod
+    def visible_trade_changes(state, row, old, changed, trade_id):
+        important = {key: value for key, value in changed.items() if key in ("status", "filled_quantity", "remaining_quantity", "stop_price", "tp_filled", "maker_target_rejection")}
+        if row.get("lifecycle_version") and row["status"] == "closed":
+            from .lifecycle import record_lifecycle
+            record_lifecycle(state, trade_id, "closed")
+            return {}
+        if row.get("lifecycle_version") and old["status"] in ("preparing", "opening") and row["status"] == "protecting":
+            important = {}
+        if row.get("lifecycle_version") and row["status"] == "open" and old["status"] == "protecting":
+            important = {key: value for key, value in important.items() if key != "status"}
+        return important
+
+    @staticmethod
+    def announce_trade_change(state, row, old, changed, trade_id):
+        important = Trading.visible_trade_changes(state, row, old, changed, trade_id)
+        if important and row["status"] not in ("preparing", "opening"):
+            identity = digest([trade_id, important])[:32]
+            chat = state["trades"][trade_id]["chat_id"]
+            state["notifications"].setdefault(identity, {"trade_id": trade_id, "change": important, "observed_at": now_ms(),
+                "previous": {key: old.get(key) for key in important},
+                "source_id": chat, "source_name": state.get("source_names", {}).get(chat)})
+
     def patch_trade(self, trade_id, *, preserve_pending_stop=False, **values):
         old = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         changed = {key: value for key, value in values.items() if old.get(key) != value}
@@ -1076,36 +1166,10 @@ class Trading:
 
         def patch(state):
             row = state["trades"][trade_id]
-            pending = row.get("pending_stop_update")
-            original_pending = old.get("pending_stop_update")
-            if (preserve_pending_stop and "management_revision" in changed and pending and original_pending
-                    and pending["phase"] in STOP_UPDATE_ACTIVE and pending["management_revision"] == row["management_revision"]
-                    and all(pending[key] == original_pending[key] for key in ("stop", "source_binding", "operation_id"))
-                    and state["bindings"].get(pending["operation_id"]) == pending["source_binding"]):
-                pending["management_revision"] = changed["management_revision"]
+            self.preserve_stop_revision(state, row, old, changed, preserve_pending_stop)
             row.update(changed)
-            if row["status"] in ("rejected", "cancelled") and row.get("observation_retry"):
-                row["observation_retry"].update(exhausted=True, completed=True, attempt_inflight=False)
-            if row.get("observation_retry"):
-                state["plans"][row["plan"]["plan_id"]]["observation_retry"] = row["observation_retry"].copy()
-                for target in state["events"][row["event_id"]].get("targets", {}).values():
-                    if target.get("trade_id") == trade_id or target.get("plan_id") == row["plan"]["plan_id"]:
-                        target.update(status=row["status"], observation_retry=row["observation_retry"].copy())
-            important = {key: value for key, value in changed.items() if key in ("status", "filled_quantity", "remaining_quantity", "stop_price", "tp_filled", "maker_target_rejection")}
-            if row.get("lifecycle_version") and row["status"] == "closed":
-                from .lifecycle import record_lifecycle
-                record_lifecycle(state, trade_id, "closed")
-                return
-            if row.get("lifecycle_version") and old["status"] in ("preparing", "opening") and row["status"] == "protecting":
-                important = {}
-            if row.get("lifecycle_version") and row["status"] == "open" and old["status"] == "protecting":
-                important = {key: value for key, value in important.items() if key != "status"}
-            if important and row["status"] not in ("preparing", "opening"):
-                identity = digest([trade_id, important])[:32]
-                chat = state["trades"][trade_id]["chat_id"]
-                state["notifications"].setdefault(identity, {"trade_id": trade_id, "change": important, "observed_at": now_ms(),
-                    "previous": {key: old.get(key) for key in important},
-                    "source_id": chat, "source_name": state.get("source_names", {}).get(chat)})
+            self.propagate_observation_retry(state, row, trade_id)
+            self.announce_trade_change(state, row, old, changed, trade_id)
 
         self.state.update(patch)
 
@@ -2108,6 +2172,11 @@ class Trading:
         self.state.update(stage)
         return await self.dispatch_close_intent(trade_id, intent)
 
+    @staticmethod
+    def submitted_owned_order(trade, row):
+        return (not row.get("not_sent")
+                and trade.get("order_observations", {}).get(row["cloid"], {}).get("status") not in TERMINAL_ORDER)
+
     async def cancel_owned_orders(self, trade_id, include_sl=False, operation_id=None):
         from .target_recovery import absence_proved
         trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
@@ -2117,7 +2186,7 @@ class Trading:
         if include_sl and trade.get("lifecycle_version") == 2:
             orders.extend(row for row in trade.get("exit_orders", []) if row["kind"] in ("waverider", "waverider_retirement") and not row.get("not_sent"))
         if trade.get("lifecycle_version") == 2:
-            orders = [row for row in orders if not row.get("not_sent") and trade.get("order_observations", {}).get(row["cloid"], {}).get("status") not in TERMINAL_ORDER]
+            orders = [row for row in orders if self.submitted_owned_order(trade, row)]
         operations = self.state.read("operations")["operations"]
         orders = [row for row in orders if not absence_proved(operations, row)]
         if not orders:

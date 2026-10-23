@@ -41,6 +41,8 @@ async def lost_target(setup, signal, monkeypatch):
 
 
 @pytest.mark.asyncio
+# Sequential safety assertions; control flow (including test doubles): 6.
+# skipcq: PY-R1000
 async def test_expired_target_absence_retires_exact_generation_then_restores_once(setup, signal, monkeypatch):
     state, fake, exchange, trading, trade, staged, _ = await lost_target(setup, signal, monkeypatch)
     before = copy.deepcopy(fake.actions)

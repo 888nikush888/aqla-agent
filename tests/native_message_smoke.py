@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
+# Sequential safety assertions; control flow (including test doubles): 5.
+# skipcq: PY-R1000
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--hermes-source', required=True)

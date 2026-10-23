@@ -242,37 +242,43 @@ class HermesExtension:
 
 
 
+    async def refresh_reader_configuration(self):
+        metadata = reader_metadata_token(self.settings, self.config_path)
+        if self._reader_metadata is not None and metadata != self._reader_metadata:
+            config_changed = metadata[0] != self._reader_metadata[0]
+            self._reader_metadata = metadata
+            self.reader_retry.reset()
+            await self.close_reader()
+            if config_changed:
+                self._reader_configuration_valid = False
+                try:
+                    fresh = Settings.load(self.config_path)
+                except Exception:
+                    raise SourceAccessError("reader_configuration_unreadable") from None
+                for name in ("telegram_api_id", "telegram_api_hash_file", "telegram_session_file"):
+                    setattr(self.settings, name, getattr(fresh, name))
+                self._reader_configuration_valid = True
+        self._reader_metadata = reader_metadata_token(self.settings, self.config_path)
+
+    async def refresh_reader_selection(self):
+        if self.reader_retry.attempts:
+            try:
+                overview = await self.call("snapshot")
+            except Exception:
+                if self.reader_retry.ready():
+                    raise
+            else:
+                selection = tuple(overview.get("sources", ()))
+                if self._reader_selection is not None and selection != self._reader_selection:
+                    self.reader_retry.reset()
+                self._reader_selection = selection
+
     async def reader_worker(self):
         try:
             while True:
                 try:
-                    metadata = reader_metadata_token(self.settings, self.config_path)
-                    if self._reader_metadata is not None and metadata != self._reader_metadata:
-                        config_changed = metadata[0] != self._reader_metadata[0]
-                        self._reader_metadata = metadata
-                        self.reader_retry.reset()
-                        await self.close_reader()
-                        if config_changed:
-                            self._reader_configuration_valid = False
-                            try:
-                                fresh = Settings.load(self.config_path)
-                            except Exception:
-                                raise SourceAccessError("reader_configuration_unreadable") from None
-                            for name in ("telegram_api_id", "telegram_api_hash_file", "telegram_session_file"):
-                                setattr(self.settings, name, getattr(fresh, name))
-                            self._reader_configuration_valid = True
-                    self._reader_metadata = reader_metadata_token(self.settings, self.config_path)
-                    if self.reader_retry.attempts:
-                        try:
-                            overview = await self.call("snapshot")
-                        except Exception:
-                            if self.reader_retry.ready():
-                                raise
-                        else:
-                            selection = tuple(overview.get("sources", ()))
-                            if self._reader_selection is not None and selection != self._reader_selection:
-                                self.reader_retry.reset()
-                            self._reader_selection = selection
+                    await self.refresh_reader_configuration()
+                    await self.refresh_reader_selection()
                     if not self.reader_retry.ready():
                         await asyncio.sleep(min(3, self.reader_retry.deadline - self.reader_retry.clock()))
                         continue
@@ -306,6 +312,76 @@ class HermesExtension:
             except Exception as error:
                 LOG.warning("aqla reader disconnect failed (%s)", SourceAccessError.from_error(error).code)
 
+    async def hybrid_worker_tick(self, reader_signature, reader_changed):
+        await self.source_worker.bind()
+        observed = await self.call("snapshot")
+        blocked_signature = observed.get("source_queue", {}).get("blocked_signature")
+        if self._reader_status_observed and (reader_changed or not self._reader_notice_observed):
+            await self.source_worker.internal("source_notice", failure_code=(self.reader_error or {}).get("code", "reader_recovered"),
+                                              processing_version=reader_signature, notice_sources=(self.reader_error or {}).get("sources", []))
+            self.reported_reader_error = self.reader_error.copy() if self.reader_error else None
+            self._reader_notice_observed = True
+        if blocked_signature != self.reported_blocked_signature or not self._blocked_notice_observed:
+            await self.source_worker.internal("source_notice", failure_code="source_conflict" if blocked_signature else "source_conflict_resolved",
+                                              processing_version=blocked_signature or "clear")
+            self.reported_blocked_signature = blocked_signature
+            self._blocked_notice_observed = True
+        await self.source_worker.tick()
+
+    async def legacy_worker_notices(self, snapshot, reader_signature, reader_changed, blocked_signature):
+        reader_notice_due = self._reader_status_observed and (reader_changed or not self._reader_notice_observed)
+        try:
+            if reader_notice_due:
+                await self.setup_request("source_notice", failure_code=(self.reader_error or {}).get("code", "reader_recovered"),
+                    processing_version=reader_signature, notice_sources=(self.reader_error or {}).get("sources", []))
+                self._reader_notice_observed = True
+            if blocked_signature != self.reported_blocked_signature:
+                await self.setup_request("source_notice", failure_code="source_conflict" if blocked_signature else "source_conflict_resolved",
+                    processing_version=blocked_signature or "clear")
+            if reader_notice_due or blocked_signature != self.reported_blocked_signature:
+                snapshot = await self.call("snapshot")
+        except Exception:
+            LOG.warning("aqla source notice unavailable; ready work remains actionable")
+        self.reported_reader_error = self.reader_error.copy() if self.reader_error else None
+        self.reported_blocked_signature = blocked_signature
+        return snapshot
+
+    def wake_pending_work(self, snapshot, queue, blocked_signature, reader_changed):
+        pending = snapshot["pending"] or snapshot.get("source_queue", {}).get("recovery_total", 0) > 0
+        if pending:
+            self.yield_clarification()
+        work = {"queue": queue, "pending": snapshot["pending"]}
+        due = self.wake_schedule.due(work, time.monotonic(), self.last_wake, busy=self.turns_active > 0)
+        if self.efficiency.get("wake_coalescing", True):
+            wake = bool(pending) and due
+        else:
+            wake = pending and time.monotonic() - self.last_wake >= 30
+        if wake:
+            text, offset, selected_ids = self.wake_payload(snapshot, queue, blocked_signature, reader_changed)
+            if self.ctx.inject_message(text, session_key=self.session_key):
+                self.last_wake = time.monotonic()
+                self.wake_schedule.accepted(self.last_wake)
+                self.source_offset = offset + len(selected_ids)
+                self.reported_reader_error = self.reader_error
+                self.reported_blocked_signature = blocked_signature
+
+    def wake_payload(self, snapshot, queue, blocked_signature, reader_changed):
+        text = WAKE
+        pending_ids = snapshot["pending"]
+        offset = self.source_offset % len(pending_ids) if pending_ids else 0
+        selected_ids = (pending_ids[offset:] + pending_ids[:offset])[:8]
+        observed = {"ready_total": queue.get("ready_total", len(snapshot["pending"])),
+                    "ready_ids": selected_ids, "blocked_total": queue.get("blocked_total", 0),
+                    "blocked_ids": queue.get("blocked", [])[:8], "blocked_signature": blocked_signature,
+                    "recovery_total": queue.get("recovery_total", 0), "recovery_ids": queue.get("recovery", [])[:8],
+                    "recovery_operation_ids": queue.get("recovery_operations", [])[:8],
+                    "notification_pending": snapshot["notification_pending"]}
+        text += "\nBeobachtete Warteschlange: " + json.dumps(observed, ensure_ascii=False)
+        if reader_changed:
+            text += "\nQuellenleserstatus: " + json.dumps(self.reader_error or {"code": "reader_recovered", "sources": []}, ensure_ascii=False)
+            text += ". Nur die neue Backend-Ereignismeldung verarbeiten; vorhandene Ready-Arbeit weiterbearbeiten."
+        return text, offset, selected_ids
+
     async def worker(self):
         """Durable wakeups remain independent of reader startup, I/O and failures."""
         while True:
@@ -314,70 +390,14 @@ class HermesExtension:
                 reader_signature = reader_notice_signature(self.reader_error)
                 reader_changed = reader_signature != reader_notice_signature(self.reported_reader_error)
                 if self.source_worker.config.mode == "hybrid":
-                    await self.source_worker.bind()
-                    observed = await self.call("snapshot")
-                    blocked_signature = observed.get("source_queue", {}).get("blocked_signature")
-                    if self._reader_status_observed and (reader_changed or not self._reader_notice_observed):
-                        await self.source_worker.internal("source_notice", failure_code=(self.reader_error or {}).get("code", "reader_recovered"),
-                                                          processing_version=reader_signature, notice_sources=(self.reader_error or {}).get("sources", []))
-                        self.reported_reader_error = self.reader_error.copy() if self.reader_error else None
-                        self._reader_notice_observed = True
-                    if blocked_signature != self.reported_blocked_signature or not self._blocked_notice_observed:
-                        await self.source_worker.internal("source_notice", failure_code="source_conflict" if blocked_signature else "source_conflict_resolved",
-                                                          processing_version=blocked_signature or "clear")
-                        self.reported_blocked_signature = blocked_signature
-                        self._blocked_notice_observed = True
-                    await self.source_worker.tick()
+                    await self.hybrid_worker_tick(reader_signature, reader_changed)
                     await asyncio.sleep(3)
                     continue
                 snapshot = await self.call("snapshot")
                 queue = snapshot.get("source_queue", {})
                 blocked_signature = queue.get("blocked_signature")
-                reader_notice_due = self._reader_status_observed and (reader_changed or not self._reader_notice_observed)
-                try:
-                    if reader_notice_due:
-                        await self.setup_request("source_notice", failure_code=(self.reader_error or {}).get("code", "reader_recovered"),
-                            processing_version=reader_signature, notice_sources=(self.reader_error or {}).get("sources", []))
-                        self._reader_notice_observed = True
-                    if blocked_signature != self.reported_blocked_signature:
-                        await self.setup_request("source_notice", failure_code="source_conflict" if blocked_signature else "source_conflict_resolved",
-                            processing_version=blocked_signature or "clear")
-                    if reader_notice_due or blocked_signature != self.reported_blocked_signature:
-                        snapshot = await self.call("snapshot")
-                except Exception:
-                    LOG.warning("aqla source notice unavailable; ready work remains actionable")
-                self.reported_reader_error = self.reader_error.copy() if self.reader_error else None
-                self.reported_blocked_signature = blocked_signature
-                pending = snapshot["pending"] or snapshot.get("source_queue", {}).get("recovery_total", 0) > 0
-                if pending:
-                    self.yield_clarification()
-                work = {"queue": queue, "pending": snapshot["pending"]}
-                due = self.wake_schedule.due(work, time.monotonic(), self.last_wake, busy=self.turns_active > 0)
-                if self.efficiency.get("wake_coalescing", True):
-                    wake = bool(pending) and due
-                else:
-                    wake = pending and time.monotonic() - self.last_wake >= 30
-                if wake:
-                    text = WAKE
-                    pending_ids = snapshot["pending"]
-                    offset = self.source_offset % len(pending_ids) if pending_ids else 0
-                    selected_ids = (pending_ids[offset:] + pending_ids[:offset])[:8]
-                    observed = {"ready_total": queue.get("ready_total", len(snapshot["pending"])),
-                                "ready_ids": selected_ids, "blocked_total": queue.get("blocked_total", 0),
-                                "blocked_ids": queue.get("blocked", [])[:8], "blocked_signature": blocked_signature,
-                                "recovery_total": queue.get("recovery_total", 0), "recovery_ids": queue.get("recovery", [])[:8],
-                                "recovery_operation_ids": queue.get("recovery_operations", [])[:8],
-                                "notification_pending": snapshot["notification_pending"]}
-                    text += "\nBeobachtete Warteschlange: " + json.dumps(observed, ensure_ascii=False)
-                    if reader_changed:
-                        text += "\nQuellenleserstatus: " + json.dumps(self.reader_error or {"code": "reader_recovered", "sources": []}, ensure_ascii=False)
-                        text += ". Nur die neue Backend-Ereignismeldung verarbeiten; vorhandene Ready-Arbeit weiterbearbeiten."
-                    if self.ctx.inject_message(text, session_key=self.session_key):
-                        self.last_wake = time.monotonic()
-                        self.wake_schedule.accepted(self.last_wake)
-                        self.source_offset = offset + len(selected_ids)
-                        self.reported_reader_error = self.reader_error
-                        self.reported_blocked_signature = blocked_signature
+                snapshot = await self.legacy_worker_notices(snapshot, reader_signature, reader_changed, blocked_signature)
+                self.wake_pending_work(snapshot, queue, blocked_signature, reader_changed)
             except Exception as error:
                 LOG.warning("aqla durable wake unavailable (%s); work remains pending", type(error).__name__)
             await asyncio.sleep(3)

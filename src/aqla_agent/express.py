@@ -40,17 +40,17 @@ def require_source_access(snapshot, event_id):
         raise AqlaError("Source revision is owned by express; use its existing outcome")
 
 
-def compile_template(source: SourceEvent):
-    """A draft is never admission. Historical replay may inspect unchanged text."""
-    if (source.media != "text" or any((source.edited_at is not None, source.reply_to_id,
-            source.thread_id, source.album_id, source.forward_from))):
-        return None
+def template_lines(text):
     lines, offset = [], 0
-    for raw in source.text.splitlines(keepends=True):
+    for raw in text.splitlines(keepends=True):
         text = raw.strip()
         if text:
             lines.append((offset + len(raw) - len(raw.lstrip()), text))
         offset += len(raw)
+    return lines
+
+
+def template_header(lines):
     if not lines:
         return None
     first = 0
@@ -62,75 +62,104 @@ def compile_template(source: SourceEvent):
     header = HEADER.fullmatch(lines[first][1])
     if header is None:
         return None
-    ref = source.source_id
-    packet = {"messages": [{"text": source.text, "source_id": ref, "event_id": source.event_id}]}
-    try:
-        spans = candidates(packet)
-    except ValueError:
-        return None
-    proofs: list[Evidence] = []
-    values: dict[str, Any] = {}
-    targets: list[Decimal] = []
+    return first, header
 
-    def proof(field, quote):
-        proofs.append(Evidence(field=field, source_id=ref, quote=quote))
 
-    def number(field, match, name, origin):
+class TemplateDraft:
+    """One whole-message draft using the existing original-span candidates."""
+
+    def __init__(self, source, header, spans):
+        self.source, self.ref, self.spans = source, source.source_id, spans
+        self.proofs: list[Evidence] = []
+        self.values: dict[str, Any] = {}
+        self.targets: list[Decimal] = []
+        self.symbol = header["symbol"] or header["symbol_first"]
+        self.side = header["side"] or header["side_last"]
+        self.proof("symbol", self.symbol)
+        self.proof("side", self.side)
+
+    def proof(self, field, quote):
+        self.proofs.append(Evidence(field=field, source_id=self.ref, quote=quote))
+
+    def number(self, field, match, name, origin):
         start, end = match.span(name)
-        found = {span.value for span in spans if span.kind == "number" and span.notation == "value"
-                 and span.start == origin + start and (span.end == origin + end or field == "leverage"
-                     and origin + end <= span.end <= origin + match.end())}
+        found = {span.value for span in self.spans if span.kind == 'number' and span.notation == 'value' and (span.start == origin + start) and (span.end == origin + end or (field == 'leverage' and origin + end <= span.end <= origin + match.end()))}
         if len(found) != 1:
-            raise ValueError("Numeric original is not uniquely interpreted")
+            raise ValueError('Numeric original is not uniquely interpreted')
         value = Decimal(found.pop())
         if value <= 0:
-            raise ValueError("Nonpositive source value")
-        proof(field, match[0] if field in ("leverage", "stop_loss") or field.startswith("take_profits.")
-              else source.text[origin + start:origin + end])
+            raise ValueError('Nonpositive source value')
+        self.proof(field, match[0] if field in ('leverage', 'stop_loss') or field.startswith('take_profits.') else self.source.text[origin + start:origin + end])
         return value
 
-    symbol = header["symbol"] or header["symbol_first"]
-    side = header["side"] or header["side_last"]
-    proof("symbol", symbol)
-    proof("side", side)
-    try:
-        for origin, line in lines[first + 1:]:
-            if match := ENTRY.fullmatch(line):
-                if "entry" in values:
-                    return None
-                body = match["body"]
-                body_origin = origin + match.start("body")
-                if prices := RANGE.fullmatch(body):
-                    ordered = sorted((Decimal(prices[name].replace(",", ".")), name) for name in ("first", "second"))
-                    values.update(entry="range", entry_prices=[number(f"entry_prices.{i}", prices, name, body_origin)
-                                                               for i, (_, name) in enumerate(ordered)])
-                elif order := ORDER.fullmatch(body):
-                    market = order["form"].lower() in ("market", "рынок", "по рынку", "markt")
-                    if not market and order["first"] is None:
-                        return None
-                    values.update(entry="market" if market else "limit", entry_prices=(
-                        [number("entry_prices.0", order, "first", body_origin)] if order["first"] else []))
-                else:
-                    return None
-                proof("entry", line)
-            elif match := TARGET.fullmatch(line):
-                index = int(match["index"] or match["tp_index"] or match["ziel_index"])
-                if index != len(targets) + 1 or index > 20:
-                    return None
-                targets.append(number(f"take_profits.{len(targets)}", match, "value", origin))
-            elif match := STOP.fullmatch(line):
-                if "stop_loss" in values:
-                    return None
-                values["stop_loss"] = number("stop_loss", match, "value", origin)
-            elif match := LEVERAGE.fullmatch(line):
-                if "leverage" in values:
-                    return None
-                values["leverage"] = number("leverage", match, "value", origin)
-            else:
-                return None
-        if "entry" not in values or "stop_loss" not in values or not targets:
+    def entry(self, match, origin):
+        if "entry" in self.values:
+            return False
+        body = match["body"]
+        body_origin = origin + match.start("body")
+        if prices := RANGE.fullmatch(body):
+            ordered = sorted((Decimal(prices[name].replace(",", ".")), name) for name in ("first", "second"))
+            self.values.update(entry="range", entry_prices=[self.number(f"entry_prices.{i}", prices, name, body_origin)
+                                                           for i, (_, name) in enumerate(ordered)])
+        elif order := ORDER.fullmatch(body):
+            market = order["form"].lower() in ("market", "рынок", "по рынку", "markt")
+            if not market and order["first"] is None:
+                return False
+            self.values.update(entry="market" if market else "limit", entry_prices=(
+                [self.number("entry_prices.0", order, "first", body_origin)] if order["first"] else []))
+        else:
+            return False
+        self.proof("entry", match[0])
+        return True
+
+    def target(self, match, origin):
+        index = int(match["index"] or match["tp_index"] or match["ziel_index"])
+        if index != len(self.targets) + 1 or index > 20:
+            return False
+        self.targets.append(self.number(f"take_profits.{len(self.targets)}", match, "value", origin))
+        return True
+
+    def unique_number(self, field, match, origin):
+        if field in self.values:
+            return False
+        self.values[field] = self.number(field, match, "value", origin)
+        return True
+
+    def line(self, origin, line):
+        if match := ENTRY.fullmatch(line):
+            return self.entry(match, origin)
+        if match := TARGET.fullmatch(line):
+            return self.target(match, origin)
+        if match := STOP.fullmatch(line):
+            return self.unique_number("stop_loss", match, origin)
+        if match := LEVERAGE.fullmatch(line):
+            return self.unique_number("leverage", match, origin)
+        return False
+
+    def interpretation(self):
+        if "entry" not in self.values or "stop_loss" not in self.values or not self.targets:
             return None
-        return Interpretation(kind="new_signal", source_refs=[ref], symbol=symbol, side="long" if side.upper() == "LONG" else "short",
-                              take_profits=targets, evidence=proofs, **values)
+        return Interpretation(kind="new_signal", source_refs=[self.ref], symbol=self.symbol,
+                              side="long" if self.side.upper() == "LONG" else "short",
+                              take_profits=self.targets, evidence=self.proofs, **self.values)
+
+
+def compile_template(source: SourceEvent):
+    """A draft is never admission. Historical replay may inspect unchanged text."""
+    if (source.media != "text" or any((source.edited_at is not None, source.reply_to_id,
+            source.thread_id, source.album_id, source.forward_from))):
+        return None
+    lines = template_lines(source.text)
+    selected = template_header(lines)
+    if selected is None:
+        return None
+    first, header = selected
+    packet = {"messages": [{"text": source.text, "source_id": source.source_id, "event_id": source.event_id}]}
+    try:
+        draft = TemplateDraft(source, header, candidates(packet))
+        for origin, line in lines[first + 1:]:
+            if not draft.line(origin, line):
+                return None
+        return draft.interpretation()
     except ValueError:
         return None
