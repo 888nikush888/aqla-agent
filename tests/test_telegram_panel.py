@@ -294,6 +294,40 @@ async def test_menu_cancel_revokes_an_unanswered_password_challenge(panel):
 
 
 @pytest.mark.asyncio
+async def test_removed_source_opened_from_old_selection_is_read_only_history(panel):
+    menu, bot, _, changes, *_ = panel
+    async def historical(*args, **kwargs):
+        return {"sources": {}, "inactive_sources": {"-103": {"active": False, "tier": "C"}}, "history": []}
+    menu.rpc = historical
+    await menu.run(bot, "source_details", "-103")
+    source = (bot.edits or bot.sent)[-1]
+    labels = [button["text"] for row in source["reply_markup"]["inline_keyboard"] for button in row]
+    assert "nicht mehr aktiv" in source["text"] and "Rang ändern" not in labels and not changes
+
+
+@pytest.mark.asyncio
+async def test_current_source_menu_resolves_alias_rank_and_excludes_retired_rows(panel):
+    menu, bot, data, changes, *_ = panel
+    data["sources"] = ["@current"]
+    data["source_aliases"] = {"@current": "-101", "@retired": "-102"}
+    await menu.run(bot, "sources")
+    text = (bot.edits or bot.sent)[-1]["text"]
+    assert "Kanalname · D" in text and "Zweiter Kanal" not in text
+    await menu.run(bot, "source_list")
+    assert "Kanalname" in str((bot.edits or bot.sent)[-1]["reply_markup"]) and not changes
+
+
+@pytest.mark.asyncio
+async def test_rank_picker_excludes_inactive_rows_even_from_an_old_status_response(panel):
+    menu, bot, data, changes, *_ = panel
+    data["sources"] = ["@current"]
+    data["source_aliases"] = {"@current": "-101", "@retired": "-102"}
+    await menu.commands.start(bot, "aqla_rang", "")
+    assert menu.commands.targets(menu.commands.dialog) == [("Kanalname · -101", "-101")]
+    assert not changes
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("navigation", ["Abbrechen", "⌂ Hauptmenü"])
 async def test_setup_started_from_menu_can_be_cancelled_through_actual_ingress(panel, navigation):
     menu, bot, _, changes, *_ = panel

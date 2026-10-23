@@ -28,7 +28,7 @@ from aqla_hyperliquid_mcp.state import State
 
 
 def rank_data(tier="F"):
-    return {"ranking_policy": RankingPolicy(enabled=True).model_dump(mode="json"), "ranking_revision": 1,
+    return {"sources": ["channel"], "ranking_policy": RankingPolicy(enabled=True).model_dump(mode="json"), "ranking_revision": 1,
             "source_ranks": {"channel": {"tier": tier, "bootstrap": tier == "C", "revision": 1, "evaluated": [], "up": None, "down": 0}},
             "ranking_history": {}, "notifications": {}, "trades": {}, "source_aliases": {}}
 

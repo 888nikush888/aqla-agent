@@ -354,8 +354,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
 
     @server.tool(annotations=read)
     async def ranking_status(source: str | None = None, history_limit: int = 30) -> dict:
-        """Read source tiers, net-R performance, proof/exclusions, policy and rank history. Never consumes new proof or changes ranks."""
-        from aqla_agent.ranking import source_key
+        """Read current configured source ranks. An explicit inactive source returns read-only inactive_sources/history; no cleanup or re-add/remove cycle is needed. Never changes ranks or subscriptions."""
+        from aqla_agent.ranking import active_sources, source_key
         from aqla_agent.sources import resolve_source
         data = state.read("ranking_policy", "ranking_revision", "source_ranks", "ranking_history", "source_names",
                           "sources", "source_aliases", "network", "venue_accounts", "venue_enabled", "account_enabled",
@@ -363,10 +363,17 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         if not 1 <= history_limit <= 100:
             raise AqlaError("Ranking history limit must be 1–100")
         selected = source_key(data, resolve_source(data, source)) if source else None
+        current = active_sources(data)
+        rows = {identity: {**row, "source_id": identity, "name": data.get("source_names", {}).get(identity, identity)}
+                for identity, row in status_view(data, include_inactive=selected is not None).items()
+                if selected is None or identity == selected}
+        history_sources = current if selected is None else {selected}
+        history = [row for row in data["ranking_history"].values() if source_key(data, row["source_id"]) in history_sources]
         return {"policy": data["ranking_policy"], "revision": data["ranking_revision"],
-                "sources": {identity: {**row, "source_id": identity, "name": data.get("source_names", {}).get(identity, identity)}
-                            for identity, row in status_view(data).items() if selected is None or identity == selected},
-                "history": sorted([row for row in data["ranking_history"].values() if selected is None or row["source_id"] == selected], key=lambda row: row["time"], reverse=True)[:history_limit],
+                "sources": {identity: row for identity, row in rows.items() if row["active"]},
+                "inactive_sources": {identity: row for identity, row in rows.items() if not row["active"]},
+                "inactive_source_policy": "Historical evidence is retained automatically, not an active subscription or cleanup task. Never re-add/remove sources to hide history.",
+                "history": sorted(history, key=lambda row: row["time"], reverse=True)[:history_limit],
                 "execution_accounts": trading.accounts_ready(data), "basis": "net_R_per_original_signal_setup"}
 
     @server.tool(annotations=read)

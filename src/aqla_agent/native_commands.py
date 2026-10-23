@@ -302,8 +302,10 @@ class NativeCommands:
     def targets(self, dialog):
         snapshot = dialog.snapshot
         if dialog.command == "aqla_rang":
+            from .ranking import active_sources, source_key
+            selected = active_sources(snapshot)
             return [(snapshot.get("source_names", {}).get(identity, identity) + " · " + identity, identity)
-                    for identity in snapshot["source_ranks"]]
+                    for identity in snapshot["source_ranks"] if source_key(snapshot, identity) in selected]
         if dialog.command == "aqla_limits":
             return [(identity, identity) for identity, row in snapshot["execution_accounts"].items() if row.get("configured")]
         return [(row["name"] + " · " + identity, identity) for identity, row in snapshot["profiles"].items() if row.get("parameters")]

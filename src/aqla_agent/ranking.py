@@ -51,6 +51,10 @@ def source_key(data, chat):
     return data.get("source_aliases", {}).get(chat, chat)
 
 
+def active_sources(data):
+    return {source_key(data, source) for source in data.get("sources", [])}
+
+
 def source_rank(data, chat):
     key = source_key(data, chat)
     row = data.setdefault("source_ranks", {}).get(key)
@@ -288,12 +292,16 @@ def evaluate(data):
     return changes
 
 
-def status_view(data):
+def status_view(data, *, include_inactive=False):
     policy = RankingPolicy.model_validate(data["ranking_policy"])
+    selected = active_sources(data)
+    ranks = data.get("source_ranks", {})
+    resolved = {source_key(data, source): ranks.get(source_key(data, source), row) for source, row in ranks.items()}
     return {source: {key: value for key, value in row.items() if key not in ("evaluated", "evidence", "exclusions")}
             | {"proof_total": len(row.get("evidence", [])), "excluded_count": len(row.get("exclusions", [])),
-               "evidence": row.get("evidence", [])[-policy.window:], "exclusions": row.get("exclusions", [])[-20:]}
-            for source, row in data["source_ranks"].items()}
+               "evidence": row.get("evidence", [])[-policy.window:], "exclusions": row.get("exclusions", [])[-20:],
+               "active": source in selected}
+            for source, row in resolved.items() if include_inactive or source in selected}
 
 
 def set_manual_rank(data, selector, tier, revision, operator):
@@ -301,9 +309,8 @@ def set_manual_rank(data, selector, tier, revision, operator):
     if not selector or tier not in TIERS or type(revision) is not int or not operator:
         raise AqlaError("Supply a source, valid tier and current source rank revision")
     source = source_key(data, resolve_source(data, selector))
-    known = {*data.get("sources", []), *data.get("source_aliases", {}).values(), *data.get("source_ranks", {})}
-    if source not in known:
-        raise AqlaError("Select an existing source by name or Telegram ID")
+    if source not in active_sources(data):
+        raise AqlaError("Select a configured active source; inactive ranks are retained history and need no cleanup")
     rank = source_rank(data, source)
     previous = rank.get("manual_change", {})
     if (rank["tier"] == tier and rank.get("origin") == "manual" and previous.get("operator") == operator

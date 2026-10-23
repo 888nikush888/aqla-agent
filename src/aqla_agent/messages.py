@@ -427,7 +427,8 @@ def status_text(data, exchanges, inventory):
     lines = ["📊 **Aqla · Systemstatus**", "**Entries:** " + ("pausiert" if data["paused"] else "nach Profilregeln freigegeben" if enabled else "keine Börse freigegeben")]
     lines += [f"**{VENUES.get(row.get('exchange', venue), literal(venue))}:** {literal(row.get('network', ''))} · " + ("aktiv" if row.get("enabled") and row.get("configured") else "Einrichtung fehlt" if not row.get("configured") else "deaktiviert") for venue, row in exchanges.items()]
     if data.get("ranking_policy", {}).get("enabled"):
-        ranks = data.get("source_ranks", {})
+        from .ranking import status_view
+        ranks = status_view(data)
         lines.append("**Kanalränge:** " + " · ".join(f"{source_name(data, source)}: {literal(row['tier'])}" + (" (Startfreigabe)" if row.get("bootstrap") and row.get("metrics", {}).get("score") is None else "") for source, row in ranks.items()))
     counts = execution_counts(data)
     lines.append(f"**Belegte eigene offene Positionen:** {counts['known_own_open']} · **Entries ausstehend:** {counts['pending_entries']} · **Eigene Position ungeklärt:** {counts['unsettled_ownership']}\n"

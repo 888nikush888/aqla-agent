@@ -12,7 +12,7 @@ from aqla_hyperliquid_mcp.models import AqlaError
 
 from .messages import number
 from .pipelines import AccountLimits, Parameters, Pipeline, TradingProfile
-from .ranking import RankingPolicy
+from .ranking import RankingPolicy, active_sources
 
 PREFIX = "aqla-menu:"
 HOME = [("📊 Dashboard", "dashboard"), ("📍 Positionen", "positions"), ("📒 Journal & Berichte", "journal"),
@@ -356,15 +356,17 @@ class TelegramMenu:
             return await self.dashboard(bot, args[1])
         if action == "sources":
             data = await self.config()
-            lines = [data.get("source_names", {}).get(key, key) + " · " + data.get("source_ranks", {}).get(key, {}).get("tier", "F") for key in data["sources"]]
+            lines = [data.get("source_names", {}).get(key, key) + " · " + data.get("source_ranks", {}).get(key, {}).get("tier", "F") for key in sorted(active_sources(data))]
             return await self.display(bot, "Quellen & Routing\n" + "\n".join(lines), [("Kanäle & Nachweise", "source_list"), ("Kanalrang ändern", "command", "aqla_rang"),
                 ("Quelle ergänzen", "prompt", "add_source", ""), ("Quelle entfernen", "prompt", "remove_source", ""),
                 ("Quelle benennen", "prompt", "rename_source", ""), ("Ranking-Regeln", "ranking"), ("Routing", "pipelines")])
         if action == "source_list":
             data = await self.config()
-            return await self.paged(bot, "Aktuelle Quellen · Rang, Metriken und Ausschlüsse", [(data.get("source_names", {}).get(key, key), key) for key in data["sources"]], "source_details")
+            return await self.paged(bot, "Aktuelle Quellen · Rang, Metriken und Ausschlüsse", [(data.get("source_names", {}).get(key, key), key) for key in sorted(active_sources(data))], "source_details")
         if action == "source_details":
             result = await self.rpc("ranking_status", source=args[0], history_limit=8)
+            if not result["sources"]:
+                return await self.display(bot, "Quelle ist nicht mehr aktiv.\nHistorische Rangdaten und Handelsbelege bleiben erhalten; keine Bereinigung oder erneute Aufnahme nötig.", [("Aktuelle Quellen", "source_list")])
             text = []
             for key, row in result["sources"].items():
                 text += [row.get("name", key) + " · " + row["tier"], "Belege: " + str(row.get("proof_total", 0)),
