@@ -1768,7 +1768,7 @@ class Trading:
 
 
     def stage_initial_targets(self, trade_id, trade, plan):
-        sizes = split_targets(Decimal(trade["remaining_quantity"] if trade.get("lifecycle_version") == 2 else trade["filled_quantity"]), len(plan.take_profits), plan.policy, plan.market)
+        sizes = split_targets(Decimal(trade["remaining_quantity"]), len(plan.take_profits), plan.policy, plan.market)
         if trade.get("lifecycle_version") == 2 and trade.get("target_budgets"):
             sizes = [max(Decimal(0), Decimal(budget) - Decimal(spent)) for budget, spent in zip(trade["target_budgets"], trade["tp_filled"], strict=True)]
         generation = trade.get("managed_target_generation", 0) if trade.get("lifecycle_version") == 2 else 0
@@ -1863,6 +1863,23 @@ class Trading:
                     await self.replace_stop(trade_id, entry, "break-even:" + trade_id + ":" + str(stage))
 
 
+    async def resize_legacy_targets(self, trade_id, trade, plan):
+        if (trade.get("lifecycle_version") == 2
+                or trade.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE
+                or not any(order["kind"] == "tp" and not order.get("retired") for order in trade["orders"])):
+            return trade
+        budgets = trade.get("target_budgets") or plan.tp_quantities
+        if any(budget is None for budget in budgets):
+            return trade
+        outstanding = sum(max(Decimal(0), Decimal(budget) - Decimal(spent))
+                          for budget, spent in zip(budgets, trade["tp_filled"], strict=True))
+        if outstanding <= Decimal(trade["remaining_quantity"]):
+            return trade
+        identity = "resize-targets:" + trade_id + ":" + digest([trade["remaining_quantity"], trade["tp_filled"], trade["targets"]])
+        await self.replace_targets(trade_id, list(map(Decimal, trade["targets"])), identity)
+        return await self.ready_protection_targets(trade_id)
+
+
     async def ensure_protection(self, trade_id):
         trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
@@ -1879,6 +1896,9 @@ class Trading:
         if trade["status"] == "closing":
             return
         trade = await self.ready_protection_targets(trade_id)
+        if trade is None:
+            return
+        trade = await self.resize_legacy_targets(trade_id, trade, plan)
         if trade is None:
             return
         if not any(order["kind"] == "tp" and not order.get("retired") for order in trade["orders"]):
@@ -2926,8 +2946,8 @@ class Trading:
         outstanding = [max(Decimal(0), budget - spent) for budget, spent in zip(budgets, consumed, strict=True)]
         total_outstanding = sum(outstanding)
         if total_outstanding > current:
-            outstanding = [quantity_grid(size * current / total_outstanding, plan.market) for size in outstanding]
             live_indices = [i for i, size in enumerate(outstanding) if size > 0]
+            outstanding = [quantity_grid(size * current / total_outstanding, plan.market) for size in outstanding]
             if live_indices:
                 outstanding[live_indices[-1]] += current - sum(outstanding)
         return current, consumed, outstanding
