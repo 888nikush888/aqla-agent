@@ -27,6 +27,8 @@ Eine neue Installation zeigt das noch leere Standardprofil zuerst mit allen Ausg
 
 Die private Setup-Freigabe dauert 300 Sekunden. Das Passwort wird ausschließlich im ursprünglichen nativen Passwortdialog verarbeitet und nach bestätigter Löschung geprüft. Lesen, Pause und Risikoreduktion bleiben nach ihren bestehenden Regeln erreichbar. Alte Buttons, fremde Nutzer, Gruppen und weitergeleitete Eingaben verleihen keine Autorität.
 
+Eine über das Menü geöffnete Passwortnachfrage lässt sich mit **Abbrechen** oder **Hauptmenü** beenden. Dabei wird keine Freigabe erteilt und kein Passwortversuch gezählt. Eine bereits erfolgreich erteilte Freigabe bleibt nach ihren bestehenden Ablaufregeln gültig.
+
 Positionsaufträge binden exakt einen Trade, die angezeigten Belege und eine dauerhafte Auftragsidentität. Doppelklick und Wiederanlauf erzeugen keine neue Handelsabsicht. Es gibt keinen Menüdialog zum Eröffnen neuer manueller Positionen. Bereits beendete Waverider werden nicht wieder aufgenommen.
 
 ## Meldungen

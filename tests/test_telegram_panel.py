@@ -279,3 +279,20 @@ async def test_menu_cancel_revokes_an_unanswered_password_challenge(panel):
     await menu.run(bot, "cancel")
     assert menu.extension.setup.challenge is None and menu.extension.setup.lease is None
     assert 999 in menu.extension.setup.old_prompts and not changes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("navigation", ["Abbrechen", "⌂ Hauptmenü"])
+async def test_setup_started_from_menu_can_be_cancelled_through_actual_ingress(panel, navigation):
+    menu, bot, _, changes, *_ = panel
+    await menu.run(bot, "help")
+    start = callback(menu, choose(bot, "Setup"))
+    assert await menu.intercept(start, bot)
+    assert menu.extension.setup.challenge is not None
+    current = callback(menu, choose(bot, navigation))
+    current.effective_message = current.callback_query.message
+    current.effective_message.from_user = SimpleNamespace(id="999", is_bot=True)
+    assert not await menu.extension.setup.intercept(current, bot)
+    assert await menu.intercept(current, bot)
+    assert menu.extension.setup.challenge is None and menu.extension.setup.claims() is None
+    assert menu.extension.setup.failures == 0 and not changes

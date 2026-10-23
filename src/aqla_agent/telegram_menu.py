@@ -315,7 +315,7 @@ class TelegramMenu:
 
     async def run(self, bot, action, *args):
         if action in ("home", "cancel"):
-            if action == "cancel" and self.extension.setup.challenge is not None:
+            if self.extension.setup.challenge is not None:
                 await self.extension.setup.revoke()
             return await self.home(bot)
         if action == "dashboard":
@@ -453,7 +453,10 @@ class TelegramMenu:
             # The original private password ingress owns deletion, verification and lease issuance.
             update = SimpleNamespace(effective_message=SimpleNamespace(text="/setup", from_user=SimpleNamespace(id=self.extension.owner, is_bot=False),
                 chat=SimpleNamespace(id=self.extension.owner, type="private")), edited_message=None, edited_channel_post=None)
-            return await self.extension.setup.intercept(update, bot)
+            await self.extension.setup.intercept(update, bot)
+            text = ("Die private Passwortnachfrage ist geöffnet. Passwort ausschließlich dort senden."
+                    if self.extension.setup.challenge is not None else "Beachte die private Setup-Antwort im Chat.")
+            return await self.display(bot, "Setup-Freigabe\n" + text + "\nAbbrechen oder Hauptmenü beendet eine offene Nachfrage.")
         if action == "command":
             command = args[0]
             if command in ("aqla_rang", "aqla_limits", "aqla_parameter", "aqla_maker"):

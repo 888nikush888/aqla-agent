@@ -311,6 +311,19 @@ def main():
                 pass
             else:
                 raise AssertionError("Revoked native grant was accepted")
+            await app.process_update(Update.de_json(payload("/aqla_funktionen", 150), app.bot))
+            setup_token = next(key for key, value in extension.commands.menu.tokens.items() if value[0] == "setup")
+            setup_callback = {"update_id": 151, "callback_query": {"id": "setup-preview", "chat_instance": "panel-chat",
+                "from": {"id": 12345, "is_bot": False, "first_name": "Synthetic"}, "data": setup_token,
+                "message": {"message_id": extension.commands.menu.message_id, "date": 1791490000,
+                    "chat": {"id": 12345, "type": "private"}, "from": {"id": 999, "is_bot": True, "first_name": "Synthetic bot"}, "text": "Setup"}}}
+            await app.process_update(Update.de_json(setup_callback, app.bot))
+            assert extension.setup.challenge is not None and extension.setup.claims() is None
+            setup_callback["update_id"] = 152
+            setup_callback["callback_query"]["id"] = "setup-cancel"
+            setup_callback["callback_query"]["data"] = next(key for key, value in extension.commands.menu.tokens.items() if value[0] == "cancel")
+            await app.process_update(Update.de_json(setup_callback, app.bot))
+            assert extension.setup.challenge is None and extension.setup.claims() is None and extension.setup.failures == 0
             await app.process_update(Update.de_json(payload("/setup", 4), app.bot))
             old_prompt = extension.setup.challenge.prompt_id
             candidate_deleted_before = len(deleted)

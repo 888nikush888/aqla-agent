@@ -121,6 +121,18 @@ async def test_five_failures_lock_for_fifteen_minutes_and_delayed_answers_are_de
 
 
 @pytest.mark.asyncio
+async def test_callback_is_not_a_password_candidate_and_preserves_the_menu():
+    native, bot, _, _, _, calls, checks = fixture_controller()
+    await native.intercept(update("/setup"), bot)
+    current = update("Menu button", bot=True)
+    current.callback_query = SimpleNamespace(data="aqla-menu:synthetic-cancel")
+    assert not await native.intercept(current, bot)
+    assert native.challenge is not None and native.failures == 0
+    assert not bot.deleted and not checks
+    assert not any(row["action"] in ("setup_failed", "setup_grant") for row in calls)
+
+
+@pytest.mark.asyncio
 async def test_challenge_timeout_or_session_change_after_await_never_grants():
     for reason in ("expiry", "session", "stop"):
         native, bot, _, now, current, calls, checks = fixture_controller()
