@@ -515,7 +515,7 @@ class NativeCommands:
             title = f"Aktuell ausgewählte Kanäle ({len(selected)}) · Konfigurationsrevision " + str(snapshot.get("configuration_revision", "—"))
             lines = [snapshot.get("source_names", {}).get(identity, identity) + " · " + identity + " · "
                      + snapshot.get("source_ranks", {}).get(identity, {}).get("tier", "Rang nicht bestätigt") for identity in selected]
-            await self.reply(bot, title + "\n" + ("\n".join(lines) or "Keine Kanäle konfiguriert.") + "\n\nRangnachweise und Routing: /aqla → Quellen & Routing.")
+            await self.reply(bot, title + "\n" + ("\n".join(lines) or "Keine Kanäle konfiguriert.") + "\n\nNachweise und Routing: /aqla → Quellen & Routing.")
         elif command == "aqla_profile":
             lines = [f"{row['name']} · {identity}\n" + "\n".join(f"{name}: {getattr(Parameters.model_validate(row['parameters']), name)}" + (" · " + parameter_unit(name, row['parameters']) if name in ("fallback_stop_loss_percent", "fallback_take_profit_percentages") else "") for name in Parameters.model_fields)
                      for identity, row in snapshot["profiles"].items() if row.get("parameters")]
