@@ -140,6 +140,9 @@ async def test_last_guard_rejects_race_before_dispatch_and_nonce_is_not_reused(s
 async def test_owner_pause_during_final_price_await_blocks_prepared_order(setup, signal, monkeypatch):
     _, state, fake, exchange, trading = setup
     source, value = signal
+    stamp = now_ms()
+    # Exercise the owner-pause race independently of disk-induced quote expiry.
+    monkeypatch.setattr("aqla_hyperliquid_mcp.models.time.time_ns", lambda: stamp * 1_000_000)
     plan = await trading.preview(source.event_id, value)
     original = exchange.price_snapshot
     async def paused(market):
@@ -149,6 +152,7 @@ async def test_owner_pause_during_final_price_await_blocks_prepared_order(setup,
         return snapshot
     monkeypatch.setattr(exchange, "price_snapshot", paused)
     row = await trading.execute(plan["plan_id"])
+    assert state.snapshot()["paused"] is True
     assert row["status"] == "rejected"
     assert state.snapshot()["operations"][row["entry_operation_id"]]["outcome"] == "not_sent"
     assert not any(action["type"] == "order" for action in fake.actions)
