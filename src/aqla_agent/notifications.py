@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import json
+from functools import partial
 from typing import Literal, NotRequired
 
 from pydantic_core import to_json
@@ -134,15 +135,7 @@ def _summary(identity: str, notice) -> Notice:
     return result
 
 
-def notification_page(snapshot, key: bytes | None, exchanges, *, cursor: str | None = None,
-                      limit: int = 100, require_key: bool = True, view: str = "full") -> NotificationReadResult:
-    from .messages import telegram_view
-    if type(limit) is not int or not 1 <= limit <= 100:
-        raise AqlaError("Notification page limit must be between 1 and 100")
-    if view not in ("full", "facts", "rendered"):
-        raise AqlaError("Notification view must be full, facts or rendered")
-    if require_key or cursor is not None:
-        key = _require_key(key)
+def notification_anchor(cursor, snapshot, key):
     anchor = None
     if cursor is not None:
         body = _decode_cursor(cursor, snapshot, _require_key(key), "notifications_read", {"last"})
@@ -150,30 +143,52 @@ def notification_page(snapshot, key: bytes | None, exchanges, *, cursor: str | N
         if not isinstance(last, list) or len(last) != 4 or any(type(value) is not int for value in last[:3]) or not isinstance(last[3], str):
             raise AqlaError("Invalid notification cursor sort key")
         anchor = tuple(last)
-    source = snapshot.get("notifications", {})
+    return anchor
+
+
+def ordered_notification_page(source, anchor, limit):
     ordered = sorted((notification_sort_key(identity, notice), identity) for identity, notice in source.items())
     if anchor is not None:
         ordered = [item for item in ordered if item[0] > anchor]
     selected = ordered[:limit]
     all_versions = {identity: digest(source[identity]) for _, identity in selected}
 
-    def response(count, summary=False) -> NotificationReadResult:
-        chosen = selected[:count]
-        notices = {identity: _summary(identity, source[identity]) if summary else source[identity] for _, identity in chosen}
-        versions = {identity: all_versions[identity] for _, identity in chosen}
-        more = count < len(ordered)
-        result: NotificationReadResult = {"notifications": dict(notices), "notification_versions": dict(versions),
-                "telegram_view": telegram_view({**snapshot, "notifications": notices}, exchanges,
-                                               notification_versions=versions, include_status=False),
-                "pending": len(source), "next_cursor": _cursor(snapshot, key, "notifications_read", last=chosen[-1][0]) if chosen and more and key is not None else None}
-        if view == "facts":
-            result.pop("telegram_view")
-        elif view == "rendered":
-            result.pop("notifications")
-            result["details_required"] = versions if summary else {}
-        if view != "full":
-            result["view"] = view
-        return result
+    return ordered, selected, all_versions
+
+
+def notification_page_response(snapshot, key, exchanges, source, ordered, selected, all_versions, view, count, summary=False) -> NotificationReadResult:
+    from .messages import telegram_view
+    chosen = selected[:count]
+    notices = {identity: _summary(identity, source[identity]) if summary else source[identity] for _, identity in chosen}
+    versions = {identity: all_versions[identity] for _, identity in chosen}
+    more = count < len(ordered)
+    result: NotificationReadResult = {"notifications": dict(notices), "notification_versions": dict(versions),
+            "telegram_view": telegram_view({**snapshot, "notifications": notices}, exchanges,
+                                           notification_versions=versions, include_status=False),
+            "pending": len(source), "next_cursor": _cursor(snapshot, key, "notifications_read", last=chosen[-1][0]) if chosen and more and key is not None else None}
+    if view == "facts":
+        result.pop("telegram_view")
+    elif view == "rendered":
+        result.pop("notifications")
+        result["details_required"] = versions if summary else {}
+    if view != "full":
+        result["view"] = view
+    return result
+
+
+
+def notification_page(snapshot, key: bytes | None, exchanges, *, cursor: str | None = None,
+                      limit: int = 100, require_key: bool = True, view: str = "full") -> NotificationReadResult:
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise AqlaError("Notification page limit must be between 1 and 100")
+    if view not in ("full", "facts", "rendered"):
+        raise AqlaError("Notification view must be full, facts or rendered")
+    if require_key or cursor is not None:
+        key = _require_key(key)
+    anchor = notification_anchor(cursor, snapshot, key)
+    source = snapshot.get("notifications", {})
+    ordered, selected, all_versions = ordered_notification_page(source, anchor, limit)
+    response = partial(notification_page_response, snapshot, key, exchanges, source, ordered, selected, all_versions, view)
 
     count = len(selected)
     result = response(count)

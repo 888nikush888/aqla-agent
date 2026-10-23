@@ -35,7 +35,7 @@ async def test_owner_reduction_has_one_fixed_quantity_and_identity(setup, signal
 
 @pytest.mark.asyncio
 async def test_owner_stop_uses_real_pending_stop_recovery_without_a_source(setup, signal):
-    state, fake, router, trade = await opened(setup, signal)
+    state, _fake, router, trade = await opened(setup, signal)
     events = copy.deepcopy(state.snapshot()["events"])
     request = ManagementRequest(trade_id=trade["trade_id"], action="move_stop", stop=95, expected_fingerprint=fingerprint(trade))
     result = await submit(router, request, "stop", lambda: None)

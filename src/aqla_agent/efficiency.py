@@ -85,29 +85,33 @@ def decision_context(context):
     return result
 
 
+def _batch_assistance(result, contracts, candidates):
+    assistance = result["interpretation_assistance"]
+    assistance.pop("anchor_setup_bound")  # The item's authoritative field is already present.
+    if not assistance["original_structure_vetoes"]:
+        assistance.pop("original_structure_vetoes")
+    if "candidates" in assistance:
+        spans = assistance.pop("candidates")
+        for span in spans:
+            candidates[span["candidate_id"]] = {key: value for key, value in span.items() if key != "candidate_id"}
+        assistance["candidate_ids"] = [span["candidate_id"] for span in spans]
+    if "contract" in assistance:
+        contract = assistance.pop("contract")
+        for key in ("workflow", "candidate_roles_are_not_inferred", "version", "candidate_limit",
+                    "vetoes_are_not_classification_or_permission"):
+            contract[key] = assistance.pop(key)
+        identity = signature(contract)[:24]
+        contracts[identity] = contract
+        assistance["contract_id"] = identity
+
+
 def decision_batch(contexts):
     if not 1 <= len(contexts) <= 8:
         raise AqlaError("Source context batch requires 1–8 distinct event IDs")
     messages, trades, configurations, items, contracts, candidates = {}, {}, {}, [], {}, {}
     for context in contexts:
         result = decision_context(context)
-        assistance = result["interpretation_assistance"]
-        assistance.pop("anchor_setup_bound")  # The item's authoritative field is already present.
-        if not assistance["original_structure_vetoes"]:
-            assistance.pop("original_structure_vetoes")
-        if "candidates" in assistance:
-            spans = assistance.pop("candidates")
-            for span in spans:
-                candidates[span["candidate_id"]] = {key: value for key, value in span.items() if key != "candidate_id"}
-            assistance["candidate_ids"] = [span["candidate_id"] for span in spans]
-        if "contract" in assistance:
-            contract = assistance.pop("contract")
-            for key in ("workflow", "candidate_roles_are_not_inferred", "version", "candidate_limit",
-                        "vetoes_are_not_classification_or_permission"):
-                contract[key] = assistance.pop(key)
-            identity = signature(contract)[:24]
-            contracts[identity] = contract
-            assistance["contract_id"] = identity
+        _batch_assistance(result, contracts, candidates)
         percentage_rule = result.pop("percentage_rule")
         result.pop("projection")
         source_messages = result.pop("messages")
@@ -139,6 +143,17 @@ def classification_ack(row, changed):
             "detail": {"tool": "source_context", "event_id": row["event_id"], "view": "full"}}
 
 
+def _diagnostic_sources(output, result, snapshot, plan):
+    refs = set(plan["source_refs"])
+    output["source_messages"] = {row["event_id"]: {"source_id": row["source_id"], "source": row["source"]}
+                                  for row in snapshot["events"].values() if is_source_row(row) and row["source_id"] in refs}
+    output["source_revisions"] = result["source_revisions"]
+    output["missing_original_sources"] = result["missing_original_sources"]
+    output["original_sources"] = {key: {"event_id": row["event_id"]} for key, row in result["original_sources"].items()}
+    for key in ("later_source_edits", "retained_revisions_with_missing_original"):
+        output[key] = [{name: value for name, value in row.items() if name != "source"} for row in result[key]]
+
+
 def diagnostic_sections(result, snapshot, sections):
     groups = {
         "plan": ("plan",), "orders": ("orders", "exit_orders", "order_observations"),
@@ -158,12 +173,5 @@ def diagnostic_sections(result, snapshot, sections):
                   selected_sections=list(dict.fromkeys(sections)), details_omitted=True,
                   historical_missing_quotes_are_not_inferred=True)
     if "sources" in sections:
-        refs = set(plan["source_refs"])
-        output["source_messages"] = {row["event_id"]: {"source_id": row["source_id"], "source": row["source"]}
-                                      for row in snapshot["events"].values() if is_source_row(row) and row["source_id"] in refs}
-        output["source_revisions"] = result["source_revisions"]
-        output["missing_original_sources"] = result["missing_original_sources"]
-        output["original_sources"] = {key: {"event_id": row["event_id"]} for key, row in result["original_sources"].items()}
-        for key in ("later_source_edits", "retained_revisions_with_missing_original"):
-            output[key] = [{name: value for name, value in row.items() if name != "source"} for row in result[key]]
+        _diagnostic_sources(output, result, snapshot, plan)
     return output

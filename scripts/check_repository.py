@@ -1,4 +1,5 @@
 """Reject committed local credentials, installation state and QA outputs."""
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -9,7 +10,10 @@ from aqla_agent.artifact_rules import forbidden  # noqa: E402
 
 
 def main():
-    result = subprocess.run(["git", "ls-files", "-z"], check=True, capture_output=True)
+    git = shutil.which("git")
+    if git is None:
+        raise SystemExit("Git is required to verify tracked repository paths")
+    result = subprocess.run([git, "ls-files", "-z"], check=True, capture_output=True)
     files = [name for name in result.stdout.decode("utf-8").split("\0") if name]
     bad = [name for name in files if forbidden(name)]
     if bad:

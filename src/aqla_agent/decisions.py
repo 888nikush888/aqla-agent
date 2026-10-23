@@ -140,24 +140,34 @@ class CalibrationProfile(Model):
     def checked(self):
         if any(not math.isfinite(value) or not 0.5 <= value <= 1 for value in self.thresholds.values()):
             raise ValueError("Decision thresholds must be finite probabilities between 0.5 and 1")
-        if self.validated and (self.version != VERSION or not self.model or not self.model_revision or not self.sources
-                or not self.master_hash or not self.dataset_hash or not self.holdout_hash or self.dataset_hash == self.holdout_hash
-                or self.holdout_cases < 30 or self.critical_errors != 0 or not self.thresholds):
+        if self.validated and self.activation_incomplete():
             raise ValueError("Activation requires separate calibration/holdout evidence and zero critical errors")
         if self.validated:
-            for source in self.sources:
-                proof = self.source_evidence.get(source, {})
-                permitted = self.source_permissions.get(source, [])
-                if (proof.get("calibration_groups", 0) < 3 or proof.get("holdout_groups", 0) < 5
-                        or proof.get("accepted_accuracy", 0) < 0.95 or proof.get("critical_errors", 1) != 0
-                        or not permitted or not set(permitted) <= set(KINDS)):
-                    raise ValueError("Every activated source needs independent held-out evidence and tested kinds")
-                for kind in permitted:
-                    kind_proof = proof.get("kinds", {}).get(kind, {})
-                    if (kind_proof.get("calibration_correct_groups", 0) < 1
-                            or kind_proof.get("holdout_correct_accepted_groups", 0) < 2):
-                        raise ValueError("Every activated source kind needs distinct correctly admitted held-out groups")
+            self.check_source_evidence()
         return self
+
+    def activation_incomplete(self):
+        return (self.version != VERSION or not self.model or not self.model_revision or not self.sources
+                or not self.master_hash or not self.dataset_hash or not self.holdout_hash or self.dataset_hash == self.holdout_hash
+                or self.holdout_cases < 30 or self.critical_errors != 0 or not self.thresholds)
+
+    def check_source_evidence(self):
+        for source in self.sources:
+            proof = self.source_evidence.get(source, {})
+            permitted = self.source_permissions.get(source, [])
+            if (proof.get("calibration_groups", 0) < 3 or proof.get("holdout_groups", 0) < 5
+                    or proof.get("accepted_accuracy", 0) < 0.95 or proof.get("critical_errors", 1) != 0
+                    or not permitted or not set(permitted) <= set(KINDS)):
+                raise ValueError("Every activated source needs independent held-out evidence and tested kinds")
+            self.check_source_kinds(proof, permitted)
+
+    @staticmethod
+    def check_source_kinds(proof, permitted):
+        for kind in permitted:
+            kind_proof = proof.get("kinds", {}).get(kind, {})
+            if (kind_proof.get("calibration_correct_groups", 0) < 1
+                    or kind_proof.get("holdout_correct_accepted_groups", 0) < 2):
+                raise ValueError("Every activated source kind needs distinct correctly admitted held-out groups")
 
     def permits(self, source, master_hash=None, *, model=DEFAULT_DECISION_MODEL, model_revision=None):
         return (self.validated and source in self.sources and self.master_hash == master_hash
@@ -203,6 +213,24 @@ class SourceProcessingConfig(Model):
 
 
 
+def _valid_probability(value):
+    return (not isinstance(value, bool) and isinstance(value, (float, int))
+            and math.isfinite(value) and 0 <= value <= 1)
+
+
+def _checked_choice(answer, question):
+    distribution = answer.get("probabilities")
+    value = answer.get("choice")
+    if not isinstance(distribution, dict) or set(distribution) != set(question["criteria"]) or value not in distribution:
+        raise DecisionFailure("answer_options")
+    if any(not _valid_probability(p) for p in distribution.values()) or abs(sum(distribution.values()) - 1) > 0.001:
+        raise DecisionFailure("answer_probabilities")
+    probability = distribution[value]
+    if probability != max(distribution.values()):
+        raise DecisionFailure("answer_choice")
+    return value, probability
+
+
 def checked_answers(response, questions, _profile, *, collect=False):
     # Retain the historical collector keyword; grading is shared for all callers.
     # skipcq: PTC-W0043
@@ -219,193 +247,233 @@ def checked_answers(response, questions, _profile, *, collect=False):
             probability = answer.get("noul")
             value = probability
         else:
-            distribution = answer.get("probabilities")
-            value = answer.get("choice")
-            if not isinstance(distribution, dict) or set(distribution) != set(question["criteria"]) or value not in distribution:
-                raise DecisionFailure("answer_options")
-            if any(isinstance(p, bool) or not isinstance(p, (float, int)) or not math.isfinite(p) or not 0 <= p <= 1
-                   for p in distribution.values()) or abs(sum(distribution.values()) - 1) > 0.001:
-                raise DecisionFailure("answer_probabilities")
-            probability = distribution[value]
-            if probability != max(distribution.values()):
-                raise DecisionFailure("answer_choice")
-        if isinstance(probability, bool) or not isinstance(probability, (float, int)) or not math.isfinite(probability) or not 0 <= probability <= 1:
+            value, probability = _checked_choice(answer, question)
+        if not _valid_probability(probability):
             raise DecisionFailure("answer_probability")
         probabilities[key] = probability
-        # Irrelevant fields are gated later; a missing optional field is still a real choice.
+        # Irrelevant fields are gated later; an absent optional field is still a choice.
         values[key] = value
     return values, probabilities
 
 
-def assemble(packet, spans, values, probabilities, profile, *, collect=False, required_questions=None):
-    by_id = {span.candidate_id: span for span in spans}
-    selected = {}
-    evidence = []
-    refs = {packet["anchor_source_id"]}
 
-    def read(question):
-        if required_questions is not None and question not in required_questions:
-            required_questions.append(question)
-        if question not in values or values[question] == UNKNOWN or (not collect and
-                (profile.question_disabled(question, values[question]) or probabilities[question] < profile.threshold(question, values[question]))):
+class _DecisionAssembly:
+    def __init__(self, packet, spans, values, probabilities, profile, collect, required_questions):
+        self.packet, self.spans, self.values = packet, spans, values
+        self.probabilities, self.profile, self.collect = probabilities, profile, collect
+        self.required_questions = required_questions
+        self.by_id = {span.candidate_id: span for span in spans}
+        self.selected, self.fields, self.evidence = {}, {}, []
+        self.refs = {packet["anchor_source_id"]}
+        self.kind = None
+
+    def read(self, question):
+        if self.required_questions is not None and question not in self.required_questions:
+            self.required_questions.append(question)
+        if question not in self.values or self.values[question] == UNKNOWN or (not self.collect and
+                (self.profile.question_disabled(question, self.values[question]) or self.probabilities[question] < self.profile.threshold(question, self.values[question]))):
             raise DecisionFailure("uncertain_decision")
-        return values[question]
+        return self.values[question]
 
-    def proof(field):
-        original = [span for span in spans if span.kind == "text" and span.source_id == packet["anchor_source_id"]]
+
+    def proof(self, field):
+        original = [span for span in self.spans if span.kind == "text" and span.source_id == self.packet["anchor_source_id"]]
         if not original:
             raise DecisionFailure("evidence_missing")
-        evidence.extend(Evidence(field=field, source_id=span.source_id, quote=span.quote) for span in original)
+        self.evidence.extend(Evidence(field=field, source_id=span.source_id, quote=span.quote) for span in original)
 
-    kind = read("kind")
-    action_probability = values["live_action"]
-    if required_questions is not None:
-        required_questions.append("live_action")
-    if kind in ("incomplete", "ambiguous") and action_probability >= 0.5:
-        raise DecisionFailure("uncertain_trading_intent_requires_review")
-    oriented = action_probability if kind in ("new_signal", "trade_update") else 1 - action_probability
-    positive_intent = kind in ("new_signal", "trade_update")
-    if not collect and (profile.question_disabled("live_action", positive_intent)
-                        or oriented < profile.threshold("live_action", positive_intent)):
-        raise DecisionFailure("conflicting_live_intent")
-    if kind in ("report", "unrelated", "incomplete", "ambiguous"):
-        if kind in ("report", "unrelated") and values.get("update_action") not in (NONE, UNKNOWN):
+
+    def check_intent(self):
+        self.kind = self.read("kind")
+        action_probability = self.values["live_action"]
+        if self.required_questions is not None:
+            self.required_questions.append("live_action")
+        if self.kind in ("incomplete", "ambiguous") and action_probability >= 0.5:
+            raise DecisionFailure("uncertain_trading_intent_requires_review")
+        oriented = action_probability if self.kind in ("new_signal", "trade_update") else 1 - action_probability
+        positive_intent = self.kind in ("new_signal", "trade_update")
+        if not self.collect and (self.profile.question_disabled("live_action", positive_intent)
+                            or oriented < self.profile.threshold("live_action", positive_intent)):
+            raise DecisionFailure("conflicting_live_intent")
+
+    def classification(self):
+        if self.kind in ("report", "unrelated") and self.values.get("update_action") not in (NONE, UNKNOWN):
             raise DecisionFailure("conflicting_management_intent")
-        if not require_first(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"]).strip():
-            return Interpretation(kind="incomplete", source_refs=sorted(refs), reason="Originaltext fehlt.", reason_codes=["missing_source_text"])
-        evidence.extend(Evidence(field="classification", source_id=span.source_id, quote=span.quote)
-                        for span in spans if span.kind == "text" and span.source_id == packet["anchor_source_id"])
-        code = {"report": "result_report", "unrelated": "non_trade", "incomplete": "other", "ambiguous": "other"}[kind]
-        return Interpretation(kind=kind, source_refs=sorted(refs), evidence=evidence,
-                              reason={"report": "Bericht ohne neue Handlungsanweisung", "unrelated": "Kein Handelsauftrag", "incomplete": "Unvollständige Quelle", "ambiguous": "Mehrdeutige Quelle"}[kind],
+        if not require_first(row["text"] for row in self.packet["messages"] if row["event_id"] == self.packet["anchor_event_id"]).strip():
+            return Interpretation(kind="incomplete", source_refs=sorted(self.refs), reason="Originaltext fehlt.", reason_codes=["missing_source_text"])
+        self.evidence.extend(Evidence(field="classification", source_id=span.source_id, quote=span.quote)
+                        for span in self.spans if span.kind == "text" and span.source_id == self.packet["anchor_source_id"])
+        code = {"report": "result_report", "unrelated": "non_trade", "incomplete": "other", "ambiguous": "other"}[self.kind]
+        return Interpretation(kind=self.kind, source_refs=sorted(self.refs), evidence=self.evidence,
+                              reason={"report": "Bericht ohne neue Handlungsanweisung", "unrelated": "Kein Handelsauftrag", "incomplete": "Unvollständige Quelle", "ambiguous": "Mehrdeutige Quelle"}[self.kind],
                               reason_codes=[code])
-    fields = {}
-    # Updates can only newly specify a venue with an original anchor occurrence.
-    # Absence of such a candidate is an authoritative lexical fact, not a vote
-    # between historical footer venues and not_present.
-    source_exchange = (NONE if kind == "trade_update" and not any(
-        s.kind == "exchange" and s.source_id == packet["anchor_source_id"] for s in spans) else read("source_exchange"))
-    if source_exchange != NONE:
-        span = by_id[source_exchange]
-        fields["source_exchange"] = span.value
-        evidence.append(Evidence(field="source_exchange", source_id=span.source_id, quote=span.quote))
-        refs.add(span.source_id)
-    symbol = read("symbol")
-    if symbol != NONE:
-        span = by_id[symbol]
-        fields["symbol"] = span.value
-        evidence.append(Evidence(field="symbol", source_id=span.source_id, quote=span.quote))
-        refs.add(span.source_id)
-    side = read("side")
-    if side != NONE:
-        fields["side"] = side
-        proof("side")
-    if kind == "new_signal":
-        if required_questions is not None:
-            required_questions.append("single_entry_form")
-        if not collect and (profile.question_disabled("single_entry_form") or values["single_entry_form"] < profile.threshold("single_entry_form")):
+
+    def identity_fields(self):
+        # Updates can only newly specify a venue with an original anchor occurrence.
+        # Absence of such a candidate is an authoritative lexical fact, not a vote
+        # between historical footer venues and not_present.
+        source_exchange = (NONE if self.kind == "trade_update" and not any(
+            s.kind == "exchange" and s.source_id == self.packet["anchor_source_id"] for s in self.spans) else self.read("source_exchange"))
+        if source_exchange != NONE:
+            span = self.by_id[source_exchange]
+            self.fields["source_exchange"] = span.value
+            self.evidence.append(Evidence(field="source_exchange", source_id=span.source_id, quote=span.quote))
+            self.refs.add(span.source_id)
+        symbol = self.read("symbol")
+        if symbol != NONE:
+            span = self.by_id[symbol]
+            self.fields["symbol"] = span.value
+            self.evidence.append(Evidence(field="symbol", source_id=span.source_id, quote=span.quote))
+            self.refs.add(span.source_id)
+        side = self.read("side")
+        if side != NONE:
+            self.fields["side"] = side
+            self.proof("side")
+
+    def entry_fields(self):
+        if self.required_questions is not None:
+            self.required_questions.append("single_entry_form")
+        if not self.collect and (self.profile.question_disabled("single_entry_form") or self.values["single_entry_form"] < self.profile.threshold("single_entry_form")):
             raise DecisionFailure("entry_form_not_representable")
-        if not fields.get("symbol") or not fields.get("side"):
+        if not self.fields.get("symbol") or not self.fields.get("side"):
             raise DecisionFailure("signal_identity_missing")
-        fields["entry"] = read("entry")
-        fields["entry_timing"] = read("entry_timing")
-        if fields["entry_timing"] == "deferred":
-            proof("entry_timing")
-    else:
-        if required_questions is not None:
-            required_questions.append("single_management_action")
-        if not collect and (profile.question_disabled("single_management_action")
-                or values["single_management_action"] < profile.threshold("single_management_action")):
+        self.fields["entry"] = self.read("entry")
+        self.fields["entry_timing"] = self.read("entry_timing")
+        if self.fields["entry_timing"] == "deferred":
+            self.proof("entry_timing")
+
+    def update_fields(self):
+        if self.required_questions is not None:
+            self.required_questions.append("single_management_action")
+        if not self.collect and (self.profile.question_disabled("single_management_action")
+                or self.values["single_management_action"] < self.profile.threshold("single_management_action")):
             raise DecisionFailure("management_actions_not_representable")
-        action = read("update_action")
+        action = self.read("update_action")
         if action == NONE:
             raise DecisionFailure("update_action_missing")
-        fields["update_action"] = action
-        proof("update_action")
-    used_occurrences = set()
-    for identity, alternatives in numeric_occurrences(spans):
-        span = alternatives[0]
-        if kind == "trade_update" and span.source_id != packet["anchor_source_id"]:
-            # Older setup values cannot become newly changed update values.
-            # This temporal/source constraint is Python-owned, not a confidence vote.
-            continue
-        question = "role." + identity
-        if question not in values:
-            continue
-        role = read(question)
-        if role == "ignore":
-            continue
-        if len(alternatives) > 1:
-            normalized = read("normalization." + identity)
-            if normalized == NONE:
-                raise DecisionFailure("numeric_normalization_missing")
-            selected_span = next((candidate for candidate in alternatives if candidate.candidate_id == normalized), None)
-            if selected_span is None:
-                raise DecisionFailure("numeric_normalization_invalid")
-            span = selected_span
-        if role in selected and redundant_numeric_mention(packet, selected[role], span, role):
-            continue
+        self.fields["update_action"] = action
+        self.proof("update_action")
+
+    def normalized_span(self, identity, alternatives):
+        normalized = self.read("normalization." + identity)
+        if normalized == NONE:
+            raise DecisionFailure("numeric_normalization_missing")
+        selected_span = next((candidate for candidate in alternatives if candidate.candidate_id == normalized), None)
+        if selected_span is None:
+            raise DecisionFailure("numeric_normalization_invalid")
+        span = selected_span
+        return span
+
+    def check_numeric_overlap(self, span, role, used_occurrences):
         occurrence = (span.source_id, span.start, span.end)
-        if role in selected or occurrence in used_occurrences or any(
+        if role in self.selected or occurrence in used_occurrences or any(
                 prior.source_id == span.source_id and prior.start < span.end and span.start < prior.end
-                for prior in selected.values()):
+                for prior in self.selected.values()):
             raise DecisionFailure("conflicting_numeric_roles")
-        selected[role] = span
-        used_occurrences.add(occurrence)
-    allowed = set(ROLES) if kind == "new_signal" else {
-        "move_stop": {"stop_loss"}, "replace_targets": {f"target_{i + 1}" for i in range(20)},
-        "reduce": {"reduce_percent"}, "break_even": set(), "close": set(), "cancel_entry": set(),
-    }[fields["update_action"]]
-    if kind == "trade_update" and set(selected) - allowed:
-        raise DecisionFailure("update_role_conflict")
-    for group, keys in (("entry_prices", ["entry0", "entry1"]), ("take_profits", [f"target_{i + 1}" for i in range(20)])):
-        chosen = [key for key in keys if key in selected]
-        if chosen and chosen != keys[:len(chosen)]:
-            raise DecisionFailure("numeric_sequence_gap")
-        if chosen:
-            fields[group] = [Decimal(selected[key].value) for key in chosen]
-        for i, key in enumerate(chosen):
-            span = selected[key]
-            evidence.append(Evidence(field=f"{group}.{i}", source_id=span.source_id, quote=span.quote))
-            refs.add(span.source_id)
-    tp_spans = [span for key, span in selected.items() if key.startswith("target_")]
-    if tp_spans:
-        markers = {"%" in span.quote for span in tp_spans}
-        if len(markers) != 1:
-            raise DecisionFailure("mixed_target_units")
-        fields["take_profit_unit"] = "roe_percent" if True in markers else "price"
-    for key in ("stop_loss", "leverage", "reduce_percent"):
-        if key in selected:
-            span = selected[key]
-            fields[key] = Decimal(span.value)
-            evidence.append(Evidence(field=key, source_id=span.source_id, quote=span.quote))
-            refs.add(span.source_id)
-    if kind == "trade_update":
-        required = {"move_stop": "stop_loss", "replace_targets": "take_profits", "reduce": "reduce_percent"}.get(fields["update_action"])
-        if required and not fields.get(required):
-            raise DecisionFailure("update_value_missing")
-    if kind == "new_signal" and fields.get("entry") == "unspecified":
+        return occurrence
+
+    def select_numbers(self):
+        used_occurrences = set()
+        for identity, alternatives in numeric_occurrences(self.spans):
+            span = alternatives[0]
+            if self.kind == "trade_update" and span.source_id != self.packet["anchor_source_id"]:
+                # Older setup values cannot become newly changed update values.
+                # This temporal/source constraint is Python-owned, not a confidence vote.
+                continue
+            question = "role." + identity
+            if question not in self.values:
+                continue
+            role = self.read(question)
+            if role == "ignore":
+                continue
+            if len(alternatives) > 1:
+                span = self.normalized_span(identity, alternatives)
+            if role in self.selected and redundant_numeric_mention(self.packet, self.selected[role], span, role):
+                continue
+            occurrence = self.check_numeric_overlap(span, role, used_occurrences)
+            self.selected[role] = span
+            used_occurrences.add(occurrence)
+
+    def check_update_roles(self):
+        allowed = set(ROLES) if self.kind == "new_signal" else {
+            "move_stop": {"stop_loss"}, "replace_targets": {f"target_{i + 1}" for i in range(20)},
+            "reduce": {"reduce_percent"}, "break_even": set(), "close": set(), "cancel_entry": set(),
+        }[self.fields["update_action"]]
+        if self.kind == "trade_update" and set(self.selected) - allowed:
+            raise DecisionFailure("update_role_conflict")
+
+    def sequence_fields(self):
+        for group, keys in (("entry_prices", ["entry0", "entry1"]), ("take_profits", [f"target_{i + 1}" for i in range(20)])):
+            chosen = [key for key in keys if key in self.selected]
+            if chosen and chosen != keys[:len(chosen)]:
+                raise DecisionFailure("numeric_sequence_gap")
+            if chosen:
+                self.fields[group] = [Decimal(self.selected[key].value) for key in chosen]
+            for i, key in enumerate(chosen):
+                span = self.selected[key]
+                self.evidence.append(Evidence(field=f"{group}.{i}", source_id=span.source_id, quote=span.quote))
+                self.refs.add(span.source_id)
+
+    def target_unit(self):
+        tp_spans = [span for key, span in self.selected.items() if key.startswith("target_")]
+        if tp_spans:
+            markers = {"%" in span.quote for span in tp_spans}
+            if len(markers) != 1:
+                raise DecisionFailure("mixed_target_units")
+            self.fields["take_profit_unit"] = "roe_percent" if True in markers else "price"
+
+    def scalar_fields(self):
+        for key in ("stop_loss", "leverage", "reduce_percent"):
+            if key in self.selected:
+                span = self.selected[key]
+                self.fields[key] = Decimal(span.value)
+                self.evidence.append(Evidence(field=key, source_id=span.source_id, quote=span.quote))
+                self.refs.add(span.source_id)
+        if self.kind == "trade_update":
+            required = {"move_stop": "stop_loss", "replace_targets": "take_profits", "reduce": "reduce_percent"}.get(self.fields["update_action"])
+            if required and not self.fields.get(required):
+                raise DecisionFailure("update_value_missing")
+
+    def infer_entry(self):
         from .semantic_contract import (
             bounded_live_entry_range,
             one_sided_live_entry_limit,
             strict_deferred_price,
         )
-        anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
-        if bounded_live_entry_range(packet, [selected.get("entry0"), selected.get("entry1")]):
-            fields["entry"] = "range"
-        elif one_sided_live_entry_limit(packet, selected.get("entry0"), fields.get("side")):
-            fields["entry"] = "limit"
-        elif (selected.get("entry0") and selected["entry0"].source_id == packet["anchor_source_id"]
-                and strict_deferred_price(anchor["text"], fields.get("entry_timing"), fields.get("entry_prices", []))):
+        anchor = require_first(row for row in self.packet["messages"] if row["event_id"] == self.packet["anchor_event_id"])
+        if bounded_live_entry_range(self.packet, [self.selected.get("entry0"), self.selected.get("entry1")]):
+            self.fields["entry"] = "range"
+        elif one_sided_live_entry_limit(self.packet, self.selected.get("entry0"), self.fields.get("side")):
+            self.fields["entry"] = "limit"
+        elif (self.selected.get("entry0") and self.selected["entry0"].source_id == self.packet["anchor_source_id"]
+                and strict_deferred_price(anchor["text"], self.fields.get("entry_timing"), self.fields.get("entry_prices", []))):
             # An expressly strict deferred price gate is one price-bound entry,
             # unlike an ordinary reference price or a time-delayed market order.
-            fields["entry"] = "limit"
-    interpretation = Interpretation(kind=kind, source_refs=sorted(refs), evidence=evidence, **fields)
-    validate_interpretation(packet, interpretation)
-    return interpretation
+            self.fields["entry"] = "limit"
+
+    def build(self):
+        self.check_intent()
+        if self.kind in ("report", "unrelated", "incomplete", "ambiguous"):
+            return self.classification()
+        self.identity_fields()
+        if self.kind == "new_signal":
+            self.entry_fields()
+        else:
+            self.update_fields()
+        self.select_numbers()
+        self.check_update_roles()
+        self.sequence_fields()
+        self.target_unit()
+        self.scalar_fields()
+        if self.kind == "new_signal" and self.fields.get("entry") == "unspecified":
+            self.infer_entry()
+        interpretation = Interpretation(kind=self.kind, source_refs=sorted(self.refs), evidence=self.evidence, **self.fields)
+        validate_interpretation(self.packet, interpretation)
+        return interpretation
 
 
-
+def assemble(packet, spans, values, probabilities, profile, *, collect=False, required_questions=None):
+    return _DecisionAssembly(packet, spans, values, probabilities, profile, collect, required_questions).build()
 
 
 
@@ -453,6 +521,47 @@ def replay_decision(packet, profile, responses, *, model, revision, collect=Fals
         required_questions=required, usage=(usage or []).copy())
 
 
+def _catalog_revision(response, model):
+    if len(response.content) > 5_000_000:
+        raise DecisionFailure("decision_catalog_limit")
+    catalog = response.json()
+    models = catalog.get("data", []) if isinstance(catalog, dict) else []
+    selected = next((row for row in models if isinstance(row, dict) and row.get("id") == model), None)
+    if selected is None or not isinstance(selected.get("canonical_slug"), str) or not selected["canonical_slug"]:
+        raise DecisionFailure("decision_model_not_available")
+    return selected["canonical_slug"]
+
+
+def _decision_response(response, revision):
+    if len(response.content) > 2_000_000:
+        raise DecisionFailure("decision_response_limit")
+    value = response.json()
+    if not isinstance(value, dict) or value.get("model") != revision:
+        raise DecisionFailure("decision_model_changed")
+    return value
+
+
+def _measured_usage(value, phase, model, revision, body, started):
+    raw = value.get("usage")
+    measured = {"phase": phase, "model": model, "model_revision": revision, "provider": "openrouter", "failed": False,
+             "response_success": True, "contract_valid": True, "request_hash": digest(body), "question_contract_version": QUESTION_CONTRACT_VERSION,
+             "duration_seconds": time.monotonic() - started, "usage_available": isinstance(raw, dict)}
+    if isinstance(raw, dict):
+        for key in ("input_tokens", "output_tokens"):
+            n = raw.get(key)
+            if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+                raise DecisionFailure("decision_usage_invalid")
+            measured[key] = n
+    cost = raw.get("cost") if isinstance(raw, dict) else None
+    if cost is not None:
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0:
+            raise DecisionFailure("decision_cost_invalid")
+        measured.update(cost_usd=cost, estimated_cost_usd=cost, cost_status="actual", cost_source="openrouter_usage")
+    else:
+        measured.update(cost_usd=None, cost_status="unknown")
+    return measured
+
+
 class OpenRouterDecisionAdapter:
     def __init__(self, api_key, *, client=None, timeout=5, model=DEFAULT_DECISION_MODEL, model_revision=None):
         self.api_key, self.timeout, self.model = api_key, timeout, model
@@ -469,14 +578,7 @@ class OpenRouterDecisionAdapter:
         try:
             response = await client.get(OPENROUTER_MODELS_URL, params={"output_modalities": "decisions"}, timeout=self.timeout)
             response.raise_for_status()
-            if len(response.content) > 5_000_000:
-                raise DecisionFailure("decision_catalog_limit")
-            catalog = response.json()
-            models = catalog.get("data", []) if isinstance(catalog, dict) else []
-            selected = next((row for row in models if isinstance(row, dict) and row.get("id") == self.model), None)
-            if selected is None or not isinstance(selected.get("canonical_slug"), str) or not selected["canonical_slug"]:
-                raise DecisionFailure("decision_model_not_available")
-            self.model_revision = selected["canonical_slug"]
+            self.model_revision = _catalog_revision(response, self.model)
             self.catalog_checked_at = time.monotonic()
             return self.model_revision
         except DecisionFailure:
@@ -509,28 +611,8 @@ class OpenRouterDecisionAdapter:
                 json=body, timeout=self.timeout)
             response.raise_for_status()
             received_ok = True
-            if len(response.content) > 2_000_000:
-                raise DecisionFailure("decision_response_limit")
-            value = response.json()
-            if not isinstance(value, dict) or value.get("model") != revision:
-                raise DecisionFailure("decision_model_changed")
-            raw = value.get("usage")
-            measured = {"phase": phase, "model": self.model, "model_revision": revision, "provider": "openrouter", "failed": False,
-                     "response_success": True, "contract_valid": True, "request_hash": digest(body), "question_contract_version": QUESTION_CONTRACT_VERSION,
-                     "duration_seconds": time.monotonic() - started, "usage_available": isinstance(raw, dict)}
-            if isinstance(raw, dict):
-                for key in ("input_tokens", "output_tokens"):
-                    n = raw.get(key)
-                    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
-                        raise DecisionFailure("decision_usage_invalid")
-                    measured[key] = n
-            cost = raw.get("cost") if isinstance(raw, dict) else None
-            if cost is not None:
-                if isinstance(cost, bool) or not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost < 0:
-                    raise DecisionFailure("decision_cost_invalid")
-                measured.update(cost_usd=cost, estimated_cost_usd=cost, cost_status="actual", cost_source="openrouter_usage")
-            else:
-                measured.update(cost_usd=None, cost_status="unknown")
+            value = _decision_response(response, revision)
+            measured = _measured_usage(value, phase, self.model, revision, body, started)
             if usage is not None:
                 usage.append(measured)
             recorded = True

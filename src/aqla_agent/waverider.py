@@ -7,7 +7,7 @@ import hmac
 import json
 import sqlite3
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache, partial
 from pathlib import Path
 
@@ -24,7 +24,7 @@ from aqla_hyperliquid_mcp.models import (
 from aqla_hyperliquid_mcp.precision import price_step
 from aqla_hyperliquid_mcp.rules import quantity_grid, slippage_price
 
-from .accounting import position_basis
+from .accounting import entry_quantity_evidence, position_basis
 from .entry import passive_entry_price
 from .observations import TemporaryObservation, read_observation
 
@@ -180,8 +180,7 @@ def qualification_scope(report, expected_profile, expected_venue, expected_cohor
 def qualification_evidence(report):
     return (report["version"] == VERSION and report["critical_errors"] == 0
         and report.get("cost_model") == COST_MODEL and report.get("data_errors") == 0
-        and report.get("cases_requested") == report["cases"]
-        and report["cases"] >= MIN_CASES and report["waves"] >= MIN_WAVES
+        and report.get("cases_requested") == report["cases"] >= MIN_CASES and report["waves"] >= MIN_WAVES
         and report["data_kind"] == "executable_depth" and bool(report["holdout_hash"]))
 
 
@@ -595,6 +594,58 @@ async def resume_cycle(engine, trade_id, state):
     return result
 
 
+def abort_cycle_exit(engine, trade_id, state, identity, not_sent):
+    def abort(data):
+        current = data["trades"][trade_id]
+        for row in current["exit_orders"]:
+            if row.get("operation_id") == identity:
+                row.update(retired=True, **({"not_sent": True} if not_sent else {}))
+        current.update(suspended_wave_targets=None, managed_target_fingerprint=None,
+                       protection_repair_pending=identity,
+                       waverider={**reset_phase(state, "waiting_rise"), "cycle": state.get("cycle", 0) + 1})
+    engine.state.update(abort)
+    return True
+
+
+def cycle_exit_quantity_confirmed(status, fills):
+    try:
+        confirmed = entry_quantity_evidence(status)
+        observed = sum((Decimal(row["sz"]) for row in fills), Decimal(0))
+        return confirmed is not None and Decimal(confirmed) == observed
+    except (InvalidOperation, ValueError, TypeError):
+        return False
+
+
+def cycle_exit_request_matches(trade, identity, cloid, action):
+    orders = action.get("orders", [])
+    owned = [row for row in trade.get("exit_orders", []) if row.get("operation_id") == identity
+             and row.get("kind") in ("waverider", "waverider_retirement")]
+    if action.get("type") != "order" or len(orders) != 1 or len(owned) != 1:
+        return False
+    order, row = orders[0], owned[0]
+    return (order.get("c") == row.get("cloid") == cloid and order.get("r") is True
+        and order.get("a") == trade["plan"]["market"]["asset_id"]
+        and order.get("b") is (trade["plan"]["side"] == "short")
+        and Decimal(order["s"]) == Decimal(row["quantity"]) and Decimal(order["p"]) == Decimal(row["price"]))
+
+
+def definitive_cycle_exit_rejection(trade, identity, cloid, operation):
+    if (operation.get("phase") != "rejected" or operation.get("outcome") != "rejected"
+            or operation.get("operation_id") != identity):
+        return False
+    from aqla_hyperliquid_mcp.api import Hyperliquid
+    try:
+        action = operation.get("wire_action", {})
+        if not cycle_exit_request_matches(trade, identity, cloid, action):
+            return False
+        # A global nonce/request error is not a rejection of this exact order.
+        phase, outcome, legs = Hyperliquid.decode_result(action, operation.get("result"))
+        return ((phase, outcome) == ("rejected", "rejected") and len(legs) == 1
+            and legs[0].get("index") == 0 and legs[0].get("disposition") == "rejected")
+    except (InvalidOperation, KeyError, ValueError, TypeError):
+        return False
+
+
 async def resume_exit(engine, trade_id):
     """Restore source targets only after the optional exit's exact outcome is known."""
     trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
@@ -604,19 +655,17 @@ async def resume_exit(engine, trade_id):
     state = dict(trade["waverider"])
     operation = engine.state.read("operations")["operations"].get(identity)
     if operation is None or operation.get("outcome") == "not_sent":
-        def abort(data):
-            current = data["trades"][trade_id]
-            for row in current["exit_orders"]:
-                if row.get("operation_id") == identity:
-                    row.update(not_sent=True, retired=True)
-            current.update(suspended_wave_targets=None, managed_target_fingerprint=None,
-                           protection_repair_pending=identity,
-                           waverider={**reset_phase(state, "waiting_rise"), "cycle": state.get("cycle", 0) + 1})
-        engine.state.update(abort)
+        abort_cycle_exit(engine, trade_id, state, identity, not_sent=True)
         return True
     cloid = engine.exchange.cloid(identity)
     status = await engine.order_status(cloid)
     if status.get("status") == "unknownOid":
+        if definitive_cycle_exit_rejection(trade, identity, cloid, operation):
+            await engine.capture_fills(trade_id)
+            current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+            if current.get("order_observations", {}).get(cloid, {}).get("oid") is None:
+                abort_cycle_exit(engine, trade_id, state, identity, not_sent=False)
+                return True
         return False
     if status.get("order", {}).get("status") == "open":
         plan = TradePlan.model_validate(trade["plan"])
@@ -628,7 +677,10 @@ async def resume_exit(engine, trade_id):
     await engine.capture_fills(trade_id)
     current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     oid = status["order"]["order"]["oid"]
-    fills = [row for row in current["fill_events"].values() if row["oid"] == oid]
+    fills = own_cycle_fills(current, oid, reentering=False)
+    # Terminal order status can precede complete native fill-history visibility.
+    if not cycle_exit_quantity_confirmed(status, fills):
+        return False
     amount = sum((Decimal(row["sz"]) for row in fills), Decimal(0))
     if amount:
         sale = sum(Decimal(row["sz"]) * Decimal(row["px"]) for row in fills) / amount
@@ -745,7 +797,7 @@ def reentry_size(context, quote, limit, sold):
     reserved_quantity = pending_quantity(trade)
     pending_risk = sum((Decimal(row["quantity"]) * (abs(Decimal(row["limit"]) - stop)
         + Decimal(row["limit"]) * plan.policy.cost_reserve_bps / 10000) for row in trade["entry_orders"]
-        if not row.get("not_sent") and trade.get("order_observations", {}).get(row["cloid"], {}).get("status") not in ("filled", "canceled", "rejected")), Decimal(0))
+        if not row.get("not_sent") and trade.get("order_observations", {}).get(row["cloid"], {}).get("status") not in TERMINAL_ORDER), Decimal(0))
     available = plan.risk_usdc - spent - open_risk - pending_risk
     maximum = quantity_grid(max(Decimal(0), available) / (abs(limit - stop) + limit * plan.policy.cost_reserve_bps / 10000), plan.market)
     pending_notional = sum((Decimal(row["quantity"]) * Decimal(row["limit"]) for row in trade["entry_orders"] if row.get("phase") == "pending" and not row.get("not_sent")), Decimal(0))

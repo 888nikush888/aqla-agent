@@ -15,6 +15,23 @@ from .source_queue import canonical_sources, content, is_source_row, recovery_id
 REREAD = "Source read receipt is missing, invalid, expired or stale; read source_context for the current anchor again"
 
 
+def _other_classification_reason(reason):
+    other = re.search(r"(?:missing|unknown|unclear|ambig|not (?:clear|specified))\s+(?:market|symbol|direction|reference|entry price)|(?:market|symbol|direction|reference|entry price)\s+(?:missing|unknown|unclear|ambig)|(?:markt|symbol|richtung|referenz|einstiegspreis).{0,30}(?:fehl|unbekannt|unklar|mehrdeutig)|(?:fehl|unbekannt|unklar|mehrdeutig).{0,30}(?:markt|symbol|richtung|referenz|einstiegspreis)|(?:рынок|тикер|направлен|ссылк|цен[аы] входа).{0,30}(?:неяс|неизвест|отсутств|не указан)|contradict|conflict|widerspr|противореч", reason)
+    other = other or re.search(r"(?:no|kein\w*)\s+(?:market|symbol|direction|markt|richtung)|"
+        r"(?:leverage|hebel|плеч\w*)[^.!?;\n]{0,60}(?:interval|spanne|range|диапазон)|"
+        r"(?:interval|spanne|range|диапазон)[^.!?;\n]{0,60}(?:leverage|hebel|плеч\w*)", reason)
+    return other
+
+
+def _percentage_basis_reason(reason, original):
+    target = re.search(r"\btps?\b|take.?profits?|targets?|ziele?|тейк|цел[ьи]", reason)
+    source_target = SOURCE_TP_PERCENT.search(original)
+    percentage = re.search(r"%|percent|prozent|процент", reason)
+    basis = re.search(r"\bro[ei]\b|price movement|course|kurs|margin|equity|цены|ценов|марж|движени|доходност", reason)
+    uncertain = re.search(r"ambig|unclear|unknown|unspecif|missing|not (?:clear|specified)|mehrdeutig|uneindeutig|unklar|unbekannt|nicht eindeutig|nicht .*belegbar|fehl|неяс|неоднознач|неизвест|непонят|не определ|не указан", reason)
+    return bool((target or source_target) and percentage and basis and uncertain)
+
+
 def verify_classification_policy(interpretation, original):
     """Missing execution inputs and fixed TP policy are not semantic ambiguity."""
     if interpretation.kind == "ambiguous" and binding_percentage_target_interval(original):
@@ -28,15 +45,7 @@ def verify_classification_policy(interpretation, original):
     # Compatibility for callers without structured codes. This checks only the
     # stated classification cause, not whether the source constitutes a signal.
     reason = interpretation.reason.casefold()
-    target = re.search(r"\btps?\b|take.?profits?|targets?|ziele?|тейк|цел[ьи]", reason)
-    source_target = SOURCE_TP_PERCENT.search(original)
-    percentage = re.search(r"%|percent|prozent|процент", reason)
-    basis = re.search(r"\bro[ei]\b|price movement|course|kurs|margin|equity|цены|ценов|марж|движени|доходност", reason)
-    uncertain = re.search(r"ambig|unclear|unknown|unspecif|missing|not (?:clear|specified)|mehrdeutig|uneindeutig|unklar|unbekannt|nicht eindeutig|nicht .*belegbar|fehl|неяс|неоднознач|неизвест|непонят|не определ|не указан", reason)
-    other = re.search(r"(?:missing|unknown|unclear|ambig|not (?:clear|specified))\s+(?:market|symbol|direction|reference|entry price)|(?:market|symbol|direction|reference|entry price)\s+(?:missing|unknown|unclear|ambig)|(?:markt|symbol|richtung|referenz|einstiegspreis).{0,30}(?:fehl|unbekannt|unklar|mehrdeutig)|(?:fehl|unbekannt|unklar|mehrdeutig).{0,30}(?:markt|symbol|richtung|referenz|einstiegspreis)|(?:рынок|тикер|направлен|ссылк|цен[аы] входа).{0,30}(?:неяс|неизвест|отсутств|не указан)|contradict|conflict|widerspr|противореч", reason)
-    other = other or re.search(r"(?:no|kein\w*)\s+(?:market|symbol|direction|markt|richtung)|"
-        r"(?:leverage|hebel|плеч\w*)[^.!?;\n]{0,60}(?:interval|spanne|range|диапазон)|"
-        r"(?:interval|spanne|range|диапазон)[^.!?;\n]{0,60}(?:leverage|hebel|плеч\w*)", reason)
+    other = _other_classification_reason(reason)
     if interpretation.kind in ("ambiguous", "incomplete") and not other:
         field = r"(?:\bsl\b|stop(?:[-\s]*loss)?|stopp?loss|стоп(?:[-\s]*лосс)?|targets?|take[-\s]*profits?|tps?\b|ziele?|цел[ьи]|тейк\w*|leverage|hebel|плечо)"
         missing = r"(?:missing|absent|without|not\s+(?:given|provided|stated|specified)|no\b|fehl\w*|ohne|kein\w*|nicht\s+(?:genannt|angegeben|vorhanden)|нет\b|без\b|отсутств\w*|не\s+указан\w*)"
@@ -47,7 +56,7 @@ def verify_classification_policy(interpretation, original):
                 raise AqlaError("Missing source SL/TP/leverage alone cannot classify this source as non-actionable. Keep unstated values absent; trade_preview applies configured Backup or rejects execution. Explicit TP percentages use source-roe-v1 roe_percent, never require invented absolute prices. Re-read source_context and correct the interpretation; genuine independent ambiguity remains blocked.")
     if "%" not in original:
         return
-    percentage_only = not other and (explicit or bool((target or source_target) and percentage and basis and uncertain))
+    percentage_only = not other and (explicit or _percentage_basis_reason(reason, original))
     if percentage_only:
         raise AqlaError("Percentage basis alone cannot classify this source as non-actionable: source-roe-v1 defines source TP % as nominal ROE on own initial margin before costs. Re-read source_context and reinterpret with roe_percent; keep all other market, direction, evidence and execution guards.")
 
@@ -81,38 +90,31 @@ def issue_receipt(events, event_id, key, *, stamp=None, context_rows=None, compa
     return json.dumps({"body": body, "signature": hmac.new(key, body.encode(), hashlib.sha256).hexdigest()}, separators=(",", ":"))
 
 
-def verify_disposition(snapshot, event_id, interpretation, token, key, *, stamp=None):
-    stamp = now_ms() if stamp is None else stamp
-    try:
-        if not isinstance(token, str) or len(token) > 32768:
+def _receipt_claims(token, key):
+    if not isinstance(token, str) or len(token) > 32768:
+        raise ValueError(REREAD)
+    if token.startswith("sr2."):
+        _, body, signed = token.split(".")
+        payload = base64.b64decode(body + "=" * (-len(body) % 4), altchars=b"-_", validate=True)
+        signature = base64.b64decode(signed + "=" * (-len(signed) % 4), altchars=b"-_", validate=True)
+        expected = hmac.new(key, b"aqla-source-read:v2:" + payload, hashlib.sha256).digest()
+        if not secrets.compare_digest(expected, signature):
             raise ValueError(REREAD)
-        if token.startswith("sr2."):
-            _, body, signed = token.split(".")
-            payload = base64.b64decode(body + "=" * (-len(body) % 4), altchars=b"-_", validate=True)
-            signature = base64.b64decode(signed + "=" * (-len(signed) % 4), altchars=b"-_", validate=True)
-            expected = hmac.new(key, b"aqla-source-read:v2:" + payload, hashlib.sha256).digest()
-            if not secrets.compare_digest(expected, signature):
-                raise ValueError(REREAD)
-            decoder = zlib.decompressobj()
-            raw = decoder.decompress(payload, 65536)
-            if not decoder.eof or decoder.unused_data:
-                raise ValueError(REREAD)
-            claims = json.loads(raw)
-        else:
-            envelope = json.loads(token)
-            expected = hmac.new(key, envelope["body"].encode(), hashlib.sha256).hexdigest()
-            if not secrets.compare_digest(expected, envelope["signature"]):
-                raise ValueError(REREAD)
-            claims = json.loads(envelope["body"])
-        if (claims["kind"] != "source_read"
-                or claims["event_id"] != event_id or claims["expires_at"] <= stamp
-                or claims["fingerprint"] != fingerprint(snapshot["events"], event_id, claims["refs"])):
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(payload, 65536)
+        if not decoder.eof or decoder.unused_data:
             raise ValueError(REREAD)
-    except (ValueError, KeyError, TypeError, zlib.error, RecursionError) as error:
-        raise AqlaError(REREAD) from error
-    row = snapshot["events"][event_id]
-    if row["status"] in ("executed", "updated") or event_id in recovery_ids(snapshot):
-        raise AqlaError("Financial execution/recovery revision is immutable")
+        claims = json.loads(raw)
+    else:
+        envelope = json.loads(token)
+        expected = hmac.new(key, envelope["body"].encode(), hashlib.sha256).hexdigest()
+        if not secrets.compare_digest(expected, envelope["signature"]):
+            raise ValueError(REREAD)
+        claims = json.loads(envelope["body"])
+    return claims
+
+
+def _verify_classification(row, interpretation):
     if row["source_id"] not in interpretation.source_refs or not interpretation.reason.strip():
         raise AqlaError("Classification requires the current anchor reference and a reason")
     from aqla_hyperliquid_mcp.rules import verify_setup_references
@@ -123,3 +125,19 @@ def verify_disposition(snapshot, event_id, interpretation, token, key, *, stamp=
                and proof.quote.strip() and proof.quote in row["source"]["text"] for proof in interpretation.evidence):
         raise AqlaError("Classification requires a classification evidence quote from the original anchor")
     verify_classification_policy(interpretation, row["source"]["text"])
+
+
+def verify_disposition(snapshot, event_id, interpretation, token, key, *, stamp=None):
+    stamp = now_ms() if stamp is None else stamp
+    try:
+        claims = _receipt_claims(token, key)
+        if (claims["kind"] != "source_read"
+                or claims["event_id"] != event_id or claims["expires_at"] <= stamp
+                or claims["fingerprint"] != fingerprint(snapshot["events"], event_id, claims["refs"])):
+            raise ValueError(REREAD)
+    except (ValueError, KeyError, TypeError, zlib.error, RecursionError) as error:
+        raise AqlaError(REREAD) from error
+    row = snapshot["events"][event_id]
+    if row["status"] in ("executed", "updated") or event_id in recovery_ids(snapshot):
+        raise AqlaError("Financial execution/recovery revision is immutable")
+    _verify_classification(row, interpretation)

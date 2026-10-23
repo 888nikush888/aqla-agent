@@ -39,61 +39,10 @@ class State:
         except portalocker.LockException as error:
             raise AqlaError("Another aqla process already owns this state") from error
         try:
-            existing = self.path.exists()
-            legacy_path = self.path.with_suffix(".json")
-            if not existing and self.path.with_suffix(self.path.suffix + ".initialized").exists():
-                raise AqlaError("Previously initialized SQLite state is missing; explicit recovery is required")
-            if existing or legacy_path.exists():
-                self.data = read_snapshot(self.path) if existing else json.loads(legacy_path.read_text(encoding="utf-8"))
-                if not isinstance(self.data, dict) or self.data.get("schema") not in (1, 2, 3) or self.data.get("network") != settings.network or self.data.get("account", "").lower() != settings.account.lower():
-                    raise AqlaError("State version, account or network differs; use a separate state")
-                for key in ("events", "trades", "operations", "nonces", "plans", "bindings", "sources"):
-                    if key not in self.data:
-                        raise AqlaError("State is incomplete; do not restore an old snapshot blindly")
-            else:
-                self.data = {"schema": 1, "network": settings.network, "account": settings.account.lower(), "trading_account": (settings.vault_address or settings.account).lower(), "sequence": 0,
-                             "policy": settings.policy.model_dump(mode="json") if settings.policy else None,
-                             "policy_revision": 1 if settings.policy else 0, "paused": False,
-                             "sources": settings.sources, "source_aliases": {}, "events": {}, "trades": {}, "plans": {},
-                             "bindings": {}, "operations": {}, "nonces": {}, "cursors": {}, "notifications": {}, "event_tombstones": {}}
-            target = (settings.vault_address or settings.account).lower()
-            legacy = "trading_account" not in self.data
-            if legacy:
-                # Legacy state can inherit only a target proved by its own execution records.
-                targets = {row["plan"]["account"].lower() for row in self.data["plans"].values()}
-                targets.update(row["plan"]["account"].lower() for row in self.data["trades"].values())
-                targets.update(row["request"]["account"].lower() for row in self.data["operations"].values()
-                               if row.get("request", {}).get("account") and not row["request"].get("leader"))
-                inferred = require_first(iter(targets)) if len(targets) == 1 else settings.account.lower() if not targets else None
-                if inferred != target:
-                    raise AqlaError("Legacy execution state belongs to another or ambiguous trading target")
-                self.data["trading_account"] = inferred
-            self.assert_binding(settings)
-            for row in [*self.data["plans"].values(), *self.data["trades"].values()]:
-                plan = row["plan"]
-                if plan.get("exchange", "hyperliquid") != "hyperliquid" or plan.get("account_key") not in (None, "hyperliquid:" + settings.network):
-                    continue
-                if plan["account"].lower() != target or plan["network"] != settings.network or plan.get("principal") not in (None, settings.account.lower()):
-                    raise AqlaError("Saved plan belongs to another trading target or network")
-            for row in self.data["operations"].values():
-                if row.get("exchange", "hyperliquid") == "hyperliquid" and row.get("account_key") in (None, "hyperliquid:" + settings.network):
-                    self.assert_operation_binding(settings, row)
-            from aqla_agent.pipelines import migrate
-
-            had_ranking = "ranking_policy" in self.data
-            migrated = migrate(self.data)
-            if settings.ranking_enabled and not had_ranking:
-                self.data["ranking_policy"]["enabled"] = True
-                migrated = True
-            if not existing and not legacy_path.exists():
-                for row in self.data["source_ranks"].values():
-                    row.update(tier="F", bootstrap=False)
-            from aqla_agent.journal import retire_export_queue
-            migrated = retire_export_queue(self.data) or migrated
-            if "notice_policy_state" not in self.data:
-                self.data["notice_policy_state"] = {"seen_fills": [trade_id + ":" + key
-                    for trade_id, trade in self.data["trades"].items() for key in trade.get("fill_events", {})]}
-                migrated = True
+            existing, legacy_path = self._load_state(settings)
+            legacy = self._restore_trading_target(settings)
+            self._validate_saved_bindings(settings)
+            migrated = self._migrate_state(settings, existing, legacy_path)
             self._store = SQLiteStore(self.path, create=not existing)
             if not existing or migrated or legacy:
                 self._write(self.data)
@@ -105,6 +54,72 @@ class State:
                 self._store.close()
             self._lock.release()
             raise
+
+    def _load_state(self, settings):
+        existing = self.path.exists()
+        legacy_path = self.path.with_suffix(".json")
+        if not existing and self.path.with_suffix(self.path.suffix + ".initialized").exists():
+            raise AqlaError("Previously initialized SQLite state is missing; explicit recovery is required")
+        if existing or legacy_path.exists():
+            self.data = read_snapshot(self.path) if existing else json.loads(legacy_path.read_text(encoding="utf-8"))
+            if not isinstance(self.data, dict) or self.data.get("schema") not in (1, 2, 3) or self.data.get("network") != settings.network or self.data.get("account", "").lower() != settings.account.lower():
+                raise AqlaError("State version, account or network differs; use a separate state")
+            for key in ("events", "trades", "operations", "nonces", "plans", "bindings", "sources"):
+                if key not in self.data:
+                    raise AqlaError("State is incomplete; do not restore an old snapshot blindly")
+        else:
+            self.data = {"schema": 1, "network": settings.network, "account": settings.account.lower(), "trading_account": (settings.vault_address or settings.account).lower(), "sequence": 0,
+                         "policy": settings.policy.model_dump(mode="json") if settings.policy else None,
+                         "policy_revision": 1 if settings.policy else 0, "paused": False,
+                         "sources": settings.sources, "source_aliases": {}, "events": {}, "trades": {}, "plans": {},
+                         "bindings": {}, "operations": {}, "nonces": {}, "cursors": {}, "notifications": {}, "event_tombstones": {}}
+        return existing, legacy_path
+
+    def _restore_trading_target(self, settings):
+        target = (settings.vault_address or settings.account).lower()
+        legacy = "trading_account" not in self.data
+        if legacy:
+            # Legacy state can inherit only a target proved by its own execution records.
+            targets = {row["plan"]["account"].lower() for row in self.data["plans"].values()}
+            targets.update(row["plan"]["account"].lower() for row in self.data["trades"].values())
+            targets.update(row["request"]["account"].lower() for row in self.data["operations"].values()
+                           if row.get("request", {}).get("account") and not row["request"].get("leader"))
+            inferred = require_first(iter(targets)) if len(targets) == 1 else settings.account.lower() if not targets else None
+            if inferred != target:
+                raise AqlaError("Legacy execution state belongs to another or ambiguous trading target")
+            self.data["trading_account"] = inferred
+        return legacy
+
+    def _validate_saved_bindings(self, settings):
+        self.assert_binding(settings)
+        for row in [*self.data["plans"].values(), *self.data["trades"].values()]:
+            plan = row["plan"]
+            if plan.get("exchange", "hyperliquid") != "hyperliquid" or plan.get("account_key") not in (None, "hyperliquid:" + settings.network):
+                continue
+            if plan["account"].lower() != (settings.vault_address or settings.account).lower() or plan["network"] != settings.network or plan.get("principal") not in (None, settings.account.lower()):
+                raise AqlaError("Saved plan belongs to another trading target or network")
+        for row in self.data["operations"].values():
+            if row.get("exchange", "hyperliquid") == "hyperliquid" and row.get("account_key") in (None, "hyperliquid:" + settings.network):
+                self.assert_operation_binding(settings, row)
+
+    def _migrate_state(self, settings, existing, legacy_path):
+        from aqla_agent.pipelines import migrate
+
+        had_ranking = "ranking_policy" in self.data
+        migrated = migrate(self.data)
+        if settings.ranking_enabled and not had_ranking:
+            self.data["ranking_policy"]["enabled"] = True
+            migrated = True
+        if not existing and not legacy_path.exists():
+            for row in self.data["source_ranks"].values():
+                row.update(tier="F", bootstrap=False)
+        from aqla_agent.journal import retire_export_queue
+        migrated = retire_export_queue(self.data) or migrated
+        if "notice_policy_state" not in self.data:
+            self.data["notice_policy_state"] = {"seen_fills": [trade_id + ":" + key
+                for trade_id, trade in self.data["trades"].items() for key in trade.get("fill_events", {})]}
+            migrated = True
+        return migrated
 
     def assert_binding(self, settings):
         with self._thread_lock:

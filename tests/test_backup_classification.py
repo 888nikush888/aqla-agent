@@ -32,6 +32,13 @@ def source_case(trading, text=TEXT):
     return source, draft
 
 
+def assert_backup_stop_source_roe_plan(plan):
+    assert plan["backup_fields"] == ["stop_loss"] and plan["effective_leverage"] == 10
+    assert Decimal(plan["stop_loss"]) == 104 and list(map(Decimal, plan["take_profits"])) == [95, 90]
+    assert plan["source_tp"]["values"] == ["50", "100"]
+    assert plan["policy"]["risk_percent"] == "5" and Decimal(plan["risk_usdc"]) <= 500
+
+
 @pytest.mark.parametrize("reason", [
     "ohne Stop-Loss und Ziele nur als 50%/100% ohne Preise",
     "Stop-Loss fehlt; kein vollstaendig ausfuehrbares Setup",
@@ -108,8 +115,6 @@ async def test_public_writes_recheck_policy_without_planning_or_ordering(setup, 
         await close_server(server)
 
 
-# Sequential safety assertions; control flow (including test doubles): 7.
-# skipcq: PY-R1000
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backup_enabled", [False, True])
 async def test_corrected_source_uses_only_backup_stop_and_preserves_both_source_roe_targets(setup, backup_enabled):
@@ -131,10 +136,7 @@ async def test_corrected_source_uses_only_backup_stop_and_preserves_both_source_
         assert not state.snapshot()["plans"] and not fake.actions
         return
     plan = await trading.preview(source.event_id, draft)
-    assert plan["backup_fields"] == ["stop_loss"] and plan["effective_leverage"] == 10
-    assert Decimal(plan["stop_loss"]) == 104 and list(map(Decimal, plan["take_profits"])) == [95, 90]
-    assert plan["source_tp"]["values"] == ["50", "100"]
-    assert plan["policy"]["risk_percent"] == "5" and Decimal(plan["risk_usdc"]) <= 500
+    assert_backup_stop_source_roe_plan(plan)
     trade = await trading.execute(plan["plan_id"])
     assert trade["status"] == "opening" and fake.position == 0
     fake.fill(trade["entry_cloid"], plan["quantity"], "100")

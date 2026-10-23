@@ -37,6 +37,15 @@ def record_endpoints(data, identity, initial, wave_end, stamp):
         row["waverider"].setdefault("endpoint_reached_at", stamp)
 
 
+def _book_actionable(trade, book):
+    pending = [row for row in trade.get("entry_orders", []) if not row.get("not_sent") and row.get("phase") != "terminal"]
+    actionable = any(book.ask <= Decimal(row["limit"]) if trade["plan"]["side"] == "long" else book.bid >= Decimal(row["limit"]) for row in pending)
+    completed = set(trade.get("completed_target_indices", []))
+    actionable |= any((book.bid >= Decimal(target) if trade["plan"]["side"] == "long" else book.ask <= Decimal(target))
+        for index, target in enumerate(trade.get("targets", trade["plan"]["take_profits"])) if index not in completed)
+    return actionable
+
+
 class EntryWatch:
     def __init__(self, router, *, connector=connect):
         self.router, self.connector = router, connector
@@ -64,6 +73,29 @@ class EntryWatch:
         if initial and not trade.get("entry_tp1_reached_at") or wave_end and not wave.get("endpoint_reached_at"):
             engine.state.update(lambda data: record_endpoints(data, identity, initial, wave_end, stamp))
 
+    @staticmethod
+    async def _manage_one(current_engine, current_id, book, last_sync):
+        try:
+            async with current_engine.lock.work(30):
+                if not current_engine.recovery_checked:
+                    return
+                trade = current_engine.state.read("trades", entries={"trades": [current_id]})["trades"].get(current_id)
+                if not trade:
+                    return
+                now = asyncio.get_running_loop().time()
+                actionable = _book_actionable(trade, book)
+                if actionable and now - last_sync.get(current_id, 0) >= 3:
+                    await current_engine.refresh_trade(current_id)
+                    last_sync[current_id] = now
+                if trade["plan"]["policy"].get("management_mode") == "waverider" and Decimal(trade["remaining_quantity"]) > 0:
+                    from .waverider import tick
+                    await tick(current_engine, current_id, book)
+                if Decimal(trade["remaining_quantity"]) > 0:
+                    from .waverider import queue_evidence
+                    queue_evidence(current_engine, current_id, book)
+        except Exception:
+            # Native recovery owns financial diagnostics; another account must still be served.
+            pass
     async def observe(self, engine, identity, market):
         venue = getattr(engine.exchange.settings, "venue", "hyperliquid")
         base = str(engine.exchange.client.base_url).rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
@@ -82,32 +114,6 @@ class EntryWatch:
             for current_engine, current_id in subscribers():
                 self.latch(current_engine, current_id, book.bid, book.ask, book.exchange_time)
             wake.set()
-        async def manage_one(current_engine, current_id, book):
-            try:
-                async with current_engine.lock.work(30):
-                    if not current_engine.recovery_checked:
-                        return
-                    trade = current_engine.state.read("trades", entries={"trades": [current_id]})["trades"].get(current_id)
-                    if not trade:
-                        return
-                    now = asyncio.get_running_loop().time()
-                    pending = [row for row in trade.get("entry_orders", []) if not row.get("not_sent") and row.get("phase") != "terminal"]
-                    actionable = any(book.ask <= Decimal(row["limit"]) if trade["plan"]["side"] == "long" else book.bid >= Decimal(row["limit"]) for row in pending)
-                    completed = set(trade.get("completed_target_indices", []))
-                    actionable |= any((book.bid >= Decimal(target) if trade["plan"]["side"] == "long" else book.ask <= Decimal(target))
-                        for index, target in enumerate(trade.get("targets", trade["plan"]["take_profits"])) if index not in completed)
-                    if actionable and now - last_sync.get(current_id, 0) >= 3:
-                        await current_engine.refresh_trade(current_id)
-                        last_sync[current_id] = now
-                    if trade["plan"]["policy"].get("management_mode") == "waverider" and Decimal(trade["remaining_quantity"]) > 0:
-                        from .waverider import tick
-                        await tick(current_engine, current_id, book)
-                    if Decimal(trade["remaining_quantity"]) > 0:
-                        from .waverider import queue_evidence
-                        queue_evidence(current_engine, current_id, book)
-            except Exception:
-                # Native recovery owns financial diagnostics; another account must still be served.
-                pass
         async def manage():
             last = 0.0
             while True:
@@ -116,7 +122,7 @@ class EntryWatch:
                 wake.clear()
                 book = latest_book
                 if book is not None:
-                    await asyncio.gather(*(manage_one(current_engine, current_id, book) for current_engine, current_id in subscribers()))
+                    await asyncio.gather(*(self._manage_one(current_engine, current_id, book, last_sync) for current_engine, current_id in subscribers()))
                 last = asyncio.get_running_loop().time()
         manager = asyncio.create_task(manage(), name="aqla-entry-events")
         delay = 1
@@ -142,20 +148,24 @@ class EntryWatch:
             manager.cancel()
             await asyncio.gather(manager, return_exceptions=True)
 
+    def _wanted(self):
+        wanted = {}
+        for identity, trade in self.router.state.read("trades")["trades"].items():
+            if trade.get("lifecycle_version") != 2 or trade["status"] not in ("waiting_entry", "preparing", "opening", "protecting", "open", "unknown"):
+                continue
+            engine = self.router.engine_for_plan(trade["plan"])
+            if engine:
+                market = Market.model_validate(trade["plan"]["market"])
+                base = str(engine.exchange.client.base_url).rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
+                key = (getattr(engine.exchange.settings, "venue", "hyperliquid"), engine.exchange.settings.network, base, market.asset_id, market.symbol)
+                wanted.setdefault(key, []).append((engine, identity, market))
+        return wanted
+
     async def run(self):
         try:
             while not self.closed:
                 self.changed.clear()
-                wanted = {}
-                for identity, trade in self.router.state.read("trades")["trades"].items():
-                    if trade.get("lifecycle_version") != 2 or trade["status"] not in ("waiting_entry", "preparing", "opening", "protecting", "open", "unknown"):
-                        continue
-                    engine = self.router.engine_for_plan(trade["plan"])
-                    if engine:
-                        market = Market.model_validate(trade["plan"]["market"])
-                        base = str(engine.exchange.client.base_url).rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
-                        key = (getattr(engine.exchange.settings, "venue", "hyperliquid"), engine.exchange.settings.network, base, market.asset_id, market.symbol)
-                        wanted.setdefault(key, []).append((engine, identity, market))
+                wanted = self._wanted()
                 self.groups = {key: [(engine, identity) for engine, identity, _ in rows] for key, rows in wanted.items()}
                 removed = [self.tasks.pop(key) for key in set(self.tasks) - set(wanted)]
                 for task in removed:

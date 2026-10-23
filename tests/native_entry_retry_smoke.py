@@ -227,7 +227,7 @@ config_path.write_text(yaml.safe_dump(config))
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
-            pass
+            return None
 
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))

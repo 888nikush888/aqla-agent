@@ -166,6 +166,20 @@ def split_direct(raw, count):
 
 
 
+def _source_processing_text(processing):
+    jobs = processing.get("jobs", processing.get("states", {}))
+    decisions = processing.get("decision", processing.get("decision_status", {}))
+    permissions = decisions.get("permissions", {}) if processing.get("mode") == "hybrid" and decisions.get("validated") else {}
+    if processing.get("mode") == "legacy":
+        processing_text = "Verarbeitung: Hermes + DeepSeek + Tools\nHistorische Quellenjobs: " + json.dumps(
+            processing.get("historical_jobs", jobs), ensure_ascii=False)
+    else:
+        processing_text = "Verarbeitung: " + json.dumps(jobs, ensure_ascii=False) + "\n"
+        processing_text += "Decision-Modell: " + str(decisions.get("model", "nicht gemeldet")) + " · kalibriert: " + ("ja" if decisions.get("validated") else "nein") + "\n"
+        processing_text += "Aktive Decision-Freigabe: " + json.dumps(permissions, ensure_ascii=False)
+    return processing_text
+
+
 class NativeCommands:
     def __init__(self, extension):
         self.extension = extension
@@ -321,6 +335,9 @@ class NativeCommands:
         else:
             await self.reply(bot, "Feld wählen:", self.choices(self.fields(), "field"))
 
+    def _value_choices(self, dialog, options):
+        return self.choices([(BACKUP_UNIT_LABELS.get(value, str(value)) if dialog.field in ("fallback_stop_loss_unit", "fallback_take_profit_unit") else {"standard": "Standard", "waverider": "Waverider"}.get(value, str(value)) if dialog.field == "management_mode" else str(value), value) for value in options], "value")
+
     async def show_value(self, bot, prefix=""):
         dialog = self.dialog
         schema = self.schema()
@@ -336,7 +353,7 @@ class NativeCommands:
         if dialog.command == "aqla_parameter" and dialog.field.startswith("fallback_") and "roe_percent" in parameters.values():
             text += "\nROE-Basis: ursprüngliche Positionsmargin vor Gebühren und Funding."
         if options is not None:
-            buttons = self.choices([(BACKUP_UNIT_LABELS.get(value, str(value)) if dialog.field in ("fallback_stop_loss_unit", "fallback_take_profit_unit") else {"standard": "Standard", "waverider": "Waverider"}.get(value, str(value)) if dialog.field == "management_mode" else str(value), value) for value in options], "value")
+            buttons = self._value_choices(dialog, options)
         else:
             example = '["move_stop", "close"]' if dialog.field == "allowed_updates" else "[1, 2]" if selected.get("type") == "array" else "5" if selected.get("type") == "integer" else "0,5"
             if dialog.field == "waverider_until_tp":
@@ -432,38 +449,32 @@ class NativeCommands:
             return
         await self.commit(bot, parse_value(value, self.schema()))
 
+    async def _read_status(self, bot, snapshot):
+        for block in snapshot.get("telegram_view", {}).get("status", []):
+            await self.reply(bot, block, markdown=True)
+        # Use the same established trade formatter as notifications.
+        from .messages import trade_block
+        data = {**snapshot, "trades": {trade["trade_id"]: trade for trade in snapshot.get("trades", [])}}
+        for trade in snapshot.get("trades", []):
+            await self.reply(bot, trade_block(data, trade, []), markdown=True)
+        setup = snapshot.get("setup", {})
+        journal = snapshot.get("journal", {})
+        accounts = "\n".join(f"{identity}: {'aktiv' if row.get('enabled') else 'aus'} · {'konfiguriert' if row.get('configured') else 'nicht konfiguriert'} · Limits: {row.get('limits') or '—'}"
+                             for identity, row in snapshot.get("execution_accounts", {}).items())
+        await self.reply(bot, "Konten:\n" + (accounts or "—"))
+        await self.reply(bot, f"Setup: {setup.get('remaining_seconds', 0)} Sekunden übrig\nJournal: {journal.get('pending', 0)} ausstehend; letzter Sync: {journal.get('last_synced_at') or '—'}")
+        queue = snapshot.get("source_queue", {})
+        processing = snapshot.get("source_processing", {})
+        processing_text = _source_processing_text(processing)
+        await self.reply(bot, f"Quellenwarteschlange: bereit {queue.get('ready_total', 0)} · blockiert {queue.get('blocked_total', 0)} · Recovery {queue.get('recovery_total', 0)}\n"
+            + "Verarbeitungsmodus: " + str(processing.get("mode", "nicht gemeldet")) + "\n" + processing_text + "\n"
+            + "Eigentumskonflikte: " + str(sum(row.get("status") == "conflicted" for row in snapshot.get("trades", []))) + "\n"
+            + "\nBenachrichtigungen und abgeschlossene Verarbeitung sind getrennte Zähler.")
+
     async def read(self, bot, command):
         snapshot = await self.status()
         if command == "aqla_status":
-            for block in snapshot.get("telegram_view", {}).get("status", []):
-                await self.reply(bot, block, markdown=True)
-            # Use the same established trade formatter as notifications.
-            from .messages import trade_block
-            data = {**snapshot, "trades": {trade["trade_id"]: trade for trade in snapshot.get("trades", [])}}
-            for trade in snapshot.get("trades", []):
-                await self.reply(bot, trade_block(data, trade, []), markdown=True)
-            setup = snapshot.get("setup", {})
-            journal = snapshot.get("journal", {})
-            accounts = "\n".join(f"{identity}: {'aktiv' if row.get('enabled') else 'aus'} · {'konfiguriert' if row.get('configured') else 'nicht konfiguriert'} · Limits: {row.get('limits') or '—'}"
-                                 for identity, row in snapshot.get("execution_accounts", {}).items())
-            await self.reply(bot, "Konten:\n" + (accounts or "—"))
-            await self.reply(bot, f"Setup: {setup.get('remaining_seconds', 0)} Sekunden übrig\nJournal: {journal.get('pending', 0)} ausstehend; letzter Sync: {journal.get('last_synced_at') or '—'}")
-            queue = snapshot.get("source_queue", {})
-            processing = snapshot.get("source_processing", {})
-            jobs = processing.get("jobs", processing.get("states", {}))
-            decisions = processing.get("decision", processing.get("decision_status", {}))
-            permissions = decisions.get("permissions", {}) if processing.get("mode") == "hybrid" and decisions.get("validated") else {}
-            if processing.get("mode") == "legacy":
-                processing_text = "Verarbeitung: Hermes + DeepSeek + Tools\nHistorische Quellenjobs: " + json.dumps(
-                    processing.get("historical_jobs", jobs), ensure_ascii=False)
-            else:
-                processing_text = "Verarbeitung: " + json.dumps(jobs, ensure_ascii=False) + "\n"
-                processing_text += "Decision-Modell: " + str(decisions.get("model", "nicht gemeldet")) + " · kalibriert: " + ("ja" if decisions.get("validated") else "nein") + "\n"
-                processing_text += "Aktive Decision-Freigabe: " + json.dumps(permissions, ensure_ascii=False)
-            await self.reply(bot, f"Quellenwarteschlange: bereit {queue.get('ready_total', 0)} · blockiert {queue.get('blocked_total', 0)} · Recovery {queue.get('recovery_total', 0)}\n"
-                + "Verarbeitungsmodus: " + str(processing.get("mode", "nicht gemeldet")) + "\n" + processing_text + "\n"
-                + "Eigentumskonflikte: " + str(sum(row.get("status") == "conflicted" for row in snapshot.get("trades", []))) + "\n"
-                + "\nBenachrichtigungen und abgeschlossene Verarbeitung sind getrennte Zähler.")
+            await self._read_status(bot, snapshot)
         elif command == "aqla_kanaele":
             from .ranking import active_sources
             selected = sorted(active_sources(snapshot))
@@ -520,63 +531,108 @@ class NativeCommands:
             result = await self.control(action="resolve_conflict", trade_id=parts[0], review_fingerprint=parts[1])
             await self.reply(bot, "Eigene Schließung bestätigt; Marktreservierung freigegeben. PnL unvollständig." if result["resolved"] else "Schließung nicht belegt; Reservierung bleibt bestehen. Neue Eigentumsprüfung lesen.")
 
-    async def intercept(self, update, bot):
-        if self.menu and await self.menu.intercept(update, bot):
+    async def _callback_action(self, bot, dialog, action, value):
+        if action == "cancel":
+            self.cancel()
+            await self.reply(bot, "Dialog abgebrochen.")
+        elif action == "page":
+            rows, stage, page = value
+            await self.reply(bot, "Auswahl:", self.choices(rows, stage, page))
+        elif action == "target":
+            dialog.target = value
+            await self.show_field(bot)
+        elif action == "field":
+            dialog.field = value
+            await self.show_value(bot)
+        elif action == "value":
+            await self.commit(bot, value)
+
+    async def _intercept_callback(self, query, bot):
+        user, chat = query.from_user, getattr(query.message, "chat", None)
+        authentic = bool(user and chat and not user.is_bot and str(user.id) == self.extension.owner
+                         and str(chat.id) == self.extension.owner and chat.type == "private")
+        await query.answer()
+        if not authentic:
             return True
-        query = getattr(update, "callback_query", None)
-        if query and str(getattr(query, "data", "")).startswith(CALLBACK_PREFIX):
-            user, chat = query.from_user, getattr(query.message, "chat", None)
-            authentic = bool(user and chat and not user.is_bot and str(user.id) == self.extension.owner
-                             and str(chat.id) == self.extension.owner and chat.type == "private")
-            await query.answer()
-            if not authentic:
+        async with self.serial:
+            dialog = self.live()
+            selection = dialog.tokens.pop(query.data, None) if dialog else None
+            if selection is None:
                 return True
-            async with self.serial:
-                dialog = self.live()
-                selection = dialog.tokens.pop(query.data, None) if dialog else None
-                if selection is None:
-                    return True
-                # Every displayed button is a one-use capability. Changing stage
-                # invalidates its siblings, and data is never parsed as a value.
-                dialog.tokens.clear()
-                action, value = selection
-                try:
-                    if action == "cancel":
-                        self.cancel()
-                        await self.reply(bot, "Dialog abgebrochen.")
-                    elif action == "page":
-                        rows, stage, page = value
-                        await self.reply(bot, "Auswahl:", self.choices(rows, stage, page))
-                    elif action == "target":
-                        dialog.target = value
-                        await self.show_field(bot)
-                    elif action == "field":
-                        dialog.field = value
-                        await self.show_value(bot)
-                    elif action == "value":
-                        await self.commit(bot, value)
-                except ValueError:
-                    if self.live():
-                        await self.show_value(bot, "Wert oder Änderung nicht zulässig. Prüfe die vollständigen Profilregeln.\n")
-                    else:
-                        await self.reply(bot, "Setup oder Dialog ist abgelaufen.")
-            return True
+            # Every displayed button is a one-use capability. Changing stage
+            # invalidates its siblings, and data is never parsed as a value.
+            dialog.tokens.clear()
+            action, value = selection
+            try:
+                await self._callback_action(bot, dialog, action, value)
+            except ValueError:
+                if self.live():
+                    await self.show_value(bot, "Wert oder Änderung nicht zulässig. Prüfe die vollständigen Profilregeln.\n")
+                else:
+                    await self.reply(bot, "Setup oder Dialog ist abgelaufen.")
+        return True
+
+    async def _dispatch_command(self, bot, command, raw, dialog, text):
+        if command in PROTECTED or command == "aqla_kanalname":
+            if command == "aqla_fortsetzen":
+                self.cancel()
+                result = await self.control(action="resume")
+                await self.reply(bot, f"Entries: {'pausiert' if result['previous_paused'] else 'aktiv'} → freigegeben.")
+            elif command in ("aqla_hinzufuegen", "aqla_entfernen", "aqla_kanalname"):
+                await self.source_change(bot, command, raw.strip())
+            elif command == "aqla_konflikt_loesen":
+                await self.ownership(bot, command, raw.strip())
+            else:
+                await self.start(bot, command, raw.strip())
+        elif command == "aqla_konflikt":
+            await self.ownership(bot, command, raw.strip())
+        elif command in COMMANDS:
+            await self.read(bot, command)
+        elif dialog is not None:
+            if command:
+                self.cancel()
+                return False  # Preserve legitimate typed Hermes commands.
+            if dialog.field is None:
+                await self.reply(bot, "Wähle zuerst die Schaltflächen oder /cancel.")
+            else:
+                await self.commit(bot, parse_value(text, self.schema()))
+
+    def _message_fields(self, update):
         message = getattr(update, "effective_message", None)
         text = getattr(message, "text", None) or ""
         head, _, raw = text.partition(" ")
         command = head.split("@", 1)[0].lstrip("/").lower() if head.startswith("/") else ""
         if not command and self.dialog is None:
             command = routine_query(text) or ""
+        return message, text, head, raw, command
+
+    async def _safe_dispatch_command(self, bot, command, raw, dialog, text):
+        try:
+            if await self._dispatch_command(bot, command, raw, dialog, text) is False:
+                return False
+        except ValueError:
+            if self.live() and self.dialog.field is not None:
+                await self.show_value(bot, "Wert oder Änderung nicht zulässig. Prüfe die vollständigen Profilregeln.\n")
+            else:
+                await self.reply(bot, "Befehl nicht verfügbar oder ungültig. Für Änderungen /setup starten; genaue Ziele und vollständige Werte verwenden.")
+        except Exception:
+            # Do not log Update, values, callback actors or exception payloads.
+            self.cancel()
+            await self.reply(bot, "Native aqla-Steuerung ist vorübergehend nicht verfügbar.")
+        return True
+
+    def _authentic_message(self, update, message):
+        return self.extension.setup.private_owner(message) and not any(
+            getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))
+
+    async def _intercept_message(self, update, bot):
+        message, text, head, raw, command = self._message_fields(update)
         if not addressed_to_bot(head, bot):
             return command in COMMANDS
-        authentic = self.extension.setup.private_owner(message) and not any(getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))
-        if command in RESET_COMMANDS or command in ("setup", "cancel", "abbrechen"):
-            if authentic:
-                self.cancel()
-            if command in ("cancel", "abbrechen") and authentic:
-                await self.reply(bot, "Dialog abgebrochen.")
-                return True
-            return False
+        authentic = self._authentic_message(update, message)
+        reset = await self._reset_command(bot, command, authentic)
+        if reset is not None:
+            return reset
         had_dialog = self.dialog is not None
         dialog = self.live()
         if command not in COMMANDS and dialog is None:
@@ -596,41 +652,26 @@ class NativeCommands:
             await self.reply(bot, f"Entries: {'pausiert' if result['previous_paused'] else 'aktiv'} → pausiert. Positionsschutz läuft weiter.")
             return True
         async with self.serial:
-            try:
-                if command in PROTECTED or command == "aqla_kanalname":
-                    if command == "aqla_fortsetzen":
-                        self.cancel()
-                        result = await self.control(action="resume")
-                        await self.reply(bot, f"Entries: {'pausiert' if result['previous_paused'] else 'aktiv'} → freigegeben.")
-                    elif command in ("aqla_hinzufuegen", "aqla_entfernen", "aqla_kanalname"):
-                        await self.source_change(bot, command, raw.strip())
-                    elif command == "aqla_konflikt_loesen":
-                        await self.ownership(bot, command, raw.strip())
-                    else:
-                        await self.start(bot, command, raw.strip())
-                elif command == "aqla_konflikt":
-                    await self.ownership(bot, command, raw.strip())
-                elif command in COMMANDS:
-                    await self.read(bot, command)
-                elif dialog is not None:
-                    if command:
-                        self.cancel()
-                        return False  # Preserve legitimate typed Hermes commands.
-                    if dialog.field is None:
-                        await self.reply(bot, "Wähle zuerst die Schaltflächen oder /cancel.")
-                    else:
-                        await self.commit(bot, parse_value(text, self.schema()))
-            except ValueError:
-                if self.live() and self.dialog.field is not None:
-                    await self.show_value(bot, "Wert oder Änderung nicht zulässig. Prüfe die vollständigen Profilregeln.\n")
-                else:
-                    await self.reply(bot, "Befehl nicht verfügbar oder ungültig. Für Änderungen /setup starten; genaue Ziele und vollständige Werte verwenden.")
-            except Exception:
-                # Do not log Update, values, callback actors or exception payloads.
-                self.cancel()
-                await self.reply(bot, "Native aqla-Steuerung ist vorübergehend nicht verfügbar.")
-        return True
+            return await self._safe_dispatch_command(bot, command, raw, dialog, text)
 
+
+    async def _reset_command(self, bot, command, authentic):
+        if command not in RESET_COMMANDS and command not in ("setup", "cancel", "abbrechen"):
+            return None
+        if authentic:
+            self.cancel()
+        if command in ("cancel", "abbrechen") and authentic:
+            await self.reply(bot, "Dialog abgebrochen.")
+            return True
+        return False
+
+    async def intercept(self, update, bot):
+        if self.menu and await self.menu.intercept(update, bot):
+            return True
+        query = getattr(update, "callback_query", None)
+        if query and str(getattr(query, "data", "")).startswith(CALLBACK_PREFIX):
+            return await self._intercept_callback(query, bot)
+        return await self._intercept_message(update, bot)
 
 # Stable named exports for native integrations and existing callers.
 __all__ = ['BACKUP_UNIT_LABELS', 'CALLBACK_PREFIX', 'COMMANDS', 'Dialog', 'LIMIT_FIELDS', 'NativeCommands', 'PROTECTED', 'RESET_COMMANDS', 'UNITS', 'install_catalog', 'install_menu', 'parameter_unit', 'parse_value', 'register_commands', 'routine_query', 'split_direct', 'system_catalog']

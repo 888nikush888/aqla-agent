@@ -641,7 +641,7 @@ async def test_six_account_identity_network_nonce_and_rank_selection(setup):
 
 @pytest.mark.asyncio
 async def test_new_f_source_uses_testnet_and_missing_market_fallback_is_typed(setup):
-    settings, state, fake, exchange, _ = setup
+    settings, state, _fake, exchange, _ = setup
     router = Router(settings, state, exchange)
     state.update(lambda data: data["ranking_policy"].update(enabled=True))
     source, value = percentage_signal(router, entry=False)

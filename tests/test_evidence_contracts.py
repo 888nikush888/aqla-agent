@@ -51,7 +51,7 @@ def test_missing_context_and_all_indexed_prices_return_one_repair(setup):
 
 def test_indexed_original_prices_pass_and_shared_multi_number_quote_fails(setup):
     _, state, _, _, trading = setup
-    source, value = axs(trading)
+    _source, value = axs(trading)
     verify_evidence(value, state.snapshot()["events"])
     value.evidence = [proof if not proof.field.startswith("take_profits.") else
         proof.model_copy(update={"quote": "1.3; 1.33"}) for proof in value.evidence]

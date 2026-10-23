@@ -97,6 +97,15 @@ class NotificationOutbox:
         if queued:
             self.state.update_metadata_if_changed(("notification_outbox",), lambda data: [data["notification_outbox"].setdefault(row["delivery_id"], row) for row in queued])
 
+    @staticmethod
+    def delivery_part(row, part):
+        text = row["chunks"][part]
+        if row["uncertain"] and not row.get("edit_message_id"):
+            text = "⚠️ Wiederhergestellte Zustellung – diese Meldung könnte bereits angekommen sein.\n\n" + text
+        return {"delivery_id": row["delivery_id"], "part": part, "text": text,
+                **({"edit_message_id": row["edit_message_id"]} if row.get("edit_message_id") else {})}
+
+
     def next_part(self, generation):
         if generation != self.generation:
             raise AqlaError("Native delivery owner changed")
@@ -115,13 +124,27 @@ class NotificationOutbox:
                 if part is None:
                     continue
                 row.update(status="sending", sending_part=part, attempts=row["attempts"] + 1, send_lease_until=now_ms() + 30000)
-                text = row["chunks"][part]
-                if row["uncertain"] and not row.get("edit_message_id"):
-                    text = "⚠️ Wiederhergestellte Zustellung – diese Meldung könnte bereits angekommen sein.\n\n" + text
-                return {"delivery_id": row["delivery_id"], "part": part, "text": text,
-                        **({"edit_message_id": row["edit_message_id"]} if row.get("edit_message_id") else {})}
+                return self.delivery_part(row, part)
             return {"delivery_id": None}
         return self.state.update_metadata_if_changed(("notification_outbox",), select)
+
+    @staticmethod
+    def acknowledge_completed_delivery(data, row, identity):
+        row["status"] = "sent"
+        if row.get("incident"):
+            policy = data.setdefault("notice_policy_state", {})
+            policy.setdefault("announced_incidents", {})[row["incident"]] = not row.get("resolved")
+            policy.setdefault("incident_signatures", {})[row["incident"]] = row.get("incident_signature")
+            if row.get("resolved"):
+                policy.setdefault("incident_since", {}).pop(row["incident"], None)
+        for notice_id, version in row["versions"].items():
+            notice = data["notifications"].get(notice_id)
+            if notice and digest(notice) == version:
+                data["notice_history"][notice_id + ":" + version] = {"notice": notice, "version": version,
+                    "disposition": "sent", "delivery_id": identity, "recorded_at": now_ms()}
+        # Persisted success and the exact-version facts ACK are ONE state transaction.
+        acknowledge_notifications(data, list(row["versions"]), row["versions"])
+
 
     def complete(self, generation, identity, part, success, message_id=None):
         if generation != self.generation:
@@ -138,20 +161,7 @@ class NotificationOutbox:
                 row["sent_parts"].append(part)
                 row.update(status="pending", attempts=0, uncertain=False, next_attempt_at=0)
                 if len(row["sent_parts"]) == len(row["chunks"]):
-                    row["status"] = "sent"
-                    if row.get("incident"):
-                        policy = data.setdefault("notice_policy_state", {})
-                        policy.setdefault("announced_incidents", {})[row["incident"]] = not row.get("resolved")
-                        policy.setdefault("incident_signatures", {})[row["incident"]] = row.get("incident_signature")
-                        if row.get("resolved"):
-                            policy.setdefault("incident_since", {}).pop(row["incident"], None)
-                    for notice_id, version in row["versions"].items():
-                        notice = data["notifications"].get(notice_id)
-                        if notice and digest(notice) == version:
-                            data["notice_history"][notice_id + ":" + version] = {"notice": notice, "version": version,
-                                "disposition": "sent", "delivery_id": identity, "recorded_at": now_ms()}
-                    # Persisted success and the exact-version facts ACK are ONE state transaction.
-                    acknowledge_notifications(data, list(row["versions"]), row["versions"])
+                    self.acknowledge_completed_delivery(data, row, identity)
             else:
                 row.update(status="exhausted" if row["attempts"] >= 5 else "pending", uncertain=True,
                            next_attempt_at=now_ms() + min(300000, 30000 * 2 ** row["attempts"]))

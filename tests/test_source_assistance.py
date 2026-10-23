@@ -191,7 +191,7 @@ def test_expected_move_interval_cannot_become_one_tp_endpoint(value, unit, quote
             ("symbol","BTC"),("side","LONG"),("take_profits.0",quote))])
     checked = check_interpretation(context, draft)
     assert not checked["valid"] and checked["errors"][0]["code"] == "source_percentage_interval_needs_role_review"
-    settings, state, fake, exchange, _ = setup
+    _settings, state, fake, exchange, _ = setup
     trading = Trading(exchange, state)
     trading.ingest(source)
     before = state.snapshot()
@@ -713,7 +713,7 @@ def test_real_reply_supplies_original_market_for_unbound_update():
 def test_writer_rechecks_unbound_update_identity_before_saving(setup):
     from aqla_agent.trading import Trading
     from aqla_hyperliquid_mcp.models import AqlaError
-    settings, state, fake, exchange, _ = setup
+    _settings, state, fake, exchange, _ = setup
     trading = Trading(exchange, state)
     source, _, _ = material("Reduce 40% now.")
     trading.ingest(source)

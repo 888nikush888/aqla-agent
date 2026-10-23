@@ -114,9 +114,8 @@ def validate_entry_execution(plan, quote, price, limit, maker, as_of):
         high = plan.entry_price * (1 + plan.policy.max_slippage_percent / 100)
         if not low <= price <= high:
             raise AqlaError("Executable entry price exceeds the source slippage tolerance")
-    elif plan.entry_kind == "market" and not marketable:
-        if not maker:
-            raise AqlaError("Executable entry price exceeds the saved market limit")
+    elif plan.entry_kind == "market" and not marketable and not maker:
+        raise AqlaError("Executable entry price exceeds the saved market limit")
     return marketable
 
 

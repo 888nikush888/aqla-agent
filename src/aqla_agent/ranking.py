@@ -36,15 +36,19 @@ class RankingPolicy(Model):
             raise ValueError("Configure every source tier exactly once")
         if any(not value.is_finite() or value <= 0 for value in self.factors.values()):
             raise ValueError("Rank risk factors must be positive and finite")
+        self.check_thresholds()
+        if any(not 0 <= weight <= 1 for weight in self.weights) or sum(self.weights) != 1:
+            raise ValueError("Ranking weights must sum to one")
+        return self
+
+
+    def check_thresholds(self):
         if any(not 0 <= self.thresholds[key] <= 100 or self.minimum_proof[key] < 0 for key in TIERS):
             raise ValueError("Invalid tier score/proof thresholds")
         if [self.thresholds[key] for key in TIERS] != sorted(set(self.thresholds.values())):
             raise ValueError("Tier thresholds must strictly increase")
         if [self.minimum_proof[key] for key in TIERS] != sorted(self.minimum_proof.values()):
             raise ValueError("Proof thresholds must increase with source tier")
-        if any(not 0 <= weight <= 1 for weight in self.weights) or sum(self.weights) != 1:
-            raise ValueError("Ranking weights must sum to one")
-        return self
 
 
 def source_key(data, chat):
@@ -156,8 +160,44 @@ def outcome_index(data) -> OutcomeIndex:
     return index
 
 
-def outcomes(data, *, selected_ids=None, report_rows=None):
+def _initial_sl_risk(trade, reasons):
+    initial = trade.get("initial_sl_risk")
+    if not initial:
+        # Conservative legacy reconstruction: only a source-backed absolute SL.
+        stop = trade.get("backup_finalization", {}).get("stop_loss") or trade["plan"]["stop_loss"]
+        reference = Decimal(trade.get("entry_vwap") or 0)
+        valid = Decimal(stop) < reference if trade["plan"]["side"] == "long" else Decimal(stop) > reference
+        if valid and reference > 0:
+            initial = {"amount": str(Decimal(trade["filled_quantity"]) * abs(reference - Decimal(stop)))}
+        elif reference > 0:
+            reasons.append("Systemfehler: bestätigter Einstieg außerhalb der ursprünglichen SL-Struktur")
+    return initial
+
+
+def _outcome_values(data, trades, report_rows, reasons, values, timestamps):
     from .monthly import report_row
+    for trade in trades:
+        if trade.get("rerouted_to_plan_id") and not Decimal(trade.get("filled_quantity", "0")):
+            continue
+        if trade["status"] not in ("closed", "cancelled", "rejected"):
+            reasons.append("Trade noch offen")
+            continue
+        row = report_rows.get(id(trade)) if report_rows is not None else None
+        if row is None:
+            row = report_row(data, trade)
+        initial = _initial_sl_risk(trade, reasons)
+        incident = (trade.get("external_conflict") or trade.get("manual_closure") or trade.get("execution_incident")
+                    or any(order.get("reason") == "operator_close" for order in trade.get("exit_orders", [])))
+        if incident or not initial or Decimal(initial["amount"]) <= 0:
+            reasons.append("Systemfehler/manueller Eingriff oder anfängliches SL-Risiko nicht belegt")
+        elif not row["complete"]:
+            reasons.extend(row["issues"])
+        else:
+            values.append(Decimal(row["net_pnl"]) / Decimal(initial["amount"]))
+            timestamps.append(row["closed_at"])
+
+
+def outcomes(data, *, selected_ids=None, report_rows=None):
     if selected_ids is not None and not selected_ids:
         return {}, {}
     index = outcome_index(data)
@@ -172,34 +212,7 @@ def outcomes(data, *, selected_ids=None, report_rows=None):
         pending = index.pending_legs.get((source, refs))
         if refs & index.pending_refs or pending and pending.has_other_family((source, family)):
             reasons.append("Weitere Ausführung dieses Setups noch nicht abgeschlossen")
-        for trade in trades:
-            if trade.get("rerouted_to_plan_id") and not Decimal(trade.get("filled_quantity", "0")):
-                continue
-            if trade["status"] not in ("closed", "cancelled", "rejected"):
-                reasons.append("Trade noch offen")
-                continue
-            row = report_rows.get(id(trade)) if report_rows is not None else None
-            if row is None:
-                row = report_row(data, trade)
-            initial = trade.get("initial_sl_risk")
-            if not initial:
-                # Conservative legacy reconstruction: only a source-backed absolute SL.
-                stop = trade.get("backup_finalization", {}).get("stop_loss") or trade["plan"]["stop_loss"]
-                reference = Decimal(trade.get("entry_vwap") or 0)
-                valid = Decimal(stop) < reference if trade["plan"]["side"] == "long" else Decimal(stop) > reference
-                if valid and reference > 0:
-                    initial = {"amount": str(Decimal(trade["filled_quantity"]) * abs(reference - Decimal(stop)))}
-                elif reference > 0:
-                    reasons.append("Systemfehler: bestätigter Einstieg außerhalb der ursprünglichen SL-Struktur")
-            incident = (trade.get("external_conflict") or trade.get("manual_closure") or trade.get("execution_incident")
-                        or any(order.get("reason") == "operator_close" for order in trade.get("exit_orders", [])))
-            if incident or not initial or Decimal(initial["amount"]) <= 0:
-                reasons.append("Systemfehler/manueller Eingriff oder anfängliches SL-Risiko nicht belegt")
-            elif not row["complete"]:
-                reasons.extend(row["issues"])
-            else:
-                values.append(Decimal(row["net_pnl"]) / Decimal(initial["amount"]))
-                timestamps.append(row["closed_at"])
+        _outcome_values(data, trades, report_rows, reasons, values, timestamps)
         if reasons or not values:
             excluded.setdefault(source, []).append({"setup_id": family, "reasons": sorted(set(reasons)), "trade_ids": [row["trade_id"] for row in trades]})
         else:
@@ -208,6 +221,78 @@ def outcomes(data, *, selected_ids=None, report_rows=None):
     for rows in result.values():
         rows.sort(key=lambda row: (row["closed_at"], row["setup_id"]))
     return result, excluded
+
+
+def _clear_pending_promotion(rank, current_metrics, results, policy):
+    if rank.get("up"):
+        following = rank["up"]["tier"]
+        if (current_metrics["score"] is None or len(results) < policy.minimum_proof[following]
+                or Decimal(current_metrics["score"]) < policy.thresholds[following] + policy.promotion_margin
+                or TIERS.index(following) >= 3 and Decimal(current_metrics["drawdown_r"]) >= policy.hard_drawdown_r):
+            rank["up"] = None
+
+
+def _promotion_eligible(tier, count, score, drawdown, policy):
+    return (count >= policy.minimum_proof[tier] and score >= policy.thresholds[tier] + policy.promotion_margin
+            and (TIERS.index(tier) < 3 or drawdown < policy.hard_drawdown_r))
+
+
+def _advance_promotion(rank, index, prefix, score, drawdown, policy):
+    reason = None
+    if index < 6:
+        next_tier = TIERS[index + 1]
+        eligible = _promotion_eligible(next_tier, len(prefix), score, drawdown, policy)
+        pending = rank.get("up")
+        if eligible:
+            if pending and pending["tier"] == next_tier:
+                pending["confirmations"] += 1
+                if pending["confirmations"] >= policy.promotion_confirmations:
+                    rank.update(tier=next_tier, up=None)
+                    reason = "Mindestnachweise und zusätzliche Aufstiegsbestätigungen erfüllt"
+                    following_index = TIERS.index(next_tier) + 1
+                    if following_index < len(TIERS):
+                        following = TIERS[following_index]
+                        if _promotion_eligible(following, len(prefix), score, drawdown, policy):
+                            rank["up"] = {"tier": following, "confirmations": 0}
+            else:
+                rank["up"] = {"tier": next_tier, "confirmations": 0}
+        else:
+            rank["up"] = None
+    return reason
+
+
+def _evaluate_rank_evidence(rank, prefix, observation, policy):
+    reason = None
+    score, drawdown = Decimal(observation["score"]), Decimal(observation["drawdown_r"])
+    index = TIERS.index(rank["tier"])
+    if drawdown >= policy.hard_drawdown_r and index >= 3:
+        rank.update(tier="D", up=None, down=0)
+        reason = "Drawdown-Grenze erreicht; Mainnet-Bewährung zurückgesetzt"
+    elif index and len(prefix) >= policy.demotion_minimum and score <= policy.thresholds[rank["tier"]] - policy.demotion_margin:
+        rank["down"] += 1
+        rank["up"] = None
+        if rank["down"] >= policy.demotion_confirmations:
+            rank.update(tier=TIERS[index - 1], down=0)
+            reason = "Score unter Abstiegsgrenze in bestätigten neuen Abschlüssen"
+    else:
+        rank["down"] = 0
+        reason = _advance_promotion(rank, index, prefix, score, drawdown, policy)
+    return reason
+
+
+def _record_rank_change(data, source, rank, old, current_metrics, results, reason, policy, changes):
+    if "manual_change" in rank:
+        rank["origin"] = "auto"
+    rank["revision"] += 1
+    event = {"source_id": source, "old": old, "new": rank["tier"], "metrics": current_metrics,
+             "revision": rank["revision"], "time": now_ms(), "network": "mainnet" if TIERS.index(rank["tier"]) >= 3 else "testnet",
+             "reason": reason, "proof_total": len(results), "factor": str(policy.factors[rank["tier"]])}
+    if "manual_change" in rank:
+        event["origin"] = "auto"
+    identity = digest([source, event["revision"]])[:32]
+    data["ranking_history"][identity] = event
+    data["notifications"].setdefault("rank:" + identity, {"rank_change": event})
+    changes.append(event)
 
 
 def evaluate(data):
@@ -221,12 +306,7 @@ def evaluate(data):
         results = complete.get(source, [])
         current_metrics = metrics(results, policy)
         rank.update(metrics=current_metrics, exclusions=exclusions.get(source, []), evidence=results)
-        if rank.get("up"):
-            following = rank["up"]["tier"]
-            if (current_metrics["score"] is None or len(results) < policy.minimum_proof[following]
-                    or Decimal(current_metrics["score"]) < policy.thresholds[following] + policy.promotion_margin
-                    or TIERS.index(following) >= 3 and Decimal(current_metrics["drawdown_r"]) >= policy.hard_drawdown_r):
-                rank["up"] = None
+        _clear_pending_promotion(rank, current_metrics, results, policy)
         old = rank["tier"]
         reason = None
         unseen = [row for row in results if row["setup_id"] not in rank["evaluated"]]
@@ -237,58 +317,14 @@ def evaluate(data):
             considered = {*rank["evaluated"], evidence["setup_id"]}
             prefix = [row for row in results if row["setup_id"] in considered]
             observation = metrics(prefix, policy)
-            score, drawdown = Decimal(observation["score"]), Decimal(observation["drawdown_r"])
-            index = TIERS.index(rank["tier"])
-            if drawdown >= policy.hard_drawdown_r and index >= 3:
-                rank.update(tier="D", up=None, down=0)
-                reason = "Drawdown-Grenze erreicht; Mainnet-Bewährung zurückgesetzt"
-            elif index and len(prefix) >= policy.demotion_minimum and score <= policy.thresholds[rank["tier"]] - policy.demotion_margin:
-                rank["down"] += 1
-                rank["up"] = None
-                if rank["down"] >= policy.demotion_confirmations:
-                    rank.update(tier=TIERS[index - 1], down=0)
-                    reason = "Score unter Abstiegsgrenze in bestätigten neuen Abschlüssen"
-            else:
-                rank["down"] = 0
-                if index < 6:
-                    next_tier = TIERS[index + 1]
-                    eligible = (len(prefix) >= policy.minimum_proof[next_tier] and score >= policy.thresholds[next_tier] + policy.promotion_margin
-                                and (TIERS.index(next_tier) < 3 or drawdown < policy.hard_drawdown_r))
-                    pending = rank.get("up")
-                    if eligible:
-                        if pending and pending["tier"] == next_tier:
-                            pending["confirmations"] += 1
-                            if pending["confirmations"] >= policy.promotion_confirmations:
-                                rank.update(tier=next_tier, up=None)
-                                reason = "Mindestnachweise und zusätzliche Aufstiegsbestätigungen erfüllt"
-                                following_index = TIERS.index(next_tier) + 1
-                                if following_index < len(TIERS):
-                                    following = TIERS[following_index]
-                                    if (len(prefix) >= policy.minimum_proof[following] and score >= policy.thresholds[following] + policy.promotion_margin
-                                            and (following_index < 3 or drawdown < policy.hard_drawdown_r)):
-                                        rank["up"] = {"tier": following, "confirmations": 0}
-                        else:
-                            rank["up"] = {"tier": next_tier, "confirmations": 0}
-                    else:
-                        rank["up"] = None
+            reason = _evaluate_rank_evidence(rank, prefix, observation, policy) or reason
             rank["evaluated"].append(evidence["setup_id"])
         # Corrections may demote immediately, but cannot create extra promotion confirmations.
         if Decimal(current_metrics["drawdown_r"]) >= policy.hard_drawdown_r and TIERS.index(rank["tier"]) >= 3:
             rank.update(tier="D", up=None, down=0)
             reason = "Drawdown-Grenze durch ergänzte Belege erreicht"
         if rank["tier"] != old:
-            if "manual_change" in rank:
-                rank["origin"] = "auto"
-            rank["revision"] += 1
-            event = {"source_id": source, "old": old, "new": rank["tier"], "metrics": current_metrics,
-                     "revision": rank["revision"], "time": now_ms(), "network": "mainnet" if TIERS.index(rank["tier"]) >= 3 else "testnet",
-                     "reason": reason, "proof_total": len(results), "factor": str(policy.factors[rank["tier"]])}
-            if "manual_change" in rank:
-                event["origin"] = "auto"
-            identity = digest([source, event["revision"]])[:32]
-            data["ranking_history"][identity] = event
-            data["notifications"].setdefault("rank:" + identity, {"rank_change": event})
-            changes.append(event)
+            _record_rank_change(data, source, rank, old, current_metrics, results, reason, policy, changes)
     return changes
 
 
@@ -304,6 +340,14 @@ def status_view(data, *, include_inactive=False):
             for source, row in resolved.items() if include_inactive or source in selected}
 
 
+def _same_manual_change(rank, tier, revision, operator):
+    previous = rank.get("manual_change", {})
+    if (rank["tier"] == tier and rank.get("origin") == "manual" and previous.get("operator") == operator
+            and revision in (rank["revision"], previous.get("expected_revision"))):
+        return True
+    return False
+
+
 def set_manual_rank(data, selector, tier, revision, operator):
     from .source_queue import resolve_source
     if not selector or tier not in TIERS or type(revision) is not int or not operator:
@@ -312,9 +356,7 @@ def set_manual_rank(data, selector, tier, revision, operator):
     if source not in active_sources(data):
         raise AqlaError("Select a configured active source; inactive ranks are retained history and need no cleanup")
     rank = source_rank(data, source)
-    previous = rank.get("manual_change", {})
-    if (rank["tier"] == tier and rank.get("origin") == "manual" and previous.get("operator") == operator
-            and revision in (rank["revision"], previous.get("expected_revision"))):
+    if _same_manual_change(rank, tier, revision, operator):
         return {"source_id": source, "rank": rank, "changed": False}
     if revision != rank["revision"]:
         raise AqlaError("Read the current source rank revision before changing its tier")

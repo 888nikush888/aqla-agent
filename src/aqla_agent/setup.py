@@ -82,6 +82,10 @@ class SetupGate:
                 self._bindings[binding.owner_id] = binding
             return self.generation
 
+    @staticmethod
+    def _valid_identity(identity):
+        return type(identity) is str and len(identity) == 64 and all(char in "0123456789abcdef" for char in identity)
+
     def register(self, binding: SetupBinding, identity: str, expires_at: float | None, generation: str) -> None:
         with self._lock:
             now = self._now()
@@ -89,8 +93,7 @@ class SetupGate:
                 expires_at = now + GRANT_SECONDS
             if (not self.configured or not binding.valid() or self._bindings.get(binding.owner_id) != binding
                     or now < self._locked_until.get(binding.owner_id, 0)
-                    or generation != self.generation or type(identity) is not str or len(identity) != 64
-                    or any(char not in "0123456789abcdef" for char in identity)
+                    or generation != self.generation or not self._valid_identity(identity)
                     or type(expires_at) not in (int, float) or not now < expires_at <= now + GRANT_SECONDS):
                 raise AqlaError("Setup registration is unavailable, expired or not bound to the current native session")
             existing = self._seen.get(identity)

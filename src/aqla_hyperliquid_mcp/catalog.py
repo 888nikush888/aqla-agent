@@ -97,6 +97,43 @@ SDK_HELPERS = {name: vars(Exchange)[name] for name in ("c_signer_inner", "spot_d
 _converted: dict[object, type[Model]] = {}
 
 
+def _sdk_dict_type(annotation):
+    if annotation in _converted:
+        return _converted[annotation]
+    hints = get_type_hints(annotation, include_extras=True)
+    fields = {}
+    for key, item in hints.items():
+        required = key in annotation.__required_keys__ or (annotation.__name__ == "OrderRequest" and key != "cloid") or annotation.__name__ == "ModifyRequest"
+        if get_origin(item) and getattr(get_origin(item), "__name__", "") in ("NotRequired", "Required"):
+            item = get_args(item)[0]
+        fields[key] = (sdk_type(item), ... if required else None)
+    model = create_model("SDK" + annotation.__name__, __base__=Model, **fields)
+    _converted[annotation] = model
+    return model
+
+
+def _validate_order_contract(value):
+    if "limit" in value or "trigger" in value:
+        present = [key for key in ("limit", "trigger") if value.get(key) is not None]
+        if len(present) != 1:
+            raise AqlaError("Order type requires exactly one limit or trigger contract")
+
+
+def _validate_sdk_nested(value):
+    if isinstance(value, dict):
+        _validate_order_contract(value)
+        for key in ("sz", "limit_px"):
+            if value.get("operation") == "market_close" and key == "sz" and value.get(key) is None:
+                continue
+            if key in value and (value[key] is None or value[key] <= 0):
+                raise AqlaError(f"Order {key} must be positive")
+        for item in value.values():
+            _validate_sdk_nested(item)
+    elif isinstance(value, list):
+        for item in value:
+            _validate_sdk_nested(item)
+
+
 def sdk_type(annotation):
     if annotation in (str, int, bool, float):
         return {str: StrictStr, int: StrictInt, bool: StrictBool, float: StrictFloat}[annotation]
@@ -105,18 +142,7 @@ def sdk_type(annotation):
     if annotation is type(None):
         return type(None)
     if is_typeddict(annotation):
-        if annotation in _converted:
-            return _converted[annotation]
-        hints = get_type_hints(annotation, include_extras=True)
-        fields = {}
-        for key, item in hints.items():
-            required = key in annotation.__required_keys__ or (annotation.__name__ == "OrderRequest" and key != "cloid") or annotation.__name__ == "ModifyRequest"
-            if get_origin(item) and getattr(get_origin(item), "__name__", "") in ("NotRequired", "Required"):
-                item = get_args(item)[0]
-            fields[key] = (sdk_type(item), ... if required else None)
-        model = create_model("SDK" + annotation.__name__, __base__=Model, **fields)
-        _converted[annotation] = model
-        return model
+        return _sdk_dict_type(annotation)
     origin, args = get_origin(annotation), get_args(annotation)
     if origin is Literal:
         return annotation
@@ -167,24 +193,7 @@ def validate_sdk(request):
     if "leverage" in values and values["leverage"] < 1:
         raise AqlaError("Leverage must be positive")
 
-    def nested(value):
-        if isinstance(value, dict):
-            if "limit" in value or "trigger" in value:
-                present = [key for key in ("limit", "trigger") if value.get(key) is not None]
-                if len(present) != 1:
-                    raise AqlaError("Order type requires exactly one limit or trigger contract")
-            for key in ("sz", "limit_px"):
-                if value.get("operation") == "market_close" and key == "sz" and value.get(key) is None:
-                    continue
-                if key in value and (value[key] is None or value[key] <= 0):
-                    raise AqlaError(f"Order {key} must be positive")
-            for item in value.values():
-                nested(item)
-        elif isinstance(value, list):
-            for item in value:
-                nested(item)
-
-    nested(values)
+    _validate_sdk_nested(values)
     return values
 
 

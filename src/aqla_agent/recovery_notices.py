@@ -4,6 +4,13 @@ import re
 from aqla_hyperliquid_mcp.models import digest, now_ms
 
 
+def safe_report_identifiers(row, fact):
+    for key in ("trade_id", "operation_id", "account_key", "exchange", "market"):
+        value = row.get(key)
+        if isinstance(value, str) and 0 < len(value) <= 128 and all(char.isalnum() or char in ":_-" for char in value):
+            fact[key] = value
+
+
 def safe_report(row):
     if not (row.get("error") or row.get("replacement_unconfirmed") or row.get("market_conflict")):
         return None
@@ -22,18 +29,11 @@ def safe_report(row):
     nested = row.get("operation")
     if isinstance(nested, dict) and "operation_id" not in row:
         row = {**row, "operation_id": nested.get("operation_id")}
-    for key in ("trade_id", "operation_id", "account_key", "exchange", "market"):
-        value = row.get(key)
-        if isinstance(value, str) and 0 < len(value) <= 128 and all(char.isalnum() or char in ":_-" for char in value):
-            fact[key] = value
+    safe_report_identifiers(row, fact)
     return fact
 
 
-def record_recovery_notices(data, reports, account_passes=None):
-    # These are diagnostics captured from THIS recovery call, not the durable
-    # last-known account_recovery projection. Missing/stale/partial observations
-    # never prove that an earlier protection problem has disappeared.
-    observed_at = now_ms()
+def complete_recovery_accounts(account_passes, observed_at):
     complete = set()
     for account, row in (account_passes or {}).items():
         if not isinstance(account, str) or not isinstance(row, dict):
@@ -44,16 +44,10 @@ def record_recovery_notices(data, reports, account_passes=None):
                 and 0 <= attempted <= succeeded <= observed_at and 0 <= duration <= 120000
                 and observed_at - succeeded <= 120000):
             complete.add(account)
-    active = {}
-    for row in reports:
-        fact = safe_report(row)
-        if fact:
-            key = digest([fact.get("account_key", fact.get("exchange")), fact.get("trade_id"), fact.get("operation_id")])
-            active.setdefault(key, []).append(fact)
-    status = data.setdefault("source_status", {}).setdefault("recovery", {})
-    protected_accounts = {row["account_key"] for old in status.values() if old.get("active")
-                          for row in old.get("reports", []) if row.get("account_key")
-                          and row.get("code") in ("replacement_unconfirmed", "protection_unconfirmed")}
+    return complete
+
+
+def record_recovery_transitions(data, status, active, complete, protected_accounts, observed_at):
     for key in sorted(set(status) | set(active)):
         old = status.get(key, {})
         observed = active.get(key, [])
@@ -75,6 +69,25 @@ def record_recovery_notices(data, reports, account_passes=None):
                 row["code"] in ("replacement_unconfirmed", "protection_unconfirmed") or row.get("account_key") in protected_accounts
                 for row in facts) else "normal"})
         status[key] = {"signature": signature, "generation": generation, "active": bool(facts), "reports": facts}
+
+
+def record_recovery_notices(data, reports, account_passes=None):
+    # These are diagnostics captured from THIS recovery call, not the durable
+    # last-known account_recovery projection. Missing/stale/partial observations
+    # never prove that an earlier protection problem has disappeared.
+    observed_at = now_ms()
+    complete = complete_recovery_accounts(account_passes, observed_at)
+    active = {}
+    for row in reports:
+        fact = safe_report(row)
+        if fact:
+            key = digest([fact.get("account_key", fact.get("exchange")), fact.get("trade_id"), fact.get("operation_id")])
+            active.setdefault(key, []).append(fact)
+    status = data.setdefault("source_status", {}).setdefault("recovery", {})
+    protected_accounts = {row["account_key"] for old in status.values() if old.get("active")
+                          for row in old.get("reports", []) if row.get("account_key")
+                          and row.get("code") in ("replacement_unconfirmed", "protection_unconfirmed")}
+    record_recovery_transitions(data, status, active, complete, protected_accounts, observed_at)
 
 
 def reader_notice_signature(status):

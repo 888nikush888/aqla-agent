@@ -68,22 +68,30 @@ def reference_entry(signal, policy):
     return (high if long else low) if policy.entry_range_choice == "near" else (low if long else high)
 
 
-def prices(reference, side, market, unit, values, leverage=None):
-    from aqla_hyperliquid_mcp.precision import price_grid
-    reference = Decimal(str(reference))
+def _validate_percentage_basis(unit, leverage):
     if unit not in ("course_percent", "roi_percent", "roe_percent"):
         raise AqlaError("Unknown source percentage interpretation")
     if unit in ("roi_percent", "roe_percent") and (leverage is None or Decimal(str(leverage)) < 1):
         if unit == "roe_percent":
             raise AqlaError("ROE targets need the actual effective own initial margin leverage")
         raise AqlaError("ROI targets need the evidenced original signal leverage; profile/Backup leverage cannot replace it")
+
+
+def _validate_target_prices(targets, values, reference, long):
+    if (len(targets) != len(values) or targets != sorted(set(targets), reverse=not long)
+            or any(value <= 0 or (value <= reference if long else value >= reference) for value in targets)):
+        raise AqlaError("Source percentage prices collapse or have invalid direction on the exchange tick grid")
+
+
+def prices(reference, side, market, unit, values, leverage=None):
+    from aqla_hyperliquid_mcp.precision import price_grid
+    reference = Decimal(str(reference))
+    _validate_percentage_basis(unit, leverage)
     percentages = [Decimal(str(value)) / (Decimal(str(leverage)) if unit in ("roi_percent", "roe_percent") else 1) for value in values]
     if percentages != sorted(set(percentages)) or any(value <= 0 or not value.is_finite() for value in percentages):
         raise AqlaError("Source percentage targets must be finite, positive, unique and ascending")
     long = side == "long"
     raw = [reference * (1 + (1 if long else -1) * percentage / 100) for percentage in percentages]
     targets = [price_grid(value, market, up=long) for value in raw if value > 0]
-    if (len(targets) != len(values) or targets != sorted(set(targets), reverse=not long)
-            or any(value <= 0 or (value <= reference if long else value >= reference) for value in targets)):
-        raise AqlaError("Source percentage prices collapse or have invalid direction on the exchange tick grid")
+    _validate_target_prices(targets, values, reference, long)
     return targets

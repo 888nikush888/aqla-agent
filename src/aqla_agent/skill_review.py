@@ -69,14 +69,19 @@ def native_background_review():
     return is_background_review()
 
 
-def master_content(args, path):
-    """Validate flat calls and the native single-operation shape before staging or approval."""
+def _single_master_operation(args):
     operation = args
     if args.get("operations") is not None:
         operations = args["operations"]
         if not isinstance(operations, list) or len(operations) != 1 or not isinstance(operations[0], dict):
             raise ValueError("Only one aqla-master patch or edit is allowed per proposal")
         operation = {**operations[0], "name": operations[0].get("name") or args.get("name")}
+    return operation
+
+
+def master_content(args, path):
+    """Validate flat calls and the native single-operation shape before staging or approval."""
+    operation = _single_master_operation(args)
     if operation.get("name") != "aqla-master" or operation.get("action") not in ("patch", "edit"):
         raise ValueError("Only aqla-master patches and edits may be proposed")
     if any(operation.get(key) is not None for key in ("file_path", "file_content", "category", "absorbed_into", "operations")):
@@ -96,26 +101,14 @@ def master_content(args, path):
     return content
 
 
-def install_skill_review(replace):
-    from agent import background_review as review
-    from hermes_constants import get_hermes_home
-    from tools import skill_manager_tool as manager
-    from tools import skill_usage
-    from tools import write_approval as approval
-
-    from .extension_registry import EXTENSIONS
-
-    master = get_hermes_home() / "skills" / "aqla-master" / "SKILL.md"
-    cadence = ReviewCadence(get_hermes_home())
-    gate, stage, apply = approval.write_approval_enabled, approval.stage_write, manager.apply_skill_pending
-    # Pinned native integration interface; covered by native contract and integration checks.
-    # skipcq: PYL-W0212
-    spawn, action_lines = review.spawn_background_review_thread, review._action_lines
-
+def _wrap_approval_enabled(approval, gate):
     def approval_enabled(subsystem):
         # This owner preference cannot fail open on malformed config or /skills approval off.
         return subsystem == approval.SKILLS or gate(subsystem)
+    return approval_enabled
 
+
+def _wrap_stage_write(approval, stage, manager, master):
     def stage_write(subsystem, payload, *, summary, origin):
         if subsystem != approval.SKILLS:
             return stage(subsystem, payload, summary=summary, origin=origin)
@@ -135,7 +128,10 @@ def install_skill_review(replace):
             if approval.get_pending(subsystem, record["id"]) is None:
                 raise OSError("The skill proposal could not be saved; no skill was changed")
             return record
+    return stage_write
 
+
+def _wrap_apply_pending(EXTENSIONS, manager, master, apply):
     def apply_pending(payload):
         if not any((origin := ext.active_context) and origin[0] == "operator" for ext in tuple(EXTENSIONS)):
             return json.dumps({"success": False, "error": "An authenticated owner approval is required"})
@@ -149,7 +145,10 @@ def install_skill_review(replace):
             except (ValueError, OSError) as error:
                 return json.dumps({"success": False, "error": str(error)})
             return apply(payload)
+    return apply_pending
 
+
+def _wrap_spawn_review(spawn, review, cadence, approval):
     def spawn_review(*args, **kwargs):
         bound = inspect.signature(spawn).bind(*args, **kwargs)
         explicit = bool(bound.arguments.get("explicit", False))
@@ -177,7 +176,10 @@ def install_skill_review(replace):
                 return target()
             return skipped_target()
         return guarded_target, prompt
+    return spawn_review
 
+
+def _wrap_proposal_lines(approval, action_lines):
     def proposal_lines(data, detail, verbose):
         if data.get("staged") and detail.get("tool") == "skill_manage":
             identifier = data.get("pending_id")
@@ -188,7 +190,10 @@ def install_skill_review(replace):
                         f"Ansehen: /skills diff {identifier}\n"
                         f"Zustimmen: /skills approve {identifier}\nAblehnen: /skills reject {identifier}"]
         return action_lines(data, detail, verbose)
+    return proposal_lines
 
+
+def _wrap_publish_proposal():
     def publish_proposal(agent, actions):
         # A staged proposal must not be announced as 'Memory updated'. Use native delivery.
         text = "\n\n".join(dict.fromkeys(actions))
@@ -198,6 +203,36 @@ def install_skill_review(replace):
         if agent.background_review_callback:
             with suppress(Exception):
                 agent.background_review_callback(text)
+    return publish_proposal
+
+
+def install_skill_review(replace):
+    from agent import background_review as review
+    from hermes_constants import get_hermes_home
+    from tools import skill_manager_tool as manager
+    from tools import skill_usage
+    from tools import write_approval as approval
+
+    from .extension_registry import EXTENSIONS
+
+    master = get_hermes_home() / "skills" / "aqla-master" / "SKILL.md"
+    cadence = ReviewCadence(get_hermes_home())
+    gate, stage, apply = approval.write_approval_enabled, approval.stage_write, manager.apply_skill_pending
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
+    spawn, action_lines = review.spawn_background_review_thread, review._action_lines
+
+    approval_enabled = _wrap_approval_enabled(approval, gate)
+
+    stage_write = _wrap_stage_write(approval, stage, manager, master)
+
+    apply_pending = _wrap_apply_pending(EXTENSIONS, manager, master, apply)
+
+    spawn_review = _wrap_spawn_review(spawn, review, cadence, approval)
+
+    proposal_lines = _wrap_proposal_lines(approval, action_lines)
+
+    publish_proposal = _wrap_publish_proposal()
 
     replace(approval, "write_approval_enabled", approval_enabled)
     replace(approval, "stage_write", stage_write)

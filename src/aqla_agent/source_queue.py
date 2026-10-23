@@ -61,9 +61,7 @@ def canonical_sources(events, refs=None):
     return result
 
 
-def recovery_ids(snapshot, event_rows=None):
-    identities = {row["event_id"] for row in (event_rows if event_rows is not None else snapshot["events"].values())
-                  if is_source_row(row) and row.get("status") == "needs_reconciliation"}
+def _trade_recovery_ids(snapshot, identities):
     for trade in snapshot.get("trades", {}).values():
         for sequence in trade.get("management_sequences", {}).values():
             if not sequence.get("completed"):
@@ -77,6 +75,9 @@ def recovery_ids(snapshot, event_rows=None):
         if pending and pending.get("phase") in ("waiting_fill", "replacing", "unknown"):
             identities.add(pending["event_id"])
             identities.update(pending.get("source_revisions", {}).values())
+
+
+def _operation_recovery_ids(snapshot, identities):
     for operation_id, operation in snapshot.get("operations", {}).items():
         if operation.get("phase") in ("prepared", "sending", "unknown"):
             request = operation.get("request", {})
@@ -93,6 +94,9 @@ def recovery_ids(snapshot, event_rows=None):
                 plan = saved.get("plan", {})
                 if operation_id in ("entry:" + plan.get("trade_id", ""), "leverage:" + plan.get("trade_id", "")):
                     identities.update(plan.get("source_revisions", {}).values())
+
+
+def _binding_recovery_ids(snapshot, identities):
     binding_roots = [snapshot.get("bindings", {})]
     binding_roots.extend(snapshot.get("account_bindings", {}).values())
     binding_roots.extend(snapshot.get("venue_bindings", {}).values())
@@ -103,6 +107,9 @@ def recovery_ids(snapshot, event_rows=None):
                 if identity in snapshot["events"]:
                     identities.add(identity)
                 identities.update(trade.get("plan", {}).get("source_revisions", {}).values())
+
+
+def _operation_plan_recovery_ids(snapshot, identities):
     for operation_id, operation in snapshot.get("operations", {}).items():
         if operation.get("phase") in ("prepared", "sending", "unknown"):
             tokens = set(operation_id.split(":"))
@@ -112,6 +119,15 @@ def recovery_ids(snapshot, event_rows=None):
                     identities.update(plan.get("source_revisions", {}).values())
                     if saved.get("event_id"):
                         identities.add(saved["event_id"])
+
+
+def recovery_ids(snapshot, event_rows=None):
+    identities = {row["event_id"] for row in (event_rows if event_rows is not None else snapshot["events"].values())
+                  if is_source_row(row) and row.get("status") == "needs_reconciliation"}
+    _trade_recovery_ids(snapshot, identities)
+    _operation_recovery_ids(snapshot, identities)
+    _binding_recovery_ids(snapshot, identities)
+    _operation_plan_recovery_ids(snapshot, identities)
     return identities
 
 
@@ -142,6 +158,45 @@ def repair_queue(snapshot):
                 row["queue_anchor"] = True
 
 
+def _historical_conflicts(ref, rows, current):
+    result = []
+    if len(rows) > len(current):
+        historical = {}
+        for row in rows:
+            if version(row) < version(current[0]):
+                historical.setdefault(version(row), []).append(row)
+        for stamp, previous in historical.items():
+            if len(previous) > 1 and len({digest(content(row)) for row in previous}) > 1:
+                result.append({"source_id": ref, "version": stamp, "signature": digest(sorted(row["event_id"] for row in previous))})
+    return result
+
+
+def _queue_groups(grouped, recovery, ready, blocked, signatures, historical_conflicts):
+    for ref, rows in grouped.items():
+        current = current_rows(rows)
+        historical_conflicts.extend(_historical_conflicts(ref, rows, current))
+        if len(current) > 1 and len({digest(content(row)) for row in current}) > 1:
+            unfinished = [row["event_id"] for row in current if row.get("status") in UNFINISHED]
+            if unfinished:
+                blocked.extend(unfinished)
+                signatures.append(digest(sorted(row["event_id"] for row in current)))
+        elif anchor_row(current).get("status") in ("pending", "interpreted") and anchor_row(current)["event_id"] not in recovery:
+            ready.append(anchor_row(current)["event_id"])
+
+
+def _recovery_work(events, recovery):
+    return {identity for identity in recovery if identity in events and is_source_row(events[identity]) and events[identity].get("status") in UNFINISHED}
+
+
+def _express_ids(snapshot, ready):
+    from .express import active_claim
+    return [identity for identity in ready if active_claim(snapshot, identity)]
+
+
+def _count_status(rows, statuses):
+    return sum(row.get("status") in statuses for row in rows)
+
+
 def queue_overview(snapshot, limit=50, *, event_rows=None, include_express=False):
     events = snapshot["events"]
     event_rows = [row for row in (events.values() if event_rows is None else event_rows) if is_source_row(row)]
@@ -150,27 +205,10 @@ def queue_overview(snapshot, limit=50, *, event_rows=None, include_express=False
     for row in event_rows:
         grouped.setdefault(row["source_id"], []).append(row)
     ready, blocked, signatures = [], [], []
-    recovery_work = {identity for identity in recovery if identity in events and is_source_row(events[identity]) and events[identity].get("status") in UNFINISHED}
+    recovery_work = _recovery_work(events, recovery)
     historical_conflicts = []
-    for ref, rows in grouped.items():
-        current = current_rows(rows)
-        if len(rows) > len(current):
-            historical = {}
-            for row in rows:
-                if version(row) < version(current[0]):
-                    historical.setdefault(version(row), []).append(row)
-            for stamp, previous in historical.items():
-                if len(previous) > 1 and len({digest(content(row)) for row in previous}) > 1:
-                    historical_conflicts.append({"source_id": ref, "version": stamp, "signature": digest(sorted(row["event_id"] for row in previous))})
-        if len(current) > 1 and len({digest(content(row)) for row in current}) > 1:
-            unfinished = [row["event_id"] for row in current if row.get("status") in UNFINISHED]
-            if unfinished:
-                blocked.extend(unfinished)
-                signatures.append(digest(sorted(row["event_id"] for row in current)))
-        elif anchor_row(current).get("status") in ("pending", "interpreted") and anchor_row(current)["event_id"] not in recovery:
-            ready.append(anchor_row(current)["event_id"])
-    from .express import active_claim
-    express = [identity for identity in ready if active_claim(snapshot, identity)]
+    _queue_groups(grouped, recovery, ready, blocked, signatures, historical_conflicts)
+    express = _express_ids(snapshot, ready)
     if not include_express:
         claimed = set(express)
         ready = [identity for identity in ready if identity not in claimed]
@@ -178,8 +216,8 @@ def queue_overview(snapshot, limit=50, *, event_rows=None, include_express=False
     return {"ready_total": len(ready), "ready": ready[:limit],
             **({"express_total": len(express), "express": express[:limit]} if express else {}),
             "ready_signature": digest(sorted(ready)),
-            "raw_unfinished_total": sum(row.get("status") in UNFINISHED for row in event_rows),
-            "superseded_total": sum(row.get("status") == "superseded" for row in event_rows),
+            "raw_unfinished_total": _count_status(event_rows, UNFINISHED),
+            "superseded_total": _count_status(event_rows, {"superseded"}),
             "blocked_total": len(signatures), "blocked_revision_total": len(blocked), "blocked": blocked[:limit],
             "blocked_signature": digest(sorted(signatures)) if signatures else None,
             "recovery_total": len(recovery_work) + len(operations), "recovery_source_total": len(recovery_work), "recovery": sorted(recovery_work)[:limit],

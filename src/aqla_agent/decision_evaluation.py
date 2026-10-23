@@ -201,11 +201,7 @@ def expected_numeric(expected, field):
     return expected.get(field)
 
 
-def covered_by_proof(packet, span, proof):
-    if proof["source_id"] != span.source_id:
-        return False
-    # An occurrence must be inside the unchanged original quote, not merely
-    # have an equal numeric value somewhere else in the same message.
+def _proof_latest_source(packet, span):
     rows = [row for row in packet["messages"] if row["source_id"] == span.source_id]
     latest = None
     for row in rows:
@@ -213,36 +209,65 @@ def covered_by_proof(packet, span, proof):
         previous = (latest.get("edited_at") or latest.get("sent_at") or 0) if latest else -1
         if latest is None or stamp > previous or row["event_id"] == packet["anchor_event_id"]:
             latest = row
+    return latest
+
+
+def covered_by_proof(packet, span, proof):
+    if proof["source_id"] != span.source_id:
+        return False
+    # An occurrence must be inside the unchanged original quote, not merely
+    # have an equal numeric value somewhere else in the same message.
+    latest = _proof_latest_source(packet, span)
     originals = [latest["text"]] if latest else []
     import re
     return any(occurrence.start() <= span.start and span.end <= occurrence.end()
                for original in originals for occurrence in re.finditer(re.escape(proof["quote"]), original))
 
 
-def annotated_numeric_roles(packet, expected, spans, candidate_occurrences=None):
-    annotations = candidate_occurrences or []
-    if not isinstance(annotations, list):
-        raise ValueError("Candidate occurrence annotations must be a list")
+def _annotation_span_matches(span, annotation, expected, field):
+    return (span.kind == "number" and
+                span.source_id == annotation.get("source_id") and span.start == annotation.get("start") and
+                span.end == annotation.get("end") and span.quote == annotation.get("quote") and
+                (not annotation.get("candidate_id") or span.candidate_id == annotation["candidate_id"]) and
+                equal(span.value, expected_numeric(expected, field)))
+
+
+def _duplicate_annotation(selected, by_id, occurrence):
+    return any((by_id[identity].source_id, by_id[identity].start, by_id[identity].end) == occurrence
+           for identities in selected.values() for identity in identities)
+
+
+def _selected_numeric_occurrences(packet, expected, spans, annotations):
     selected = {}
     for annotation in annotations:
         if not isinstance(annotation, dict) or annotation.get("field") not in NUMERIC_ROLE_FIELDS:
             raise ValueError("Candidate occurrence annotation needs a numeric public field")
         field = annotation["field"]
-        matching = [span for span in spans if span.kind == "number" and
-            span.source_id == annotation.get("source_id") and span.start == annotation.get("start") and
-            span.end == annotation.get("end") and span.quote == annotation.get("quote") and
-            (not annotation.get("candidate_id") or span.candidate_id == annotation["candidate_id"]) and
-            equal(span.value, expected_numeric(expected, field))]
+        matching = [span for span in spans if _annotation_span_matches(span, annotation, expected, field)]
         proofs = [proof for proof in expected.get("evidence", []) or [] if proof["field"] == field]
         matching = [span for span in matching if any(covered_by_proof(packet, span, proof) for proof in proofs)]
         if len(matching) != 1:
             raise ValueError("Candidate occurrence must uniquely match gold value, original position and Evidence")
         by_id = {span.candidate_id: span for span in spans}
         occurrence = (matching[0].source_id, matching[0].start, matching[0].end)
-        if any((by_id[identity].source_id, by_id[identity].start, by_id[identity].end) == occurrence
-               for identities in selected.values() for identity in identities):
+        if _duplicate_annotation(selected, by_id, occurrence):
             raise ValueError("Candidate occurrence cannot be annotated twice or as different fields")
         selected.setdefault(field, []).append(matching[0].candidate_id)
+    return selected
+
+
+def _numeric_proof_candidates(packet, expected, spans, field, wanted):
+    proofs = [proof for proof in expected.get("evidence", []) or [] if proof["field"] == field]
+    matching = [span for span in spans if span.kind == "number" and equal(span.value, wanted) and
+                any(covered_by_proof(packet, span, proof) for proof in proofs)]
+    return matching
+
+
+def annotated_numeric_roles(packet, expected, spans, candidate_occurrences=None):
+    annotations = candidate_occurrences or []
+    if not isinstance(annotations, list):
+        raise ValueError("Candidate occurrence annotations must be a list")
+    selected = _selected_numeric_occurrences(packet, expected, spans, annotations)
     roles = {span.candidate_id: set() for span in spans if span.kind == "number"}
     for field, role in NUMERIC_ROLE_FIELDS.items():
         wanted = expected_numeric(expected, field)
@@ -252,9 +277,7 @@ def annotated_numeric_roles(packet, expected, spans, candidate_occurrences=None)
             for identity in selected[field]:
                 roles[identity].add(role)
             continue
-        proofs = [proof for proof in expected.get("evidence", []) or [] if proof["field"] == field]
-        matching = [span for span in spans if span.kind == "number" and equal(span.value, wanted) and
-                    any(covered_by_proof(packet, span, proof) for proof in proofs)]
+        matching = _numeric_proof_candidates(packet, expected, spans, field, wanted)
         if len(matching) == 1:
             roles[matching[0].candidate_id].add(role)
         elif matching:
@@ -266,33 +289,38 @@ def annotated_numeric_roles(packet, expected, spans, candidate_occurrences=None)
     return roles
 
 
-def question_labels(packet, expected, actual=None, candidate_occurrences=None):
-    """Independent annotated values/quotes map prepared choices to correct answers."""
-    spans = candidates(packet)
-    proofs = expected.get("evidence", []) or []
-    labels = {"kind": {expected.get("kind")}, "side": {expected.get("side") or "not_present"},
-        "entry": {expected.get("entry", "unspecified")}, "entry_timing": {expected.get("entry_timing", "standard")},
-        "update_action": {expected.get("update_action") or "not_present"}}
+def _strict_entry_labels(labels, packet, expected):
     from .semantic_contract import strict_deferred_price
     anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     if expected.get("entry") == "limit" and strict_deferred_price(
             anchor["text"], expected.get("entry_timing"), expected.get("entry_prices") or []):
         labels["entry"].add("unspecified")
+
+
+def _lexical_question_labels(labels, spans, expected):
     for field, kind in (("symbol", "symbol"), ("source_exchange", "exchange")):
         wanted = expected.get(field)
         labels[field] = {s.candidate_id for s in spans if s.kind == kind and wanted is not None and
                          str(s.value).casefold() == str(wanted).casefold()} if wanted is not None else {"not_present"}
+
+
+def _proof_question_labels(labels, spans, proofs):
     for field in ("classification", "side", "entry_timing", "update_action"):
         quotes = [p for p in proofs if p["field"] == field]
         labels["proof." + field] = {s.candidate_id for s in spans if s.kind == "text" and any(
             p["source_id"] == s.source_id and p["quote"] == s.quote for p in quotes)} if quotes else {"not_present"}
-    numeric_roles = annotated_numeric_roles(packet, expected, spans, candidate_occurrences)
+
+
+def _range_entry_labels(labels, packet, expected, spans, numeric_roles):
     if expected.get("entry") == "range":
         from .semantic_contract import bounded_live_entry_range
         entries = [[span for span in spans if role in numeric_roles.get(span.candidate_id, set())]
                    for role in ("entry0", "entry1")]
         if all(len(entry) == 1 for entry in entries) and bounded_live_entry_range(packet, [entry[0] for entry in entries]):
             labels["entry"].add("unspecified")
+
+
+def _numeric_question_labels(labels, spans, numeric_roles):
     for identity, alternatives in numeric_occurrences(spans):
         roles = set().union(*(numeric_roles[span.candidate_id] for span in alternatives))
         if "unclear" in roles:
@@ -307,6 +335,21 @@ def question_labels(packet, expected, actual=None, candidate_occurrences=None):
             labels["normalization." + identity] = ({"unclear"} if "unclear" in roles else
                 {span.candidate_id for span in alternatives if numeric_roles[span.candidate_id]} if roles else
                 {"not_present", *(span.candidate_id for span in alternatives)})
+
+
+def question_labels(packet, expected, actual=None, candidate_occurrences=None):
+    """Independent annotated values/quotes map prepared choices to correct answers."""
+    spans = candidates(packet)
+    proofs = expected.get("evidence", []) or []
+    labels = {"kind": {expected.get("kind")}, "side": {expected.get("side") or "not_present"},
+        "entry": {expected.get("entry", "unspecified")}, "entry_timing": {expected.get("entry_timing", "standard")},
+        "update_action": {expected.get("update_action") or "not_present"}}
+    _strict_entry_labels(labels, packet, expected)
+    _lexical_question_labels(labels, spans, expected)
+    _proof_question_labels(labels, spans, proofs)
+    numeric_roles = annotated_numeric_roles(packet, expected, spans, candidate_occurrences)
+    _range_entry_labels(labels, packet, expected, spans, numeric_roles)
+    _numeric_question_labels(labels, spans, numeric_roles)
     actionable = expected.get("kind") in ("new_signal", "trade_update")
     if expected.get("kind") not in ("incomplete", "ambiguous"):
         labels["live_action"] = {actionable}
@@ -379,24 +422,15 @@ def fit_thresholds(rows):
     return thresholds, disabled
 
 
-def validate_splits(dataset, sources=()):
-    by_id = {case["id"]: case for case in dataset}
-    if len(by_id) != len(dataset):
-        raise ValueError("Dataset requires distinct case IDs")
-    groups = {split: {case.get("group_id", case["id"]) for case in dataset if case.get("split") == split}
-              for split in ("calibration", "holdout")}
-    if groups["calibration"] & groups["holdout"]:
-        raise ValueError("Calibration and holdout must use different source threads/groups")
+def _split_original_sources(dataset):
     original_sources = {split: {SourceEvent.model_validate(message).source_id
         for case in dataset if case.get("split") == split
         for message in case.get("messages", []) if isinstance(message, dict)}
         for split in ("calibration", "holdout")}
-    if original_sources["calibration"] & original_sources["holdout"]:
-        raise ValueError("Calibration and holdout must not share original source messages or edits")
-    for case in dataset:
-        if case.get("candidate_occurrences") is not None:
-            packet = case_packet(case)
-            annotated_numeric_roles(packet, case["expected"], candidates(packet), case["candidate_occurrences"])
+    return original_sources
+
+
+def _validate_activation_sources(dataset, sources):
     if sources and all(case.get("messages") for case in dataset):
         represented = set()
         for case in dataset:
@@ -405,6 +439,24 @@ def validate_splits(dataset, sources=()):
                 represented.add(require_first(row["chat_id"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"]))
         if not set(sources) <= represented:
             raise ValueError("Activation sources must have independently annotated real anchor messages")
+
+
+def validate_splits(dataset, sources=()):
+    by_id = {case["id"]: case for case in dataset}
+    if len(by_id) != len(dataset):
+        raise ValueError("Dataset requires distinct case IDs")
+    groups = {split: {case.get("group_id", case["id"]) for case in dataset if case.get("split") == split}
+              for split in ("calibration", "holdout")}
+    if groups["calibration"] & groups["holdout"]:
+        raise ValueError("Calibration and holdout must use different source threads/groups")
+    original_sources = _split_original_sources(dataset)
+    if original_sources["calibration"] & original_sources["holdout"]:
+        raise ValueError("Calibration and holdout must not share original source messages or edits")
+    for case in dataset:
+        if case.get("candidate_occurrences") is not None:
+            packet = case_packet(case)
+            annotated_numeric_roles(packet, case["expected"], candidates(packet), case["candidate_occurrences"])
+    _validate_activation_sources(dataset, sources)
     return by_id
 
 
@@ -414,50 +466,106 @@ def annotation_identity(case):
         "id", "expected", "candidate_occurrences", "group_id", "split", "origin", "annotation_complete", "language", "tags")})
 
 
+def _evaluation_groups(by_id, rows):
+    return len({by_id[row["id"]].get("group_id", row["id"]) for row in rows})
+
+
+def _kind_gate_proofs(proof, training, accepted, by_id):
+    allowed = []
+    for kind in ("new_signal", "trade_update", "report", "unrelated", "incomplete", "ambiguous"):
+        cal_correct = [row for row in training if row["passed"] and row.get("kind") == kind]
+        test_correct = [row for row in accepted if row["passed"] and row.get("kind") == kind]
+        kind_proof = {"calibration_correct_groups": _evaluation_groups(by_id, cal_correct),
+                      "holdout_correct_accepted_groups": _evaluation_groups(by_id, test_correct)}
+        reasons = []
+        if kind_proof["calibration_correct_groups"] < 1:
+            reasons.append("kind_calibration_correct_groups_below_1")
+        if kind_proof["holdout_correct_accepted_groups"] < 2:
+            reasons.append("kind_holdout_correct_accepted_groups_below_2")
+        kind_proof["blocking_reasons"] = reasons
+        proof["kinds"][kind] = kind_proof
+        if not reasons:
+            allowed.append(kind)
+    return allowed
+
+
+def _source_gate_diagnostic(source, results, by_id):
+    real = [row for row in results if row.get("source_id") == source and by_id[row["id"]].get("origin") == "real"]
+    training = [row for row in real if by_id[row["id"]].get("split") == "calibration"]
+    testing = [row for row in real if by_id[row["id"]].get("split") == "holdout"]
+    accepted = [row for row in testing if row.get("accepted")]
+
+    proof = {"calibration_groups": _evaluation_groups(by_id, training), "holdout_groups": _evaluation_groups(by_id, testing),
+             "accepted_cases": len(accepted),
+             "accepted_accuracy": sum(row["passed"] for row in accepted) / len(accepted) if accepted else 0,
+             "critical_errors": sum(row.get("critical_error", False) for row in accepted), "kinds": {}}
+    allowed = _kind_gate_proofs(proof, training, accepted, by_id)
+    reasons = []
+    for failed, code in (
+        (proof["calibration_groups"] < 3, "source_calibration_groups_below_3"),
+        (proof["holdout_groups"] < 5, "source_holdout_groups_below_5"),
+        (proof["accepted_accuracy"] < 0.95, "source_accepted_accuracy_below_0_95"),
+        (proof["critical_errors"] != 0, "source_critical_errors"),
+        (not allowed, "source_no_tested_kind"),
+    ):
+        if failed:
+            reasons.append(code)
+    return {"evidence": proof, "eligible_kinds": allowed, "blocking_reasons": reasons}
+
+
 def source_gate_diagnostics(results, dataset, sources):
     """Explain missing source/kind evidence without converting omissions to grants."""
     by_id = {case["id"]: case for case in dataset}
     diagnostics = {}
     for source in sources:
-        real = [row for row in results if row.get("source_id") == source and by_id[row["id"]].get("origin") == "real"]
-        training = [row for row in real if by_id[row["id"]].get("split") == "calibration"]
-        testing = [row for row in real if by_id[row["id"]].get("split") == "holdout"]
-        accepted = [row for row in testing if row.get("accepted")]
-
-        def groups(rows):
-            return len({by_id[row["id"]].get("group_id", row["id"]) for row in rows})
-
-        proof = {"calibration_groups": groups(training), "holdout_groups": groups(testing),
-                 "accepted_cases": len(accepted),
-                 "accepted_accuracy": sum(row["passed"] for row in accepted) / len(accepted) if accepted else 0,
-                 "critical_errors": sum(row.get("critical_error", False) for row in accepted), "kinds": {}}
-        allowed = []
-        for kind in ("new_signal", "trade_update", "report", "unrelated", "incomplete", "ambiguous"):
-            cal_correct = [row for row in training if row["passed"] and row.get("kind") == kind]
-            test_correct = [row for row in accepted if row["passed"] and row.get("kind") == kind]
-            kind_proof = {"calibration_correct_groups": groups(cal_correct),
-                          "holdout_correct_accepted_groups": groups(test_correct)}
-            reasons = []
-            if kind_proof["calibration_correct_groups"] < 1:
-                reasons.append("kind_calibration_correct_groups_below_1")
-            if kind_proof["holdout_correct_accepted_groups"] < 2:
-                reasons.append("kind_holdout_correct_accepted_groups_below_2")
-            kind_proof["blocking_reasons"] = reasons
-            proof["kinds"][kind] = kind_proof
-            if not reasons:
-                allowed.append(kind)
-        reasons = []
-        for failed, code in (
-            (proof["calibration_groups"] < 3, "source_calibration_groups_below_3"),
-            (proof["holdout_groups"] < 5, "source_holdout_groups_below_5"),
-            (proof["accepted_accuracy"] < 0.95, "source_accepted_accuracy_below_0_95"),
-            (proof["critical_errors"] != 0, "source_critical_errors"),
-            (not allowed, "source_no_tested_kind"),
-        ):
-            if failed:
-                reasons.append(code)
-        diagnostics[source] = {"evidence": proof, "eligible_kinds": allowed, "blocking_reasons": reasons}
+        diagnostics[source] = _source_gate_diagnostic(source, results, by_id)
     return diagnostics
+
+
+def _sufficient_annotations(dataset):
+    return all(case.get("group_id") and case.get("annotation_complete") is True
+                                 and set(CRITICAL_FIELDS) <= set(case["expected"])
+                                 for case in dataset if case.get("split") in ("calibration", "holdout"))
+
+
+def _calibration_coverage(dataset):
+    return all(
+        {"new_signal", "trade_update", "report", "unrelated", "incomplete", "ambiguous"} <=
+        {case["expected"].get("kind") for case in dataset if case.get("split") == split}
+        and {"de", "en", "ru"} <= {case.get("language") for case in dataset if case.get("split") == split}
+        and REQUIRED_SCENARIOS <= {tag for case in dataset if case.get("split") == split for tag in case.get("tags", [])}
+        for split in ("calibration", "holdout"))
+
+
+def _real_action_coverage(accepted, by_id):
+    return all(sum(r["passed"] and r.get("kind") == kind and by_id[r["id"]].get("origin") == "real"
+                                  for r in accepted) >= 4 for kind in ("new_signal", "trade_update"))
+
+
+def _complete_measurement(results, dataset, calibration, holdout):
+    required_ids = {case["id"] for case in dataset if case.get("split") in ("calibration", "holdout")}
+    measured_ids = [row["id"] for row in results if row["id"] in required_ids]
+    complete_measurement = (set(measured_ids) == required_ids and len(measured_ids) == len(required_ids)
+                            and not any(row.get("failure_code") in PROVIDER_FAILURES for row in calibration + holdout))
+    return complete_measurement
+
+
+def _profile_configuration_reasons(master_hash, evidence, thresholds, complete_measurement):
+    return [code for failed, code in (
+        (not master_hash, "approved_master_hash_missing"), (not evidence, "source_evidence_missing"),
+        (not thresholds, "calibrated_thresholds_missing"), (not complete_measurement, "measurement_incomplete_or_provider_failure"),
+    ) if failed]
+
+
+def _global_evidence_reasons(calibration, holdout, accepted, by_id, sufficient_annotations, coverage, real_action_coverage, critical):
+    return [code for failed, code in (
+            (len(calibration) < 30, "calibration_cases_below_30"), (len(holdout) < 30, "holdout_cases_below_30"),
+            (len({by_id[r["id"]].get("group_id", r["id"]) for r in accepted}) < 30, "accepted_holdout_groups_below_30"),
+            (not sufficient_annotations, "complete_annotations_missing"), (not coverage, "required_scenario_coverage_missing"),
+            (not real_action_coverage, "real_accepted_action_coverage_missing"), (critical != 0, "critical_errors"),
+            (any(row.get("unlabelled_occurrence_questions") for row in holdout), "unlabelled_holdout_occurrence_evidence"),
+            (not accepted or sum(row["passed"] for row in accepted) / len(accepted) < 0.95, "accepted_accuracy_below_0_95"),
+        ) if failed]
 
 
 def calibration_profile(results, dataset, sources, master_hash="", *, model=DEFAULT_DECISION_MODEL, model_revision=DEFAULT_DECISION_MODEL):
@@ -467,34 +575,16 @@ def calibration_profile(results, dataset, sources, master_hash="", *, model=DEFA
     thresholds, disabled = fit_thresholds(calibration)
     accepted = [row for row in holdout if row.get("accepted")]
     critical = sum(row.get("critical_error", False) for row in accepted)
-    sufficient_annotations = all(case.get("group_id") and case.get("annotation_complete") is True
-                                 and set(CRITICAL_FIELDS) <= set(case["expected"])
-                                 for case in dataset if case.get("split") in ("calibration", "holdout"))
-    coverage = all(
-        {"new_signal", "trade_update", "report", "unrelated", "incomplete", "ambiguous"} <=
-        {case["expected"].get("kind") for case in dataset if case.get("split") == split}
-        and {"de", "en", "ru"} <= {case.get("language") for case in dataset if case.get("split") == split}
-        and REQUIRED_SCENARIOS <= {tag for case in dataset if case.get("split") == split for tag in case.get("tags", [])}
-        for split in ("calibration", "holdout"))
+    sufficient_annotations = _sufficient_annotations(dataset)
+    coverage = _calibration_coverage(dataset)
     diagnostics = source_gate_diagnostics(results, dataset, sources)
     evidence = {source: diagnostic["evidence"] for source, diagnostic in diagnostics.items() if not diagnostic["blocking_reasons"]}
     permissions = {source: diagnostics[source]["eligible_kinds"] for source in evidence}
-    real_action_coverage = all(sum(r["passed"] and r.get("kind") == kind and by_id[r["id"]].get("origin") == "real"
-                                  for r in accepted) >= 4 for kind in ("new_signal", "trade_update"))
-    required_ids = {case["id"] for case in dataset if case.get("split") in ("calibration", "holdout")}
-    measured_ids = [row["id"] for row in results if row["id"] in required_ids]
-    complete_measurement = (set(measured_ids) == required_ids and len(measured_ids) == len(required_ids)
-                            and not any(row.get("failure_code") in PROVIDER_FAILURES for row in calibration + holdout))
-    global_reasons = [code for failed, code in (
-        (not master_hash, "approved_master_hash_missing"), (not evidence, "source_evidence_missing"),
-        (not thresholds, "calibrated_thresholds_missing"), (not complete_measurement, "measurement_incomplete_or_provider_failure"),
-        (len(calibration) < 30, "calibration_cases_below_30"), (len(holdout) < 30, "holdout_cases_below_30"),
-        (len({by_id[r["id"]].get("group_id", r["id"]) for r in accepted}) < 30, "accepted_holdout_groups_below_30"),
-        (not sufficient_annotations, "complete_annotations_missing"), (not coverage, "required_scenario_coverage_missing"),
-        (not real_action_coverage, "real_accepted_action_coverage_missing"), (critical != 0, "critical_errors"),
-        (any(row.get("unlabelled_occurrence_questions") for row in holdout), "unlabelled_holdout_occurrence_evidence"),
-        (not accepted or sum(row["passed"] for row in accepted) / len(accepted) < 0.95, "accepted_accuracy_below_0_95"),
-    ) if failed]
+    real_action_coverage = _real_action_coverage(accepted, by_id)
+    complete_measurement = _complete_measurement(results, dataset, calibration, holdout)
+    global_reasons = _profile_configuration_reasons(master_hash, evidence, thresholds, complete_measurement)
+    global_reasons += _global_evidence_reasons(calibration, holdout, accepted, by_id, sufficient_annotations,
+                                              coverage, real_action_coverage, critical)
     valid = not global_reasons
     return CalibrationProfile(model=model, model_revision=model_revision, thresholds=thresholds, disabled_questions=disabled,
         sources=list(evidence), source_evidence=evidence, source_permissions=permissions, master_hash=master_hash,
@@ -502,6 +592,60 @@ def calibration_profile(results, dataset, sources, master_hash="", *, model=DEFA
         holdout_hash=digest([case for case in dataset if case.get("split") == "holdout"]),
         holdout_cases=len(holdout), critical_errors=critical, validated=valid,
         activation_diagnostics={"blocking_reasons": global_reasons, "sources": diagnostics})
+
+
+def _candidate_role_mismatch(case, kind, question_results):
+    return (kind in ("new_signal", "trade_update") and case.get("annotation_complete")
+            and any(row["question"].startswith(("role.", "normalization.")) and not row["correct"] for row in question_results))
+
+
+def _baseline_gate(packet, profile, result, observation, adapter, accepted):
+    baseline_passed = accepted
+    if observation.get("responses"):
+        try:
+            baseline = CalibrationProfile(model=profile.model, model_revision=profile.model_revision,
+                thresholds={key: 0.5 for key in (result.required_questions if result else observation.get("required_questions", []))})
+            replay_decision(packet, baseline, observation["responses"], model=getattr(adapter, "model", DEFAULT_DECISION_MODEL),
+                            revision=getattr(adapter, "model_revision", profile.model_revision))
+            baseline_passed = True
+        except DecisionFailure:
+            baseline_passed = False
+    return baseline_passed
+
+
+def _unlabelled_questions(packet, expected, result, observation, candidate_occurrences):
+    labels = question_labels(packet, expected, result.interpretation if result else None,
+                             candidate_occurrences)
+    required_questions = result.required_questions if result else observation.get("required_questions", [])
+    unlabelled = [question for question in dict.fromkeys(required_questions)
+                   if question.startswith(("role.", "normalization.")) and labels.get(question) == {"unclear"}]
+    return unlabelled
+
+
+def _evaluation_result(case, packet, usage, result, failure, mismatches, observation, profile, adapter):
+    question_results = calibration_question_results(packet, case["expected"], observation, result,
+                                                     case.get("candidate_occurrences"))
+    unlabelled = _unlabelled_questions(packet, case["expected"], result, observation, case.get("candidate_occurrences"))
+    if result and _candidate_role_mismatch(case, result.interpretation.kind, question_results):
+        mismatches.append("candidate_occurrences")
+    predicted = result.interpretation.kind if result else None
+    expected_kind = case["expected"].get("kind")
+    actionable = predicted in ("new_signal", "trade_update")
+    accepted = result is not None and not result.collection_only
+    critical = bool(accepted and mismatches and
+                    (actionable or expected_kind in ("new_signal", "trade_update")))
+    baseline_passed = _baseline_gate(packet, profile, result, observation, adapter, accepted)
+    return {"id": case["id"], "source_hash": digest(packet), "annotation_hash": annotation_identity(case), "kind": predicted,
+                 "source_id": require_first(r["chat_id"] for r in packet["messages"] if r["event_id"] == packet["anchor_event_id"]),
+                 "expected_kind": expected_kind, "passed": failure is None and not mismatches,
+                 "raw_correct": failure is None and not mismatches, "accepted": accepted, "deferred": not accepted,
+                 "baseline_gate_passed": baseline_passed,
+                 "critical_error": critical, "missed_actionable": expected_kind in ("new_signal", "trade_update") and not actionable,
+                 "mismatch_fields": mismatches, "failure_code": failure,
+                 "probabilities": result.probabilities if result else observation.get("probabilities", {}), "usage": usage,
+                 "question_results": question_results,
+                 "unlabelled_occurrence_questions": unlabelled,
+                 "responses": observation.get("responses", [])}
 
 
 async def evaluate(dataset, adapter, *, profile=None, master="", collect=False, checkpoint=None):
@@ -525,43 +669,7 @@ async def evaluate(dataset, adapter, *, profile=None, master="", collect=False, 
             mismatches = annotation_mismatches(result.interpretation, case["expected"])
         except Exception as error:
             failure = str(error) if isinstance(error, DecisionFailure) else "evaluation_failed"
-        question_results = calibration_question_results(packet, case["expected"], observation, result,
-                                                         case.get("candidate_occurrences"))
-        labels = question_labels(packet, case["expected"], result.interpretation if result else None,
-                                 case.get("candidate_occurrences"))
-        required_questions = result.required_questions if result else observation.get("required_questions", [])
-        unlabelled = [question for question in dict.fromkeys(required_questions)
-                       if question.startswith(("role.", "normalization.")) and labels.get(question) == {"unclear"}]
-        if (result and result.interpretation.kind in ("new_signal", "trade_update") and case.get("annotation_complete")
-                and any(row["question"].startswith(("role.", "normalization.")) and not row["correct"] for row in question_results)):
-            mismatches.append("candidate_occurrences")
-        predicted = result.interpretation.kind if result else None
-        expected_kind = case["expected"].get("kind")
-        actionable = predicted in ("new_signal", "trade_update")
-        accepted = result is not None and not result.collection_only
-        critical = bool(accepted and mismatches and
-                        (actionable or expected_kind in ("new_signal", "trade_update")))
-        baseline_passed = accepted
-        if observation.get("responses"):
-            try:
-                baseline = CalibrationProfile(model=profile.model, model_revision=profile.model_revision,
-                    thresholds={key: 0.5 for key in (result.required_questions if result else observation.get("required_questions", []))})
-                replay_decision(packet, baseline, observation["responses"], model=getattr(adapter, "model", DEFAULT_DECISION_MODEL),
-                                revision=getattr(adapter, "model_revision", profile.model_revision))
-                baseline_passed = True
-            except DecisionFailure:
-                baseline_passed = False
-        rows.append({"id": case["id"], "source_hash": digest(packet), "annotation_hash": annotation_identity(case), "kind": predicted,
-                     "source_id": require_first(r["chat_id"] for r in packet["messages"] if r["event_id"] == packet["anchor_event_id"]),
-                     "expected_kind": expected_kind, "passed": failure is None and not mismatches,
-                     "raw_correct": failure is None and not mismatches, "accepted": accepted, "deferred": not accepted,
-                     "baseline_gate_passed": baseline_passed,
-                     "critical_error": critical, "missed_actionable": expected_kind in ("new_signal", "trade_update") and not actionable,
-                     "mismatch_fields": mismatches, "failure_code": failure,
-                     "probabilities": result.probabilities if result else observation.get("probabilities", {}), "usage": usage,
-                     "question_results": question_results,
-                     "unlabelled_occurrence_questions": unlabelled,
-                     "responses": observation.get("responses", [])})
+        rows.append(_evaluation_result(case, packet, usage, result, failure, mismatches, observation, profile, adapter))
         if checkpoint is not None:
             checkpoint.put(rows[-1])
             if failure in PROVIDER_FAILURES:
@@ -569,28 +677,7 @@ async def evaluate(dataset, adapter, *, profile=None, master="", collect=False, 
     return rows
 
 
-async def evaluate_split(dataset, adapter, sources, master="", *, checkpoint_path=None, retry_provider_failures=False):
-    validate_splits(dataset, sources)
-    model = getattr(adapter, "model", DEFAULT_DECISION_MODEL)
-    revision = await adapter.identity() if hasattr(adapter, "identity") else model
-    if hasattr(adapter, "pin_revision"):
-        adapter.pin_revision(revision)
-    checkpoint = EvaluationCheckpoint(checkpoint_path, {"version": VERSION, "dataset_hash": digest(dataset),
-        "master_hash": digest(master), "model": model, "model_revision": revision},
-        retry_provider_failures=retry_provider_failures) if checkpoint_path else None
-    training = [case for case in dataset if case.get("split") == "calibration"]
-    test = [case for case in dataset if case.get("split") == "holdout"]
-    other = [case for case in dataset if case.get("split") not in ("calibration", "holdout")]
-    rows = await evaluate(training, adapter, profile=CalibrationProfile(model=model, model_revision=revision), master=master,
-                          collect=True, checkpoint=checkpoint) if training else []
-    import hashlib
-    master_hash = hashlib.sha256(master.encode()).hexdigest() if master else ""
-    frozen = calibration_profile(rows, dataset, sources, master_hash, model=model, model_revision=revision)
-    if checkpoint is not None:
-        checkpoint.freeze(frozen)
-    # Held-out results must be measured with the fitted thresholds, never retrofitted.
-    heldout = await evaluate(test, adapter, profile=frozen, master=master, collect=True, checkpoint=checkpoint) if test else []
-    test_by_id = {case["id"]: case for case in test}
+def _regrade_holdout(heldout, test_by_id, master, frozen, model, revision):
     for row in heldout:
         case = test_by_id[row["id"]]
         try:
@@ -602,9 +689,7 @@ async def evaluate_split(dataset, adapter, sources, master="", *, checkpoint_pat
             # calibration and held-out evidence; the report checks both again.
             row["accepted"], row["deferred"] = True, False
             row["mismatch_fields"] = annotation_mismatches(accepted.interpretation, case["expected"])
-            if (case.get("annotation_complete") and accepted.interpretation.kind in ("new_signal", "trade_update")
-                    and any(question["question"].startswith(("role.", "normalization.")) and not question["correct"]
-                            for question in row["question_results"])):
+            if _candidate_role_mismatch(case, accepted.interpretation.kind, row["question_results"]):
                 row["mismatch_fields"].append("candidate_occurrences")
             row["passed"] = not row["mismatch_fields"]
             row["critical_error"] = bool(row["mismatch_fields"] and (accepted.interpretation.kind in ("new_signal", "trade_update")
@@ -612,12 +697,42 @@ async def evaluate_split(dataset, adapter, sources, master="", *, checkpoint_pat
         except DecisionFailure as error:
             row["accepted"], row["deferred"], row["passed"], row["critical_error"] = False, True, False, False
             row["failure_code"] = str(error)
+
+
+def _dataset_splits(dataset):
+    training = [case for case in dataset if case.get("split") == "calibration"]
+    test = [case for case in dataset if case.get("split") == "holdout"]
+    other = [case for case in dataset if case.get("split") not in ("calibration", "holdout")]
+    return training, test, other
+
+
+async def evaluate_split(dataset, adapter, sources, master="", *, checkpoint_path=None, retry_provider_failures=False):
+    validate_splits(dataset, sources)
+    model = getattr(adapter, "model", DEFAULT_DECISION_MODEL)
+    revision = await adapter.identity() if hasattr(adapter, "identity") else model
+    if hasattr(adapter, "pin_revision"):
+        adapter.pin_revision(revision)
+    checkpoint = EvaluationCheckpoint(checkpoint_path, {"version": VERSION, "dataset_hash": digest(dataset),
+        "master_hash": digest(master), "model": model, "model_revision": revision},
+        retry_provider_failures=retry_provider_failures) if checkpoint_path else None
+    training, test, other = _dataset_splits(dataset)
+    rows = await evaluate(training, adapter, profile=CalibrationProfile(model=model, model_revision=revision), master=master,
+                          collect=True, checkpoint=checkpoint) if training else []
+    import hashlib
+    master_hash = hashlib.sha256(master.encode()).hexdigest() if master else ""
+    frozen = calibration_profile(rows, dataset, sources, master_hash, model=model, model_revision=revision)
+    if checkpoint is not None:
+        checkpoint.freeze(frozen)
+    # Held-out results must be measured with the fitted thresholds, never retrofitted.
+    heldout = await evaluate(test, adapter, profile=frozen, master=master, collect=True, checkpoint=checkpoint) if test else []
+    test_by_id = {case["id"]: case for case in test}
+    _regrade_holdout(heldout, test_by_id, master, frozen, model, revision)
     rows += heldout
     rows += await evaluate(other, adapter, master=master) if other else []
     return rows
 
 
-def main():
+def _argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -631,13 +746,80 @@ def main():
     parser.add_argument("--retry-provider-failures", action="store_true", help="Explicitly retry only saved provider failures, not semantic deferrals")
     parser.add_argument("--request-interval", type=float, default=4, help="Minimum seconds between decision API calls, 0–60")
     parser.add_argument("--timeout", type=float, default=30, help="Per-request evaluation timeout, 0–30 seconds")
+    return parser
+
+
+def _mark_production_eligible(rows, profile, by_id):
+    for row in rows:
+        row["production_eligible"] = bool(profile.validated and row["accepted"] and row["passed"]
+            and by_id[row["id"]].get("origin") == "real" and row["source_id"] in profile.sources
+            and profile.permits_kind(row["source_id"], row["kind"]))
+
+
+def _sum_usage(rows, field):
+    return sum(usage.get(field, 0) for row in rows for usage in row["usage"])
+
+
+def _report_usage_totals(report, rows):
+    report["missing_usage_calls"] = sum(not u.get("usage_available", False) for row in rows for u in row["usage"])
+    report["estimated_cost_complete"] = all("estimated_cost_usd" in u for row in rows for u in row["usage"])
+    if not report["estimated_cost_complete"]:
+        report["estimated_cost_usd"] = None
+
+
+def _evaluation_report(rows, profile, by_id):
+    heldout = [row for row in rows if by_id[row["id"]].get("split") == "holdout"]
+    real_heldout = [row for row in heldout if by_id[row["id"]].get("origin") == "real"]
+    passed = sum(row["passed"] for row in heldout)
+    report = {"version": VERSION, "model": profile.model, "model_revision": profile.model_revision, "cases": rows, "order_tools_available": False,
+              "passed_cases": passed, "raw_correct_cases": sum(row["raw_correct"] for row in rows),
+              "accepted_holdout_cases": sum(row["accepted"] for row in heldout),
+              "deferred_holdout_cases": sum(row["deferred"] for row in heldout),
+              "without_fallback_share": sum(row["production_eligible"] for row in real_heldout) / len(real_heldout) if real_heldout else None,
+              "without_fallback_share_is_live_measurement": False,
+              "activated_sources": profile.sources, "source_permissions": profile.source_permissions,
+              "activation_diagnostics": profile.activation_diagnostics,
+              "critical_errors": sum(row["critical_error"] for row in rows),
+              "calibration_validated": profile.validated,
+              "input_tokens": _sum_usage(rows, "input_tokens"),
+              "estimated_cost_usd": _sum_usage(rows, "estimated_cost_usd")}
+    _report_usage_totals(report, rows)
+    durations = sorted(sum(u.get("duration_seconds", 0) for u in row["usage"]) for row in rows)
+    report["api_latency_p50_seconds"] = durations[max(0, math.ceil(len(durations) * 0.5) - 1)]
+    report["api_latency_p95_seconds"] = durations[max(0, math.ceil(len(durations) * 0.95) - 1)]
+    return report, real_heldout
+
+
+def _baseline_report(baseline_path, report, rows, real_heldout):
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    if not isinstance(baseline, list) or {r["id"] for r in baseline} != {r["id"] for r in rows} or len(baseline) != len(rows):
+        raise SystemExit("Baseline must cover exactly the same distinct case IDs")
+    benchmark_ids = {r["id"] for r in real_heldout}
+    total = sum(r["input_tokens"] + r.get("cache_read_tokens", 0) for r in baseline if r["id"] in benchmark_ids)
+    report["baseline_generative_input_tokens"] = total
+    report["baseline_comparison_scope"] = "real_holdout_only"
+    report["baseline_comparison_cases"] = len(benchmark_ids)
+    # Unresolved cases conservatively retain the FULL old baseline spend.
+    unresolved = {r["id"] for r in real_heldout if not r["production_eligible"]}
+    retained = sum(r["input_tokens"] + r.get("cache_read_tokens", 0) for r in baseline if r["id"] in unresolved)
+    report["conservative_projected_generative_input_reduction"] = 1 - retained / total if total else None
+    report["generative_reduction_is_measured"] = False
+
+
+def _load_dataset(path):
+    dataset = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(dataset, list) or not dataset or len({c["id"] for c in dataset}) != len(dataset):
+        raise SystemExit("Dataset must contain distinct annotated case IDs")
+    return dataset
+
+
+def main():
+    parser = _argument_parser()
     args = parser.parse_args()
     key = os.environ.get(args.key_env)
     if not key:
         raise SystemExit("Set the decision API key environment variable; no calls were made")
-    dataset = json.loads(args.dataset.read_text(encoding="utf-8"))
-    if not isinstance(dataset, list) or not dataset or len({c["id"] for c in dataset}) != len(dataset):
-        raise SystemExit("Dataset must contain distinct annotated case IDs")
+    dataset = _load_dataset(args.dataset)
     calibration_profile([], dataset, args.sources)
     master = args.master.read_text(encoding="utf-8") if args.master else ""
     import hashlib
@@ -653,46 +835,10 @@ def main():
         raise SystemExit("Evaluation interrupted: " + str(error) + "; saved observations remain in the checkpoint") from None
     profile = calibration_profile(rows, dataset, args.sources, master_hash, model=args.model, model_revision=adapter.model_revision)
     by_id = {case["id"]: case for case in dataset}
-    for row in rows:
-        row["production_eligible"] = bool(profile.validated and row["accepted"] and row["passed"]
-            and by_id[row["id"]].get("origin") == "real" and row["source_id"] in profile.sources
-            and profile.permits_kind(row["source_id"], row["kind"]))
-    heldout = [row for row in rows if by_id[row["id"]].get("split") == "holdout"]
-    real_heldout = [row for row in heldout if by_id[row["id"]].get("origin") == "real"]
-    passed = sum(row["passed"] for row in heldout)
-    report = {"version": VERSION, "model": profile.model, "model_revision": profile.model_revision, "cases": rows, "order_tools_available": False,
-              "passed_cases": passed, "raw_correct_cases": sum(row["raw_correct"] for row in rows),
-              "accepted_holdout_cases": sum(row["accepted"] for row in heldout),
-              "deferred_holdout_cases": sum(row["deferred"] for row in heldout),
-              "without_fallback_share": sum(row["production_eligible"] for row in real_heldout) / len(real_heldout) if real_heldout else None,
-              "without_fallback_share_is_live_measurement": False,
-              "activated_sources": profile.sources, "source_permissions": profile.source_permissions,
-              "activation_diagnostics": profile.activation_diagnostics,
-              "critical_errors": sum(row["critical_error"] for row in rows),
-              "calibration_validated": profile.validated,
-              "input_tokens": sum(u.get("input_tokens", 0) for row in rows for u in row["usage"]),
-              "estimated_cost_usd": sum(u.get("estimated_cost_usd", 0) for row in rows for u in row["usage"])}
-    report["missing_usage_calls"] = sum(not u.get("usage_available", False) for row in rows for u in row["usage"])
-    report["estimated_cost_complete"] = all("estimated_cost_usd" in u for row in rows for u in row["usage"])
-    if not report["estimated_cost_complete"]:
-        report["estimated_cost_usd"] = None
-    durations = sorted(sum(u.get("duration_seconds", 0) for u in row["usage"]) for row in rows)
-    report["api_latency_p50_seconds"] = durations[max(0, math.ceil(len(durations) * 0.5) - 1)]
-    report["api_latency_p95_seconds"] = durations[max(0, math.ceil(len(durations) * 0.95) - 1)]
+    _mark_production_eligible(rows, profile, by_id)
+    report, real_heldout = _evaluation_report(rows, profile, by_id)
     if args.baseline:
-        baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
-        if not isinstance(baseline, list) or {r["id"] for r in baseline} != {r["id"] for r in rows} or len(baseline) != len(rows):
-            raise SystemExit("Baseline must cover exactly the same distinct case IDs")
-        benchmark_ids = {r["id"] for r in real_heldout}
-        total = sum(r["input_tokens"] + r.get("cache_read_tokens", 0) for r in baseline if r["id"] in benchmark_ids)
-        report["baseline_generative_input_tokens"] = total
-        report["baseline_comparison_scope"] = "real_holdout_only"
-        report["baseline_comparison_cases"] = len(benchmark_ids)
-        # Unresolved cases conservatively retain the FULL old baseline spend.
-        unresolved = {r["id"] for r in real_heldout if not r["production_eligible"]}
-        retained = sum(r["input_tokens"] + r.get("cache_read_tokens", 0) for r in baseline if r["id"] in unresolved)
-        report["conservative_projected_generative_input_reduction"] = 1 - retained / total if total else None
-        report["generative_reduction_is_measured"] = False
+        _baseline_report(args.baseline, report, rows, real_heldout)
     write_private_json(args.output, report)
     if args.write_profile:
         write_private_json(args.write_profile, profile.model_dump(mode="json"))

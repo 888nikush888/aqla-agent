@@ -158,7 +158,7 @@ def _restore_pair(output, sha, recovery_zip, recovery_sha, staging):
     _sync_directory(output.parent)
 
 
-def build(project: Path, output: Path):
+def release_inputs(project, output):
     project, output = _lexical_path(project), _lexical_path(output)
     sha = output.with_suffix(output.suffix + ".sha256")
     for target in (output, sha):
@@ -182,6 +182,28 @@ def build(project: Path, output: Path):
     if all(previous):
         _verify_pair(output, sha, output.name)
     members = [item[2] for item in files] + ["aqla-agent/CONTENTS.sha256"]
+    return project, output, sha, previous, files, members
+
+
+def stage_release(staged_zip, staged_sha, files, output_name, members):
+    with zipfile.ZipFile(staged_zip, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+        contents = []
+        for path, info, name in files:
+            body = _read_source(path, info)
+            archive.writestr(name, body)
+            contents.append(hashlib.sha256(body).hexdigest() + "  " + name.removeprefix("aqla-agent/"))
+        archive.writestr("aqla-agent/CONTENTS.sha256", "\n".join(contents) + "\n")
+    with staged_zip.open("r+b") as source:
+        source.flush()
+        os.fsync(source.fileno())
+    digest = hashlib.sha256(staged_zip.read_bytes()).hexdigest()
+    _write_fsynced(staged_sha, f"{digest}  {output_name}\n".encode())
+    _verify_pair(staged_zip, staged_sha, output_name, members)
+    return digest
+
+
+def build(project: Path, output: Path):
+    project, output, sha, previous, files, members = release_inputs(project, output)
     staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
     staged_zip, staged_sha = staging / "new.zip", staging / "new.sha256"
     recovery_zip, recovery_sha = staging / "previous.zip", staging / "previous.sha256"
@@ -189,19 +211,7 @@ def build(project: Path, output: Path):
     publication_started = False
     keep_recovery = False
     try:
-        with zipfile.ZipFile(staged_zip, "x", compression=zipfile.ZIP_DEFLATED) as archive:
-            contents = []
-            for path, info, name in files:
-                body = _read_source(path, info)
-                archive.writestr(name, body)
-                contents.append(hashlib.sha256(body).hexdigest() + "  " + name.removeprefix("aqla-agent/"))
-            archive.writestr("aqla-agent/CONTENTS.sha256", "\n".join(contents) + "\n")
-        with staged_zip.open("r+b") as source:
-            source.flush()
-            os.fsync(source.fileno())
-        digest = hashlib.sha256(staged_zip.read_bytes()).hexdigest()
-        _write_fsynced(staged_sha, f"{digest}  {output.name}\n".encode())
-        _verify_pair(staged_zip, staged_sha, output.name, members)
+        digest = stage_release(staged_zip, staged_sha, files, output.name, members)
         if all(previous):
             _write_fsynced(recovery_zip, _read_source(output, previous[0]))
             _write_fsynced(recovery_sha, _read_source(sha, previous[1]))

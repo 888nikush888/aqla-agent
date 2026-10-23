@@ -207,6 +207,37 @@ def current_actions(text, *, include_tp_footers=True):
     return actions
 
 
+def _historical_action(clause, match, inherited_blocked):
+    before = clause[:match.start()]
+    history_prefix = CURRENT.split(before)[-1]
+    markers = [(point.start(), True) for matcher in (PAST, HYPOTHETICAL, PAST_WORD)
+               for point in matcher.finditer(clause[:match.end()])]
+    markers += [(point.start(), False) for point in CURRENT.finditer(clause[:match.end()])]
+    blocked = max(markers)[1] if markers else inherited_blocked
+    # A governor scopes coordinated clauses until a current marker or sentence boundary.
+    return (blocked or NEGATED.search(before) or PAST_PREFIX.search(history_prefix)
+            or PAST_MATCH.search(match.group()) or PAST_GOVERNOR.search(history_prefix))
+
+
+def _stop_clause_action(clause, match, initial_setup):
+    tail = clause[match.end():]
+    if POSTFIX_PAST_STOP.search(tail):
+        return None
+    # A bare numeric stop in a full setup is initial protection.
+    if (initial_setup and match.start() == 0 and not re.match(WORD + VERB, match.group(), re.I)
+            and re.fullmatch(r"\s*\d+(?:[.,]\d+)*\s*", tail)):
+        return None
+    return "break_even" if BE_DESTINATION.search(tail) else "move_stop"
+
+
+def _exit_clause_action(clause, match):
+    if "фикс" in match.group() and PORTION.search(match.group()) and PAST.search(clause[match.end():]):
+        return None
+    quantities = [quantity for quantity in PORTION.finditer(clause) if not (
+        "%" in quantity.group() and re.search(r"(?:[-−+]\s*|(?:at|на|в)\s*)$", clause[:quantity.start()]))]
+    return "reduce" if quantities or match.group().startswith(("reduce", "reducing", "trim", "cut", "сократ", "reduzier")) else "close"
+
+
 def clause_actions(clause, inherited_blocked, *, initial_setup=False):
     actions = []
     if not clause:
@@ -216,34 +247,16 @@ def clause_actions(clause, inherited_blocked, *, initial_setup=False):
     matches += [(match, "cancel_entry") for match in CANCEL_ACTION.finditer(clause)]
     matches += [(match, "exit") for match in EXIT_ACTION.finditer(clause)]
     for match, action in matches:
-        before = clause[:match.start()]
-        history_prefix = CURRENT.split(before)[-1]
-        markers = [(point.start(), True) for matcher in (PAST, HYPOTHETICAL, PAST_WORD)
-                   for point in matcher.finditer(clause[:match.end()])]
-        markers += [(point.start(), False) for point in CURRENT.finditer(clause[:match.end()])]
-        blocked = max(markers)[1] if markers else inherited_blocked
-        # A governor scopes coordinated clauses until an explicit current marker
-        # or hard sentence boundary establishes a new instruction.
-        if (blocked or NEGATED.search(before) or PAST_PREFIX.search(history_prefix)
-                or PAST_MATCH.search(match.group()) or PAST_GOVERNOR.search(history_prefix)):
+        if _historical_action(clause, match, inherited_blocked):
             continue
         if action == "stop":
-            if POSTFIX_PAST_STOP.search(clause[match.end():]):
-                continue
-            # A bare numeric stop field in a full setup is initial protection;
-            # explicit move verbs and stop-to-entry instructions remain actions.
-            if (initial_setup and match.start() == 0 and not re.match(WORD + VERB, match.group(), re.I)
-                    and re.fullmatch(r"\s*\d+(?:[.,]\d+)*\s*", clause[match.end():])):
-                continue
-            action = "break_even" if BE_DESTINATION.search(clause[match.end():]) else "move_stop"
+            action = _stop_clause_action(clause, match, initial_setup)
         elif action == "exit":
-            if "фикс" in match.group() and PORTION.search(match.group()) and PAST.search(clause[match.end():]):
-                continue
-            quantities = [quantity for quantity in PORTION.finditer(clause) if not (
-                "%" in quantity.group() and re.search(r"(?:[-−+]\s*|(?:at|на|в)\s*)$", clause[:quantity.start()]))]
-            action = "reduce" if quantities or match.group().startswith(("reduce", "reducing", "trim", "cut", "сократ", "reduzier")) else "close"
-        actions.append((action, clause))
+            action = _exit_clause_action(clause, match)
+        if action is not None:
+            actions.append((action, clause))
     return actions
+
 
 
 def matching_words(text):
@@ -311,29 +324,32 @@ def current_structure_text(text):
     return ";".join(live)
 
 
+def _future_opening_opportunity(sentence):
+    return (OPPORTUNITY.search(sentence) and OPENING_OPPORTUNITY.search(sentence)
+            and (FUTURE_OPPORTUNITY.search(sentence) or FUTURE.search(sentence) or CONDITION.search(sentence)))
+
+
+def _independent_entry_instruction(sentence):
+    if CURRENT_ENTRY.search(sentence):
+        return True
+    if re.search(r"\d", sentence) and (ENTRY_LABEL.search(sentence) or STRICT_ENTRY_PRICE.search(sentence)
+            or LIMIT.search(sentence) and ENTRY.search(sentence)):
+        return True
+    return bool(CURRENT.search(sentence) and (ENTRY.search(sentence) or SETUP_HEADING.search(sentence)) and MARKET.search(sentence))
+
+
 def future_entry_opportunity_failure(text):
     """A forecasted qualitative opening opportunity is not a current entry order."""
-    # A sentence may end immediately after a price ("Entry: 100. Forecast").
-    # Keep decimal points intact while separating that independent instruction.
+    # Keep decimal points intact while separating independent instructions.
     sentences = re.split(r";|\.(?!\d)(?=\s|$)", current_structure_text(text))
-    opportunities = [sentence for sentence in sentences if OPPORTUNITY.search(sentence)
-        and OPENING_OPPORTUNITY.search(sentence) and (FUTURE_OPPORTUNITY.search(sentence)
-            or FUTURE.search(sentence) or CONDITION.search(sentence))]
+    opportunities = [sentence for sentence in sentences if _future_opening_opportunity(sentence)]
     if not opportunities:
         return None
-    for sentence in sentences:
-        # An independent current instruction or a concrete deferred price-bound
-        # order remains eligible. An opportunity's price/target is not an order.
-        if sentence in opportunities:
-            continue
-        if CURRENT_ENTRY.search(sentence):
-            return None
-        if re.search(r"\d", sentence) and (ENTRY_LABEL.search(sentence) or STRICT_ENTRY_PRICE.search(sentence)
-                or LIMIT.search(sentence) and ENTRY.search(sentence)):
-            return None
-        if CURRENT.search(sentence) and (ENTRY.search(sentence) or SETUP_HEADING.search(sentence)) and MARKET.search(sentence):
-            return None
+    # An opportunity's price/target is not an order; an independent order remains eligible.
+    if any(_independent_entry_instruction(sentence) for sentence in sentences if sentence not in opportunities):
+        return None
     return "future_entry_opportunity_requires_review"
+
 
 
 def incomplete_financial_instruction_failure(text):
@@ -358,17 +374,16 @@ def tp_break_even_footer(sentence):
             and [action for action, _ in current_actions(sentence)] == ["break_even"])
 
 
-def entry_structure_failure(text):
-    text = current_structure_text(matching_words(text))
-    if STOP_CONDITION.search(text):
-        return "conditional_stop_not_representable"
-    # A legitimate zone has one form and two bounds. Separate MARKET and
-    # LIMIT entry legs cannot be silently merged into that zone or one order.
+def _entry_form_clause(clause):
+    return not PAST.search(clause) and (ENTRY.search(clause) or PORTION.search(clause)
+        or CURRENT_PRICE_ENTRY.search(clause) or PENDING_ENTRY_ORDER.search(clause)
+        or re.search(r"(?:market|рынок|маркет\w*|limit|лимит\w*)\s*[:@=-]?\s*\d", clause))
+
+
+def _entry_forms(text):
     forms = set()
     for clause_group in SENTENCES.split(text):
-        if not PAST.search(clause_group) and (ENTRY.search(clause_group) or PORTION.search(clause_group)
-                or CURRENT_PRICE_ENTRY.search(clause_group) or PENDING_ENTRY_ORDER.search(clause_group)
-                or re.search(r"(?:market|рынок|маркет\w*|limit|лимит\w*)\s*[:@=-]?\s*\d", clause_group)):
+        if _entry_form_clause(clause_group):
             for kind, matcher in (("market", MARKET), ("limit", LIMIT), ("market", CURRENT_PRICE_ENTRY), ("limit", PENDING_ENTRY_ORDER)):
                 for match in matcher.finditer(clause_group):
                     before, after = clause_group[:match.start()], clause_group[match.end():]
@@ -378,6 +393,16 @@ def entry_structure_failure(text):
                             or re.match(r"\s*(?:(?:of|for|für|des)\s+)?(?:risk|risiko|риск\w*)\b", after)):
                         continue
                     forms.add(kind)
+    return forms
+
+
+def entry_structure_failure(text):
+    text = current_structure_text(matching_words(text))
+    if STOP_CONDITION.search(text):
+        return "conditional_stop_not_representable"
+    # A legitimate zone has one form and two bounds. Separate MARKET and
+    # LIMIT entry legs cannot be silently merged into that zone or one order.
+    forms = _entry_forms(text)
     if len(forms) > 1:
         return "entry_legs_not_representable"
     for clause in SENTENCES.split(text):
@@ -391,11 +416,7 @@ def entry_structure_failure(text):
     return None
 
 
-def split_entry_failure(text, interpretation):
-    """A two-leg schema does not authorize omitted legs or independent setups."""
-    legs = interpretation.entry_legs
-    if len(legs) != 2 or re.search(r"\b(?:third|dritt\w*|трет\w*|(?:entry|einstieg|вход)\s*[#:]?\s*3)\b", text, re.I):
-        return "entry_legs_not_representable"
+def _split_setup_failure(text):
     pairs = {re.sub(r"(?:USDT|USDC)$", "", value) for value in re.findall(r"\b[A-Z0-9]{2,}(?:USDT|USDC)\b", text)}
     normalized_text = "\n".join(SENTENCES.split(matching_words(text)))
     headings = {match.group().strip().split()[0].lstrip("#$").upper() for match in SETUP_HEADING.finditer(normalized_text)}
@@ -404,37 +425,66 @@ def split_entry_failure(text, interpretation):
     directions = {value.casefold() for value in re.findall(r"\b(?:long|short)\b", matching_words(text), re.I)}
     if len(pairs) > 1 or len(headings) > 1 or len(directions) > 1:
         return "entry_legs_not_representable"
+    return None
+
+
+def _split_leg_form(quote, leg):
+    normalized = matching_words(quote)
+    if HYPOTHETICAL.search(normalized):
+        return False
+    if any(NEGATED.search(normalized[:match.start()]) for matcher in (MARKET, LIMIT) for match in matcher.finditer(normalized)):
+        return False
+    if leg.kind == "market":
+        form = bool(MARKET.search(normalized)) and not LIMIT.search(normalized)
+    elif leg.kind == "unspecified":
+        form = bool(CURRENT_PRICE_ENTRY.search(normalized)) and not MARKET.search(normalized) and not LIMIT.search(normalized)
+    else:
+        form = bool(LIMIT.search(normalized) or PENDING_ENTRY_ORDER.search(normalized)
+            or ENTRY.search(normalized) and leg.price is not None)
+        form = form and not MARKET.search(normalized)
+    return form
+
+
+def _split_weight_failure(quote, leg):
+    from .evidence import position_fractions
+    portions = {value for _, value in position_fractions(quote)}
+    portions.update(Decimal(match.group(1).replace(",", ".")) for match in re.finditer(r"(\d+(?:[.,]\d+)?)\s*%", quote))
+    if leg.weight_percent is not None and not portions:
+        return "split_entry_weights_missing_or_changed"
+    if portions and portions != {leg.weight_percent or Decimal(50)}:
+        return "split_entry_weights_missing_or_changed"
+    return None
+
+
+def _split_leg_evidence(text, interpretation, index, leg):
+    proofs = [proof for proof in interpretation.evidence if proof.field == f"entry_legs.{index}.kind"]
+    contexts = [proof.quote for proof in proofs if proof.quote in text and text.count(proof.quote) == 1]
+    valid = []
+    for quote in contexts:
+        if _split_leg_form(quote, leg) and (leg.price is None or leg.price in set(quoted_numbers(quote))):
+            failure = _split_weight_failure(quote, leg)
+            if failure:
+                return failure, valid
+            valid.append((text.index(quote), text.index(quote) + len(quote)))
+    return None, valid
+
+
+def split_entry_failure(text, interpretation):
+    """A two-leg schema does not authorize omitted legs or independent setups."""
+    legs = interpretation.entry_legs
+    if len(legs) != 2 or re.search(r"\b(?:third|dritt\w*|трет\w*|(?:entry|einstieg|вход)\s*[#:]?\s*3)\b", text, re.I):
+        return "entry_legs_not_representable"
+    failure = _split_setup_failure(text)
+    if failure:
+        return failure
     scopes = [part for part in SENTENCES.split(current_structure_text(text)) if re.search(r"\d|half|половин|hälfte", part, re.I)]
     if sum(len(MARKET.findall(part)) + len(LIMIT.findall(part)) for part in scopes) > 2:
         return "entry_legs_not_representable"
     spans = []
     for index, leg in enumerate(legs):
-        proofs = [proof for proof in interpretation.evidence if proof.field == f"entry_legs.{index}.kind"]
-        contexts = [proof.quote for proof in proofs if proof.quote in text and text.count(proof.quote) == 1]
-        valid = []
-        for quote in contexts:
-            normalized = matching_words(quote)
-            if HYPOTHETICAL.search(normalized):
-                continue
-            if any(NEGATED.search(normalized[:match.start()]) for matcher in (MARKET, LIMIT) for match in matcher.finditer(normalized)):
-                continue
-            if leg.kind == "market":
-                form = bool(MARKET.search(normalized)) and not LIMIT.search(normalized)
-            elif leg.kind == "unspecified":
-                form = bool(CURRENT_PRICE_ENTRY.search(normalized)) and not MARKET.search(normalized) and not LIMIT.search(normalized)
-            else:
-                form = bool(LIMIT.search(normalized) or PENDING_ENTRY_ORDER.search(normalized)
-                    or ENTRY.search(normalized) and leg.price is not None)
-                form = form and not MARKET.search(normalized)
-            if form and (leg.price is None or leg.price in set(quoted_numbers(quote))):
-                from .evidence import position_fractions
-                portions = {value for _, value in position_fractions(quote)}
-                portions.update(Decimal(match.group(1).replace(",", ".")) for match in re.finditer(r"(\d+(?:[.,]\d+)?)\s*%", quote))
-                if leg.weight_percent is not None and not portions:
-                    return "split_entry_weights_missing_or_changed"
-                if portions and portions != {leg.weight_percent or Decimal(50)}:
-                    return "split_entry_weights_missing_or_changed"
-                valid.append((text.index(quote), text.index(quote) + len(quote)))
+        failure, valid = _split_leg_evidence(text, interpretation, index, leg)
+        if failure:
+            return failure
         if not valid:
             return "split_entry_evidence_needs_role_review"
         spans.append(valid[0])
@@ -443,11 +493,27 @@ def split_entry_failure(text, interpretation):
     return None
 
 
-def management_structure_failure(text, *, ignore_tp_footers=False, allow_sequence=False):
+
+def _conditional_exit_failure(text):
     for sentence in SENTENCES.split(matching_words(text).casefold().replace("ё", "е")):
         permission = CONDITIONAL_EXIT_PERMISSION.search(sentence)
         if permission and not any(matcher.search(sentence[:permission.start()]) for matcher in (PAST, PAST_WORD, HYPOTHETICAL)):
             return "scheduled_management_not_representable"
+    return None
+
+
+def _scheduled_management_failure(text, immediate_actions, ignore_tp_footers):
+    if any(current_actions(sentence) and (FUTURE.search(sentence) or CONDITION.search(sentence))
+           and not ((immediate_actions or ignore_tp_footers) and tp_break_even_footer(sentence))
+           for sentence in re.split(r"[;!?\n]|(?<!\d)\.(?!\d)", text)):
+        return "scheduled_management_not_representable"
+    return None
+
+
+def management_structure_failure(text, *, ignore_tp_footers=False, allow_sequence=False):
+    failure = _conditional_exit_failure(text)
+    if failure:
+        return failure
     actions = current_actions(text)
     if any(STOP_CONDITION.search(clause) and action in ("move_stop", "break_even") for action, clause in actions):
         return "conditional_stop_not_representable"
@@ -457,13 +523,8 @@ def management_structure_failure(text, *, ignore_tp_footers=False, allow_sequenc
     sequence = [action for action, _ in actions]
     if len(actions) > 1 and not (allow_sequence and len(sequence) == 2 and sequence[0] == "reduce" and sequence[1] in ("move_stop", "break_even")):
         return "management_actions_not_representable"
-    # One future update is still unsupported: Interpretation has no update
-    # scheduler/trigger. Deferred ENTRY remains supported by its explicit field.
-    if any(current_actions(sentence) and (FUTURE.search(sentence) or CONDITION.search(sentence))
-           and not ((immediate_actions or ignore_tp_footers) and tp_break_even_footer(sentence))
-           for sentence in re.split(r"[;!?\n]|(?<!\d)\.(?!\d)", text)):
-        return "scheduled_management_not_representable"
-    return None
+    return _scheduled_management_failure(text, immediate_actions, ignore_tp_footers)
+
 
 
 def unsupported_structure(packet):
@@ -498,16 +559,16 @@ def source_percentage_target_failure(text, interpretation):
     return None
 
 
-def supported_action_failure(text, interpretation):
-    """Return a stable rejection code for explicitly unrepresentable instructions."""
+def _existing_target_failure(text, interpretation):
     if (interpretation.kind == "trade_update" and TP_LABEL.search(text)
             and re.search(r"(?:забыл\w*|забыли|forgot(?:ten)?)[^.!?\n]{0,45}(?:ордер\w*|order)|"
                           r"(?:order|auftrag)[^.!?\n]{0,25}vergessen", text, re.I)
             and not current_actions(text)):
         return "existing_target_catchup_requires_report_review"
-    direction_failure = managed_position_side_failure(text, interpretation)
-    if direction_failure:
-        return direction_failure
+    return None
+
+
+def _completed_or_topic_failure(text, interpretation):
     if (interpretation.kind == "trade_update" and interpretation.update_action in (None, "move_stop", "break_even")
             and not current_actions(text)
             and any(POSTFIX_PAST_STOP.search(clause[match.end():])
@@ -517,67 +578,74 @@ def supported_action_failure(text, interpretation):
             and re.fullmatch(r"(?:#\w+[\s,]*)+", text.strip())
             and re.search(r"(?:#|_)(?:scenarios?|setups?|plans?|szenari\w*|сценари\w*|сетап\w*|план\w*)(?:_|$)", text, re.I)):
         return "source_setup_topic_needs_original_context"
-    scope = re.search(r"(?:everything\s+above\s+(?:is|was)\s+(?:an?\s+)?example|"
-        r"alles\s+obige\s+(?:ist|war)\s+(?:ein\s+)?beispiel|"
-        r"вс[её]\s*,?\s*что\s+выше[^\n.!?]{0,100}\bпример\w*)", text, re.I)
+    return None
+
+
+def _example_scope_failure(text, interpretation, scope):
     if scope and interpretation.kind in ("new_signal", "trade_update"):
         tail = text[scope.end():]
         if not NEW_ENTRY.search(tail) and not SETUP_HEADING.search(tail) and not current_actions(tail):
             return "source_example_requires_report_review"
-    if interpretation.kind in ("report", "unrelated"):
-        if interpretation.kind == "report":
-            # Original document framing scopes examples and chapter headings, never live orders.
-            chapters = list(re.finditer(r"(?m)^\s*\d{1,2}:\d{2}(?::\d{2})?\s*[-–—]\s*[^\n]+", text))
-            if len(chapters) >= 3 and re.search(r"\b(?:video|chapters?|webinar|kapitel|видео|разбираем|обсуждаем)\b", text, re.I):
-                text = re.sub(r"(?m)^\s*\d{1,2}:\d{2}(?::\d{2})?\s*[-–—]\s*[^\n]+", "", text)
-            if scope:
-                text = text[scope.end():]
-            if PAST_WORD.search(text):
-                text = ";".join(sentence for sentence in SENTENCES.split(text)
-                    if not (CONDITION.search(sentence) and OPPORTUNITY.search(sentence) and not CURRENT.search(sentence)))
-        if (ENTRY.search(text) or re.search(r"\b(?:long|short|лонг|шорт)\b", text, re.I)
-            or CURRENT_PRICE_ENTRY.search(matching_words(text)) or PENDING_ENTRY_ORDER.search(matching_words(text))):
-            failure = entry_structure_failure(text)
-            if failure:
-                return failure
-        failure = management_structure_failure(text, ignore_tp_footers=bool(NEW_ENTRY.search(text) or SETUP_HEADING.search(text)))
+    return None
+
+
+def _report_instruction_text(text, scope):
+    # Original document framing scopes examples and chapter headings, never live orders.
+    chapters = list(re.finditer(r"(?m)^\s*\d{1,2}:\d{2}(?::\d{2})?\s*[-–—]\s*[^\n]+", text))
+    if len(chapters) >= 3 and re.search(r"\b(?:video|chapters?|webinar|kapitel|видео|разбираем|обсуждаем)\b", text, re.I):
+        text = re.sub(r"(?m)^\s*\d{1,2}:\d{2}(?::\d{2})?\s*[-–—]\s*[^\n]+", "", text)
+    if scope:
+        text = text[scope.end():]
+    if PAST_WORD.search(text):
+        text = ";".join(sentence for sentence in SENTENCES.split(text)
+            if not (CONDITION.search(sentence) and OPPORTUNITY.search(sentence) and not CURRENT.search(sentence)))
+    return text
+
+
+def _nonactional_instruction_failure(text, interpretation, scope):
+    if interpretation.kind == "report":
+        text = _report_instruction_text(text, scope)
+    if (ENTRY.search(text) or re.search(r"\b(?:long|short|лонг|шорт)\b", text, re.I)
+        or CURRENT_PRICE_ENTRY.search(matching_words(text)) or PENDING_ENTRY_ORDER.search(matching_words(text))):
+        failure = entry_structure_failure(text)
         if failure:
             return failure
-        # Bare exit/close words also describe market analysis (e.g. a candle close).
-        if any(action in ("break_even", "move_stop") for action, _ in current_actions(text, include_tp_footers=False)):
-            return "classification_omits_management_instruction"
-        return None
-    if interpretation.kind not in ("new_signal", "trade_update"):
-        return None
-    failure = incomplete_financial_instruction_failure(text)
+    failure = management_structure_failure(text, ignore_tp_footers=bool(NEW_ENTRY.search(text) or SETUP_HEADING.search(text)))
     if failure:
         return failure
-    failure = source_percentage_target_failure(text, interpretation)
+    # Bare exit/close words also describe market analysis (e.g. a candle close).
+    if any(action in ("break_even", "move_stop") for action, _ in current_actions(text, include_tp_footers=False)):
+        return "classification_omits_management_instruction"
+    return None
+
+
+def _new_signal_report_failure(text):
+    if (re.search(r"\b(?:entry\s+\d+\s*[✅✔]|all\s+entries\s+(?:achieved|filled|executed))", text, re.I)
+            and re.search(r"\baverage\s+entry\s+price\s*[:=@]", text, re.I)
+            and not any(CURRENT_ENTRY.search(sentence.strip()) for sentence in SENTENCES.split(current_structure_text(text)))):
+        return "entry_execution_report_not_new_signal"
+    failure = future_entry_opportunity_failure(text)
     if failure:
         return failure
-    if interpretation.kind == "new_signal":
-        if (re.search(r"\b(?:entry\s+\d+\s*[✅✔]|all\s+entries\s+(?:achieved|filled|executed))", text, re.I)
-                and re.search(r"\baverage\s+entry\s+price\s*[:=@]", text, re.I)
-                and not any(CURRENT_ENTRY.search(sentence.strip()) for sentence in SENTENCES.split(current_structure_text(text)))):
-            return "entry_execution_report_not_new_signal"
-        failure = future_entry_opportunity_failure(text)
-        if failure:
-            return failure
-    if interpretation.update_action in ("move_stop", "break_even") and STOP_CONDITION.search(current_structure_text(text)):
-        return "conditional_stop_not_representable"
-    if interpretation.kind == "new_signal":
-        failure = split_entry_failure(text, interpretation) if interpretation.entry == "split" else entry_structure_failure(text)
-        if failure:
-            return failure
-        failure = source_leverage_interval_failure(text, interpretation)
-        if failure:
-            return failure
-        failure = source_price_boundary_failure(text, interpretation)
-        if failure:
-            return failure
-        if current_actions(text, include_tp_footers=False):
-            return "signal_contains_management_instruction"
-        return None
+    return None
+
+
+def _new_signal_structure_failure(text, interpretation):
+    failure = split_entry_failure(text, interpretation) if interpretation.entry == "split" else entry_structure_failure(text)
+    if failure:
+        return failure
+    failure = source_leverage_interval_failure(text, interpretation)
+    if failure:
+        return failure
+    failure = source_price_boundary_failure(text, interpretation)
+    if failure:
+        return failure
+    if current_actions(text, include_tp_footers=False):
+        return "signal_contains_management_instruction"
+    return None
+
+
+def _management_action_failure(text, interpretation):
     failure = management_structure_failure(text, allow_sequence=interpretation.update_action == "sequence")
     if failure:
         return failure
@@ -594,3 +662,34 @@ def supported_action_failure(text, interpretation):
     if actions and interpretation.update_action not in {action for action, _ in actions}:
         return "management_action_mismatch"
     return None
+
+
+def supported_action_failure(text, interpretation):
+    """Return a stable rejection code for explicitly unrepresentable instructions."""
+    failure = (_existing_target_failure(text, interpretation)
+               or managed_position_side_failure(text, interpretation)
+               or _completed_or_topic_failure(text, interpretation))
+    if failure:
+        return failure
+    scope = re.search(r"(?:everything\s+above\s+(?:is|was)\s+(?:an?\s+)?example|"
+        r"alles\s+obige\s+(?:ist|war)\s+(?:ein\s+)?beispiel|"
+        r"вс[её]\s*,?\s*что\s+выше[^\n.!?]{0,100}\bпример\w*)", text, re.I)
+    failure = _example_scope_failure(text, interpretation, scope)
+    if failure:
+        return failure
+    if interpretation.kind in ("report", "unrelated"):
+        return _nonactional_instruction_failure(text, interpretation, scope)
+    if interpretation.kind not in ("new_signal", "trade_update"):
+        return None
+    failure = incomplete_financial_instruction_failure(text) or source_percentage_target_failure(text, interpretation)
+    if failure:
+        return failure
+    if interpretation.kind == "new_signal":
+        failure = _new_signal_report_failure(text)
+        if failure:
+            return failure
+    if interpretation.update_action in ("move_stop", "break_even") and STOP_CONDITION.search(current_structure_text(text)):
+        return "conditional_stop_not_representable"
+    if interpretation.kind == "new_signal":
+        return _new_signal_structure_failure(text, interpretation)
+    return _management_action_failure(text, interpretation)

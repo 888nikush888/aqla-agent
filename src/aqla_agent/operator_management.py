@@ -43,6 +43,72 @@ def save(engine, identity, **values):
     engine.state.root.update(lambda data: data["operator_requests"][identity].update(**values))
 
 
+async def dispatch_operator_wave(engine, identity, root, request, trade, plan, action):
+    from .waverider import ended, live_permission, resume_exit
+    wave_id = trade.get("waverider", {}).get("operation_id")
+    wave_operation = root.read("operations", entries={"operations": [wave_id]})["operations"].get(wave_id) if wave_id else None
+    if wave_operation and wave_operation["phase"] in ("prepared", "sending", "unknown"):
+        reconciled = await engine.exchange.reconcile(wave_id)
+        if reconciled["operation"]["phase"] in ("prepared", "sending", "unknown"):
+            raise AqlaError("Der ursprüngliche Waverider-Auftrag ist noch ungeklärt")
+    quote = await engine.exchange.price_snapshot(plan.market)
+    quote.fresh()
+    if plan.policy.management_mode != "waverider" or ended(plan, trade, quote):
+        save(engine, identity, status="superseded", reason="Waverider endpoint already reached")
+        return {"request_id": identity, "status": "superseded"}
+    if action == "resume_waverider" and not live_permission(engine, plan):
+        save(engine, identity, status="rejected", reason="Waverider permission changed")
+        return {"request_id": identity, "status": "rejected"}
+    if trade.get("suspended_wave_targets"):
+        await resume_exit(engine, request.trade_id)
+        trade = engine.state.read("trades", entries={"trades": [request.trade_id]})["trades"][request.trade_id]
+        if trade.get("suspended_wave_targets"):
+            raise AqlaError("Zuerst den bereits begonnenen Waverider-Auftrag abgleichen")
+    engine.patch_trade(request.trade_id, waverider_paused=action == "pause_waverider")
+    save(engine, identity, status="done")
+    return {"request_id": identity, "status": root.read("operator_requests")["operator_requests"][identity]["status"]}
+
+
+async def dispatch_operator_reduction(engine, identity, saved, request, action):
+    if action == "reduce" and request.percent is None:
+        raise AqlaError("Teilreduktion benötigt einen ausdrücklichen Prozentwert")
+    result = await engine.close_position(request.trade_id, operation_id=identity,
+        **({"quantity": Decimal(saved["original_quantity"]) * request.percent / 100} if action == "reduce" else {}))
+    save(engine, identity, status="pending" if result.get("phase") in ("prepared", "sending", "unknown") else "rejected" if result.get("phase") == "rejected" else "done")
+
+
+async def dispatch_operator_action(engine, identity, root, saved, request, trade, plan, action):
+    if action in ("move_stop", "break_even"):
+        stop = request.stop if action == "move_stop" else Decimal(trade["entry_vwap"])
+        if stop is None:
+            raise AqlaError("Ein bestätigter Stop-Preis ist erforderlich")
+        # queue_stop_update persists the identity before replacement and recovers on every refresh.
+        result = await engine.queue_stop_update(request.trade_id, identity, request, stop, operation_id=identity)
+        save(engine, identity, status="pending" if result.get("pending_stop_update") else "rejected" if result.get("phase") == "rejected" else "done")
+    elif action in ("close", "reduce"):
+        await dispatch_operator_reduction(engine, identity, saved, request, action)
+    elif action == "replace_targets":
+        if not request.targets:
+            raise AqlaError("Vollständige TP-Preise erforderlich")
+        result = await engine.replace_targets(request.trade_id, request.targets, identity, source_tp={"unit": "price", "origin": "operator"})
+        save(engine, identity, status="pending" if result.get("phase") in ("prepared", "sending", "unknown") else "rejected" if result.get("phase") == "rejected" else "done")
+    elif action == "cancel_entry":
+        await engine.cancel_entry(request.trade_id)
+        await engine.refresh_trade(request.trade_id)
+        save(engine, identity, status="done")
+    else:
+        return await dispatch_operator_wave(engine, identity, root, request, trade, plan, action)
+    return {"request_id": identity, "status": root.read("operator_requests")["operator_requests"][identity]["status"]}
+
+
+async def reconcile_operator_request(engine, identity, operation):
+    if operation["phase"] in ("prepared", "sending", "unknown"):
+        operation = await engine.exchange.reconcile(identity)
+    status = "pending" if operation["phase"] in ("prepared", "sending", "unknown") else "rejected" if operation["phase"] == "rejected" else "done"
+    save(engine, identity, status=status)
+    return {"request_id": identity, "status": status}
+
+
 async def dispatch(engine, identity):
     root = engine.state.root
     saved = root.read("operator_requests")["operator_requests"][identity]
@@ -54,11 +120,7 @@ async def dispatch(engine, identity):
     engine.assert_plan_binding(engine.state.snapshot(), plan)
     operation = root.read("operations", entries={"operations": [identity]})["operations"].get(identity)
     if operation:
-        if operation["phase"] in ("prepared", "sending", "unknown"):
-            operation = await engine.exchange.reconcile(identity)
-        status = "pending" if operation["phase"] in ("prepared", "sending", "unknown") else "rejected" if operation["phase"] == "rejected" else "done"
-        save(engine, identity, status=status)
-        return {"request_id": identity, "status": status}
+        return await reconcile_operator_request(engine, identity, operation)
     if trade["status"] in ("closed", "cancelled", "rejected", "expired"):
         save(engine, identity, status="superseded", reason="Position ended")
         return {"request_id": identity, "status": "superseded"}
@@ -71,52 +133,54 @@ async def dispatch(engine, identity):
         return {"request_id": identity, "status": "superseded"}
     if action not in ("pause_waverider", "resume_waverider") and action not in plan.policy.allowed_updates:
         raise AqlaError("Diese Verwaltung ist im gespeicherten Trade-Profil nicht erlaubt")
-    if action in ("move_stop", "break_even"):
-        stop = request.stop if action == "move_stop" else Decimal(trade["entry_vwap"])
-        if stop is None:
-            raise AqlaError("Ein bestätigter Stop-Preis ist erforderlich")
-        # queue_stop_update persists the identity before replacement and recovers on every refresh.
-        result = await engine.queue_stop_update(request.trade_id, identity, request, stop, operation_id=identity)
-        save(engine, identity, status="pending" if result.get("pending_stop_update") else "rejected" if result.get("phase") == "rejected" else "done")
-    elif action in ("close", "reduce"):
-        if action == "reduce" and request.percent is None:
-            raise AqlaError("Teilreduktion benötigt einen ausdrücklichen Prozentwert")
-        result = await engine.close_position(request.trade_id, operation_id=identity,
-            **({"quantity": Decimal(saved["original_quantity"]) * request.percent / 100} if action == "reduce" else {}))
-        save(engine, identity, status="pending" if result.get("phase") in ("prepared", "sending", "unknown") else "rejected" if result.get("phase") == "rejected" else "done")
-    elif action == "replace_targets":
-        if not request.targets:
-            raise AqlaError("Vollständige TP-Preise erforderlich")
-        result = await engine.replace_targets(request.trade_id, request.targets, identity, source_tp={"unit": "price", "origin": "operator"})
-        save(engine, identity, status="pending" if result.get("phase") in ("prepared", "sending", "unknown") else "rejected" if result.get("phase") == "rejected" else "done")
-    elif action == "cancel_entry":
-        await engine.cancel_entry(request.trade_id)
-        await engine.refresh_trade(request.trade_id)
-        save(engine, identity, status="done")
-    else:
-        from .waverider import ended, live_permission, resume_exit
-        wave_id = trade.get("waverider", {}).get("operation_id")
-        wave_operation = root.read("operations", entries={"operations": [wave_id]})["operations"].get(wave_id) if wave_id else None
-        if wave_operation and wave_operation["phase"] in ("prepared", "sending", "unknown"):
-            reconciled = await engine.exchange.reconcile(wave_id)
-            if reconciled["phase"] in ("prepared", "sending", "unknown"):
-                raise AqlaError("Der ursprüngliche Waverider-Auftrag ist noch ungeklärt")
-        quote = await engine.exchange.price_snapshot(plan.market)
-        quote.fresh()
-        if plan.policy.management_mode != "waverider" or ended(plan, trade, quote):
-            save(engine, identity, status="superseded", reason="Waverider endpoint already reached")
-            return {"request_id": identity, "status": "superseded"}
-        if action == "resume_waverider" and not live_permission(engine, plan):
-            save(engine, identity, status="rejected", reason="Waverider permission changed")
-            return {"request_id": identity, "status": "rejected"}
-        if trade.get("suspended_wave_targets"):
-            await resume_exit(engine, request.trade_id)
-            trade = engine.state.read("trades", entries={"trades": [request.trade_id]})["trades"][request.trade_id]
-            if trade.get("suspended_wave_targets"):
-                raise AqlaError("Zuerst den bereits begonnenen Waverider-Auftrag abgleichen")
-        engine.patch_trade(request.trade_id, waverider_paused=action == "pause_waverider")
-        save(engine, identity, status="done")
-    return {"request_id": identity, "status": root.read("operator_requests")["operator_requests"][identity]["status"]}
+    return await dispatch_operator_action(engine, identity, root, saved, request, trade, plan, action)
+
+
+def validate_operator_action(request, engine, trade, plan):
+    if request.action in ("pause_waverider", "resume_waverider"):
+        from .waverider import ended, live_permission
+        if plan.policy.management_mode != "waverider" or ended(plan, trade):
+            raise AqlaError("Dieser Trade hat keinen noch aktiven Waverider")
+        if request.action == "resume_waverider" and not live_permission(engine, plan):
+            raise AqlaError("Die bestehende Waverider-Livefreigabe fehlt")
+    elif request.action not in plan.policy.allowed_updates:
+        raise AqlaError("Diese Verwaltung ist im gespeicherten Trade-Profil nicht erlaubt")
+    if request.action == "reduce":
+        from aqla_hyperliquid_mcp.rules import quantity_grid
+        if quantity_grid(Decimal(trade["remaining_quantity"]) * request.percent / 100, plan.market) <= 0:
+            raise AqlaError("Diese Teilreduktion rundet auf null")
+    if request.action in ("move_stop", "break_even"):
+        proposed = request.stop if request.action == "move_stop" else trade.get("entry_vwap")
+        if proposed is None:
+            raise AqlaError("Break-even benötigt einen bestätigten Entry")
+        engine.validate_stop_budget(trade, plan, Decimal(proposed))
+    if request.action == "replace_targets":
+        engine.validate_targets(trade, plan, request.targets)
+
+
+def accept_operator_request(router, request, identity, commit_check, engine, data):
+    commit_check()
+    rows = data.setdefault("operator_requests", {})
+    payload = request.model_dump(mode="json")
+    if identity in rows:
+        if rows[identity]["request"] != payload:
+            raise AqlaError("Auftragsidentität gehört zu anderen Werten")
+        return
+    if any(row.get("status") == "pending" and row["request"]["trade_id"] == request.trade_id for row in rows.values()):
+        raise AqlaError("Ein angenommener Verwaltungsauftrag für diesen Trade ist noch ungeklärt; keine zweite Order")
+    if any(row["phase"] in ("prepared", "sending", "unknown") and row.get("account_key", row.get("exchange", "hyperliquid") + ":" + row.get("request", {}).get("network", "")) == engine.state.account_key
+           for row in data["operations"].values()):
+        raise AqlaError("Ungeklärte Börsenoperation zuerst mit ihrer vorhandenen Identität abgleichen")
+    trade = data["trades"][request.trade_id]
+    if fingerprint(trade) != request.expected_fingerprint:
+        raise AqlaError("Trade hat sich geändert; aktuelle Werte erneut prüfen")
+    plan = TradePlan.model_validate(trade["plan"])
+    engine.assert_plan_binding(engine.state.project(data), plan)
+    if trade["status"] in ("conflicted", "cleanup"):
+        raise AqlaError("Trade hat ein ungeklärtes Eigentum oder einen ungeklärten Abschluss")
+    validate_operator_action(request, engine, trade, plan)
+    rows[identity] = {"request": payload, "status": "pending", "accepted_at": now_ms(),
+                      "original_quantity": trade["remaining_quantity"], "account_key": engine.state.account_key}
 
 
 async def submit(router, request, request_id, commit_check):
@@ -129,46 +193,7 @@ async def submit(router, request, request_id, commit_check):
         raise AqlaError("Das ursprüngliche Ausführungskonto ist nicht verfügbar")
     async with engine.lock.work(1):
         def accept(data):
-            commit_check()
-            rows = data.setdefault("operator_requests", {})
-            payload = request.model_dump(mode="json")
-            if identity in rows:
-                if rows[identity]["request"] != payload:
-                    raise AqlaError("Auftragsidentität gehört zu anderen Werten")
-                return
-            if any(row.get("status") == "pending" and row["request"]["trade_id"] == request.trade_id for row in rows.values()):
-                raise AqlaError("Ein angenommener Verwaltungsauftrag für diesen Trade ist noch ungeklärt; keine zweite Order")
-            if any(row["phase"] in ("prepared", "sending", "unknown") and row.get("account_key", row.get("exchange", "hyperliquid") + ":" + row.get("request", {}).get("network", "")) == engine.state.account_key
-                   for row in data["operations"].values()):
-                raise AqlaError("Ungeklärte Börsenoperation zuerst mit ihrer vorhandenen Identität abgleichen")
-            trade = data["trades"][request.trade_id]
-            if fingerprint(trade) != request.expected_fingerprint:
-                raise AqlaError("Trade hat sich geändert; aktuelle Werte erneut prüfen")
-            plan = TradePlan.model_validate(trade["plan"])
-            engine.assert_plan_binding(engine.state.project(data), plan)
-            if trade["status"] in ("conflicted", "cleanup"):
-                raise AqlaError("Trade hat ein ungeklärtes Eigentum oder einen ungeklärten Abschluss")
-            if request.action in ("pause_waverider", "resume_waverider"):
-                from .waverider import ended, live_permission
-                if plan.policy.management_mode != "waverider" or ended(plan, trade):
-                    raise AqlaError("Dieser Trade hat keinen noch aktiven Waverider")
-                if request.action == "resume_waverider" and not live_permission(engine, plan):
-                    raise AqlaError("Die bestehende Waverider-Livefreigabe fehlt")
-            elif request.action not in plan.policy.allowed_updates:
-                raise AqlaError("Diese Verwaltung ist im gespeicherten Trade-Profil nicht erlaubt")
-            if request.action == "reduce":
-                from aqla_hyperliquid_mcp.rules import quantity_grid
-                if quantity_grid(Decimal(trade["remaining_quantity"]) * request.percent / 100, plan.market) <= 0:
-                    raise AqlaError("Diese Teilreduktion rundet auf null")
-            if request.action in ("move_stop", "break_even"):
-                proposed = request.stop if request.action == "move_stop" else trade.get("entry_vwap")
-                if proposed is None:
-                    raise AqlaError("Break-even benötigt einen bestätigten Entry")
-                engine.validate_stop_budget(trade, plan, Decimal(proposed))
-            if request.action == "replace_targets":
-                engine.validate_targets(trade, plan, request.targets)
-            rows[identity] = {"request": payload, "status": "pending", "accepted_at": now_ms(),
-                              "original_quantity": trade["remaining_quantity"], "account_key": engine.state.account_key}
+            accept_operator_request(router, request, identity, commit_check, engine, data)
         router.state.update_if_changed(accept)
         try:
             return await dispatch(engine, identity)

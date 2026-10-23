@@ -19,6 +19,59 @@ from aqla_hyperliquid_mcp.models import (
 )
 
 
+def assert_quantity_reconciliation_protected(current, effective, fake, source, state, trade, trading):
+    assert effective or Decimal(str(fake.position)) == 0
+    assert Decimal(current["filled_quantity"]) == Decimal(current["remaining_quantity"]) == Decimal("2.40")
+    assert Decimal(current["entry_vwap"]) == 100 and Decimal(current["reserved_risk"]) == Decimal(trade["reserved_risk"])
+    assert current["status"] == "unknown" and current["quantity_evidence_pending"] is True
+    with pytest.raises(AqlaError, match="quantity evidence.*reconciliation"):
+        trading.validate_admission(state.snapshot(), TradePlan.model_validate(current["plan"]), owned=True)
+    assert current["pending_stop_update"]["phase"] == "waiting_fill"
+    assert state.snapshot()["events"][source.event_id]["status"] == "needs_reconciliation"
+    assert "update:" + source.event_id not in state.snapshot()["operations"]
+    assert any(Decimal(order["order"]["sz"]) == Decimal("2.40") for order in effective)
+
+
+def lagged_initial_protection_orders(fake, current):
+    return [order for order in fake.orders.values() if order["status"] == "open"
+                 and order["order"].get("reduceOnly") is True and order["order"].get("isTrigger") is True
+                 and order["order"].get("side") == "A" and Decimal(order["order"].get("sz", "0"))
+                 >= Decimal(current["remaining_quantity"])]
+
+
+def unconfirmed_initial_protection_orders(fake, current, exchange, source):
+    return [row for identity, row in fake.orders.items() if identity != exchange.cloid("update:" + source.event_id)
+                 and row["status"] == "open" and row["order"]["reduceOnly"] is True and row["order"]["isTrigger"] is True
+                 and row["order"]["side"] == "A" and Decimal(row["order"]["triggerPx"]) == 90
+                 and Decimal(row["order"]["sz"]) >= Decimal(current["remaining_quantity"])]
+
+
+def lagged_close_transport(fake, trade):
+    original = fake.handle
+    lag = False
+    visible_fills = []
+
+    def lagged_close(request):
+        nonlocal lag, visible_fills
+        payload = json.loads(request.content)
+        if request.url.path == "/exchange" and payload["action"]["type"] == "order" and any(order["r"] and order["t"].get("limit", {}).get("tif") == "Ioc" for order in payload["action"]["orders"]):
+            visible_fills = copy.deepcopy(fake.fills)
+            lag = True
+        response = original(request)
+        if request.url.path == "/info" and lag:
+            if payload.get("type") == "userFillsByTime":
+                return httpx.Response(200, json=visible_fills)
+            if payload.get("type") == "clearinghouseState":
+                return httpx.Response(200, json={"assetPositions": [{"position": {"coin": "BTC", "szi": trade["plan"]["quantity"], "entryPx": "100"}}],
+                                                "marginSummary": {"accountValue": "10000"}, "withdrawable": "10000"})
+        return response
+
+    def release_close():
+        nonlocal lag
+        lag = False
+    return lagged_close, release_close
+
+
 @pytest.fixture
 async def selectable_updates(setup, monkeypatch):
     from aqla_hyperliquid_mcp.server import close_server, create_server
@@ -257,8 +310,6 @@ async def test_pending_stop_waits_for_terminal_quantity_and_complete_own_fills(s
     assert current["plan"] == trade["plan"]
 
 
-# Sequential safety assertions; control flow (including test doubles): 10.
-# skipcq: PY-R1000
 @pytest.mark.asyncio
 @pytest.mark.parametrize("old_stop", ["canceled", "malformed"])
 async def test_terminal_quantity_lag_does_not_silence_missing_initial_protection(setup, signal, old_stop):
@@ -275,20 +326,8 @@ async def test_terminal_quantity_lag_does_not_silence_missing_initial_protection
     await trading.update_trade(source.event_id, instruction)
     await trading.recover()
     current = state.snapshot()["trades"][trade["trade_id"]]
-    effective = [order for order in fake.orders.values() if order["status"] == "open"
-                 and order["order"].get("reduceOnly") is True and order["order"].get("isTrigger") is True
-                 and order["order"].get("side") == "A" and Decimal(order["order"].get("sz", "0"))
-                 >= Decimal(current["remaining_quantity"])]
-    assert effective or Decimal(str(fake.position)) == 0
-    assert Decimal(current["filled_quantity"]) == Decimal(current["remaining_quantity"]) == Decimal("2.40")
-    assert Decimal(current["entry_vwap"]) == 100 and Decimal(current["reserved_risk"]) == Decimal(trade["reserved_risk"])
-    assert current["status"] == "unknown" and current["quantity_evidence_pending"] is True
-    with pytest.raises(AqlaError, match="quantity evidence.*reconciliation"):
-        trading.validate_admission(state.snapshot(), TradePlan.model_validate(current["plan"]), owned=True)
-    assert current["pending_stop_update"]["phase"] == "waiting_fill"
-    assert state.snapshot()["events"][source.event_id]["status"] == "needs_reconciliation"
-    assert "update:" + source.event_id not in state.snapshot()["operations"]
-    assert any(Decimal(order["order"]["sz"]) == Decimal("2.40") for order in effective)
+    effective = lagged_initial_protection_orders(fake, current)
+    assert_quantity_reconciliation_protected(current, effective, fake, source, state, trade, trading)
     before = len(fake.actions)
     await trading.recover()
     assert len(fake.actions) == before
@@ -487,8 +526,6 @@ async def test_unknown_pending_stop_defers_automatic_stop_revision_without_emerg
     assert Decimal(state.snapshot()["trades"][trade["trade_id"]]["stop_price"]) == 100
 
 
-# Sequential safety assertions; control flow (including test doubles): 15.
-# skipcq: PY-R1000
 @pytest.mark.asyncio
 @pytest.mark.parametrize("old_stop", ["missing", "malformed"])
 async def test_unknown_pending_stop_does_not_bypass_missing_or_malformed_initial_protection(setup, signal, old_stop):
@@ -508,10 +545,7 @@ async def test_unknown_pending_stop_does_not_bypass_missing_or_malformed_initial
     await trading.refresh_trade(trade["trade_id"])
     assert len(fake.actions) > before
     current = state.snapshot()["trades"][trade["trade_id"]]
-    effective = [row for identity, row in fake.orders.items() if identity != exchange.cloid("update:" + source.event_id)
-                 and row["status"] == "open" and row["order"]["reduceOnly"] is True and row["order"]["isTrigger"] is True
-                 and row["order"]["side"] == "A" and Decimal(row["order"]["triggerPx"]) == 90
-                 and Decimal(row["order"]["sz"]) >= Decimal(current["remaining_quantity"])]
+    effective = unconfirmed_initial_protection_orders(fake, current, exchange, source)
     assert effective or Decimal(str(fake.position)) == 0
     assert state.snapshot()["events"][source.event_id]["status"] == "needs_reconciliation"
     assert fake.orders[original_stop["cloid"]]["status"] == "canceled"
@@ -704,33 +738,13 @@ async def test_router_supersedes_original_stop_event_on_new_acceptance(setup, si
     await router.close()
 
 
-# Sequential safety assertions; control flow (including test doubles): 10.
-# skipcq: PY-R1000
 @pytest.mark.asyncio
 async def test_crossed_pending_stop_waits_for_flat_position(setup, signal):
     _, state, fake, exchange, trading = setup
     trade = await waiting_gtc(setup, signal)
     source, interpretation = stop_update(trading, stop="105")
     await trading.update_trade(source.event_id, interpretation)
-    original = fake.handle
-    lag = False
-    visible_fills = []
-
-    def lagged_close(request):
-        nonlocal lag, visible_fills
-        payload = json.loads(request.content)
-        if request.url.path == "/exchange" and payload["action"]["type"] == "order" and any(order["r"] and order["t"].get("limit", {}).get("tif") == "Ioc" for order in payload["action"]["orders"]):
-            visible_fills = copy.deepcopy(fake.fills)
-            lag = True
-        response = original(request)
-        if request.url.path == "/info" and lag:
-            if payload.get("type") == "userFillsByTime":
-                return httpx.Response(200, json=visible_fills)
-            if payload.get("type") == "clearinghouseState":
-                return httpx.Response(200, json={"assetPositions": [{"position": {"coin": "BTC", "szi": trade["plan"]["quantity"], "entryPx": "100"}}],
-                                                "marginSummary": {"accountValue": "10000"}, "withdrawable": "10000"})
-        return response
-
+    lagged_close, release_close = lagged_close_transport(fake, trade)
     exchange.client._transport = httpx.MockTransport(lagged_close)
     fake.mid = "100"
     fake.fill(trade["entry_cloid"], trade["plan"]["quantity"])
@@ -742,7 +756,7 @@ async def test_crossed_pending_stop_waits_for_flat_position(setup, signal):
     close_id = "stop-crossed:update:" + source.event_id
     assert state.snapshot()["operations"][close_id]["phase"] == "acknowledged"
     before = len(fake.actions)
-    lag = False
+    release_close()
     await trading.recover()
     current = state.snapshot()["trades"][trade["trade_id"]]
     assert current["status"] == "closed"

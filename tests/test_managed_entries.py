@@ -113,7 +113,6 @@ async def test_open_managed_position_without_pending_entries_has_one_reconciliat
     from aqla_agent import managed_entries
     _, state, fake, _, trading = setup
     state.update(lambda data: data["policy"].update(entry_range_choice="split"))
-    from conftest import SourceEvent, now_ms
     source = SourceEvent(chat_id="channel", message_id=9, sent_at=now_ms(), text="BTC LONG Entry 100 SL 90 TP 110 120")
     trading.ingest(source)
     value = Interpretation(kind="new_signal", source_refs=[source.source_id], symbol="BTC", side="long", entry="market", stop_loss=90, take_profits=[110,120], evidence=[Evidence(field=field, source_id=source.source_id, quote=quote) for field,quote in (("symbol","BTC"),("side","LONG"),("stop_loss","90"),("take_profits.0","110"),("take_profits.1","120"))])

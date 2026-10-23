@@ -34,6 +34,42 @@ def report(packet):
         reason_codes=["result_report"], evidence=[Evidence(field="classification", source_id=anchor["source_id"], quote=anchor["text"])])
 
 
+def install_observed_fallback_services(bound_trade, capture, endpoint_changed, monkeypatch, packet, price_failed, prices, route_switched, runtime):
+    def set_context(collector, session_id):
+        capture.append(collector)
+        return "token"
+
+    def call_llm(**kwargs):
+        assert kwargs["max_tokens"] == 8192
+        assert kwargs["extra_body"]["max_tokens"] == 8192
+        assert kwargs["reasoning_config"] == {"enabled":True,"effort":"medium"}
+        kwargs["route_info"].update(provider="custom", model="fixture")
+        capture[-1].record_auxiliary_usage("fixture", "source_interpretation", billing_provider="openrouter" if route_switched else "custom",
+            model="deepseek/fixture" if route_switched else "fixture",
+            billing_base_url="https://openrouter.ai/api/v1" if route_switched else "https://other.example/v1" if endpoint_changed else runtime["base_url"])
+        interpretation = report(packet)
+        if bound_trade:
+            interpretation.bound_trade_id = "model-selected-binding"
+        return {"usage": {"prompt_tokens": 100}, "content": interpretation.model_dump_json()}
+
+    def price(*args, **kwargs):
+        prices.append(kwargs)
+        if price_failed:
+            raise OSError("Price service unavailable")
+        return SimpleNamespace(status="estimated", amount_usd=Decimal("0.007"), source="fixture", pricing_version="fixture-v1")
+
+    usage = SimpleNamespace(input_tokens=100, output_tokens=20, cache_read_tokens=0, cache_write_tokens=0, reasoning_tokens=0)
+    monkeypatch.setitem(sys.modules, "agent", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "agent.aux_accounting", SimpleNamespace(
+        set_accounting_context=set_context, reset_accounting_context=lambda _: None))
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", SimpleNamespace(call_llm=call_llm,
+        extract_content_or_reasoning=lambda response, **_: response["content"]))
+    monkeypatch.setitem(sys.modules, "agent.usage_pricing", SimpleNamespace(
+        normalize_usage=lambda *args, **kwargs: usage, estimate_usage_cost=price))
+    monkeypatch.setitem(sys.modules, "hermes_cli", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", SimpleNamespace(load_config_readonly=lambda: {}))
+
+
 @pytest.fixture
 async def worker_boundary(setup, tmp_path):
     settings, state, fake, exchange, _ = setup
@@ -181,7 +217,7 @@ async def test_uncalibrated_decision_is_reviewed_and_can_be_corrected_without_ad
 
 @pytest.mark.asyncio
 async def test_actionable_uncalibrated_decision_gets_two_calls_and_never_executes_without_review(worker_boundary, signal):
-    extension, server, state, fake, _, _ = worker_boundary
+    extension, _server, state, fake, _, _ = worker_boundary
     source, _ = signal
     requests = []
 
@@ -320,8 +356,6 @@ async def test_missing_text_is_deterministic_and_uses_no_model(worker_boundary):
     assert fake.actions == []
 
 
-# Sequential safety assertions; control flow (including test doubles): 11.
-# skipcq: PY-R1000
 @pytest.mark.asyncio
 @pytest.mark.parametrize("endpoint_changed,price_failed,bound_trade,route_switched", [(False, False, False, False), (True, False, False, False),
                                                                     (False, True, False, False), (False, False, True, False), (False, False, False, True)])
@@ -337,39 +371,7 @@ async def test_fallback_cost_requires_observed_endpoint_and_cannot_block_interpr
     extension.session_key = "fixture"
     capture, prices = [], []
 
-    def set_context(collector, session_id):
-        capture.append(collector)
-        return "token"
-
-    def call_llm(**kwargs):
-        assert kwargs["max_tokens"] == 8192
-        assert kwargs["extra_body"]["max_tokens"] == 8192
-        assert kwargs["reasoning_config"] == {"enabled":True,"effort":"medium"}
-        kwargs["route_info"].update(provider="custom", model="fixture")
-        capture[-1].record_auxiliary_usage("fixture", "source_interpretation", billing_provider="openrouter" if route_switched else "custom",
-            model="deepseek/fixture" if route_switched else "fixture",
-            billing_base_url="https://openrouter.ai/api/v1" if route_switched else "https://other.example/v1" if endpoint_changed else runtime["base_url"])
-        interpretation = report(packet)
-        if bound_trade:
-            interpretation.bound_trade_id = "model-selected-binding"
-        return {"usage": {"prompt_tokens": 100}, "content": interpretation.model_dump_json()}
-
-    def price(*args, **kwargs):
-        prices.append(kwargs)
-        if price_failed:
-            raise OSError("Price service unavailable")
-        return SimpleNamespace(status="estimated", amount_usd=Decimal("0.007"), source="fixture", pricing_version="fixture-v1")
-
-    usage = SimpleNamespace(input_tokens=100, output_tokens=20, cache_read_tokens=0, cache_write_tokens=0, reasoning_tokens=0)
-    monkeypatch.setitem(sys.modules, "agent", SimpleNamespace())
-    monkeypatch.setitem(sys.modules, "agent.aux_accounting", SimpleNamespace(
-        set_accounting_context=set_context, reset_accounting_context=lambda _: None))
-    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", SimpleNamespace(call_llm=call_llm,
-        extract_content_or_reasoning=lambda response, **_: response["content"]))
-    monkeypatch.setitem(sys.modules, "agent.usage_pricing", SimpleNamespace(
-        normalize_usage=lambda *args, **kwargs: usage, estimate_usage_cost=price))
-    monkeypatch.setitem(sys.modules, "hermes_cli", SimpleNamespace())
-    monkeypatch.setitem(sys.modules, "hermes_cli.config", SimpleNamespace(load_config_readonly=lambda: {}))
+    install_observed_fallback_services(bound_trade, capture, endpoint_changed, monkeypatch, packet, price_failed, prices, route_switched, runtime)
     measured = []
     if bound_trade:
         with pytest.raises(DecisionFailure, match="fallback_bound_trade_forbidden"):

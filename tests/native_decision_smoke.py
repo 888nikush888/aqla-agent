@@ -36,7 +36,7 @@ def main():
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
-            pass
+            return None
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))

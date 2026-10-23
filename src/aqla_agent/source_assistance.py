@@ -81,6 +81,28 @@ def context_packet(context):
     return build_packet({**context, "messages": list(messages.values())})
 
 
+def _original_vetoes(packet):
+    from .semantic_contract import (
+        supported_action_failure,
+        unbound_setup_update_failure,
+        unsupported_structure,
+    )
+    anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    vetoes = {}
+    for kind in ("new_signal", "trade_update", "report", "unrelated"):
+        draft = Interpretation(kind=kind, source_refs=[packet["anchor_source_id"]])
+        failure = supported_action_failure(anchor["text"], draft) or unbound_setup_update_failure(packet, draft)
+        if failure:
+            if kind == "trade_update" and failure == "management_actions_not_representable" and unsupported_structure(packet) is None:
+                vetoes["single_management_action"] = "Use the supported complete two-step sequence; no partial instruction is authorized"
+                continue
+            if kind == "new_signal" and failure in ("entry_legs_not_representable", "additional_entry_legs_not_representable"):
+                vetoes["flattened_entry"] = failure
+                continue
+            vetoes[kind] = failure
+    return vetoes
+
+
 def source_assistance(context):
     packet = context_packet(context)
     version = digest(packet)
@@ -100,24 +122,7 @@ def source_assistance(context):
     contract["entry"]["criteria"] = {**contract["entry"]["criteria"],
         "split": "Two discrete original entries of ONE setup: entry=split, entry_prices=[], parent entry_timing=standard, entry_legs=[{kind,price,weight_percent,timing},{kind,price,weight_percent,timing}]. ALL leg prices/timings belong INSIDE entry_legs, never in parent entry_prices. Preserve original forms/prices/weights; never flatten into range or select one leg."}
     contract["verification"] = verification_questions()
-    from .semantic_contract import (
-        supported_action_failure,
-        unbound_setup_update_failure,
-        unsupported_structure,
-    )
-    anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
-    vetoes = {}
-    for kind in ("new_signal", "trade_update", "report", "unrelated"):
-        draft = Interpretation(kind=kind, source_refs=[packet["anchor_source_id"]])
-        failure = supported_action_failure(anchor["text"], draft) or unbound_setup_update_failure(packet, draft)
-        if failure:
-            if kind == "trade_update" and failure == "management_actions_not_representable" and unsupported_structure(packet) is None:
-                vetoes["single_management_action"] = "Use the supported complete two-step sequence; no partial instruction is authorized"
-                continue
-            if kind == "new_signal" and failure in ("entry_legs_not_representable", "additional_entry_legs_not_representable"):
-                vetoes["flattened_entry"] = failure
-                continue
-            vetoes[kind] = failure
+    vetoes = _original_vetoes(packet)
     return {"version": VERSION, "source_version": version, "contract": contract,
             "original_structure_vetoes": vetoes, "vetoes_are_not_classification_or_permission": True,
             "anchor_setup_bound": packet["anchor_setup_bound"],
@@ -148,6 +153,26 @@ def source_assistance(context):
                         "A valid semantic check is not execution permission; historical sources remain non-executable."}
 
 
+def _precise_quote(proof, value, original):
+    occurrences = list(re.finditer(re.escape(proof.quote), original))
+    if len(occurrences) != 1:
+        return None
+    numbers = list(re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])(?:\s*%)?", proof.quote))
+    matching = [number for number in numbers if set(quoted_numbers(number.group())) == {value}]
+    if len(matching) == 1:
+        number = matching[0]
+        offset = occurrences[0].start()
+        if number_is_ordinal(original, offset + number.start(), offset + number.end()):
+            return None
+        if proof.quote[:number.start()].rstrip().endswith(("-", "−", "/")):
+            return None
+        if original.count(number.group()) != 1 or numeric_evidence_values(original, number.group()) != {value}:
+            return None  # Keep unique original context when a bare number would be ambiguous.
+        # The source unit is checked again by verify_evidence after shortening.
+        return number.group()
+    return None
+
+
 def precise_numeric_evidence(packet, interpretation):
     """Only shorten an already original quote around one unambiguous matching value."""
     result = interpretation.model_copy(deep=True)
@@ -163,23 +188,56 @@ def precise_numeric_evidence(packet, interpretation):
         original = originals.get(proof.source_id, "")
         if value is None or proof.source_id not in result.source_refs or proof.quote not in original:
             continue
-        occurrences = list(re.finditer(re.escape(proof.quote), original))
-        if len(occurrences) != 1:
-            continue
-        numbers = list(re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])(?:\s*%)?", proof.quote))
-        matching = [number for number in numbers if set(quoted_numbers(number.group())) == {value}]
-        if len(matching) == 1:
-            number = matching[0]
-            offset = occurrences[0].start()
-            if number_is_ordinal(original, offset + number.start(), offset + number.end()):
-                continue
-            if proof.quote[:number.start()].rstrip().endswith(("-", "−", "/")):
-                continue
-            if original.count(number.group()) != 1 or numeric_evidence_values(original, number.group()) != {value}:
-                continue  # Keep unique original context when a bare number would be ambiguous.
-            # The source unit is checked again by verify_evidence after shortening.
-            proof.quote = number.group()
+        quote = _precise_quote(proof, value, original)
+        if quote is not None:
+            proof.quote = quote
     return result
+
+
+def _validate_order_form(packet, result):
+    if result.kind == "new_signal" and result.entry in ("market", "limit"):
+        from .semantic_contract import LIMIT, MARKET, source_price_boundary_failure, strict_deferred_price
+        text = require_first(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+        if result.entry == "market" and not MARKET.search(text):
+            raise DecisionFailure("source_market_form_not_explicit_use_unspecified")
+        if (result.entry == "limit" and not LIMIT.search(text)
+                and not source_price_boundary_failure(text, result.model_copy(update={"entry": "unspecified"}))
+                and not strict_deferred_price(text, result.entry_timing, result.entry_prices)):
+            raise DecisionFailure("source_limit_form_not_explicit_use_unspecified")
+
+
+def _interpretation_error(error, packet, result):
+    message = str(error)
+    numeric_context = "Numeric source evidence must isolate one number" in message
+    field_message = message.split("; use one exact original quote", 1)[0]
+    detail = {"code": message if isinstance(error, DecisionFailure) else "source_evidence_invalid",
+                   "field_paths": REPAIR_FIELDS.get(message, sorted(field for field in set(EVIDENCE_FIELDS) | set(Interpretation.model_fields)
+                                   if re.search(r"(?<![\w.])" + re.escape(field) + r"(?![\w.])", field_message))),
+                   "message": message, **({"repair": REPAIR_GUIDANCE[message]} if message in REPAIR_GUIDANCE else {})}
+    _repair_error_detail(detail, message, numeric_context, packet, result)
+    return detail
+
+
+def _repair_error_detail(detail, message, numeric_context, packet, result):
+    if message.startswith("Missing source SL/TP/leverage alone"):
+        detail.update(code="missing_execution_fields_are_not_ambiguity", field_paths=["kind", "reason"],
+            repair="Re-read the kind criteria and original. Missing source SL/TP/leverage alone is not ambiguity. Preserve absent fields as null/[], explicit target percentages as roe_percent and exact original quotes. Use trade_preview for configured Backup and unchanged risk checks; never invent prices, ignore a genuine independent ambiguity or execute without authorization.")
+    if message.startswith("Trade update reduce requires reduce_percent"):
+        detail.update(code="source_reduce_fraction_missing", field_paths=["kind", "update_action", "reduce_percent"],
+            repair="A partial exit requires an original fraction. Never replace it with a whole-position close or invent a fraction. Recheck ambiguous when the original does not specify one; preserve separate stop instructions without executing only that part.")
+    if numeric_context:
+        detail.update(code="source_numeric_proof_needs_context", repair="Use a longer UNIQUE exact original span, including the target label and its value if needed. Verified numbering labels are context, not prices. Do not resubmit a bare repeated number or crop digits from a decimal. Preserve the actual source value and unit.")
+    if message.startswith("TP evidence selects a percentage-interval endpoint:"):
+        detail.update(code="source_percentage_interval_needs_role_review", repair="An interval endpoint is not one discrete TP. Re-read the original financial role: a nonbinding descriptive expected-move range alone is not a TP instruction; a binding profit span (only/max/no more) or explicit TP interval requires ambiguous, even without a TP label. Never erase a binding span to use backup targets. Never pick one bound or split a continuous range into invented exits. Use a unique original quote if a separate real target has the same number.")
+    if message.startswith("Entry evidence selects only an analysis level:"):
+        detail.update(code="source_entry_reference_needs_role_review", repair="The quoted number describes a historical/technical market level, not a stated entry. Re-read its original sentence and quote an actual current entry assignment if one exists. Otherwise leave entry_prices absent; preserve the valid market/direction/stop/targets. Do not invent a price or reject the whole setup merely because its optional entry reference is unstated.")
+    if message == "Evidence does not occur in its original source":
+        originals = {row["source_id"]: row["text"] for row in packet["messages"]}
+        detail.update(field_paths=[f"evidence.{i}" for i, proof in enumerate(result.evidence)
+            if proof.source_id not in result.source_refs or proof.quote not in originals.get(proof.source_id, "")],
+            repair="Each proof must quote that same source_id's exact original and the source must be in source_refs. An EMPTY anchor is incomplete with evidence=[]; remove borrowed quotes, not the incomplete classification. Never probe other kinds or invent a quote to satisfy evidence.")
+    if message.startswith("Non-actional source_refs"):
+        detail.update(code="classification_scope_requires_anchor_only", repair="Use ONLY anchor_source_id in source_refs and classification evidence. Remove parent/context refs and their proofs from this non-actional result; they remain readable through the reply chain. Do not add parent proofs merely to retain an extra classification target.")
 
 
 def check_interpretation(context, interpretation: Interpretation):
@@ -196,42 +254,10 @@ def check_interpretation(context, interpretation: Interpretation):
         if context.get("source_read_error"):
             raise DecisionFailure("source_context_changed_reread_required")
         validate_interpretation(packet, result, own_setup_refs=context.get("bound_source_refs", ()))
-        if result.kind == "new_signal" and result.entry in ("market", "limit"):
-            from .semantic_contract import LIMIT, MARKET, source_price_boundary_failure, strict_deferred_price
-            text = require_first(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
-            if result.entry == "market" and not MARKET.search(text):
-                raise DecisionFailure("source_market_form_not_explicit_use_unspecified")
-            if (result.entry == "limit" and not LIMIT.search(text)
-                    and not source_price_boundary_failure(text, result.model_copy(update={"entry": "unspecified"}))
-                    and not strict_deferred_price(text, result.entry_timing, result.entry_prices)):
-                raise DecisionFailure("source_limit_form_not_explicit_use_unspecified")
+        _validate_order_form(packet, result)
     except AqlaError as error:
         message = str(error)
-        numeric_context = "Numeric source evidence must isolate one number" in message
-        field_message = message.split("; use one exact original quote", 1)[0]
-        detail = {"code": message if isinstance(error, DecisionFailure) else "source_evidence_invalid",
-                       "field_paths": REPAIR_FIELDS.get(message, sorted(field for field in set(EVIDENCE_FIELDS) | set(Interpretation.model_fields)
-                                       if re.search(r"(?<![\w.])" + re.escape(field) + r"(?![\w.])", field_message))),
-                       "message": message, **({"repair": REPAIR_GUIDANCE[message]} if message in REPAIR_GUIDANCE else {})}
-        if message.startswith("Missing source SL/TP/leverage alone"):
-            detail.update(code="missing_execution_fields_are_not_ambiguity", field_paths=["kind", "reason"],
-                repair="Re-read the kind criteria and original. Missing source SL/TP/leverage alone is not ambiguity. Preserve absent fields as null/[], explicit target percentages as roe_percent and exact original quotes. Use trade_preview for configured Backup and unchanged risk checks; never invent prices, ignore a genuine independent ambiguity or execute without authorization.")
-        if message.startswith("Trade update reduce requires reduce_percent"):
-            detail.update(code="source_reduce_fraction_missing", field_paths=["kind", "update_action", "reduce_percent"],
-                repair="A partial exit requires an original fraction. Never replace it with a whole-position close or invent a fraction. Recheck ambiguous when the original does not specify one; preserve separate stop instructions without executing only that part.")
-        if numeric_context:
-            detail.update(code="source_numeric_proof_needs_context", repair="Use a longer UNIQUE exact original span, including the target label and its value if needed. Verified numbering labels are context, not prices. Do not resubmit a bare repeated number or crop digits from a decimal. Preserve the actual source value and unit.")
-        if message.startswith("TP evidence selects a percentage-interval endpoint:"):
-            detail.update(code="source_percentage_interval_needs_role_review", repair="An interval endpoint is not one discrete TP. Re-read the original financial role: a nonbinding descriptive expected-move range alone is not a TP instruction; a binding profit span (only/max/no more) or explicit TP interval requires ambiguous, even without a TP label. Never erase a binding span to use backup targets. Never pick one bound or split a continuous range into invented exits. Use a unique original quote if a separate real target has the same number.")
-        if message.startswith("Entry evidence selects only an analysis level:"):
-            detail.update(code="source_entry_reference_needs_role_review", repair="The quoted number describes a historical/technical market level, not a stated entry. Re-read its original sentence and quote an actual current entry assignment if one exists. Otherwise leave entry_prices absent; preserve the valid market/direction/stop/targets. Do not invent a price or reject the whole setup merely because its optional entry reference is unstated.")
-        if message == "Evidence does not occur in its original source":
-            originals = {row["source_id"]: row["text"] for row in packet["messages"]}
-            detail.update(field_paths=[f"evidence.{i}" for i, proof in enumerate(result.evidence)
-                if proof.source_id not in result.source_refs or proof.quote not in originals.get(proof.source_id, "")],
-                repair="Each proof must quote that same source_id's exact original and the source must be in source_refs. An EMPTY anchor is incomplete with evidence=[]; remove borrowed quotes, not the incomplete classification. Never probe other kinds or invent a quote to satisfy evidence.")
-        if message.startswith("Non-actional source_refs"):
-            detail.update(code="classification_scope_requires_anchor_only", repair="Use ONLY anchor_source_id in source_refs and classification evidence. Remove parent/context refs and their proofs from this non-actional result; they remain readable through the reply chain. Do not add parent proofs merely to retain an extra classification target.")
+        detail = _interpretation_error(error, packet, result)
         if not any(row["message"] == message for row in errors):
             errors.append(detail)
     return {"event_id": packet["anchor_event_id"], "anchor_source_id": packet["anchor_source_id"],

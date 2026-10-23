@@ -62,7 +62,7 @@ async def test_every_profile_setting_round_trips_through_its_input(panel, field)
 
 @pytest.mark.asyncio
 async def test_menu_navigates_one_message_and_rejects_old_buttons(panel):
-    menu, bot, data, changes, *_ = panel
+    menu, bot, _data, changes, *_ = panel
     assert await menu.intercept(update("/aqla"), bot)
     token = choose(bot, "⚙️ Profile & Handelsregeln")
     assert await menu.intercept(callback(menu, token), bot)

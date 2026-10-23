@@ -14,26 +14,42 @@ RUN = ContextVar("aqla_usage_run", default=None)
 LOG = logging.getLogger(__name__)
 
 
+def _fresh_source_calls(row):
+    workflow, responses = row.get("workflow", {}), row.get("api_responses", [])
+    if row.get("origin") != "source_python" or workflow.get("cache_hit") or workflow.get("source_work_type") in ("cached", "empty", "status"):
+        return None
+    calls = [call for call in responses if call.get("phase") in ("decision", "decision_verification", "interpretation_fallback")]
+    if not calls and workflow.get("source_work_type") != "interpretation":
+        return None
+    key = workflow.get("source_revision_hash") or workflow.get("source_job_id")
+    if not key:
+        return None
+    return workflow, calls, key
+
+
+def _api_response_failed(call):
+    return call.get("response_success") is False or "response_success" not in call and call.get("failed") is True
+
+
+def _model_response_invalid(call):
+    return call.get("response_success") is True and (
+        call.get("contract_valid") is False or call.get("interpretation_valid") is False
+        or call.get("failed") is True and call.get("review_deferred") is not True)
+
+
 def source_efficiency(rows):
     """Group fresh original revisions; retries/cache/status cannot inflate shares."""
     grouped, api_failures, invalid_responses = {}, 0, 0
     for row in rows:
-        workflow, responses = row.get("workflow", {}), row.get("api_responses", [])
-        if row.get("origin") != "source_python" or workflow.get("cache_hit") or workflow.get("source_work_type") in ("cached", "empty", "status"):
+        fresh = _fresh_source_calls(row)
+        if fresh is None:
             continue
-        calls = [call for call in responses if call.get("phase") in ("decision", "decision_verification", "interpretation_fallback")]
-        if not calls and workflow.get("source_work_type") != "interpretation":
-            continue
-        key = workflow.get("source_revision_hash") or workflow.get("source_job_id")
-        if not key:
-            continue
+        workflow, calls, key = fresh
         selected = grouped.setdefault(key, {"valid": False, "fallback": False})
         selected["valid"] |= workflow.get("interpretation_valid") is True
         selected["fallback"] |= any(call.get("phase") == "interpretation_fallback" for call in calls)
-        api_failures += sum(call.get("response_success") is False or "response_success" not in call and call.get("failed") is True for call in calls)
-        invalid_responses += sum(call.get("response_success") is True and (
-            call.get("contract_valid") is False or call.get("interpretation_valid") is False
-            or call.get("failed") is True and call.get("review_deferred") is not True) for call in calls)
+        api_failures += sum(_api_response_failed(call) for call in calls)
+        invalid_responses += sum(_model_response_invalid(call) for call in calls)
     valid = sum(item["valid"] for item in grouped.values())
     decision_only = sum(item["valid"] and not item["fallback"] for item in grouped.values())
     count = len(grouped)
@@ -42,6 +58,21 @@ def source_efficiency(rows):
             "without_fallback_share": decision_only / count if count else None,
             "fallback_used": sum(item["fallback"] for item in grouped.values()),
             "api_response_failures": api_failures, "invalid_model_responses": invalid_responses}
+
+
+def _tool_payload(content):
+    value = json.loads(content)
+    for _ in range(3):
+        if isinstance(value, dict) and set(value) == {"result"}:
+            value = value["result"]
+            value = json.loads(value) if isinstance(value, str) else value
+    return value
+
+
+def _source_timing_key(identity):
+    if not isinstance(identity, str) or not 1 <= len(identity) <= 256:
+        return None
+    return hashlib.sha256(identity.encode()).hexdigest()
 
 
 @dataclass
@@ -79,11 +110,7 @@ class UsageRun:
             self.observe_source(name, content)
         if isinstance(content, str) and not error and name.endswith(("interpret_source", "interpret_source_batch")):
             try:
-                value = json.loads(content)
-                for _ in range(3):
-                    if isinstance(value, dict) and set(value) == {"result"}:
-                        value = value["result"]
-                        value = json.loads(value) if isinstance(value, str) else value
+                value = _tool_payload(content)
                 for item in value.get("items", [value]):
                     if item.get("status") in ("report", "unrelated", "incomplete", "ambiguous") and item.get("event_id"):
                         self.classified_sources.add(item["event_id"])
@@ -95,52 +122,53 @@ class UsageRun:
         if not name.endswith(("source_context", "source_context_batch", "interpret_source", "interpret_source_batch", "trade_preview", "trade_execute")):
             return
         try:
-            value = json.loads(content)
-            for _ in range(3):
-                if isinstance(value, dict) and set(value) == {"result"}:
-                    value = value["result"]
-                    value = json.loads(value) if isinstance(value, str) else value
+            value = _tool_payload(content)
             if not isinstance(value, dict):
                 return
             stamp = int(time.time()*1000)
-            def key(identity):
-                if not isinstance(identity, str) or not 1 <= len(identity) <= 256:
-                    return None
-                return hashlib.sha256(identity.encode()).hexdigest()
             if name.endswith(("source_context", "source_context_batch")):
-                messages = value.get("messages", {})
-                if not isinstance(messages, dict):
-                    messages = {}
-                anchors = [value.get("event", {})] if "event" in value else [messages.get(item.get("anchor_event_id"), {}) for item in value.get("items", [value]) if isinstance(item, dict)]
-                if not anchors or not any(anchors):
-                    anchors = [messages.get(value.get("anchor_event_id"), {})]
-                for event in anchors[:8]:
-                    source = event.get("source", {})
-                    identity = key(event.get("event_id"))
-                    received = source.get("received_at")
-                    if identity and source.get("historical") is not True and type(received) is int and 0 <= received <= stamp:
-                        if len(self.source_timings) < 256 or identity in self.source_timings:
-                            self.source_timings.setdefault(identity, {"received_at": received, "turn_started_at": int(self.started*1000)})["context_reply_at"] = stamp
+                self.observe_context(value, stamp)
             elif name.endswith(("interpret_source", "interpret_source_batch")):
-                for item in value.get("items", [value])[:8]:
-                    if (isinstance(item, dict) and item.get("status") in ("report", "unrelated", "incomplete", "ambiguous", "interpreted", "updated", "executed")
-                            and (identity := key(item.get("event_id"))) in self.source_timings):
-                        self.source_timings[identity]["interpretation_reply_at"] = stamp
+                self.observe_interpretation(value, stamp)
             elif name.endswith(("trade_preview", "trade_execute")):
-                for item in value.get("targets", [value])[:8]:
-                    if not isinstance(item, dict):
-                        continue
-                    plan = item.get("plan", item)
-                    if not isinstance(plan, dict):
-                        continue
-                    identities = [identity for event in plan.get("source_revisions", {}).values() if (identity := key(event)) in self.source_timings]
-                    trade = item.get("trade_id", plan.get("trade_id"))
-                    if identities and isinstance(trade, str) and len(self.trade_sources) < 256:
-                        self.trade_sources[trade] = identities
-                    for identity in identities or self.trade_sources.get(trade, []):
-                        self.source_timings[identity]["preview_reply_at" if name.endswith("trade_preview") else "execution_reply_at"] = stamp
+                self.observe_trade(value, name, stamp)
         except (ValueError, TypeError, AttributeError):
             pass
+
+    def observe_context(self, value, stamp):
+        messages = value.get("messages", {})
+        if not isinstance(messages, dict):
+            messages = {}
+        anchors = [value.get("event", {})] if "event" in value else [messages.get(item.get("anchor_event_id"), {}) for item in value.get("items", [value]) if isinstance(item, dict)]
+        if not anchors or not any(anchors):
+            anchors = [messages.get(value.get("anchor_event_id"), {})]
+        for event in anchors[:8]:
+            source = event.get("source", {})
+            identity = _source_timing_key(event.get("event_id"))
+            received = source.get("received_at")
+            if (identity and source.get("historical") is not True and type(received) is int and 0 <= received <= stamp
+                    and (len(self.source_timings) < 256 or identity in self.source_timings)):
+                self.source_timings.setdefault(identity, {"received_at": received, "turn_started_at": int(self.started*1000)})["context_reply_at"] = stamp
+
+    def observe_interpretation(self, value, stamp):
+        for item in value.get("items", [value])[:8]:
+            if (isinstance(item, dict) and item.get("status") in ("report", "unrelated", "incomplete", "ambiguous", "interpreted", "updated", "executed")
+                    and (identity := _source_timing_key(item.get("event_id"))) in self.source_timings):
+                self.source_timings[identity]["interpretation_reply_at"] = stamp
+
+    def observe_trade(self, value, name, stamp):
+        for item in value.get("targets", [value])[:8]:
+            if not isinstance(item, dict):
+                continue
+            plan = item.get("plan", item)
+            if not isinstance(plan, dict):
+                continue
+            identities = [identity for event in plan.get("source_revisions", {}).values() if (identity := _source_timing_key(event)) in self.source_timings]
+            trade = item.get("trade_id", plan.get("trade_id"))
+            if identities and isinstance(trade, str) and len(self.trade_sources) < 256:
+                self.trade_sources[trade] = identities
+            for identity in identities or self.trade_sources.get(trade, []):
+                self.source_timings[identity]["preview_reply_at" if name.endswith("trade_preview") else "execution_reply_at"] = stamp
 
     def persist(self, home, result):
         try:

@@ -255,7 +255,7 @@ async def verify_scripted_agent(extension, runner, source, event, body):
     final = [False]
     class FakeModel(BaseHTTPRequestHandler):
         def log_message(self, *_):
-            pass
+            return None
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             if request.get("tools"):

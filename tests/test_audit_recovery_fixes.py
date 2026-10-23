@@ -23,6 +23,56 @@ from aqla_hyperliquid_mcp.server import close_server, create_server
 from aqla_hyperliquid_mcp.state import State
 
 
+async def _apply_later_financial_facts(exchange, fake, first, later, monkeypatch, operation, original, quantity, router, state, trade):
+    second = None
+    if later == "terminal":
+        stop = require_first(order for order in trade["orders"] if order["kind"] == "sl")
+        fake.fill(stop["cloid"], quantity, "90")
+    elif later == "reduce":
+        second, change = update(router, 3, "reduce", "Reduce 50%", reduce_percent=50)
+        await router.update_trade(second.event_id, change)
+    elif later == "stop":
+        second, change = update(router, 3, "move_stop", "SL 95", stop_loss=95)
+        change.evidence = [Evidence(field="stop_loss", source_id=second.source_id, quote="95")]
+        await router.update_trade(second.event_id, change)
+    elif later == "legacy":
+        def old_shape(data):
+            row = data["trades"][trade["trade_id"]]
+            row.pop("pending_target_update")
+            for name in ("completed", "accepted_revision"):
+                row["target_updates"][operation].pop(name)
+            data["events"][first.event_id]["status"] = "rejected"
+        state.update(old_shape)
+        second, change = update(router, 3, "replace_targets", "Neue Ziele 120 und 130", take_profits=[120, 130])
+        change.evidence = [Evidence(field=f"take_profits.{i}", source_id=second.source_id, quote=str(n)) for i, n in enumerate([120, 130])]
+        await router.update_trade(second.event_id, change)
+    elif later == "transient":
+        async def unavailable(identity, action, **kwargs):
+            if identity == operation:
+                raise TemporaryObservation("read_unavailable", "signer", "transport")
+            return await original(identity, action, **kwargs)
+        monkeypatch.setattr(exchange, "mutate", unavailable)
+        await router.recover()
+        assert Decimal(str(fake.position)) == quantity and state.snapshot()["venue_enabled"]["hyperliquid"]
+        monkeypatch.setattr(exchange, "mutate", original)
+    else:
+        monkeypatch.setattr(exchange.settings, "shared_account", True)
+        fake.position += 1
+    return second
+
+
+def _assert_recovered_targets(fake, later, saved):
+    active = [order for order in saved["orders"] if order["kind"] == "tp" and not order.get("retired")]
+    assert sum(Decimal(order["quantity"]) for order in active) == Decimal(str(fake.position))
+    assert {order["price"] for order in active} == ({"120", "130"} if later == "legacy" else {"115", "125"})
+
+
+def _assert_recovered_target_orders(fake, saved):
+    live = [row for row in fake.orders.values() if row["status"] == "open" and row["order"]["reduceOnly"] and not row["order"]["isTrigger"]]
+    assert len(live) == 2 and {row["order"]["limitPx"] for row in live} == {"115", "125"}
+    assert {row["order"]["cloid"] for row in live} == {row["c"] for row in saved["action"]["orders"]}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('venue', ['hyperliquid'])
 async def test_slow_account_transport_cannot_authorize_entry(setup, signal, request, monkeypatch, venue):
@@ -148,9 +198,7 @@ async def test_accepted_target_replacement_resumes_exactly_once_after_restart(se
     assert revision == trade["management_revision"] + 1
     assert after["trades"][trade["trade_id"]]["management_revision"] == revision
     assert after["events"][msg.event_id]["status"] == "updated"
-    live = [row for row in fake.orders.values() if row["status"] == "open" and row["order"]["reduceOnly"] and not row["order"]["isTrigger"]]
-    assert len(live) == 2 and {row["order"]["limitPx"] for row in live} == {"115", "125"}
-    assert {row["order"]["cloid"] for row in live} == {row["c"] for row in saved["action"]["orders"]}
+    _assert_recovered_target_orders(fake, saved)
     calls = copy.deepcopy(fake.actions)
     await restarted.recover()
     assert fake.actions == calls and state.snapshot()["trades"][trade["trade_id"]]["target_updates"] == after["trades"][trade["trade_id"]]["target_updates"]
@@ -178,40 +226,7 @@ async def test_pending_target_recovery_preserves_later_financial_facts(setup, si
     await router.update_trade(first.event_id, change)
     monkeypatch.setattr(exchange, "mutate", original)
     quantity = Decimal(trade["remaining_quantity"])
-    second = None
-    if later == "terminal":
-        stop = require_first(order for order in trade["orders"] if order["kind"] == "sl")
-        fake.fill(stop["cloid"], quantity, "90")
-    elif later == "reduce":
-        second, change = update(router, 3, "reduce", "Reduce 50%", reduce_percent=50)
-        await router.update_trade(second.event_id, change)
-    elif later == "stop":
-        second, change = update(router, 3, "move_stop", "SL 95", stop_loss=95)
-        change.evidence = [Evidence(field="stop_loss", source_id=second.source_id, quote="95")]
-        await router.update_trade(second.event_id, change)
-    elif later == "legacy":
-        def old_shape(data):
-            row = data["trades"][trade["trade_id"]]
-            row.pop("pending_target_update")
-            for name in ("completed", "accepted_revision"):
-                row["target_updates"][operation].pop(name)
-            data["events"][first.event_id]["status"] = "rejected"
-        state.update(old_shape)
-        second, change = update(router, 3, "replace_targets", "Neue Ziele 120 und 130", take_profits=[120, 130])
-        change.evidence = [Evidence(field=f"take_profits.{i}", source_id=second.source_id, quote=str(n)) for i, n in enumerate([120, 130])]
-        await router.update_trade(second.event_id, change)
-    elif later == "transient":
-        async def unavailable(identity, action, **kwargs):
-            if identity == operation:
-                raise TemporaryObservation("read_unavailable", "signer", "transport")
-            return await original(identity, action, **kwargs)
-        monkeypatch.setattr(exchange, "mutate", unavailable)
-        await router.recover()
-        assert Decimal(str(fake.position)) == quantity and state.snapshot()["venue_enabled"]["hyperliquid"]
-        monkeypatch.setattr(exchange, "mutate", original)
-    else:
-        monkeypatch.setattr(exchange.settings, "shared_account", True)
-        fake.position += 1
+    second = await _apply_later_financial_facts(exchange, fake, first, later, monkeypatch, operation, original, quantity, router, state, trade)
     calls = copy.deepcopy(fake.actions)
     await router.recover()
     await router.recover()
@@ -225,9 +240,7 @@ async def test_pending_target_recovery_preserves_later_financial_facts(setup, si
     else:
         assert Decimal(str(fake.position)) == (quantity / 2 if later == "reduce" else quantity)
         assert after["venue_enabled"]["hyperliquid"] and not saved.get("execution_incident")
-        active = [order for order in saved["orders"] if order["kind"] == "tp" and not order.get("retired")]
-        assert sum(Decimal(order["quantity"]) for order in active) == Decimal(str(fake.position))
-        assert {order["price"] for order in active} == ({"120", "130"} if later == "legacy" else {"115", "125"})
+        _assert_recovered_targets(fake, later, saved)
         if later == "stop":
             assert Decimal(saved["stop_price"]) == 95 and after["events"][second.event_id]["status"] == "updated"
         if later == "legacy":

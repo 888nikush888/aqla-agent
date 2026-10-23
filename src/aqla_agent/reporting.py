@@ -124,8 +124,7 @@ class Reporting:
             except ReadBudgetExceeded:
                 raise
             except Exception:
-                self.state.update(lambda data: data["trades"][trade_id].update(reporting_checked_at=now_ms(),
-                    funding_coverage={"complete": False, "reason": "Historische Entry-/Exit-Belege nicht vollständig verfügbar"}))
+                self._incomplete(trade_id, "Historische Entry-/Exit-Belege nicht vollst\u00e4ndig verf\u00fcgbar")
                 return None, None, {"complete": False, "reason": "history_unavailable"}
         return trade, engine, None
 
@@ -292,6 +291,15 @@ class Reporting:
             row["reporting_checked_at"] = self.wall_clock()
         self.state.update(save)
 
+    def reporting_candidates(self, snapshot):
+        candidates = [trade for trade in snapshot["trades"].values()
+                      if trade["status"] in CLOSED and (trade.get("fill_events") or Decimal(trade.get("filled_quantity", "0")) > 0)
+                      and self.wall_clock() >= trade.get("reporting_next_retry_at", trade.get("reporting_checked_at", 0)
+                          + (3_600_000 if verified_coverage_matches(trade) else 60_000))]
+        candidates.sort(key=lambda trade: (trade.get("reporting_attempt_sequence", 0), trade.get("reporting_checked_at", 0), trade["trade_id"]))
+        return candidates
+
+
     async def tick(self) -> ReportingTick:
         # Jobs remain serial and independent of the execution lock. Durable
         # attempt ordering survives cancellation/restarts at the same millisecond.
@@ -299,11 +307,7 @@ class Reporting:
             started = self.clock()
             tick = ReadBudget("tick", self.max_requests, started + self.time_budget_seconds, self.clock)
             snapshot = self.state.snapshot()
-            candidates = [trade for trade in snapshot["trades"].values()
-                          if trade["status"] in CLOSED and (trade.get("fill_events") or Decimal(trade.get("filled_quantity", "0")) > 0)
-                          and self.wall_clock() >= trade.get("reporting_next_retry_at", trade.get("reporting_checked_at", 0)
-                              + (3_600_000 if verified_coverage_matches(trade) else 60_000))]
-            candidates.sort(key=lambda trade: (trade.get("reporting_attempt_sequence", 0), trade.get("reporting_checked_at", 0), trade["trade_id"]))
+            candidates = self.reporting_candidates(snapshot)
             result: ReportingTick = {"attempts": [], "requests": 0, "elapsed_seconds": 0.0, "stop_reason": "idle" if not candidates else "complete"}
             for trade in candidates:
                 if len(result["attempts"]) == self.max_jobs:

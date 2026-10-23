@@ -34,6 +34,287 @@ async def grant_fixture(extension):
     assert extension.setup.claims() is not None
 
 
+def assert_candidate_private(captured, entry, home, read_snapshot, store, tool_arguments):
+    for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD):
+        assert marker not in captured.getvalue()
+        assert marker not in json.dumps(tool_arguments)
+        assert marker not in json.dumps(store.load_transcript(entry.session_id))
+        assert marker not in json.dumps(read_snapshot(home / "data/state.sqlite3"))
+
+
+def verify_registered_commands():
+    from hermes_cli.plugins import get_plugin_commands
+
+    from aqla_agent.native_commands import COMMANDS
+    registered = get_plugin_commands()
+    assert {name.replace("_", "-") for name in COMMANDS} <= set(registered)
+    assert "nichts geändert" in registered["setup"]["handler"]("synthetic-private-registry-fallback")
+    return COMMANDS
+
+
+async def verify_native_owner_menu(COMMANDS, adapter, menus):
+    # Menu setup and early ingress can run before finish_wiring.
+    await adapter._register_command_menu()
+    owner_menu = require_first(row for row in menus if row.get("scope", {}).get("type") == "chat")
+    owner_commands = owner_menu["commands"]
+    assert {row["command"] for row in owner_commands} == {"aqla", "aqla_pause", "setup"}
+    assert len(owner_commands) <= 60
+    assert all(row["description"].startswith("aqla:" if row["command"] in COMMANDS else "Hermes:") for row in owner_commands)
+    assert {row.get("scope", {}).get("type") for row in menus} >= {"default", "all_private_chats", "all_group_chats", "chat"}
+
+
+async def verify_early_admission(SETUP_PROMPT, Update, admitted, app, deleted, extension, payload, sent):
+    await app.process_update(Update.de_json(payload("/setup", 10), app.bot))
+    assert extension.setup.challenge is None and "noch nicht bereit" in sent[-1]["text"] and admitted == []
+    not_ready_late = payload(SYNTHETIC_PASSWORD, 11)
+    not_ready_late["message"]["reply_to_message"] = {"message_id": 777, "date": 1791490000,
+        "chat": {"id": 12345, "type": "private"}, "from": {"id": 999, "is_bot": True, "first_name": "Synthetic"}, "text": SETUP_PROMPT}
+    await app.process_update(Update.de_json(not_ready_late, app.bot))
+    assert len(deleted) == 1 and admitted == []
+    deleted.clear()
+
+
+async def verify_native_catalog_acl(Platform, PlatformConfig, extension, factory):
+    # The shared native renderer keeps numeric pages, skills and native
+    # ACL gates. Inject registry-only fixtures to prove dynamic reading
+    # and that system rows never appear in its Hermes section.
+    from gateway.session import SessionSource
+    from hermes_cli.commands import COMMAND_REGISTRY, CommandDef
+    fixture_native = CommandDef("native_probe", "Native registry fixture", "Info")
+    fixture_system = CommandDef("aqla_status", "Duplicate system fixture", "Plugins")
+    COMMAND_REGISTRY.extend([fixture_native, fixture_system])
+    old_gateway, extension.gateway = extension.gateway, factory
+    try:
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345")
+        help_event = SimpleNamespace(source=source, get_command_args=lambda: "")
+        help_text = await factory._handle_help_command(help_event)
+        hermes_text, system_text = help_text.split("**aqla Agent-System**")
+        assert "**Hermes Agent**" in hermes_text and "/native_probe" in hermes_text
+        assert "/aqla_status" not in hermes_text and "/aqla_status" in system_text
+        for page in ("1", "2", "999", "invalid"):
+            event = SimpleNamespace(source=source, get_command_args=lambda page=page: page)
+            wrapped = await factory._handle_commands_command(event)
+            assert "**Hermes Agent**" in wrapped and "**aqla Agent-System**" in wrapped
+            assert "/aqla_status" not in wrapped.split("**aqla Agent-System**")[0]
+        factory.config.platforms[Platform.TELEGRAM] = PlatformConfig(extra={"allow_admin_from": ["999"], "user_allowed_commands": ["help"]})
+        gated = await factory._handle_help_command(help_event)
+        assert "/aqla_status" not in gated and "/native_probe" not in gated
+    finally:
+        extension.gateway = old_gateway
+        factory.config.platforms.clear()
+        COMMAND_REGISTRY.remove(fixture_native)
+        COMMAND_REGISTRY.remove(fixture_system)
+    return SessionSource
+
+
+async def verify_rejected_candidates(AqlaError, Platform, SessionSource, Update, admitted, app, captured, delete_ack, deleted, extension, home, payload, read_snapshot, sent, store, tool_arguments):
+    await app.process_update(Update.de_json(payload("/setup@other_bot", 12), app.bot))
+    assert extension.setup.challenge is None and admitted == []
+    # Authentic private candidates must also fail closed on either a
+    # wrong password or a missing positive native Telegram DeleteACK.
+    # Both pass through the real registry adapter and PTB dispatcher.
+    for identity, candidate, ack in ((30, WRONG_SYNTHETIC_PASSWORD, True), (32, SYNTHETIC_PASSWORD, False)):
+        await app.process_update(Update.de_json(payload("/setup", identity), app.bot))
+        assert extension.setup.challenge is not None
+        delete_ack[0] = ack
+        await app.process_update(Update.de_json(payload(candidate, identity + 1), app.bot))
+        assert extension.setup.claims() is None and admitted == []
+        assert deleted[-1]["message_id"] == identity + 1
+        assert "Setup nicht freigegeben" in sent[-1]["text"]
+        ordinary = extension.authority.sign("operator", "synthetic-rejected-setup-check")
+        try:
+            await extension.mcp_call("aqla", "control", {"action": "resume", "context_auth": ordinary})
+        except AqlaError:
+            pass
+        else:
+            raise AssertionError("Rejected native candidate acquired MCP Setup authority")
+        entry = store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345"))
+        assert_candidate_private(captured, entry, home, read_snapshot, store, tool_arguments)
+
+
+async def verify_native_grant(Update, admitted, app, captured, delete_ack, deleted, extension, payload):
+    delete_ack[0] = True
+    deleted.clear()
+    await app.process_update(Update.de_json(payload("/setup", 1), app.bot))
+    updates = await app.bot.get_updates()
+    await app.process_update(updates[0])
+    assert extension.setup.claims() and len(deleted) == 1 and admitted == [], {
+        "configured": extension.setup.verifier is not None, "deleted": len(deleted), "admitted": len(admitted),
+        "challenge": extension.setup.challenge is not None,
+        "errors": [line for line in captured.getvalue().splitlines() if "Private Setup admission unavailable" in line]}
+    with extension.claim_scope(("operator", "native-owner")):
+        auth = extension.before_tool("mcp__aqla__control", {"action": "resume"})["args"]
+    assert (await extension.mcp_call("aqla", "control", {"action": "resume", **auth}))["paused"] is False
+    return auth
+
+
+async def verify_guided_profile(Update, app, home, payload, read_snapshot, sent):
+    await app.process_update(Update.de_json(payload("/aqla_parameter backup leverage 5", 20), app.bot))
+    state = read_snapshot(home / "data/state.sqlite3")
+    assert state["profiles"]["backup"]["parameters"]["leverage"] == 5
+    await app.process_update(Update.de_json(payload("/aqla_maker backup tp", 21), app.bot))
+    keyboard = sent[-1]["reply_markup"]["inline_keyboard"]
+    token = require_first(item["callback_data"] for row in keyboard for item in row if item["text"] == "maker_only")
+    callback = {"update_id": 22, "callback_query": {"id": "synthetic-callback", "chat_instance": "synthetic-chat",
+        "from": {"id": 12345, "is_bot": False, "first_name": "Synthetic"}, "data": token,
+        "message": {"message_id": 1001 + len(sent), "date": 1791490000, "chat": {"id": 12345, "type": "private"},
+                    "from": {"id": 999, "is_bot": True, "first_name": "Synthetic bot"}, "text": "Untrusted callback label"}}}
+    await app.process_update(Update.de_json(callback, app.bot))
+    state = read_snapshot(home / "data/state.sqlite3")
+    assert state["profiles"]["backup"]["parameters"]["take_profit_execution"] == "maker_only"
+    assert state["profiles"]["backup"]["parameters"].get("entry_execution", "standard") == "standard"
+    return callback, state
+
+
+async def verify_callback_once_and_pause(Update, admitted, app, callback, home, panel_edits, payload, read_snapshot, sent, state):
+    revision = state["configuration_revision"]
+    callback["update_id"] = 23
+    await app.process_update(Update.de_json(callback, app.bot))
+    assert read_snapshot(home / "data/state.sqlite3")["configuration_revision"] == revision
+    await app.process_update(Update.de_json(payload("/aqla_pause", 24), app.bot))
+    assert read_snapshot(home / "data/state.sqlite3")["paused"] is True
+    assert admitted == []
+    await app.process_update(Update.de_json(payload("/aqla_status", 25), app.bot))
+    assert any("Dashboard" in row["text"] for row in sent) and admitted == []
+    assert panel_edits, "Native menu must edit its existing panel"
+
+
+async def verify_panel_navigation(Update, admitted, app, created, extension, home, panel_edits, payload, read_snapshot, sent):
+    from aqla_agent.telegram_menu import HOME
+    panel_created = len(created)
+    panel_edited = len(panel_edits)
+    panel_revision = read_snapshot(home / "data/state.sqlite3")["configuration_revision"]
+    for sequence, (label, action) in enumerate(HOME, start=60):
+        await app.process_update(Update.de_json(payload("/aqla", sequence * 2), app.bot))
+        token = require_first(key for key, value in extension.commands.menu.tokens.items() if value[0] == action)
+        panel_callback = {"update_id": sequence * 2 + 1, "callback_query": {"id": "panel-" + str(sequence), "chat_instance": "panel-chat",
+            "from": {"id": 12345, "is_bot": False, "first_name": "Synthetic"}, "data": token,
+            "message": {"message_id": extension.commands.menu.message_id, "date": 1791490000,
+                "chat": {"id": 12345, "type": "private"}, "from": {"id": 999, "is_bot": True, "first_name": "Synthetic bot"}, "text": label}}}
+        await app.process_update(Update.de_json(panel_callback, app.bot))
+        assert not any(marker in sent[-1]["text"] for marker in ("vorübergehend nicht verfügbar", "Nicht gespeichert", "Änderung nicht ausgeführt")), (action, sent[-1]["text"])
+    assert len(created) == panel_created + len(HOME) and admitted == []
+    assert len(panel_edits) == panel_edited + len(HOME)
+    assert read_snapshot(home / "data/state.sqlite3")["configuration_revision"] == panel_revision
+
+
+async def verify_native_source_controls(Update, admitted, app, home, payload, read_snapshot, sent):
+    # New source controls run through the actual native registry/PTB
+    # dispatcher and real MCP revision/setup gates, with no model turn.
+    existing_sources = set(read_snapshot(home / "data/state.sqlite3")["sources"])
+    synthetic_sources = [str(-9000 - index) for index in range(14)]
+    await app.process_update(Update.de_json(payload("/aqla_hinzufuegen " + " ".join(synthetic_sources), 40), app.bot))
+    await app.process_update(Update.de_json(payload("/aqla_hinzufuegen -9991 -9992 -9993", 41), app.bot))
+    state = read_snapshot(home / "data/state.sqlite3")
+    assert set(state["sources"]) == existing_sources | set(synthetic_sources) | {"-9991", "-9992", "-9993"}
+    await app.process_update(Update.de_json(payload('/aqla_kanalname -9991 "Synthetic channel"', 42), app.bot))
+    await app.process_update(Update.de_json(payload('/aqla_entfernen "Synthetic channel"', 43), app.bot))
+    state = read_snapshot(home / "data/state.sqlite3")
+    assert set(state["sources"]) == existing_sources | set(synthetic_sources) | {"-9992", "-9993"}
+    before_invalid = state["configuration_revision"]
+    await app.process_update(Update.de_json(payload('/aqla_hinzufuegen "Unknown free title"', 44), app.bot))
+    assert read_snapshot(home / "data/state.sqlite3")["configuration_revision"] == before_invalid
+    for identity, text in ((45, "ALLE AKTUELLEN KANÄLE"), (46, "zeig mir alle kanäle"), (47, "wie ist Status?"), (48, "/aqla_funktionen"), (49, "/aqla_konflikt")):
+        await app.process_update(Update.de_json(payload(text, identity), app.bot))
+    assert admitted == [] and any("Aktuell ausgewählte Kanäle" in row["text"] for row in sent)
+
+
+async def verify_long_native_status(app, extension, sent):
+    from aqla_agent.messages import literal
+    long_text = "**Status**\n" + "\n".join(literal("😀[untrusted]_*`\\" * 50) for _ in range(20))
+    sent_before = len(sent)
+    await extension.commands.reply(app.bot, long_text, markdown=True)
+    chunks = sent[sent_before:]
+    assert len(chunks) > 1 and all(len(row["text"].encode("utf-16-le")) // 2 <= 4096 for row in chunks)
+
+
+async def verify_revocation_and_preview(AqlaError, Update, app, auth, extension, payload):
+    await app.process_update(Update.de_json(payload("/setup aus", 3), app.bot))
+    try:
+        await extension.mcp_call("aqla", "control", {"action": "resume", **auth})
+    except AqlaError:
+        pass
+    else:
+        raise AssertionError("Revoked native grant was accepted")
+    await app.process_update(Update.de_json(payload("/aqla_funktionen", 150), app.bot))
+    setup_token = require_first(key for key, value in extension.commands.menu.tokens.items() if value[0] == "setup")
+    setup_callback = {"update_id": 151, "callback_query": {"id": "setup-preview", "chat_instance": "panel-chat",
+        "from": {"id": 12345, "is_bot": False, "first_name": "Synthetic"}, "data": setup_token,
+        "message": {"message_id": extension.commands.menu.message_id, "date": 1791490000,
+            "chat": {"id": 12345, "type": "private"}, "from": {"id": 999, "is_bot": True, "first_name": "Synthetic bot"}, "text": "Setup"}}}
+    await app.process_update(Update.de_json(setup_callback, app.bot))
+    assert extension.setup.challenge is not None and extension.setup.claims() is None
+    setup_callback["update_id"] = 152
+    setup_callback["callback_query"]["id"] = "setup-cancel"
+    setup_callback["callback_query"]["data"] = require_first(key for key, value in extension.commands.menu.tokens.items() if value[0] == "cancel")
+    await app.process_update(Update.de_json(setup_callback, app.bot))
+    assert extension.setup.challenge is None and extension.setup.claims() is None and extension.setup.failures == 0
+
+
+async def verify_untrusted_candidates(Update, admitted, app, deleted, extension, payload):
+    await app.process_update(Update.de_json(payload("/setup", 4), app.bot))
+    old_prompt = extension.setup.challenge.prompt_id
+    candidate_deleted_before = len(deleted)
+    forwarded = payload(SYNTHETIC_PASSWORD, 5)
+    forwarded["message"]["forward_origin"] = {"type": "user", "date": 1791490000,
+        "sender_user": {"id": 6789, "is_bot": False, "first_name": "Synthetic source"}}
+    await app.process_update(Update.de_json(forwarded, app.bot))
+    assert extension.setup.claims() is None and len(deleted) == candidate_deleted_before + 1 and admitted == []
+    assert deleted[-1]["message_id"] == 5
+    edited = payload(SYNTHETIC_PASSWORD, 6)
+    edited["edited_message"] = edited.pop("message")
+    edited["edited_message"]["edit_date"] = 1791490001
+    await app.process_update(Update.de_json(edited, app.bot))
+    assert extension.setup.claims() is None and len(deleted) == candidate_deleted_before + 2 and admitted == []
+    assert deleted[-1]["message_id"] == 6
+    return old_prompt, candidate_deleted_before
+
+
+async def verify_late_reply(NativeSetup, SETUP_PROMPT, Update, admitted, app, candidate_deleted_before, deleted, extension, old_prompt, payload):
+    # Recreate ingress state as after process restart. The reply metadata
+    # is authenticated by the actual PTB Update parser and current bot.
+    extension.revoke_setup()
+    extension.setup = NativeSetup(extension.owner, extension.setup.verifier,
+                                  extension.setup_request, extension.setup_binding)
+    assert extension.setup.challenge is None and extension.setup.old_prompts == set()
+    late = payload(SYNTHETIC_PASSWORD, 7)
+    late["message"]["reply_to_message"] = {"message_id": old_prompt, "date": 1791490000,
+        "chat": {"id": 12345, "type": "private"},
+        "from": {"id": app.bot.id, "is_bot": True, "first_name": "Synthetic"}, "text": SETUP_PROMPT}
+    await app.process_update(Update.de_json(late, app.bot))
+    assert extension.setup.claims() is None and len(deleted) == candidate_deleted_before + 3 and admitted == []
+    assert deleted[-1]["message_id"] == 7
+
+
+async def verify_factory_reload(Application, COMMANDS, EXTENSIONS, Platform, PlatformConfig, admitted, app, captured, discover_plugins, extension, factory, gateway, install_strict_profile, undo):
+    # Factory, handler rebuild, plugin replacement and runtime undo all
+    # retain one earliest handler and remove the previous authority.
+    replacement = factory._create_adapter(Platform.TELEGRAM, PlatformConfig(extra={"allow_from": ["12345"]}))
+    replacement.set_message_handler(admitted.append)
+    extension.boot(gateway, adapter=replacement)
+    assert extension.binding[0] is replacement and extension.setup.claims() is None
+    rebuild = Application.builder().bot(app.bot).build()
+    replacement._register_handlers(rebuild)
+    replacement._register_handlers(rebuild)
+    assert len(rebuild.handlers[-100]) == 1
+    assert install_strict_profile() is undo
+    discover_plugins(force=True)
+    assert extension not in EXTENSIONS and extension.binding is None
+    fresh = require_first(iter(EXTENSIONS))
+    fresh.boot(gateway, adapter=replacement)
+    assert fresh.binding[0] is replacement and fresh.setup.claims() is None
+    assert f"module=hermes_plugins.platforms__telegram.adapter hooks=true setup_handler=True system_handler=True catalog_count={len(COMMANDS)}" in captured.getvalue()
+
+
+def assert_private_persistence(captured, extension, home, read_snapshot):
+    assert all(marker not in captured.getvalue() for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD))
+    assert extension.authority.key.decode() not in captured.getvalue()
+    assert all(marker not in json.dumps(read_snapshot(home / "data/state.sqlite3")) for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD))
+    for path in home.rglob("*"):
+        if path.is_file() and path.suffix in (".json", ".jsonl", ".yaml", ".log"):
+            assert all(marker not in path.read_text(encoding="utf-8") for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hermes-source", required=True)
@@ -98,9 +379,11 @@ def main():
     extension.mcp_call = record_mcp_call
     class Request(BaseRequest):
         read_timeout = 1
-        async def initialize(self):
+        @staticmethod
+        async def initialize():
             pass
-        async def shutdown(self):
+        @staticmethod
+        async def shutdown():
             pass
         @staticmethod
         async def do_request(url, method, request_data=None, **kwargs):
@@ -154,232 +437,24 @@ def main():
         await app.initialize()
         adapter._bot = app.bot
         try:
-            from hermes_cli.plugins import get_plugin_commands
-
-            from aqla_agent.native_commands import COMMANDS
-            registered = get_plugin_commands()
-            assert {name.replace("_", "-") for name in COMMANDS} <= set(registered)
-            assert "nichts geändert" in registered["setup"]["handler"]("synthetic-private-registry-fallback")
-            # Menu setup and early ingress can run before finish_wiring.
-            await adapter._register_command_menu()
-            owner_menu = require_first(row for row in menus if row.get("scope", {}).get("type") == "chat")
-            owner_commands = owner_menu["commands"]
-            assert {row["command"] for row in owner_commands} == {"aqla", "aqla_pause", "setup"}
-            assert len(owner_commands) <= 60
-            assert all(row["description"].startswith("aqla:" if row["command"] in COMMANDS else "Hermes:") for row in owner_commands)
-            assert {row.get("scope", {}).get("type") for row in menus} >= {"default", "all_private_chats", "all_group_chats", "chat"}
-            await app.process_update(Update.de_json(payload("/setup", 10), app.bot))
-            assert extension.setup.challenge is None and "noch nicht bereit" in sent[-1]["text"] and admitted == []
-            not_ready_late = payload(SYNTHETIC_PASSWORD, 11)
-            not_ready_late["message"]["reply_to_message"] = {"message_id": 777, "date": 1791490000,
-                "chat": {"id": 12345, "type": "private"}, "from": {"id": 999, "is_bot": True, "first_name": "Synthetic"}, "text": SETUP_PROMPT}
-            await app.process_update(Update.de_json(not_ready_late, app.bot))
-            assert len(deleted) == 1 and admitted == []
-            deleted.clear()
+            COMMANDS = verify_registered_commands()
+            await verify_native_owner_menu(COMMANDS, adapter, menus)
+            await verify_early_admission(SETUP_PROMPT, Update, admitted, app, deleted, extension, payload, sent)
             extension.boot(gateway)
             adapter.gateway_runner = gateway
-            # The shared native renderer keeps numeric pages, skills and native
-            # ACL gates. Inject registry-only fixtures to prove dynamic reading
-            # and that system rows never appear in its Hermes section.
-            from gateway.session import SessionSource
-            from hermes_cli.commands import COMMAND_REGISTRY, CommandDef
-            fixture_native = CommandDef("native_probe", "Native registry fixture", "Info")
-            fixture_system = CommandDef("aqla_status", "Duplicate system fixture", "Plugins")
-            COMMAND_REGISTRY.extend([fixture_native, fixture_system])
-            old_gateway, extension.gateway = extension.gateway, factory
-            try:
-                source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345")
-                help_event = SimpleNamespace(source=source, get_command_args=lambda: "")
-                help_text = await factory._handle_help_command(help_event)
-                hermes_text, system_text = help_text.split("**aqla Agent-System**")
-                assert "**Hermes Agent**" in hermes_text and "/native_probe" in hermes_text
-                assert "/aqla_status" not in hermes_text and "/aqla_status" in system_text
-                for page in ("1", "2", "999", "invalid"):
-                    event = SimpleNamespace(source=source, get_command_args=lambda page=page: page)
-                    wrapped = await factory._handle_commands_command(event)
-                    assert "**Hermes Agent**" in wrapped and "**aqla Agent-System**" in wrapped
-                    assert "/aqla_status" not in wrapped.split("**aqla Agent-System**")[0]
-                factory.config.platforms[Platform.TELEGRAM] = PlatformConfig(extra={"allow_admin_from": ["999"], "user_allowed_commands": ["help"]})
-                gated = await factory._handle_help_command(help_event)
-                assert "/aqla_status" not in gated and "/native_probe" not in gated
-            finally:
-                extension.gateway = old_gateway
-                factory.config.platforms.clear()
-                COMMAND_REGISTRY.remove(fixture_native)
-                COMMAND_REGISTRY.remove(fixture_system)
-            await app.process_update(Update.de_json(payload("/setup@other_bot", 12), app.bot))
-            assert extension.setup.challenge is None and admitted == []
-            # Authentic private candidates must also fail closed on either a
-            # wrong password or a missing positive native Telegram DeleteACK.
-            # Both pass through the real registry adapter and PTB dispatcher.
-            for identity, candidate, ack in ((30, WRONG_SYNTHETIC_PASSWORD, True), (32, SYNTHETIC_PASSWORD, False)):
-                await app.process_update(Update.de_json(payload("/setup", identity), app.bot))
-                assert extension.setup.challenge is not None
-                delete_ack[0] = ack
-                await app.process_update(Update.de_json(payload(candidate, identity + 1), app.bot))
-                assert extension.setup.claims() is None and admitted == []
-                assert deleted[-1]["message_id"] == identity + 1
-                assert "Setup nicht freigegeben" in sent[-1]["text"]
-                ordinary = extension.authority.sign("operator", "synthetic-rejected-setup-check")
-                try:
-                    await extension.mcp_call("aqla", "control", {"action": "resume", "context_auth": ordinary})
-                except AqlaError:
-                    pass
-                else:
-                    raise AssertionError("Rejected native candidate acquired MCP Setup authority")
-                entry = store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345"))
-                for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD):
-                    assert marker not in captured.getvalue()
-                    assert marker not in json.dumps(tool_arguments)
-                    assert marker not in json.dumps(store.load_transcript(entry.session_id))
-                    assert marker not in json.dumps(read_snapshot(home / "data/state.sqlite3"))
-            delete_ack[0] = True
-            deleted.clear()
-            await app.process_update(Update.de_json(payload("/setup", 1), app.bot))
-            updates = await app.bot.get_updates()
-            await app.process_update(updates[0])
-            assert extension.setup.claims() and len(deleted) == 1 and admitted == [], {
-                "configured": extension.setup.verifier is not None, "deleted": len(deleted), "admitted": len(admitted),
-                "challenge": extension.setup.challenge is not None,
-                "errors": [line for line in captured.getvalue().splitlines() if "Private Setup admission unavailable" in line]}
-            with extension.claim_scope(("operator", "native-owner")):
-                auth = extension.before_tool("mcp__aqla__control", {"action": "resume"})["args"]
-            assert (await extension.mcp_call("aqla", "control", {"action": "resume", **auth}))["paused"] is False
-            await app.process_update(Update.de_json(payload("/aqla_parameter backup leverage 5", 20), app.bot))
-            state = read_snapshot(home / "data/state.sqlite3")
-            assert state["profiles"]["backup"]["parameters"]["leverage"] == 5
-            await app.process_update(Update.de_json(payload("/aqla_maker backup tp", 21), app.bot))
-            keyboard = sent[-1]["reply_markup"]["inline_keyboard"]
-            token = require_first(item["callback_data"] for row in keyboard for item in row if item["text"] == "maker_only")
-            callback = {"update_id": 22, "callback_query": {"id": "synthetic-callback", "chat_instance": "synthetic-chat",
-                "from": {"id": 12345, "is_bot": False, "first_name": "Synthetic"}, "data": token,
-                "message": {"message_id": 1001 + len(sent), "date": 1791490000, "chat": {"id": 12345, "type": "private"},
-                            "from": {"id": 999, "is_bot": True, "first_name": "Synthetic bot"}, "text": "Untrusted callback label"}}}
-            await app.process_update(Update.de_json(callback, app.bot))
-            state = read_snapshot(home / "data/state.sqlite3")
-            assert state["profiles"]["backup"]["parameters"]["take_profit_execution"] == "maker_only"
-            assert state["profiles"]["backup"]["parameters"].get("entry_execution", "standard") == "standard"
-            revision = state["configuration_revision"]
-            callback["update_id"] = 23
-            await app.process_update(Update.de_json(callback, app.bot))
-            assert read_snapshot(home / "data/state.sqlite3")["configuration_revision"] == revision
-            await app.process_update(Update.de_json(payload("/aqla_pause", 24), app.bot))
-            assert read_snapshot(home / "data/state.sqlite3")["paused"] is True
-            assert admitted == []
-            await app.process_update(Update.de_json(payload("/aqla_status", 25), app.bot))
-            assert any("Dashboard" in row["text"] for row in sent) and admitted == []
-            assert panel_edits, "Native menu must edit its existing panel"
-            from aqla_agent.telegram_menu import HOME
-            panel_created = len(created)
-            panel_edited = len(panel_edits)
-            panel_revision = read_snapshot(home / "data/state.sqlite3")["configuration_revision"]
-            for sequence, (label, action) in enumerate(HOME, start=60):
-                await app.process_update(Update.de_json(payload("/aqla", sequence * 2), app.bot))
-                token = require_first(key for key, value in extension.commands.menu.tokens.items() if value[0] == action)
-                panel_callback = {"update_id": sequence * 2 + 1, "callback_query": {"id": "panel-" + str(sequence), "chat_instance": "panel-chat",
-                    "from": {"id": 12345, "is_bot": False, "first_name": "Synthetic"}, "data": token,
-                    "message": {"message_id": extension.commands.menu.message_id, "date": 1791490000,
-                        "chat": {"id": 12345, "type": "private"}, "from": {"id": 999, "is_bot": True, "first_name": "Synthetic bot"}, "text": label}}}
-                await app.process_update(Update.de_json(panel_callback, app.bot))
-                assert not any(marker in sent[-1]["text"] for marker in ("vorübergehend nicht verfügbar", "Nicht gespeichert", "Änderung nicht ausgeführt")), (action, sent[-1]["text"])
-            assert len(created) == panel_created + len(HOME) and admitted == []
-            assert len(panel_edits) == panel_edited + len(HOME)
-            assert read_snapshot(home / "data/state.sqlite3")["configuration_revision"] == panel_revision
-            # New source controls run through the actual native registry/PTB
-            # dispatcher and real MCP revision/setup gates, with no model turn.
-            existing_sources = set(read_snapshot(home / "data/state.sqlite3")["sources"])
-            synthetic_sources = [str(-9000 - index) for index in range(14)]
-            await app.process_update(Update.de_json(payload("/aqla_hinzufuegen " + " ".join(synthetic_sources), 40), app.bot))
-            await app.process_update(Update.de_json(payload("/aqla_hinzufuegen -9991 -9992 -9993", 41), app.bot))
-            state = read_snapshot(home / "data/state.sqlite3")
-            assert set(state["sources"]) == existing_sources | set(synthetic_sources) | {"-9991", "-9992", "-9993"}
-            await app.process_update(Update.de_json(payload('/aqla_kanalname -9991 "Synthetic channel"', 42), app.bot))
-            await app.process_update(Update.de_json(payload('/aqla_entfernen "Synthetic channel"', 43), app.bot))
-            state = read_snapshot(home / "data/state.sqlite3")
-            assert set(state["sources"]) == existing_sources | set(synthetic_sources) | {"-9992", "-9993"}
-            before_invalid = state["configuration_revision"]
-            await app.process_update(Update.de_json(payload('/aqla_hinzufuegen "Unknown free title"', 44), app.bot))
-            assert read_snapshot(home / "data/state.sqlite3")["configuration_revision"] == before_invalid
-            for identity, text in ((45, "ALLE AKTUELLEN KANÄLE"), (46, "zeig mir alle kanäle"), (47, "wie ist Status?"), (48, "/aqla_funktionen"), (49, "/aqla_konflikt")):
-                await app.process_update(Update.de_json(payload(text, identity), app.bot))
-            assert admitted == [] and any("Aktuell ausgewählte Kanäle" in row["text"] for row in sent)
-            from aqla_agent.messages import literal
-            long_text = "**Status**\n" + "\n".join(literal("😀[untrusted]_*`\\" * 50) for _ in range(20))
-            sent_before = len(sent)
-            await extension.commands.reply(app.bot, long_text, markdown=True)
-            chunks = sent[sent_before:]
-            assert len(chunks) > 1 and all(len(row["text"].encode("utf-16-le")) // 2 <= 4096 for row in chunks)
-            await app.process_update(Update.de_json(payload("/setup aus", 3), app.bot))
-            try:
-                await extension.mcp_call("aqla", "control", {"action": "resume", **auth})
-            except AqlaError:
-                pass
-            else:
-                raise AssertionError("Revoked native grant was accepted")
-            await app.process_update(Update.de_json(payload("/aqla_funktionen", 150), app.bot))
-            setup_token = require_first(key for key, value in extension.commands.menu.tokens.items() if value[0] == "setup")
-            setup_callback = {"update_id": 151, "callback_query": {"id": "setup-preview", "chat_instance": "panel-chat",
-                "from": {"id": 12345, "is_bot": False, "first_name": "Synthetic"}, "data": setup_token,
-                "message": {"message_id": extension.commands.menu.message_id, "date": 1791490000,
-                    "chat": {"id": 12345, "type": "private"}, "from": {"id": 999, "is_bot": True, "first_name": "Synthetic bot"}, "text": "Setup"}}}
-            await app.process_update(Update.de_json(setup_callback, app.bot))
-            assert extension.setup.challenge is not None and extension.setup.claims() is None
-            setup_callback["update_id"] = 152
-            setup_callback["callback_query"]["id"] = "setup-cancel"
-            setup_callback["callback_query"]["data"] = require_first(key for key, value in extension.commands.menu.tokens.items() if value[0] == "cancel")
-            await app.process_update(Update.de_json(setup_callback, app.bot))
-            assert extension.setup.challenge is None and extension.setup.claims() is None and extension.setup.failures == 0
-            await app.process_update(Update.de_json(payload("/setup", 4), app.bot))
-            old_prompt = extension.setup.challenge.prompt_id
-            candidate_deleted_before = len(deleted)
-            forwarded = payload(SYNTHETIC_PASSWORD, 5)
-            forwarded["message"]["forward_origin"] = {"type": "user", "date": 1791490000,
-                "sender_user": {"id": 6789, "is_bot": False, "first_name": "Synthetic source"}}
-            await app.process_update(Update.de_json(forwarded, app.bot))
-            assert extension.setup.claims() is None and len(deleted) == candidate_deleted_before + 1 and admitted == []
-            assert deleted[-1]["message_id"] == 5
-            edited = payload(SYNTHETIC_PASSWORD, 6)
-            edited["edited_message"] = edited.pop("message")
-            edited["edited_message"]["edit_date"] = 1791490001
-            await app.process_update(Update.de_json(edited, app.bot))
-            assert extension.setup.claims() is None and len(deleted) == candidate_deleted_before + 2 and admitted == []
-            assert deleted[-1]["message_id"] == 6
-            # Recreate ingress state as after process restart. The reply metadata
-            # is authenticated by the actual PTB Update parser and current bot.
-            extension.revoke_setup()
-            extension.setup = NativeSetup(extension.owner, extension.setup.verifier,
-                                          extension.setup_request, extension.setup_binding)
-            assert extension.setup.challenge is None and extension.setup.old_prompts == set()
-            late = payload(SYNTHETIC_PASSWORD, 7)
-            late["message"]["reply_to_message"] = {"message_id": old_prompt, "date": 1791490000,
-                "chat": {"id": 12345, "type": "private"},
-                "from": {"id": app.bot.id, "is_bot": True, "first_name": "Synthetic"}, "text": SETUP_PROMPT}
-            await app.process_update(Update.de_json(late, app.bot))
-            assert extension.setup.claims() is None and len(deleted) == candidate_deleted_before + 3 and admitted == []
-            assert deleted[-1]["message_id"] == 7
-            # Factory, handler rebuild, plugin replacement and runtime undo all
-            # retain one earliest handler and remove the previous authority.
-            replacement = factory._create_adapter(Platform.TELEGRAM, PlatformConfig(extra={"allow_from": ["12345"]}))
-            replacement.set_message_handler(admitted.append)
-            extension.boot(gateway, adapter=replacement)
-            assert extension.binding[0] is replacement and extension.setup.claims() is None
-            rebuild = Application.builder().bot(app.bot).build()
-            replacement._register_handlers(rebuild)
-            replacement._register_handlers(rebuild)
-            assert len(rebuild.handlers[-100]) == 1
-            assert install_strict_profile() is undo
-            discover_plugins(force=True)
-            assert extension not in EXTENSIONS and extension.binding is None
-            fresh = require_first(iter(EXTENSIONS))
-            fresh.boot(gateway, adapter=replacement)
-            assert fresh.binding[0] is replacement and fresh.setup.claims() is None
-            assert f"module=hermes_plugins.platforms__telegram.adapter hooks=true setup_handler=True system_handler=True catalog_count={len(COMMANDS)}" in captured.getvalue()
-            assert all(marker not in captured.getvalue() for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD))
-            assert extension.authority.key.decode() not in captured.getvalue()
-            assert all(marker not in json.dumps(read_snapshot(home / "data/state.sqlite3")) for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD))
-            for path in home.rglob("*"):
-                if path.is_file() and path.suffix in (".json", ".jsonl", ".yaml", ".log"):
-                    assert all(marker not in path.read_text(encoding="utf-8") for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD))
+            SessionSource = await verify_native_catalog_acl(Platform, PlatformConfig, extension, factory)
+            await verify_rejected_candidates(AqlaError, Platform, SessionSource, Update, admitted, app, captured, delete_ack, deleted, extension, home, payload, read_snapshot, sent, store, tool_arguments)
+            auth = await verify_native_grant(Update, admitted, app, captured, delete_ack, deleted, extension, payload)
+            callback, state = await verify_guided_profile(Update, app, home, payload, read_snapshot, sent)
+            await verify_callback_once_and_pause(Update, admitted, app, callback, home, panel_edits, payload, read_snapshot, sent, state)
+            await verify_panel_navigation(Update, admitted, app, created, extension, home, panel_edits, payload, read_snapshot, sent)
+            await verify_native_source_controls(Update, admitted, app, home, payload, read_snapshot, sent)
+            await verify_long_native_status(app, extension, sent)
+            await verify_revocation_and_preview(AqlaError, Update, app, auth, extension, payload)
+            old_prompt, candidate_deleted_before = await verify_untrusted_candidates(Update, admitted, app, deleted, extension, payload)
+            await verify_late_reply(NativeSetup, SETUP_PROMPT, Update, admitted, app, candidate_deleted_before, deleted, extension, old_prompt, payload)
+            await verify_factory_reload(Application, COMMANDS, EXTENSIONS, Platform, PlatformConfig, admitted, app, captured, discover_plugins, extension, factory, gateway, install_strict_profile, undo)
+            assert_private_persistence(captured, extension, home, read_snapshot)
         finally:
             tasks = [task for task in asyncio.all_tasks() if task.get_name().startswith("aqla-")]
             for task in tasks:

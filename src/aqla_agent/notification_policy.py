@@ -10,9 +10,21 @@ from .messages import literal, number
 TRANSIENT = {"reconciliation_unavailable", "recovery_timeout"}
 
 
+def _completed_wave_fills(trade, exit_order, entry):
+    observations = trade.get("order_observations", {})
+    pair = [observations.get(row["cloid"], {}) for row in (exit_order, entry)]
+    if any(row.get("status") not in ("filled", "canceled") or row.get("oid") is None for row in pair):
+        return None
+    fills = [[fill for fill in trade.get("fill_events", {}).values() if fill["oid"] == row["oid"]] for row in pair]
+    sold, bought = [sum((Decimal(fill["sz"]) for fill in group), Decimal(0)) for group in fills]
+    if sold > 0 and bought >= Decimal(entry["quantity"]) and bought <= sold:
+        return fills[1]
+
+    return None
+
+
 def completed_waves(trade):
     """Only paired native terminal orders and real fills prove a completed wave."""
-    observations = trade.get("order_observations", {})
     for entry in trade.get("entry_orders", []):
         if entry.get("kind") != "waverider" or entry.get("not_sent"):
             continue
@@ -20,13 +32,10 @@ def completed_waves(trade):
                            and row.get("cycle") == entry.get("cycle") and not row.get("not_sent")), None)
         if not exit_order:
             continue
-        pair = [observations.get(row["cloid"], {}) for row in (exit_order, entry)]
-        if any(row.get("status") not in ("filled", "canceled") or row.get("oid") is None for row in pair):
-            continue
-        fills = [[fill for fill in trade.get("fill_events", {}).values() if fill["oid"] == row["oid"]] for row in pair]
-        sold, bought = [sum((Decimal(fill["sz"]) for fill in group), Decimal(0)) for group in fills]
-        if sold > 0 and bought >= Decimal(entry["quantity"]) and bought <= sold:
-            yield "wave:" + trade["trade_id"] + ":" + str(entry["cycle"]), fills[1]
+        fills = _completed_wave_fills(trade, exit_order, entry)
+        if fills is not None:
+            yield "wave:" + trade["trade_id"] + ":" + str(entry["cycle"]), fills
+
 
 
 def trade_label(trade):
@@ -62,157 +71,213 @@ def compact_event(data, _notice, trade, kind, fills=()):
     return "\n".join(lines)
 
 
-def select(data, *, covered, stamp=None):
-    """Return messages and explicit suppression receipts, never fake Telegram ACKs."""
-    stamp = now_ms() if stamp is None else stamp
-    policy = data.get("notice_policy_state", {})
-    announced = policy.get("announced_incidents", {})
-    seen_fills = set(policy.get("seen_fills", []))
-    used = {key for row in data.get("notification_outbox", {}).values() if row["status"] != "suppressed"
-            for key in row.get("event_keys", [])}
-    messages, suppressed, deferred = [], {}, {}
-    notifications = data.get("notifications", {})
-    for identity, notice in notifications.items():
-        version = digest(notice)
-        if (identity, version) in covered:
-            continue
-        trade = data.get("trades", {}).get(notice.get("trade_id"))
-        severity, keys, text = notice.get("severity", "normal"), [], None
-        incident, incident_signature = None, None
-        observed = notice.get("observed_at", stamp)
-        if identity.startswith("protection:") or severity in ("critical", "urgent", "error") and not ("recovery_reports" in notice or "reports" in notice):
-            account = notice.get("account_key") or (trade or {}).get("plan", {}).get("account_key")
-            incident = digest([account]) if account else None
-            incident_signature = digest([identity, notice.get("error"), notice.get("code"), severity])
-            if incident and announced.get(incident) and policy.get("incident_signatures", {}).get(incident) == incident_signature:
-                suppressed[identity] = (version, "same_active_alarm")
-                continue
-            keys = ["alarm:" + digest([identity, incident_signature, notice.get("generation_id", observed)])]
-        elif "recovery_reports" in notice or "reports" in notice:
-            from .recovery_notices import safe_report
-            reports = notice.get("recovery_reports", [fact for row in notice.get("reports", []) if (fact := safe_report(row))])
-            incident = digest(sorted({row.get("account_key", row.get("exchange", "unknown")) for row in reports}))
-            incident_signature = digest(reports)
-            # An announced incident is cleared only by a positively reconciled resolution.
-            if notice.get("resolved"):
-                if not announced.get(incident):
-                    suppressed[identity] = (version, "unannounced_recovery")
-                    continue
-                keys = ["recovery:" + incident + ":" + str(observed)]
-            elif reports and all(row.get("code") in TRANSIENT for row in reports):
-                newer_resolution = any(other.get("resolved") and other.get("observed_at", 0) >= observed
-                    and {row.get("account_key", row.get("exchange")) for row in other.get("recovery_reports", [])}
-                    >= {row.get("account_key", row.get("exchange")) for row in reports} for other in notifications.values())
-                if newer_resolution:
-                    suppressed[identity] = (version, "transient_resolved")
-                    continue
-                first = policy.get("incident_since", {}).get(incident, observed)
-                if stamp - first < 120000:
-                    deferred[incident] = first
-                    continue
-                if announced.get(incident):
-                    suppressed[identity] = (version, "incident_already_announced")
-                    continue
-                keys = ["incident:" + incident + ":" + str(first)]
-            else:
-                if announced.get(incident) and policy.get("incident_signatures", {}).get(incident) == incident_signature:
-                    suppressed[identity] = (version, "same_active_alarm")
-                    continue
-                keys = ["incident:" + incident + ":" + incident_signature + ":" + str(observed)]
-                severity = "urgent"
-        elif notice.get("source_notice"):
-            code = notice["source_notice"].get("code", "")
-            category = notice["source_notice"].get("category", "reader")
-            incident = "source:" + category
-            incident_signature = digest(notice["source_notice"])
-            if code.endswith(("recovered", "resolved")):
-                if not announced.get(incident):
-                    suppressed[identity] = (version, "unannounced_source_recovery")
-                    continue
-                keys = ["source-recovery:" + identity]
-            else:
-                newer_resolution = any(other.get("source_notice", {}).get("category") == category
-                    and other["source_notice"].get("code", "").endswith(("recovered", "resolved"))
-                    and other.get("observed_at", 0) >= observed for other in notifications.values())
-                if newer_resolution:
-                    suppressed[identity] = (version, "transient_source_resolved")
-                    continue
-                if announced.get(incident) and policy.get("incident_signatures", {}).get(incident) == incident_signature:
-                    suppressed[identity] = (version, "same_active_source_alarm")
-                    continue
-                if code in ("reader_unavailable", "reader_rate_limited", "sources_unavailable"):
-                    first = policy.get("incident_since", {}).get(incident, observed)
-                    if stamp - first < 120000:
-                        deferred[incident] = first
-                        continue
-                else:
-                    severity = "urgent"
-                keys = ["source:" + identity]
-        elif notice.get("monthly_report"):
-            keys = ["month:" + digest(notice["monthly_report"])]
-        elif trade:
-            lifecycle = notice.get("lifecycle", {}).get("kind")
-            current_fills = trade.get("fill_events", {})
-            fresh = [(key, row) for key, row in current_fills.items() if trade["trade_id"] + ":" + key not in seen_fills]
-            kind = None
-            if lifecycle == "entry_fill":
-                kind, keys = "entry", ["entry:" + trade["trade_id"]]
-            elif lifecycle == "closed" or notice.get("change", {}).get("status") == "closed":
-                kind, keys = "closed", ["closed:" + trade["trade_id"]]
-            elif notice.get("change", {}).get("status") in ("unknown", "conflicted"):
-                keys = ["trade-alarm:" + trade["trade_id"] + ":" + trade["status"]]
-                severity = "urgent"
-            else:
-                exits = [(key, row) for key, row in fresh if row["kind"] not in ("entry", "waverider", "waverider_retirement")]
-                if exits:
-                    kind, keys = "exit", ["fill:" + trade["trade_id"] + ":" + key for key, _ in exits]
-                    fresh = exits
-                else:
-                    wave = next(((key, fills) for key, fills in completed_waves(trade) if key not in used), None)
-                    if wave:
-                        kind, keys = "wave", [wave[0]]
-                        fresh = [(digest(fill), fill) for fill in wave[1]]
-            if kind:
-                if stamp - observed < 15000:
-                    continue
-                text = compact_event(data, notice, trade, kind, [row for _, row in fresh])
-            if not keys:
-                suppressed[identity] = (version, "routine_trade_observation")
-                continue
-        elif notice.get("error") and not notice.get("event_id"):
-            keys = ["system:" + digest(notice)]
+class _NoticePolicy:
+    def __init__(self, data, covered, stamp):
+        self.data, self.covered, self.stamp = data, covered, stamp
+        self.policy = self.data.get("notice_policy_state", {})
+        self.announced = self.policy.get("announced_incidents", {})
+        self.seen_fills = set(self.policy.get("seen_fills", []))
+        self.used = {key for row in self.data.get("notification_outbox", {}).values() if row["status"] != "suppressed"
+                for key in row.get("event_keys", [])}
+        self.messages, self.suppressed, self.deferred = [], {}, {}
+        self.notifications = self.data.get("notifications", {})
+
+    def select_notice(self, identity, notice):
+        self.identity, self.notice = identity, notice
+        self.version = digest(self.notice)
+        if (self.identity, self.version) in self.covered:
+            return
+        self.trade = self.data.get("trades", {}).get(self.notice.get("trade_id"))
+        self.severity, self.keys, self.text = self.notice.get("severity", "normal"), [], None
+        self.incident, self.incident_signature = None, None
+        self.observed = self.notice.get("observed_at", self.stamp)
+        if self.is_alarm():
+            if not self.alarm_notice():
+                return
+        elif "recovery_reports" in self.notice or "reports" in self.notice:
+            if not self.recovery_notice():
+                return
+        elif self.notice.get("source_notice"):
+            if not self.source_notice():
+                return
+        elif self.notice.get("monthly_report"):
+            self.keys = ["month:" + digest(self.notice["monthly_report"])]
+        elif self.trade:
+            if not self.trade_notice():
+                return
+        elif self.notice.get("error") and not self.notice.get("event_id"):
+            self.keys = ["system:" + digest(self.notice)]
         else:
-            suppressed[identity] = (version, "dashboard_only")
-            continue
-        resolved = bool(notice.get("resolved") or notice.get("source_notice", {}).get("code", "").endswith(("recovered", "resolved")))
-        if incident and not resolved and any(row.get("incident") == incident and row.get("incident_signature") == incident_signature
-                and not row.get("resolved") and row["status"] in ("pending", "sending", "exhausted") for row in data.get("notification_outbox", {}).values()):
-            suppressed[identity] = (version, "same_pending_alarm")
-            continue
-        if keys and all(key in used for key in keys):
-            suppressed[identity] = (version, "same_execution_event")
-            continue
-        if text is None:
-            from .messages import telegram_view
-            subset = {**data, "notifications": {identity: notice}}
-            text = "\n".join(part for message in telegram_view(subset, {}, include_status=False)["messages"] for part in message["texts"])
-        item = {"versions": {identity: version}, "text": text, "severity": severity, "event_keys": keys}
-        if trade:
-            item["fill_keys"] = [trade["trade_id"] + ":" + key for key in trade.get("fill_events", {})]
-            item["trade_id"] = trade["trade_id"]
-            if "closed:" + trade["trade_id"] in keys:
+            self.suppressed[self.identity] = (self.version, "dashboard_only")
+            return
+        self.append_notice()
+
+    def is_alarm(self):
+        return self.identity.startswith("protection:") or self.severity in ("critical", "urgent", "error") and not ("recovery_reports" in self.notice or "reports" in self.notice)
+
+    def alarm_notice(self):
+        account = self.notice.get("account_key") or (self.trade or {}).get("plan", {}).get("account_key")
+        self.incident = digest([account]) if account else None
+        self.incident_signature = digest([self.identity, self.notice.get("error"), self.notice.get("code"), self.severity])
+        if self.incident and self.announced.get(self.incident) and self.policy.get("incident_signatures", {}).get(self.incident) == self.incident_signature:
+            self.suppressed[self.identity] = (self.version, "same_active_alarm")
+            return False
+        self.keys = ["alarm:" + digest([self.identity, self.incident_signature, self.notice.get("generation_id", self.observed)])]
+        return True
+
+    def recovery_notice(self):
+        from .recovery_notices import safe_report
+        reports = self.notice.get("recovery_reports", [fact for row in self.notice.get("reports", []) if (fact := safe_report(row))])
+        self.incident = digest(sorted({row.get("account_key", row.get("exchange", "unknown")) for row in reports}))
+        self.incident_signature = digest(reports)
+        # An announced incident is cleared only by a positively reconciled resolution.
+        if self.notice.get("resolved"):
+            if not self.announced.get(self.incident):
+                self.suppressed[self.identity] = (self.version, "unannounced_recovery")
+                return False
+            self.keys = ["recovery:" + self.incident + ":" + str(self.observed)]
+        elif reports and all(row.get("code") in TRANSIENT for row in reports):
+            if not self.transient_recovery(reports):
+                return False
+        else:
+            if self.announced.get(self.incident) and self.policy.get("incident_signatures", {}).get(self.incident) == self.incident_signature:
+                self.suppressed[self.identity] = (self.version, "same_active_alarm")
+                return False
+            self.keys = ["incident:" + self.incident + ":" + self.incident_signature + ":" + str(self.observed)]
+            self.severity = "urgent"
+        return True
+
+    def transient_recovery(self, reports):
+        newer_resolution = any(other.get("resolved") and other.get("observed_at", 0) >= self.observed
+            and {row.get("account_key", row.get("exchange")) for row in other.get("recovery_reports", [])}
+            >= {row.get("account_key", row.get("exchange")) for row in reports} for other in self.notifications.values())
+        if newer_resolution:
+            self.suppressed[self.identity] = (self.version, "transient_resolved")
+            return False
+        first = self.policy.get("incident_since", {}).get(self.incident, self.observed)
+        if self.stamp - first < 120000:
+            self.deferred[self.incident] = first
+            return False
+        if self.announced.get(self.incident):
+            self.suppressed[self.identity] = (self.version, "incident_already_announced")
+            return False
+        self.keys = ["incident:" + self.incident + ":" + str(first)]
+        return True
+
+    def newer_source_resolution(self, category):
+        return any(other.get("source_notice", {}).get("category") == category
+            and other["source_notice"].get("code", "").endswith(("recovered", "resolved"))
+            and other.get("observed_at", 0) >= self.observed for other in self.notifications.values())
+
+    def source_notice(self):
+        code = self.notice["source_notice"].get("code", "")
+        category = self.notice["source_notice"].get("category", "reader")
+        self.incident = "source:" + category
+        self.incident_signature = digest(self.notice["source_notice"])
+        if code.endswith(("recovered", "resolved")):
+            if not self.announced.get(self.incident):
+                self.suppressed[self.identity] = (self.version, "unannounced_source_recovery")
+                return False
+            self.keys = ["source-recovery:" + self.identity]
+        else:
+            newer_resolution = self.newer_source_resolution(category)
+            if newer_resolution:
+                self.suppressed[self.identity] = (self.version, "transient_source_resolved")
+                return False
+            if self.announced.get(self.incident) and self.policy.get("incident_signatures", {}).get(self.incident) == self.incident_signature:
+                self.suppressed[self.identity] = (self.version, "same_active_source_alarm")
+                return False
+            if code in ("reader_unavailable", "reader_rate_limited", "sources_unavailable"):
+                first = self.policy.get("incident_since", {}).get(self.incident, self.observed)
+                if self.stamp - first < 120000:
+                    self.deferred[self.incident] = first
+                    return False
+            else:
+                self.severity = "urgent"
+            self.keys = ["source:" + self.identity]
+        return True
+
+    def trade_receipt(self):
+        lifecycle = self.notice.get("lifecycle", {}).get("kind")
+        current_fills = self.trade.get("fill_events", {})
+        fresh = [(key, row) for key, row in current_fills.items() if self.trade["trade_id"] + ":" + key not in self.seen_fills]
+        kind = None
+        if lifecycle == "entry_fill":
+            kind, self.keys = "entry", ["entry:" + self.trade["trade_id"]]
+        elif lifecycle == "closed" or self.notice.get("change", {}).get("status") == "closed":
+            kind, self.keys = "closed", ["closed:" + self.trade["trade_id"]]
+        elif self.notice.get("change", {}).get("status") in ("unknown", "conflicted"):
+            self.keys = ["trade-alarm:" + self.trade["trade_id"] + ":" + self.trade["status"]]
+            self.severity = "urgent"
+        else:
+            exits = [(key, row) for key, row in fresh if row["kind"] not in ("entry", "waverider", "waverider_retirement")]
+            if exits:
+                kind, self.keys = "exit", ["fill:" + self.trade["trade_id"] + ":" + key for key, _ in exits]
+                fresh = exits
+            else:
+                wave = next(((key, fills) for key, fills in completed_waves(self.trade) if key not in self.used), None)
+                if wave:
+                    kind, self.keys = "wave", [wave[0]]
+                    fresh = [(digest(fill), fill) for fill in wave[1]]
+        return kind, fresh
+
+    def trade_notice(self):
+        kind, fresh = self.trade_receipt()
+        if kind:
+            if self.stamp - self.observed < 15000:
+                return False
+            self.text = compact_event(self.data, self.notice, self.trade, kind, [row for _, row in fresh])
+        if not self.keys:
+            self.suppressed[self.identity] = (self.version, "routine_trade_observation")
+            return False
+        return True
+
+    def notice_item(self, resolved):
+        item = {"versions": {self.identity: self.version}, "text": self.text, "severity": self.severity, "event_keys": self.keys}
+        if self.trade:
+            item["fill_keys"] = [self.trade["trade_id"] + ":" + key for key in self.trade.get("fill_events", {})]
+            item["trade_id"] = self.trade["trade_id"]
+            if "closed:" + self.trade["trade_id"] in self.keys:
                 from .monthly import report_row
                 item["closed_notice"] = True
-                item["accounting_fingerprint"] = digest(report_row(data, trade))
-        if incident:
-            item["incident"] = incident
-            item["incident_signature"] = incident_signature
+                item["accounting_fingerprint"] = digest(report_row(self.data, self.trade))
+        if self.incident:
+            item["incident"] = self.incident
+            item["incident_signature"] = self.incident_signature
             item["resolved"] = resolved
+        return item
+
+    def pending_alarm(self, resolved):
+        return self.incident and not resolved and any(row.get("incident") == self.incident and row.get("incident_signature") == self.incident_signature
+                and not row.get("resolved") and row["status"] in ("pending", "sending", "exhausted") for row in self.data.get("notification_outbox", {}).values())
+
+    def append_notice(self):
+        resolved = bool(self.notice.get("resolved") or self.notice.get("source_notice", {}).get("code", "").endswith(("recovered", "resolved")))
+        if self.pending_alarm(resolved):
+            self.suppressed[self.identity] = (self.version, "same_pending_alarm")
+            return
+        if self.keys and all(key in self.used for key in self.keys):
+            self.suppressed[self.identity] = (self.version, "same_execution_event")
+            return
+        if self.text is None:
+            from .messages import telegram_view
+            subset = {**self.data, "notifications": {self.identity: self.notice}}
+            self.text = "\n".join(part for message in telegram_view(subset, {}, include_status=False)["messages"] for part in message["texts"])
+        item = self.notice_item(resolved)
         # Sibling notices for the same receipt are included in one immutable delivery.
-        sibling = next((row for row in messages if set(row["event_keys"]) == set(keys)), None)
+        sibling = next((row for row in self.messages if set(row["event_keys"]) == set(self.keys)), None)
         if sibling:
-            sibling["versions"][identity] = version
+            sibling["versions"][self.identity] = self.version
         else:
-            messages.append(item)
-        used.update(keys)
-    return messages, suppressed, deferred
+            self.messages.append(item)
+        self.used.update(self.keys)
+
+    def select(self):
+        for identity, notice in self.notifications.items():
+            self.select_notice(identity, notice)
+        return self.messages, self.suppressed, self.deferred
+
+
+def select(data, *, covered, stamp=None):
+    """Return messages and explicit suppression receipts, never fake Telegram ACKs."""
+    return _NoticePolicy(data, covered, now_ms() if stamp is None else stamp).select()

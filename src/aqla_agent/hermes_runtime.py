@@ -8,6 +8,204 @@ from types import MethodType
 _ACTIVE_UNDO = None
 
 
+def _wrap_setup_handlers(applications, register_handlers, intercept_native_setup, logging):
+    def setup_handlers(self, app):
+        from telegram import Update
+        from telegram.ext import ApplicationHandlerStop, TypeHandler
+
+        async def private_setup(update, context):
+            try:
+                handled = await intercept_native_setup(self, update, context)
+            except Exception as error:
+                logging.getLogger(__name__).warning("Private native admission unavailable (%s)", type(error).__name__)
+                handled = True
+            if handled:
+                # Pinned native integration interface; covered by native contract and integration checks.
+                # skipcq: PYL-W0212
+                self._accept_update()
+                raise ApplicationHandlerStop
+
+        # Handler ownership is explicit; re-registration cannot duplicate admission.
+        table = getattr(app, "handlers", {})
+        if not any(getattr(getattr(handler, "callback", None), "_aqla_admission", False) for handler in table.get(-100, [])):
+            handler = TypeHandler(Update, private_setup)
+            # Pinned native integration interface; covered by native contract and integration checks.
+            # skipcq: PYL-W0212
+            private_setup._aqla_admission = True
+            app.add_handler(handler, group=-100)
+            applications.append((app, handler))
+        register_handlers(app)
+        from .native_commands import COMMANDS
+        present = any(getattr(getattr(handler, "callback", None), "_aqla_admission", False) for handler in app.handlers.get(-100, []))
+        if not present or not getattr(self, "_aqla_runtime_bound", False):
+            raise RuntimeError("Private native Telegram admission is unavailable")
+        logging.getLogger(__name__).info(
+            "aqla native Telegram ready module=%s hooks=true setup_handler=%s system_handler=%s catalog_count=%d",
+            type(self).__module__, present, present, len(COMMANDS))
+
+    return setup_handlers
+
+
+def _wrap_run_agent(gateway_extension, run_native_turn, native_turn):
+    async def run_agent(self, message, context_prompt, history, source, session_id, **kwargs):
+        from .tool_outputs import capture_scope
+        from .tool_runtime import GUIDANCE, owned_profile
+        extension = gateway_extension(self)
+        incoming = extension.turn_event.get() if extension else None
+        if incoming and (getattr(incoming, "metadata", None) or {}).get("hermes_plugin_injection") is True:
+            from .events import WAKE
+            context_prompt = (context_prompt or "") + "\n\n" + WAKE
+            kwargs["scheduled_heartbeat"] = True
+        if owned_profile():
+            context_prompt = (context_prompt or "") + "\n\n" + GUIDANCE
+            with capture_scope(session_id, "context-history"):
+                return await run_native_turn(self, source, lambda: native_turn(self, message, context_prompt, history, source, session_id, **kwargs))
+        return await run_native_turn(self, source, lambda: native_turn(self, message, context_prompt, history, source, session_id, **kwargs))
+    return run_agent
+
+
+def _wrap_queued_followup(run_native_followup, native_followup):
+    async def queued_followup(self, turn_ctx, adapter, pending, pending_event, response, result, stream_task):
+        return await run_native_followup(self, pending_event,
+                                         lambda: native_followup(self, turn_ctx, adapter, pending, pending_event, response, result, stream_task))
+    return queued_followup
+
+
+def _wrap_install_reconnected_adapter(rebind_native_adapter, reconnect):
+    async def install_reconnected_adapter(self, platform, adapter):
+        rebind_native_adapter(self, platform, adapter)
+        return await reconnect(self, platform, adapter)
+    return install_reconnected_adapter
+
+
+def _wrap_turn_toolsets(resolve_toolsets, gateway_extension):
+    def turn_toolsets(self, user_config, source, platform_key):
+        enabled, disabled = resolve_toolsets(self, user_config, source, platform_key)
+        extension = gateway_extension(self)
+        origin = extension.active_context if extension else None
+        if origin and origin[0] == "source" and extension.efficiency.get("source_toolsets", True):
+            enabled = ["aqla-source"] if "mcp-aqla" in enabled else []
+        return enabled, disabled
+    return turn_toolsets
+
+
+def _wrap_clarify_callback(original_clarify, record_clarify_outcome):
+    def clarify_callback(self, questions):
+        try:
+            result = original_clarify(self, questions)
+        except BaseException:
+            record_clarify_outcome({"outcome": "undelivered", "answers": {}})
+            raise
+        record_clarify_outcome(result)
+        return result
+    return clarify_callback
+
+
+def _wrap_bind_telegram(applications, intercept_native_setup, logging, adapters, ingress_identity, stamp_native_event):
+    def bind_telegram(adapter):
+        from .hermes_contract import check_telegram_contract
+        check_telegram_contract(adapter)
+        if getattr(adapter, "_aqla_runtime_bound", False):
+            return
+        saved = []
+
+        def instance_replace(name, function):
+            previous = getattr(adapter, name)
+            function.__aqla_contract_original__ = getattr(previous, "__func__", previous)
+            saved.append((name, name in adapter.__dict__, adapter.__dict__.get(name)))
+            setattr(adapter, name, MethodType(function, adapter))
+
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
+        register_handlers = adapter._register_handlers
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
+        build_event = adapter._build_message_event
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
+        text_key = adapter._text_batch_key
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
+        photo_key = adapter._photo_batch_key
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
+        media_group = adapter._queue_media_group_event
+
+        setup_handlers = _wrap_setup_handlers(applications, register_handlers, intercept_native_setup, logging)
+
+        def build_message_event(_self, *args, **kwargs):
+            return stamp_native_event(build_event(*args, **kwargs))
+
+        def text_batch_key(_self, event):
+            key = text_key(event)
+            kind, identity = ingress_identity(event)
+            return f"{key}:aqla-source:{identity}" if kind == "source" else key
+
+        def photo_batch_key(_self, event, message):
+            key = photo_key(event, message)
+            kind, identity = ingress_identity(event)
+            return f"{key}:aqla-source:{identity}" if kind == "source" else key
+
+        async def queue_media_group(_self, group_id, event):
+            kind, identity = ingress_identity(event)
+            if kind == "source":
+                group_id = f"{group_id}:aqla-source:{identity}"
+            await media_group(group_id, event)
+
+        from .events import EXTENSIONS
+        from .native_commands import install_menu
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
+        adapter._aqla_owners = tuple(extension.owner for extension in EXTENSIONS)
+        instance_replace("_register_handlers", setup_handlers)
+        instance_replace("_build_message_event", build_message_event)
+        instance_replace("_text_batch_key", text_batch_key)
+        instance_replace("_photo_batch_key", photo_batch_key)
+        instance_replace("_queue_media_group_event", queue_media_group)
+        install_menu(adapter, instance_replace)
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
+        adapter._aqla_runtime_bound = True
+        adapters.append((adapter, saved))
+    return bind_telegram
+
+
+def _wrap_actual_adapter(create_adapter, bind_telegram):
+    def actual_adapter(self, platform, config):
+        adapter = create_adapter(self, platform, config)
+        if adapter is not None and getattr(platform, "value", platform) == "telegram":
+            bind_telegram(adapter)
+        return adapter
+    return actual_adapter
+
+
+def _wrap_can_merge_text(ingress_identity, can_merge):
+    def can_merge_text(self, existing, event):
+        return ingress_identity(existing) == ingress_identity(event) and can_merge(self, existing, event)
+    return can_merge_text
+
+
+def _wrap_finish_wiring(original_wiring, gateway_ready):
+    async def finish_wiring(self, connected_count):
+        await original_wiring(self, connected_count)
+        gateway_ready(self)
+    return finish_wiring
+
+
+def _wrap_trading_services_only():
+    async def trading_services_only(self, connected_count):
+        # The pinned native ABI supplies this count; configured services govern startup.
+        # skipcq: PTC-W0043
+        del connected_count
+        # Preserve the native event-loop watchdog; unused room/kanban/heartbeat
+        # products must not create their own storage or strategy work.
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
+        self._start_loop_heartbeat_task()
+        await self.hooks.emit("gateway:startup", {"platforms": [platform.value for platform in self.adapters]})
+    return trading_services_only
+
+
 def install_strict_profile():
     """Keep Aqla authority boundaries while using native SQLite session storage."""
     # Process-wide install/undo identity prevents duplicate native patches.
@@ -76,28 +274,11 @@ def install_strict_profile():
     # skipcq: PYL-W0212
     reconnect = GatewayAdapterLifecycleMixin._install_reconnected_adapter
 
-    async def run_agent(self, message, context_prompt, history, source, session_id, **kwargs):
-        from .tool_outputs import capture_scope
-        from .tool_runtime import GUIDANCE, owned_profile
-        extension = gateway_extension(self)
-        incoming = extension.turn_event.get() if extension else None
-        if incoming and (getattr(incoming, "metadata", None) or {}).get("hermes_plugin_injection") is True:
-            from .events import WAKE
-            context_prompt = (context_prompt or "") + "\n\n" + WAKE
-            kwargs["scheduled_heartbeat"] = True
-        if owned_profile():
-            context_prompt = (context_prompt or "") + "\n\n" + GUIDANCE
-            with capture_scope(session_id, "context-history"):
-                return await run_native_turn(self, source, lambda: native_turn(self, message, context_prompt, history, source, session_id, **kwargs))
-        return await run_native_turn(self, source, lambda: native_turn(self, message, context_prompt, history, source, session_id, **kwargs))
+    run_agent = _wrap_run_agent(gateway_extension, run_native_turn, native_turn)
 
-    async def queued_followup(self, turn_ctx, adapter, pending, pending_event, response, result, stream_task):
-        return await run_native_followup(self, pending_event,
-                                         lambda: native_followup(self, turn_ctx, adapter, pending, pending_event, response, result, stream_task))
+    queued_followup = _wrap_queued_followup(run_native_followup, native_followup)
 
-    async def install_reconnected_adapter(self, platform, adapter):
-        rebind_native_adapter(self, platform, adapter)
-        return await reconnect(self, platform, adapter)
+    install_reconnected_adapter = _wrap_install_reconnected_adapter(rebind_native_adapter, reconnect)
 
     replace(GatewayTurnMixin, "_run_agent", run_agent)
     import toolsets
@@ -110,13 +291,7 @@ def install_strict_profile():
     # skipcq: PYL-W0212
     resolve_toolsets = GatewayTurnMixin._resolve_turn_toolsets
 
-    def turn_toolsets(self, user_config, source, platform_key):
-        enabled, disabled = resolve_toolsets(self, user_config, source, platform_key)
-        extension = gateway_extension(self)
-        origin = extension.active_context if extension else None
-        if origin and origin[0] == "source" and extension.efficiency.get("source_toolsets", True):
-            enabled = ["aqla-source"] if "mcp-aqla" in enabled else []
-        return enabled, disabled
+    turn_toolsets = _wrap_turn_toolsets(resolve_toolsets, gateway_extension)
 
     replace(GatewayTurnMixin, "_resolve_turn_toolsets", turn_toolsets)
     replace(GatewayTurnMixin, "_run_agent_queued_followup", queued_followup)
@@ -129,14 +304,7 @@ def install_strict_profile():
     # skipcq: PYL-W0212
     original_clarify = TurnRunner._clarify_callback_sync
 
-    def clarify_callback(self, questions):
-        try:
-            result = original_clarify(self, questions)
-        except BaseException:
-            record_clarify_outcome({"outcome": "undelivered", "answers": {}})
-            raise
-        record_clarify_outcome(result)
-        return result
+    clarify_callback = _wrap_clarify_callback(original_clarify, record_clarify_outcome)
 
     replace(TurnRunner, "_clarify_callback_sync", clarify_callback)
 
@@ -146,117 +314,16 @@ def install_strict_profile():
     # skipcq: PYL-W0212
     create_adapter = GatewayAdapterLifecycleMixin._create_adapter
 
-    def bind_telegram(adapter):
-        from .hermes_contract import check_telegram_contract
-        check_telegram_contract(adapter)
-        if getattr(adapter, "_aqla_runtime_bound", False):
-            return
-        saved = []
+    bind_telegram = _wrap_bind_telegram(applications, intercept_native_setup, logging, adapters, ingress_identity, stamp_native_event)
 
-        def instance_replace(name, function):
-            previous = getattr(adapter, name)
-            function.__aqla_contract_original__ = getattr(previous, "__func__", previous)
-            saved.append((name, name in adapter.__dict__, adapter.__dict__.get(name)))
-            setattr(adapter, name, MethodType(function, adapter))
-
-        # Pinned native integration interface; covered by native contract and integration checks.
-        # skipcq: PYL-W0212
-        register_handlers = adapter._register_handlers
-        # Pinned native integration interface; covered by native contract and integration checks.
-        # skipcq: PYL-W0212
-        build_event = adapter._build_message_event
-        # Pinned native integration interface; covered by native contract and integration checks.
-        # skipcq: PYL-W0212
-        text_key = adapter._text_batch_key
-        # Pinned native integration interface; covered by native contract and integration checks.
-        # skipcq: PYL-W0212
-        photo_key = adapter._photo_batch_key
-        # Pinned native integration interface; covered by native contract and integration checks.
-        # skipcq: PYL-W0212
-        media_group = adapter._queue_media_group_event
-
-        def setup_handlers(self, app):
-            from telegram import Update
-            from telegram.ext import ApplicationHandlerStop, TypeHandler
-
-            async def private_setup(update, context):
-                try:
-                    handled = await intercept_native_setup(self, update, context)
-                except Exception as error:
-                    logging.getLogger(__name__).warning("Private native admission unavailable (%s)", type(error).__name__)
-                    handled = True
-                if handled:
-                    # Pinned native integration interface; covered by native contract and integration checks.
-                    # skipcq: PYL-W0212
-                    self._accept_update()
-                    raise ApplicationHandlerStop
-
-            # Handler ownership is explicit; re-registration cannot duplicate admission.
-            table = getattr(app, "handlers", {})
-            if not any(getattr(getattr(handler, "callback", None), "_aqla_admission", False) for handler in table.get(-100, [])):
-                handler = TypeHandler(Update, private_setup)
-                # Pinned native integration interface; covered by native contract and integration checks.
-                # skipcq: PYL-W0212
-                private_setup._aqla_admission = True
-                app.add_handler(handler, group=-100)
-                applications.append((app, handler))
-            register_handlers(app)
-            from .native_commands import COMMANDS
-            present = any(getattr(getattr(handler, "callback", None), "_aqla_admission", False) for handler in app.handlers.get(-100, []))
-            if not present or not getattr(self, "_aqla_runtime_bound", False):
-                raise RuntimeError("Private native Telegram admission is unavailable")
-            logging.getLogger(__name__).info(
-                "aqla native Telegram ready module=%s hooks=true setup_handler=%s system_handler=%s catalog_count=%d",
-                type(self).__module__, present, present, len(COMMANDS))
-
-        def build_message_event(_self, *args, **kwargs):
-            return stamp_native_event(build_event(*args, **kwargs))
-
-        def text_batch_key(_self, event):
-            key = text_key(event)
-            kind, identity = ingress_identity(event)
-            return f"{key}:aqla-source:{identity}" if kind == "source" else key
-
-        def photo_batch_key(_self, event, message):
-            key = photo_key(event, message)
-            kind, identity = ingress_identity(event)
-            return f"{key}:aqla-source:{identity}" if kind == "source" else key
-
-        async def queue_media_group(_self, group_id, event):
-            kind, identity = ingress_identity(event)
-            if kind == "source":
-                group_id = f"{group_id}:aqla-source:{identity}"
-            await media_group(group_id, event)
-
-        from .events import EXTENSIONS
-        from .native_commands import install_menu
-        # Pinned native integration interface; covered by native contract and integration checks.
-        # skipcq: PYL-W0212
-        adapter._aqla_owners = tuple(extension.owner for extension in EXTENSIONS)
-        instance_replace("_register_handlers", setup_handlers)
-        instance_replace("_build_message_event", build_message_event)
-        instance_replace("_text_batch_key", text_batch_key)
-        instance_replace("_photo_batch_key", photo_batch_key)
-        instance_replace("_queue_media_group_event", queue_media_group)
-        install_menu(adapter, instance_replace)
-        # Pinned native integration interface; covered by native contract and integration checks.
-        # skipcq: PYL-W0212
-        adapter._aqla_runtime_bound = True
-        adapters.append((adapter, saved))
-
-    def actual_adapter(self, platform, config):
-        adapter = create_adapter(self, platform, config)
-        if adapter is not None and getattr(platform, "value", platform) == "telegram":
-            bind_telegram(adapter)
-        return adapter
+    actual_adapter = _wrap_actual_adapter(create_adapter, bind_telegram)
 
     replace(GatewayAdapterLifecycleMixin, "_create_adapter", actual_adapter)
     # Pinned native integration interface; covered by native contract and integration checks.
     # skipcq: PYL-W0212
     can_merge = BasePlatformAdapter._can_merge_text_debounce_events
 
-    def can_merge_text(self, existing, event):
-        return ingress_identity(existing) == ingress_identity(event) and can_merge(self, existing, event)
+    can_merge_text = _wrap_can_merge_text(ingress_identity, can_merge)
 
     replace(BasePlatformAdapter, "_can_merge_text_debounce_events", can_merge_text)
     # Pinned native integration interface; covered by native contract and integration checks.
@@ -267,20 +334,9 @@ def install_strict_profile():
     # skipcq: PYL-W0212
     original_wiring = GatewayStartupMixin._start_finish_wiring
 
-    async def finish_wiring(self, connected_count):
-        await original_wiring(self, connected_count)
-        gateway_ready(self)
+    finish_wiring = _wrap_finish_wiring(original_wiring, gateway_ready)
 
-    async def trading_services_only(self, connected_count):
-        # The pinned native ABI supplies this count; configured services govern startup.
-        # skipcq: PTC-W0043
-        del connected_count
-        # Preserve the native event-loop watchdog; unused room/kanban/heartbeat
-        # products must not create their own storage or strategy work.
-        # Pinned native integration interface; covered by native contract and integration checks.
-        # skipcq: PYL-W0212
-        self._start_loop_heartbeat_task()
-        await self.hooks.emit("gateway:startup", {"platforms": [platform.value for platform in self.adapters]})
+    trading_services_only = _wrap_trading_services_only()
 
     replace(GatewayStartupMixin, "_start_finish_wiring", finish_wiring)
     replace(GatewayStartupMixin, "_start_post_connect_services", trading_services_only)

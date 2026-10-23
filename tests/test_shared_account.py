@@ -8,6 +8,11 @@ from aqla_agent.accounting import occupied_markets
 from aqla_hyperliquid_mcp.models import AqlaError
 
 
+async def _observe_shared_inventory(adapter,names):
+    return [(dex,await adapter.info('clearinghouseState',user=adapter.account,**({'dex':dex} if dex else {})),
+             await adapter.info('frontendOpenOrders',user=adapter.account,**({'dex':dex} if dex else {}))) for dex in names]
+
+
 @pytest.fixture
 def shared(setup,monkeypatch):
     from aqla_agent import inventory_stream
@@ -38,16 +43,13 @@ def shared(setup,monkeypatch):
                                                'tokenToAvailableAfterMaintenance':[[0,config['ceiling']]]})
         return original(request)
     exchange.client=httpx.AsyncClient(base_url=settings.base_url,transport=httpx.MockTransport(handle))
-    async def observe(adapter,names):
-        return [(dex,await adapter.info('clearinghouseState',user=adapter.account,**({'dex':dex} if dex else {})),
-                 await adapter.info('frontendOpenOrders',user=adapter.account,**({'dex':dex} if dex else {}))) for dex in names]
-    monkeypatch.setattr(inventory_stream,'observe',observe)
+    monkeypatch.setattr(inventory_stream,'observe',_observe_shared_inventory)
     return manual,orders,config,exchange,trading
 
 
 @pytest.mark.asyncio
 async def test_manual_other_markets_count_but_allow_free_market(shared,setup,signal):
-    manual,orders,config,exchange,trading=shared
+    manual,orders,_config,exchange,trading=shared
     _,state,fake,*_=setup
     source,value=signal
     snapshot=await exchange.account_inventory()
@@ -62,8 +64,8 @@ async def test_manual_other_markets_count_but_allow_free_market(shared,setup,sig
 
 @pytest.mark.asyncio
 async def test_combined_capacity_and_same_market_reject_before_mutation(shared,setup,signal):
-    manual,orders,config,exchange,trading=shared
-    _,state,fake,*_=setup
+    manual,_orders,_config,_exchange,trading=shared
+    _,_state,fake,*_=setup
     source,value=signal
     manual['ZEC']='1'
     with pytest.raises(AqlaError,match='Combined'):
@@ -77,7 +79,7 @@ async def test_combined_capacity_and_same_market_reject_before_mutation(shared,s
 
 @pytest.mark.asyncio
 async def test_reduce_only_orders_do_not_reserve_slots(shared,setup,signal):
-    manual,orders,config,exchange,trading=shared
+    _manual,orders,_config,_exchange,trading=shared
     source,value=signal
     orders.append({'coin':'BTC','reduceOnly':True,'oid':999,'sz':'0'})
     assert (await trading.preview(source.event_id,value))['plan_id']
@@ -124,7 +126,7 @@ async def test_unsupported_account_modes_never_use_classic_budget(shared,mode):
 
 @pytest.mark.asyncio
 async def test_external_intervention_is_local_and_does_not_close_mixed_position(shared,setup,signal):
-    manual,orders,config,exchange,trading=shared
+    _manual,_orders,_config,_exchange,trading=shared
     _,state,fake,*_=setup
     state.update(lambda data:data['policy'].update(max_open_trades=8))
     source,value=signal

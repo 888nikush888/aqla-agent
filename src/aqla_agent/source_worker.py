@@ -166,37 +166,8 @@ class SourceWorker:
 
         try:
             response = await asyncio.to_thread(invoke)
-            raw = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
-            cost = {"cost_status": "unknown", "cost_usd": None}
-            billing = captured.rows[0] if len(captured.rows) == 1 else {}
-            endpoint = billing.get("billing_base_url")
-            provider = billing.get("billing_provider")
-            confirmed_route = bool(endpoint and (provider == runtime.get("provider")
-                and endpoint.rstrip("/") == (runtime.get("base_url") or "").rstrip("/")
-                or provider == "openrouter" and endpoint.rstrip("/") == "https://openrouter.ai/api/v1"))
-            actual_provider = provider if confirmed_route else route.get("provider", runtime.get("provider"))
-            actual_model = billing.get("model") if confirmed_route and billing.get("model") else route.get("model", model)
-            try:
-                measured = normalize_usage(raw, provider=actual_provider) if raw else None
-            except (ValueError, TypeError, AttributeError):
-                measured = None
-            if measured is not None and confirmed_route:
-                try:
-                    priced = await asyncio.to_thread(estimate_usage_cost, actual_model, measured,
-                        provider=actual_provider, base_url=endpoint, api_key=(os.environ.get("OPENROUTER_API_KEY")
-                            if actual_provider == "openrouter" else runtime.get("api_key")))
-                    cost = {"cost_status": priced.status,
-                            "cost_usd": float(priced.amount_usd) if priced.amount_usd is not None else None,
-                            "cost_source": priced.source, "pricing_version": priced.pricing_version}
-                except Exception:
-                    # Measurement must never invalidate a successful interpretation.
-                    pass
-            usage.append({"phase": "interpretation_fallback", "provider": actual_provider,
-                          "model": actual_model, "duration_seconds": time.monotonic() - started,
-                          "failed": False, "response_success": True, "interpretation_valid": False,
-                          "usage_available": measured is not None,
-                          **cost,
-                          **({key: getattr(measured, key) for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")} if measured else {})})
+            actual_model = await self.record_fallback_usage(response, captured, runtime, route, model, started, usage,
+                                                            normalize_usage, estimate_usage_cost)
             text = extract_content_or_reasoning(response, max_reasoning_chars=0).strip()
             if text.startswith("```") and text.endswith("```"):
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0]
@@ -214,8 +185,134 @@ class SourceWorker:
                               "usage_available": False, "duration_seconds": time.monotonic() - started})
             raise SourceFailure(classify_failure(error, "interpretation_fallback")) from error
 
-    async def tick(self):
-        await self.bind()
+    @staticmethod
+    def fallback_billing_identity(captured, runtime, route, model):
+        billing = captured.rows[0] if len(captured.rows) == 1 else {}
+        endpoint = billing.get("billing_base_url")
+        provider = billing.get("billing_provider")
+        confirmed_route = bool(endpoint and (provider == runtime.get("provider")
+            and endpoint.rstrip("/") == (runtime.get("base_url") or "").rstrip("/")
+            or provider == "openrouter" and endpoint.rstrip("/") == "https://openrouter.ai/api/v1"))
+        actual_provider = provider if confirmed_route else route.get("provider", runtime.get("provider"))
+        actual_model = billing.get("model") if confirmed_route and billing.get("model") else route.get("model", model)
+        return actual_provider, actual_model, endpoint, confirmed_route
+
+    async def record_fallback_usage(self, response, captured, runtime, route, model, started, usage,
+                                    normalize_usage, estimate_usage_cost):
+        raw = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+        cost = {"cost_status": "unknown", "cost_usd": None}
+        actual_provider, actual_model, endpoint, confirmed_route = self.fallback_billing_identity(captured, runtime, route, model)
+        try:
+            measured = normalize_usage(raw, provider=actual_provider) if raw else None
+        except (ValueError, TypeError, AttributeError):
+            measured = None
+        if measured is not None and confirmed_route:
+            try:
+                priced = await asyncio.to_thread(estimate_usage_cost, actual_model, measured,
+                    provider=actual_provider, base_url=endpoint, api_key=(os.environ.get("OPENROUTER_API_KEY")
+                        if actual_provider == "openrouter" else runtime.get("api_key")))
+                cost = {"cost_status": priced.status,
+                        "cost_usd": float(priced.amount_usd) if priced.amount_usd is not None else None,
+                        "cost_source": priced.source, "pricing_version": priced.pricing_version}
+            except Exception:
+                # Measurement must never invalidate a successful interpretation.
+                pass
+        usage.append({"phase": "interpretation_fallback", "provider": actual_provider,
+                      "model": actual_model, "duration_seconds": time.monotonic() - started,
+                      "failed": False, "response_success": True, "interpretation_valid": False,
+                      "usage_available": measured is not None,
+                      **cost,
+                      **({key: getattr(measured, key) for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")} if measured else {})})
+        return actual_model
+
+    async def read_job_packet(self, selected, job):
+        packet = selected.get("packet")
+        if packet is None:
+            parts, offset = [], 0
+            for _ in range(500):
+                page = await self.internal("source_packet", job_id=job["job_id"], offset=offset)
+                if page.get("fingerprint") != job["fingerprint"] or not isinstance(page.get("chunk"), str):
+                    raise DecisionFailure("source_packet_changed")
+                parts.append(page["chunk"])
+                if page.get("eof"):
+                    packet = json.loads("".join(parts))
+                    break
+                next_offset = page.get("next_offset")
+                if type(next_offset) is not int or next_offset != offset + len(page["chunk"]):
+                    raise DecisionFailure("source_packet_cursor")
+                offset = next_offset
+            if packet is None:
+                raise DecisionFailure("source_packet_limit")
+        return packet
+
+    @staticmethod
+    def cached_decision(job, packet, policy_version, profile, master_hash):
+        result = DecisionResult.model_validate(job["result"])
+        if job.get("policy_version") != policy_version or result.question_version != VERSION or result.collection_only:
+            raise DecisionFailure("cached_decision_policy_changed")
+        if not result.fallback and result.model != "python" and (
+                not profile.permits(source=require_first(row["chat_id"] for row in packet["messages"]
+                    if row["event_id"] == packet["anchor_event_id"]), master_hash=master_hash,
+                    model=result.model, model_revision=result.model_revision)
+                or not profile.permits_kind(require_first(row["chat_id"] for row in packet["messages"]
+                    if row["event_id"] == packet["anchor_event_id"]), result.interpretation.kind)):
+            raise DecisionFailure("cached_decision_not_calibrated")
+        return result
+
+    def check_fallback_allowed(self, error, code, packet):
+        if code in ("source_context_limit", "candidate_limit"):
+            raise error
+        veto = unsupported_structure(packet)
+        if veto:
+            # A common original-only schema veto cannot be repaired
+            # by another provider. Preserve a durable review, not a
+            # generative attempt to discard part of the instruction.
+            raise SourceFailure({"phase": "validate", "code": veto, "exception_type": "DecisionFailure", "retryable": False}) from None
+        if self.config.mode == "shadow":
+            raise DecisionFailure(code) from error
+
+    async def new_decision(self, packet, measured, profile, master_hash, revision, progress):
+        usage = measured.api
+        spans = None
+        try:
+            anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+            if not anchor["text"].strip():
+                result = DecisionResult(model="python", interpretation=Interpretation(
+                    kind="incomplete", source_refs=[anchor["source_id"]], reason="Originaltext fehlt.",
+                    reason_codes=["missing_source_text"]))
+            else:
+                # Bound this actual Decision request, including master
+                # and questions. An unused fallback must not gate Mercury.
+                progress["phase"] = "decision"
+                self.check_input(packet)
+                spans = candidates(packet)
+                measured.workflow["checked_input_characters"] = self.check_input({"model": self.config.model, "state": packet,
+                                           "questions": questions_for(packet, spans)})
+                result = await self.interpret(packet, profile, master_hash, revision, usage, spans=spans)
+                # Use the same interpretation-aware admission as offline
+                # replay. Original-only heuristics belong to failure review.
+                validate_interpretation(packet, result.interpretation)
+        except ValueError as error:
+            code = str(error) if isinstance(error, DecisionFailure) else "decision_invalid"
+            mark_decision_failure(usage, code)
+            self.check_fallback_allowed(error, code, packet)
+            progress["phase"] = "interpretation_fallback"
+            self.check_input(self.fallback_messages(packet, code, spans or []))
+            # Bound method identity selects its supported call signature.
+            # skipcq: PYL-W0143
+            result = await self.fallback(packet, code, usage, spans=spans) if self.fallback == self.generative_fallback else await self.fallback(packet, code, usage)
+            measured.workflow["fallback_reason"] = code
+        return result
+
+    def check_current_policy(self, profile, master_hash):
+        try:
+            current_profile = self.profile()
+        except DecisionFailure:
+            current_profile = CalibrationProfile()
+        if self.extension.skill_hash() != master_hash or current_profile != profile:
+            raise DecisionFailure("source_policy_changed")
+
+    async def decision_policy(self):
         try:
             profile = self.profile()
         except DecisionFailure:
@@ -230,6 +327,21 @@ class SourceWorker:
                 pass
         policy_version = digest([VERSION, QUESTION_CONTRACT_VERSION, PROCESSING_VERSION, FALLBACK_VERSION,
                                  self.config.model_dump(mode="json"), revision, profile.model_dump(mode="json"), master_hash])
+        return profile, master_hash, revision, policy_version
+
+    async def persist_turn(self, measured, packet, failure, detail, interpretation_recorded, interrupted):
+        measured.workflow["decision_attempted"] = any(item.get("phase") == "decision" for item in measured.api)
+        measured.workflow["decision_reviewed"] = bool(packet.get("decision_review")) if packet is not None else False
+        measured.workflow["source_job_failed"] = failure is not None
+        measured.workflow["interpretation_valid"] = interpretation_recorded
+        measured.workflow["failure_detail"] = detail if failure is not None else None
+        await asyncio.to_thread(measured.persist, self.extension.master_path.parents[2],
+                               {"failed": failure is not None, "interrupted": interrupted, "completed": failure is None and not interrupted})
+
+
+    async def tick(self):
+        await self.bind()
+        profile, master_hash, revision, policy_version = await self.decision_policy()
         selected = await self.internal("source_prepare", processing_version=policy_version)
         job = selected.get("job")
         if job is None:
@@ -238,86 +350,24 @@ class SourceWorker:
         measured.workflow.update(source_job_id=job["job_id"], source_revision_hash=digest(job["event_id"]),
                                  processing_mode=self.config.mode, processing_version=PROCESSING_VERSION,
                                  calibration_validated=profile.validated, cache_hit=False)
-        result, failure, packet, spans = None, None, None, None
+        result, failure, packet = None, None, None
         interrupted = False
         interpretation_recorded = False
-        phase = "prepare"
+        progress = {"phase": "prepare"}
         try:
-            packet = selected.get("packet")
-            if packet is None:
-                parts, offset = [], 0
-                for _ in range(500):
-                    page = await self.internal("source_packet", job_id=job["job_id"], offset=offset)
-                    if page.get("fingerprint") != job["fingerprint"] or not isinstance(page.get("chunk"), str):
-                        raise DecisionFailure("source_packet_changed")
-                    parts.append(page["chunk"])
-                    if page.get("eof"):
-                        packet = json.loads("".join(parts))
-                        break
-                    next_offset = page.get("next_offset")
-                    if type(next_offset) is not int or next_offset != offset + len(page["chunk"]):
-                        raise DecisionFailure("source_packet_cursor")
-                    offset = next_offset
-                if packet is None:
-                    raise DecisionFailure("source_packet_limit")
+            packet = await self.read_job_packet(selected, job)
             packet["approved_source_guidance"] = self.extension.master_path.read_text(encoding="utf-8")
             selected_anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
             measured.workflow["source_work_type"] = "cached" if job.get("result") is not None else "interpretation" if selected_anchor["text"].strip() else "empty"
             if job.get("result") is not None:
-                result = DecisionResult.model_validate(job["result"])
-                if job.get("policy_version") != policy_version or result.question_version != VERSION or result.collection_only:
-                    raise DecisionFailure("cached_decision_policy_changed")
-                if not result.fallback and result.model != "python" and (
-                        not profile.permits(source=require_first(row["chat_id"] for row in packet["messages"]
-                            if row["event_id"] == packet["anchor_event_id"]), master_hash=master_hash,
-                            model=result.model, model_revision=result.model_revision)
-                        or not profile.permits_kind(require_first(row["chat_id"] for row in packet["messages"]
-                            if row["event_id"] == packet["anchor_event_id"]), result.interpretation.kind)):
-                    raise DecisionFailure("cached_decision_not_calibrated")
+                result = self.cached_decision(job, packet, policy_version, profile, master_hash)
                 measured.workflow["cache_hit"] = True
                 interpretation_recorded = True
             else:
-                usage = measured.api
-                try:
-                    anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
-                    if not anchor["text"].strip():
-                        result = DecisionResult(model="python", interpretation=Interpretation(
-                            kind="incomplete", source_refs=[anchor["source_id"]], reason="Originaltext fehlt.",
-                            reason_codes=["missing_source_text"]))
-                    else:
-                        # Bound this actual Decision request, including master
-                        # and questions. An unused fallback must not gate Mercury.
-                        phase = "decision"
-                        self.check_input(packet)
-                        spans = candidates(packet)
-                        measured.workflow["checked_input_characters"] = self.check_input({"model": self.config.model, "state": packet,
-                                                   "questions": questions_for(packet, spans)})
-                        result = await self.interpret(packet, profile, master_hash, revision, usage, spans=spans)
-                        # Use the same interpretation-aware admission as offline
-                        # replay. Original-only heuristics belong to failure review.
-                        validate_interpretation(packet, result.interpretation)
-                except ValueError as error:
-                    code = str(error) if isinstance(error, DecisionFailure) else "decision_invalid"
-                    mark_decision_failure(usage, code)
-                    if code in ("source_context_limit", "candidate_limit"):
-                        raise
-                    veto = unsupported_structure(packet)
-                    if veto:
-                        # A common original-only schema veto cannot be repaired
-                        # by another provider. Preserve a durable review, not a
-                        # generative attempt to discard part of the instruction.
-                        raise SourceFailure({"phase": "validate", "code": veto, "exception_type": "DecisionFailure", "retryable": False}) from None
-                    if self.config.mode == "shadow":
-                        raise DecisionFailure(code) from error
-                    phase = "interpretation_fallback"
-                    self.check_input(self.fallback_messages(packet, code, spans or []))
-                    # Bound method identity selects its supported call signature.
-                    # skipcq: PYL-W0143
-                    result = await self.fallback(packet, code, usage, spans=spans) if self.fallback == self.generative_fallback else await self.fallback(packet, code, usage)
-                    measured.workflow["fallback_reason"] = code
+                result = await self.new_decision(packet, measured, profile, master_hash, revision, progress)
                 if self.extension.skill_hash() != master_hash:
                     raise DecisionFailure("master_changed")
-                phase = "validate"
+                progress["phase"] = "validate"
                 await self.internal("source_record", job_id=job["job_id"], decision_result=result.model_dump(mode="json"))
                 interpretation_recorded = True
             measured.workflow.update(fallback=result.fallback, decision_success=not result.fallback,
@@ -325,13 +375,8 @@ class SourceWorker:
                                      decision_reviewed=bool(packet.get("decision_review")),
                                      payload_characters=len(json.dumps(packet, ensure_ascii=False)))
             if self.config.mode == "hybrid":
-                try:
-                    current_profile = self.profile()
-                except DecisionFailure:
-                    current_profile = CalibrationProfile()
-                if self.extension.skill_hash() != master_hash or current_profile != profile:
-                    raise DecisionFailure("source_policy_changed")
-                phase = "apply"
+                self.check_current_policy(profile, master_hash)
+                progress["phase"] = "apply"
                 applied = await self.internal("source_apply", job_id=job["job_id"])
                 measured.workflow["source_job_status"] = applied.get("status")
             else:
@@ -342,17 +387,12 @@ class SourceWorker:
         except Exception as error:
             if isinstance(getattr(error, "checked_input_characters", None), int):
                 measured.workflow["checked_input_characters"] = error.checked_input_characters
-            detail = error.detail if isinstance(error, SourceFailure) else classify_failure(error, phase)
+            detail = error.detail if isinstance(error, SourceFailure) else classify_failure(error, progress["phase"])
             failure = detail["code"]
             await self.internal("source_fail", job_id=job["job_id"], failure_code=failure, failure_detail=detail)
         finally:
-            measured.workflow["decision_attempted"] = any(item.get("phase") == "decision" for item in measured.api)
-            measured.workflow["decision_reviewed"] = bool(packet.get("decision_review")) if packet is not None else False
-            measured.workflow["source_job_failed"] = failure is not None
-            measured.workflow["interpretation_valid"] = interpretation_recorded
-            measured.workflow["failure_detail"] = detail if failure is not None else None
-            await asyncio.to_thread(measured.persist, self.extension.master_path.parents[2],
-                                   {"failed": failure is not None, "interrupted": interrupted, "completed": failure is None and not interrupted})
+            await self.persist_turn(measured, packet, failure, detail if failure is not None else None,
+                                    interpretation_recorded, interrupted)
 
     async def interpret(self, packet, profile, master_hash, revision, usage, *, spans=None):
         if len(json.dumps(packet, ensure_ascii=False)) > self.config.max_context_characters:

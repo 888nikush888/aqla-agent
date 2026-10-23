@@ -36,6 +36,15 @@ def quantity(value):
         return None
 
 
+def public_diagnostic_fields(marker):
+    output = {}
+    for key in ("code", "stage", "category", "exception_type"):
+        value = marker.get(key)
+        if isinstance(value, str) and len(value) <= 64 and all(char.isalnum() or char in "_-" for char in value):
+            output[key] = value
+    return output
+
+
 def retry_view(row):
     """Expose bounded categories/times only, never an arbitrary provider error."""
     marker = row.get("observation_retry") or row.get("managed_entry_retry")
@@ -49,10 +58,7 @@ def retry_view(row):
         output["exhausted"] = True
     if marker.get("authority") in ("execute", "preview"):
         output["authority"] = marker["authority"]
-    for key in ("code", "stage", "category", "exception_type"):
-        value = marker.get(key)
-        if isinstance(value, str) and len(value) <= 64 and all(char.isalnum() or char in "_-" for char in value):
-            output[key] = value
+    output.update(public_diagnostic_fields(marker))
     return output
 
 
@@ -65,11 +71,7 @@ def diagnostic_view(trade, operations=()):
         diagnostic = result.get("diagnostic") if isinstance(result, dict) else None
     if not isinstance(diagnostic, dict):
         return None
-    output = {}
-    for key in ("code", "stage", "category", "exception_type"):
-        value = diagnostic.get(key)
-        if isinstance(value, str) and len(value) <= 64 and all(char.isalnum() or char in "_-" for char in value):
-            output[key] = value
+    output = public_diagnostic_fields(diagnostic)
     if type(diagnostic.get("retryable")) is bool:
         output["retryable"] = diagnostic["retryable"]
     return output or None
@@ -83,38 +85,26 @@ def operation_diagnostic_view(operation):
     return {**operation, "result": {**result, "diagnostic": diagnostic_view({"entry_diagnostic": result["diagnostic"]})}}
 
 
-def trade_outcome(trade, operations=()):
-    """Separate receipt-backed entry history from reliable current ownership."""
-    operation_id = trade.get("entry_operation_id")
-    index = operations if isinstance(operations, EntryOperations) else EntryOperations(operations)
-    entry_ops = index.for_trade(trade)
-    current = index.by_id.get(operation_id, {})
-    outcome = current.get("outcome")
-    fills = list(trade.get("fill_events", {}).values())
-    entries = [row for row in fills if row.get("kind") == "entry"]
+def valid_trade_fills(trade, fills):
     kinds = ("entry", "tp", "sl", "close", "waverider", "waverider_retirement") if trade.get("lifecycle_version") == 2 else ("entry", "tp", "sl", "close")
     valid = all(row.get("kind") in kinds and quantity(row.get("sz")) is not None and quantity(row.get("sz")) > 0 for row in fills)
+    return valid
+
+
+def trade_fill_quantities(trade):
+    fills = list(trade.get("fill_events", {}).values())
+    entries = [row for row in fills if row.get("kind") == "entry"]
+    valid = valid_trade_fills(trade, fills)
     entered = sum((quantity(row["sz"]) for row in entries), Decimal(0)) if valid else None
     exited = sum((quantity(row["sz"]) for row in fills if row.get("kind") != "entry"), Decimal(0)) if valid else None
     recorded = quantity(trade.get("filled_quantity"))
     remainder = quantity(trade.get("remaining_quantity"))
-    consistent = entered is not None and exited <= entered and recorded == entered and remainder == entered - exited
-    stage = trade.get("status")
-    conflict = stage == "conflicted" or bool(trade.get("external_conflict"))
-    uncertain = stage == "unknown" or any(row.get("phase") in ("prepared", "sending", "unknown") for row in entry_ops)
-    missing = recorded is None or entered is None or (recorded > 0 and not entries)
-    submission = ("unconfirmed" if uncertain else "not_sent" if outcome == "not_sent" else
-                  "accepted" if outcome in ("accepted", "partial") else "sent_rejected" if outcome == "rejected" else "unknown")
-    retry = retry_view(trade)
-    if conflict:
-        state = "conflicted"
-    elif uncertain or missing or entries and not consistent:
-        state = "unknown"
-    elif entered and stage in ("closed", "cancelled", "rejected") and remainder != 0:
-        state = "unknown"
-    elif entered and consistent:
-        state = "closed" if remainder == 0 and stage in ("closed", "cancelled", "rejected") else "filled"
-    elif retry and not retry.get("exhausted"):
+    consistent = entered is not None and exited <= entered == recorded and remainder == entered - exited
+    return entries, valid, entered, recorded, remainder, consistent
+
+
+def classify_unfilled_trade(trade, entry_ops, submission, retry, stage, recorded, entries):
+    if retry and not retry.get("exhausted"):
         state = "pending_observation"
     elif stage == "waiting_entry":
         state = "waiting_entry"
@@ -125,8 +115,50 @@ def trade_outcome(trade, operations=()):
             submission = "not_sent"
     else:
         state = "pending_entry" if stage in ("entry_pending", "preparing", "opening", "protecting") else "unknown"
+    return state, submission
+
+
+def classify_trade_state(trade, entry_ops, submission, retry, conflict, uncertain, missing, entries, consistent, entered, stage, remainder, recorded):
+    if conflict:
+        state = "conflicted"
+    elif uncertain or missing or entries and not consistent:
+        state = "unknown"
+    elif entered and stage in ("closed", "cancelled", "rejected") and remainder != 0:
+        state = "unknown"
+    elif entered and consistent:
+        state = "closed" if remainder == 0 and stage in ("closed", "cancelled", "rejected") else "filled"
+    else:
+        return classify_unfilled_trade(trade, entry_ops, submission, retry, stage, recorded, entries)
+    return state, submission
+
+
+def entry_fill_confirmation(entries, entered, missing, uncertain, state):
+    return True if entries and entered else None if missing or uncertain or state == "unknown" else False
+
+
+def entry_submission_state(uncertain, outcome):
+    submission = ("unconfirmed" if uncertain else "not_sent" if outcome == "not_sent" else
+                  "accepted" if outcome in ("accepted", "partial") else "sent_rejected" if outcome == "rejected" else "unknown")
+    return submission
+
+
+def trade_outcome(trade, operations=()):
+    """Separate receipt-backed entry history from reliable current ownership."""
+    operation_id = trade.get("entry_operation_id")
+    index = operations if isinstance(operations, EntryOperations) else EntryOperations(operations)
+    entry_ops = index.for_trade(trade)
+    current = index.by_id.get(operation_id, {})
+    outcome = current.get("outcome")
+    entries, valid, entered, recorded, remainder, consistent = trade_fill_quantities(trade)
+    stage = trade.get("status")
+    conflict = stage == "conflicted" or bool(trade.get("external_conflict"))
+    uncertain = stage == "unknown" or any(row.get("phase") in ("prepared", "sending", "unknown") for row in entry_ops)
+    missing = recorded is None or entered is None or (recorded > 0 and not entries)
+    submission = entry_submission_state(uncertain, outcome)
+    retry = retry_view(trade)
+    state, submission = classify_trade_state(trade, entry_ops, submission, retry, conflict, uncertain, missing, entries, consistent, entered, stage, remainder, recorded)
     ownership_confirmed = consistent and not conflict and not uncertain and state not in ("unknown", "conflicted", "pending_entry")
-    return {"state": state, "entry_submission": submission, "entry_fill_confirmed": True if entries and entered else None if missing or uncertain or state == "unknown" else False,
+    return {"state": state, "entry_submission": submission, "entry_fill_confirmed": entry_fill_confirmation(entries, entered, missing, uncertain, state),
             "confirmed_entry_fill_count": len(entries) if valid else None,
             "confirmed_entry_quantity": str(entered) if entries and entered is not None else None,
             "known_own_remaining_quantity": str(remainder) if ownership_confirmed else None,
@@ -135,12 +167,7 @@ def trade_outcome(trade, operations=()):
             "entry_diagnostic": diagnostic_view(trade, index)}
 
 
-def event_outcomes(snapshot, event, operations=None):
-    """Use exact immutable source revisions, preserving independent target scopes."""
-    rows = []
-    covered = set()
-    targets = event.get("targets", {})
-    operations = EntryOperations(snapshot.get("operations", {})) if operations is None else operations
+def append_event_target_outcomes(snapshot, event, operations, targets, rows, covered):
     for identity, target in targets.items():
         trade = snapshot.get("trades", {}).get(target.get("trade_id"))
         saved = snapshot.get("plans", {}).get(target.get("plan_id"), {})
@@ -157,18 +184,18 @@ def event_outcomes(snapshot, event, operations=None):
                      "source_revision_matches": revision_matches(event, plan),
                      **facts})
         covered.add(target.get("trade_id"))
-    for trade in snapshot.get("trades", {}).values():
-        plan = trade.get("plan", {})
-        if trade.get("trade_id") in covered or plan.get("source_revisions", {}).get(event.get("source_id")) != event.get("event_id"):
-            continue
-        rows.append({"trade_id": trade["trade_id"], "plan_id": plan.get("plan_id"),
-                     **{key: plan.get(key) for key in ("exchange", "network", "account_key", "profile_id")},
-                     "quote_token": plan.get("market", {}).get("quote_token"),
-                     "source_revision_matches": True, **source_trade_outcome(event, trade, operations)})
-    covered_plans = {row.get("plan_id") for row in rows}
+
+
+def event_plan_candidates(snapshot, event, targets):
     candidates = sorted(((identity, saved) for identity, saved in snapshot.get("plans", {}).items()
                          if not targets and saved.get("event_id") == event.get("event_id")),
                         key=lambda item: (item[1].get("plan", {}).get("created_at", 0), item[0]), reverse=True)
+    return candidates
+
+
+def append_saved_plan_outcomes(snapshot, event, operations, targets, rows, covered):
+    covered_plans = {row.get("plan_id") for row in rows}
+    candidates = event_plan_candidates(snapshot, event, targets)
     for identity, saved in candidates:
         plan = saved.get("plan", {})
         if targets or identity in covered_plans or plan.get("trade_id") in covered or saved.get("event_id") != event.get("event_id"):
@@ -183,6 +210,24 @@ def event_outcomes(snapshot, event, operations=None):
                          "state": "pending_observation" if retry and not retry.get("exhausted") else "not_sent" if retry and retry.get("exhausted") else "planned",
                          "entry_fill_confirmed": False, "observation_retry": retry})})
         covered.add(plan.get("trade_id"))
+
+
+def event_outcomes(snapshot, event, operations=None):
+    """Use exact immutable source revisions, preserving independent target scopes."""
+    rows = []
+    covered = set()
+    targets = event.get("targets", {})
+    operations = EntryOperations(snapshot.get("operations", {})) if operations is None else operations
+    append_event_target_outcomes(snapshot, event, operations, targets, rows, covered)
+    for trade in snapshot.get("trades", {}).values():
+        plan = trade.get("plan", {})
+        if trade.get("trade_id") in covered or plan.get("source_revisions", {}).get(event.get("source_id")) != event.get("event_id"):
+            continue
+        rows.append({"trade_id": trade["trade_id"], "plan_id": plan.get("plan_id"),
+                     **{key: plan.get(key) for key in ("exchange", "network", "account_key", "profile_id")},
+                     "quote_token": plan.get("market", {}).get("quote_token"),
+                     "source_revision_matches": True, **source_trade_outcome(event, trade, operations)})
+    append_saved_plan_outcomes(snapshot, event, operations, targets, rows, covered)
     return {"event_status_is_fill_proof": False, "event_status_meaning": "source_processing_or_consumed_binding",
             "targets": rows, "basis": "retained_local_receipts_not_live_exchange_inventory"}
 

@@ -32,6 +32,32 @@ class InventoryStream(Streams):
         self.state_sequence = 0
         self.aggregate_ack = 0
 
+    def _snapshot(self, channel, data):
+        if not isinstance(data, dict) or str(data.get("user", "")).lower() != self.account:
+            raise AqlaError("DEX snapshot belongs to another account")
+        if channel == "allDexsClearinghouseState":
+            states = self._position_states(data)
+            self.states, self.state_sequence = states, self.sequence
+            identity = "states"
+        else:
+            dex = data.get("dex")
+            if dex not in self.names or not isinstance(data.get("orders"), list):
+                raise AqlaError("DEX order snapshot is incomplete")
+            self.orders[dex] = data["orders"]
+            identity = "orders:" + dex
+        self.sizes[identity] = len(json.dumps(data, separators=(",", ":")).encode())
+        if sum(self.sizes.values()) > self.max_event_bytes:
+            raise AqlaError("DEX snapshot exceeds its bounded memory budget")
+
+    def _position_states(self, data):
+        rows = data.get("clearinghouseStates")
+        if not isinstance(rows, list) or any(not isinstance(row, list) or len(row) != 2 or not isinstance(row[0], str) or not isinstance(row[1], dict) for row in rows):
+            raise AqlaError("DEX position snapshot is malformed")
+        states = dict(rows)
+        if len(states) != len(rows) or set(states) != set(self.names):
+            raise AqlaError("DEX position snapshot is incomplete")
+        return states
+
     def _event(self, value):
         self.sequence += 1
         channel, data = value.get("channel"), value.get("data", {})
@@ -47,26 +73,7 @@ class InventoryStream(Streams):
             self.error = AqlaError("Large DEX snapshot subscription was rejected")
         elif channel in ("allDexsClearinghouseState", "openOrders") and self.error is None:
             try:
-                if not isinstance(data, dict) or str(data.get("user", "")).lower() != self.account:
-                    raise AqlaError("DEX snapshot belongs to another account")
-                if channel == "allDexsClearinghouseState":
-                    rows = data.get("clearinghouseStates")
-                    if not isinstance(rows, list) or any(not isinstance(row, list) or len(row) != 2 or not isinstance(row[0], str) or not isinstance(row[1], dict) for row in rows):
-                        raise AqlaError("DEX position snapshot is malformed")
-                    states = dict(rows)
-                    if len(states) != len(rows) or set(states) != set(self.names):
-                        raise AqlaError("DEX position snapshot is incomplete")
-                    self.states, self.state_sequence = states, self.sequence
-                    identity = "states"
-                else:
-                    dex = data.get("dex")
-                    if dex not in self.names or not isinstance(data.get("orders"), list):
-                        raise AqlaError("DEX order snapshot is incomplete")
-                    self.orders[dex] = data["orders"]
-                    identity = "orders:" + dex
-                self.sizes[identity] = len(json.dumps(data, separators=(",", ":")).encode())
-                if sum(self.sizes.values()) > self.max_event_bytes:
-                    raise AqlaError("DEX snapshot exceeds its bounded memory budget")
+                self._snapshot(channel, data)
             except (ValueError, TypeError, KeyError) as error:
                 self.error = error if isinstance(error, AqlaError) else AqlaError("DEX snapshot is malformed")
         if self.error is not None:
@@ -74,10 +81,7 @@ class InventoryStream(Streams):
         self.changed.set()
 
 
-async def observe(adapter, names, *, connector=connect):
-    expected = set(names)
-    if not names or len(names) > 512 or len(expected) != len(names):
-        raise AqlaError("Large DEX inventory is incomplete or exceeds the subscription budget")
+async def _inventory_feed(adapter, names, connector):
     feed = getattr(adapter, "_inventory_feed", None)
     if feed is not None and (feed.closed or feed.error is not None or feed.names != tuple(names)
                              or feed.account != adapter.account.lower() or feed.url != adapter.settings.base_url.replace("https://", "wss://") + "/ws"):
@@ -89,42 +93,75 @@ async def observe(adapter, names, *, connector=connect):
         # Account-scoped feed lifecycle; freshness and generation are rechecked before admission.
         # skipcq: PYL-W0212
         adapter._inventory_feed = feed
+    return feed, new
+
+
+def _fresh_states(states):
+    return states is not None and all(type(row.get("time")) is int and -2000 <= now_ms() - row["time"] <= 10000 for row in states.values())
+
+
+async def _inventory_details(adapter, names, orders, states):
+    limiter = asyncio.Semaphore(3)
+    async def details(dex, *, orders, states, limiter):
+        values = orders[dex]
+        if values:
+            async with limiter:
+                values = await read_observation(lambda: adapter.info("frontendOpenOrders", user=adapter.account, **({"dex": dex} if dex else {})), "inventory_details")
+        return dex, states[dex], values
+    return await asyncio.gather(*(details(dex, orders=orders, states=states, limiter=limiter) for dex in names))
+
+
+def _complete_snapshot(feed, states, expected, new, requested_after, after):
+    acknowledged = new or feed.aggregate_ack > requested_after and feed.state_sequence > feed.aggregate_ack
+    complete = states is not None and set(feed.orders) == expected and feed.state_sequence > after and feed.ready.is_set() and acknowledged
+    return complete
+
+
+async def _refresh_inventory_subscription(feed, adapter, names, new):
+    if new:
+        subscription = await feed.subscribe({"type": "allDexsClearinghouseState", "user": adapter.account})
+        feed.aggregate_id = subscription["subscription_id"]
+        for dex in names:
+            await feed.subscribe({"type": "openOrders", "user": adapter.account, "dex": dex})
+    else:
+        await feed.unsubscribe(feed.aggregate_id)
+        await feed.subscribe({"type": "allDexsClearinghouseState", "user": adapter.account})
+
+
+def _reraise_inventory_error(error):
+    if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+        raise error
+    if isinstance(error, AqlaError):
+        raise error
+    if isinstance(error, (TimeoutError, ConnectionError, OSError, WebSocketException)):
+        raise TemporaryObservation("read_unavailable", "inventory", "transport") from None
+    raise AqlaError("Complete large-DEX account snapshot is invalid; no entry permitted") from None
+
+
+async def observe(adapter, names, *, connector=connect):
+    expected = set(names)
+    if not names or len(names) > 512 or len(expected) != len(names):
+        raise AqlaError("Large DEX inventory is incomplete or exceeds the subscription budget")
+    feed, new = await _inventory_feed(adapter, names, connector)
     try:
         async with asyncio.timeout(9), feed.read_lock:
             after = 0 if new else feed.sequence
             requested_after = after
-            if new:
-                subscription = await feed.subscribe({"type": "allDexsClearinghouseState", "user": adapter.account})
-                feed.aggregate_id = subscription["subscription_id"]
-                for dex in names:
-                    await feed.subscribe({"type": "openOrders", "user": adapter.account, "dex": dex})
-            else:
-                await feed.unsubscribe(feed.aggregate_id)
-                await feed.subscribe({"type": "allDexsClearinghouseState", "user": adapter.account})
+            await _refresh_inventory_subscription(feed, adapter, names, new)
             while True:
                 feed.changed.clear()
                 if feed.error is not None:
                     raise feed.error
                 states = feed.states
-                acknowledged = new or feed.aggregate_ack > requested_after and feed.state_sequence > feed.aggregate_ack
-                complete = states is not None and set(feed.orders) == expected and feed.state_sequence > after and feed.ready.is_set() and acknowledged
-                def fresh(states):
-                    return states is not None and all(type(row.get("time")) is int and -2000 <= now_ms() - row["time"] <= 10000 for row in states.values())
-                if complete and fresh(states):
+                complete = _complete_snapshot(feed, states, expected, new, requested_after, after)
+                if complete and _fresh_states(states):
                     # The connected, ordered feed retains all scopes; no budget snapshot is reused.
                     orders = dict(feed.orders)
                     generation, state_sequence = feed.generation, feed.state_sequence
-                    limiter = asyncio.Semaphore(3)
-                    async def details(dex, *, orders, states, limiter):
-                        values = orders[dex]
-                        if values:
-                            async with limiter:
-                                values = await read_observation(lambda: adapter.info("frontendOpenOrders", user=adapter.account, **({"dex": dex} if dex else {})), "inventory_details")
-                        return dex, states[dex], values
-                    result = await asyncio.gather(*(details(dex, orders=orders, states=states, limiter=limiter) for dex in names))
+                    result = await _inventory_details(adapter, names, orders, states)
                     if feed.error is not None:
                         raise feed.error
-                    if fresh(states) and generation == feed.generation and feed.ready.is_set():
+                    if _fresh_states(states) and generation == feed.generation and feed.ready.is_set():
                         return result
                     after = state_sequence
                 await feed.changed.wait()
@@ -134,10 +171,4 @@ async def observe(adapter, names, *, connector=connect):
             # Account-scoped feed lifecycle; freshness and generation are rechecked before admission.
             # skipcq: PYL-W0212
             adapter._inventory_feed = None
-        if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-            raise
-        if isinstance(error, AqlaError):
-            raise
-        if isinstance(error, (TimeoutError, ConnectionError, OSError, WebSocketException)):
-            raise TemporaryObservation("read_unavailable", "inventory", "transport") from None
-        raise AqlaError("Complete large-DEX account snapshot is invalid; no entry permitted") from None
+        _reraise_inventory_error(error)

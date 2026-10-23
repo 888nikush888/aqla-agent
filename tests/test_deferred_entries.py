@@ -270,7 +270,7 @@ def test_quote_staleness_and_clock_skew_block_entry(age):
 
 def test_entry_timing_and_source_exchange_require_original_evidence(setup):
     _, state, _, _, trading = setup
-    source, value = delayed_source(trading)
+    _source, value = delayed_source(trading)
     for field in ("entry_timing", "source_exchange"):
         invalid = value.model_copy(deep=True)
         invalid.evidence = [proof for proof in invalid.evidence if proof.field != field]

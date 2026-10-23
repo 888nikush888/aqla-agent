@@ -56,8 +56,30 @@ def sdk_signing_scope(operation):
 class Hyperliquid:
     supports_maker_orders = True
 
-    async def price_snapshot(self, market):
+    @staticmethod
+    def snapshot_from_book(market, raw, book, started):
         from aqla_agent.entry import PriceSnapshot
+        context = next((context for item, context in zip(raw[0]["universe"], raw[1], strict=True) if item["name"] == market.symbol), None)
+        if context is None:
+            raise AqlaError("Target market has no verified mark-price context")
+        if book.get("coin") != market.symbol or not all(book.get("levels", [])):
+            raise AqlaError("Target market has no executable order book")
+        bid, ask = Decimal(book["levels"][0][0]["px"]), Decimal(book["levels"][1][0]["px"])
+        return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
+                             stop_reference=context["markPx"], stop_reference_kind="mark", exchange_time=book["time"],
+                             started_at=started, observed_at=now_ms(),
+                             bids=[(row["px"], row["sz"]) for row in book["levels"][0] if Decimal(row["sz"]) > 0] if all("sz" in row for row in book["levels"][0]) else [],
+                             asks=[(row["px"], row["sz"]) for row in book["levels"][1] if Decimal(row["sz"]) > 0] if all("sz" in row for row in book["levels"][1]) else []).fresh()
+
+
+    @staticmethod
+    def mark_book_refresh_due(market, book, started):
+        if book.get("coin") != market.symbol or type(book.get("time")) is not int:
+            return False
+        aged_book = 1000 < now_ms() - book["time"] <= 2000
+        return aged_book and now_ms() - started < 1000
+
+    async def price_snapshot(self, market):
         from aqla_agent.observations import TemporaryObservation
         for attempt in range(2):
             started = now_ms()
@@ -67,20 +89,9 @@ class Hyperliquid:
                         self.info("metaAndAssetCtxs", **({"dex": market.dex} if market.dex else {})),
                         self.info("l2Book", coin=market.symbol))
                     # A slower mark read may age the book; refresh it within the same proof window.
-                    if (book.get("coin") == market.symbol and type(book.get("time")) is int
-                            and 1000 < now_ms() - book["time"] <= 2000 and now_ms() - started < 1000):
+                    if self.mark_book_refresh_due(market, book, started):
                         book = await self.info("l2Book", coin=market.symbol)
-                context = next((context for item, context in zip(raw[0]["universe"], raw[1], strict=True) if item["name"] == market.symbol), None)
-                if context is None:
-                    raise AqlaError("Target market has no verified mark-price context")
-                if book.get("coin") != market.symbol or not all(book.get("levels", [])):
-                    raise AqlaError("Target market has no executable order book")
-                bid, ask = Decimal(book["levels"][0][0]["px"]), Decimal(book["levels"][1][0]["px"])
-                return PriceSnapshot(market=market.symbol, bid=bid, ask=ask, mid=(bid + ask) / 2,
-                                     stop_reference=context["markPx"], stop_reference_kind="mark", exchange_time=book["time"],
-                                     started_at=started, observed_at=now_ms(),
-                                     bids=[(row["px"], row["sz"]) for row in book["levels"][0] if Decimal(row["sz"]) > 0] if all("sz" in row for row in book["levels"][0]) else [],
-                                     asks=[(row["px"], row["sz"]) for row in book["levels"][1] if Decimal(row["sz"]) > 0] if all("sz" in row for row in book["levels"][1]) else []).fresh()
+                return self.snapshot_from_book(market, raw, book, started)
             except (TemporaryObservation, TimeoutError):
                 if attempt:
                     raise
@@ -117,37 +128,46 @@ class Hyperliquid:
     async def fill_history(self, market: Market, start: int, end: int):
         return await self.info("userFillsByTime", user=self.account, startTime=start, endTime=end)
 
+    async def perp_collateral(self, meta, dex):
+        collateral = meta.get("collateralToken", 0 if not dex else None)
+        if type(collateral) is not int or collateral < 0:
+            collateral = None
+        quote = "USDC" if collateral == 0 else "UNKNOWN"
+        if collateral is not None and collateral != 0:
+            spot = await self.info("spotMeta")
+            token = next((item for item in spot["tokens"] if item["index"] == collateral), None)
+            if token:
+                quote = token["name"]
+        return collateral, quote
+
+
+    async def perp_markets(self, dex, result):
+        fields = {"dex": dex} if dex else {}
+        mids, meta = await asyncio.gather(self.info("allMids", **fields), self.info("meta", **fields))
+        # The native perp DEX has protocol USDC collateral. A HIP-3 DEX
+        # must identify its collateral; a legacy/missing field proves none.
+        collateral, quote = await self.perp_collateral(meta, dex)
+        offset = 0
+        if dex:
+            dexes = await self.info("perpDexs")
+            index = next((i for i, item in enumerate(dexes) if item and item["name"] == dex), None)
+            if index is None:
+                from .models import SymbolUnavailable
+                raise SymbolUnavailable("Unknown Hyperliquid DEX namespace")
+            offset = 100000 + index * 10000
+        for index, row in enumerate(meta["universe"]):
+            if row.get("isDelisted") or row["name"] not in mids:
+                continue
+            name = row["name"]
+            result[name] = Market(symbol=name, asset_id=offset + index, product="perp",
+                                  size_decimals=row["szDecimals"], max_leverage=row["maxLeverage"],
+                                  mid=mids[name], dex=dex, collateral_token=collateral, quote_token=quote)
+
+
     async def markets(self, product="perp", dex=""):
         result = {}
         if product == "perp":
-            fields = {"dex": dex} if dex else {}
-            mids, meta = await asyncio.gather(self.info("allMids", **fields), self.info("meta", **fields))
-            # The native perp DEX has protocol USDC collateral. A HIP-3 DEX
-            # must identify its collateral; a legacy/missing field proves none.
-            collateral = meta.get("collateralToken", 0 if not dex else None)
-            if type(collateral) is not int or collateral < 0:
-                collateral = None
-            quote = "USDC" if collateral == 0 else "UNKNOWN"
-            if collateral is not None and collateral != 0:
-                spot = await self.info("spotMeta")
-                token = next((item for item in spot["tokens"] if item["index"] == collateral), None)
-                if token:
-                    quote = token["name"]
-            offset = 0
-            if dex:
-                dexes = await self.info("perpDexs")
-                index = next((i for i, item in enumerate(dexes) if item and item["name"] == dex), None)
-                if index is None:
-                    from .models import SymbolUnavailable
-                    raise SymbolUnavailable("Unknown Hyperliquid DEX namespace")
-                offset = 100000 + index * 10000
-            for index, row in enumerate(meta["universe"]):
-                if row.get("isDelisted") or row["name"] not in mids:
-                    continue
-                name = row["name"]
-                result[name] = Market(symbol=name, asset_id=offset + index, product="perp",
-                                      size_decimals=row["szDecimals"], max_leverage=row["maxLeverage"],
-                                      mid=mids[name], dex=dex, collateral_token=collateral, quote_token=quote)
+            await self.perp_markets(dex, result)
         else:
             mids, meta = await asyncio.gather(self.info("allMids"), self.info("spotMeta"))
             tokens = {item["index"]: item for item in meta["tokens"]}
@@ -205,23 +225,19 @@ class Hyperliquid:
             raise AqlaError(f"Configured Gold market xyz:GOLD is unavailable on {self.settings.network}; no substitute is used")
         raise AqlaError("Source market cannot be resolved uniquely; no substitute market is used")
 
-    async def account_snapshot(self, market: Market):
-        if self.settings.shared_account and market.product == "perp":
-            return await self.account_inventory(market)
-        started = now_ms()
-        if market.product == "spot":
-            raw = await self.info("spotClearinghouseState", user=self.account)
-            balance = next((row for row in raw["balances"] if row["coin"] == "USDC"), None)
-            if not balance:
-                raise AqlaError("No USDC balance for spot entry")
-            available = Decimal(balance["total"]) - Decimal(balance.get("hold", "0"))
-            position = next((row for row in raw["balances"] if row["coin"] == market.base_token), None)
-            spot_size = Decimal(position["total"]) if position else Decimal(0)
-            return AccountSnapshot(equity=Decimal(balance["total"]), available_margin=available, position_size=spot_size, observed_at=started)
-        abstraction = await self.info("userAbstraction", user=self.account)
-        if abstraction not in ("disabled", None):
-            raise AqlaError("Automatic sizing requires standard account abstraction; other modes remain available through the full MCP")
-        raw = await self.info("clearinghouseState", user=self.account, **({"dex": market.dex} if market.dex else {}))
+    async def spot_account_snapshot(self, market, started):
+        raw = await self.info("spotClearinghouseState", user=self.account)
+        balance = next((row for row in raw["balances"] if row["coin"] == "USDC"), None)
+        if not balance:
+            raise AqlaError("No USDC balance for spot entry")
+        available = Decimal(balance["total"]) - Decimal(balance.get("hold", "0"))
+        position = next((row for row in raw["balances"] if row["coin"] == market.base_token), None)
+        spot_size = Decimal(position["total"]) if position else Decimal(0)
+        return AccountSnapshot(equity=Decimal(balance["total"]), available_margin=available, position_size=spot_size, observed_at=started)
+
+
+    @staticmethod
+    def account_position_size(raw, market):
         size = None
         positions = raw.get("assetPositions")
         if isinstance(positions, list):
@@ -232,6 +248,20 @@ class Hyperliquid:
             if len(matching) > 1:
                 raise AqlaError("Account position observation is ambiguous")
             size = Decimal(matching[0]["szi"]) if matching else Decimal(0)
+        return size
+
+
+    async def account_snapshot(self, market: Market):
+        if self.settings.shared_account and market.product == "perp":
+            return await self.account_inventory(market)
+        started = now_ms()
+        if market.product == "spot":
+            return await self.spot_account_snapshot(market, started)
+        abstraction = await self.info("userAbstraction", user=self.account)
+        if abstraction not in ("disabled", None):
+            raise AqlaError("Automatic sizing requires standard account abstraction; other modes remain available through the full MCP")
+        raw = await self.info("clearinghouseState", user=self.account, **({"dex": market.dex} if market.dex else {}))
+        size = self.account_position_size(raw, market)
         return AccountSnapshot(equity=raw["marginSummary"]["accountValue"], available_margin=raw["withdrawable"], position_size=size, observed_at=started)
 
     @staticmethod
@@ -360,18 +390,23 @@ class Hyperliquid:
     def cloid(self, operation_id, leg=0):
         return "0x" + digest([self.settings.network, self.account.lower(), operation_id, leg])[:32]
 
+    @staticmethod
+    def advance_nonce(state, scope, requested, allow_existing):
+        prior = state["nonces"].get(scope, 0)
+        value = max(now_ms(), prior + 1) if requested is None else requested
+        if requested is not None and (not isinstance(requested, int) or not now_ms() - 172800000 < requested < now_ms() + 86400000):
+            raise AqlaError("Requested nonce is outside the exchange time window")
+        if requested is not None and not allow_existing and value <= prior:
+            raise AqlaError("Prepared nonce was already consumed; prepare and collect signatures again")
+        state["nonces"][scope] = max(prior, value)
+        return value
+
+
     def _nonce(self, requested=None, *, allow_existing=False):
         scope = self.settings.network + ":" + self.wallet.address.lower()
 
         def advance(state):
-            prior = state["nonces"].get(scope, 0)
-            value = max(now_ms(), prior + 1) if requested is None else requested
-            if requested is not None and (not isinstance(requested, int) or not now_ms() - 172800000 < requested < now_ms() + 86400000):
-                raise AqlaError("Requested nonce is outside the exchange time window")
-            if requested is not None and not allow_existing and value <= prior:
-                raise AqlaError("Prepared nonce was already consumed; prepare and collect signatures again")
-            state["nonces"][scope] = max(prior, value)
-            return value
+            return self.advance_nonce(state, scope, requested, allow_existing)
 
         root = getattr(self.state, "root", self.state)
         if not hasattr(root, "update_metadata"):
@@ -426,6 +461,79 @@ class Hyperliquid:
 
         return await self._dispatch(operation_id, request, build, deadline, prepare_guard=prepare_guard, async_prepare_guard=async_prepare_guard)
 
+    def existing_dispatch(self, previous, request, request_hash):
+        self.state.assert_operation_binding(self.settings, previous)
+        matches = previous["request_hash"] == request_hash
+        if not matches and request.get("operation") and "signing_scope" not in previous["request"]:
+            legacy_request = {key: value for key, value in request.items() if key not in ("principal", "signing_scope")}
+            matches = previous["request"] == legacy_request and previous["request_hash"] == digest(legacy_request)
+        if not matches:
+            raise AqlaError("Operation ID already identifies a different request")
+        return previous
+
+
+    async def prepared_dispatch_guard(self, async_prepare_guard, operation_id):
+        if async_prepare_guard is not None:
+            try:
+                if invalidate := getattr(async_prepare_guard, "invalidate_account", None):
+                    invalidate()
+                await async_prepare_guard()
+            except BaseException as error:
+                from aqla_agent.observations import not_sent
+                fact = not_sent(error, "prepared_guard")
+                self.state.update(lambda state, fact=fact: state["operations"][operation_id].update(phase="rejected", outcome="not_sent", result=fact))
+                if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
+                return self.state.snapshot()["operations"][operation_id]
+
+
+    async def dispatch_transport_guard(self, record, operation_id, prepare_guard, async_prepare_guard, deadline, payload):
+        try:
+            def begin_send(state):
+                self.state.assert_operation_binding(self.settings, record)
+                if prepare_guard is not None:
+                    prepare_guard(state)
+                if deadline is not None and now_ms() >= deadline:
+                    raise AqlaError("Entry deadline expired before exchange send")
+                state["operations"][operation_id].update(phase="sending")
+            self.state.update(begin_send)
+            # The durable sending write itself may be slow. Observe again
+            # after it, then make the last synchronous check at transport.
+            if async_prepare_guard is not None:
+                await async_prepare_guard()
+            if prepare_guard is not None:
+                prepare_guard(self.state.snapshot())
+            if deadline is not None and now_ms() >= deadline:
+                raise AqlaError("Entry deadline expired before exchange transport")
+            if payload.get("expiresAfter") is not None and now_ms() >= payload["expiresAfter"]:
+                from aqla_agent.observations import TemporaryObservation
+                raise TemporaryObservation("wire_expired", "transport_guard")
+        except BaseException as error:
+            from aqla_agent.observations import not_sent
+            fact = not_sent(error, "transport_guard")
+            self.state.update(lambda state, fact=fact: state["operations"][operation_id].update(phase="rejected", outcome="not_sent", result=fact))
+            if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            return self.state.snapshot()["operations"][operation_id]
+
+
+    async def send_dispatch(self, operation_id, payload, sender):
+        try:
+            if sender is None:
+                response = await self.client.post("/exchange", json=payload)
+                response.raise_for_status()
+                result = response.json()
+            else:
+                result = await sender(payload)
+            phase, outcome, legs = self.decode_result(payload["action"], result)
+            self.state.update(lambda state: state["operations"][operation_id].update(phase=phase, outcome=outcome, legs=legs, result=result))
+        except BaseException as error:
+            self.state.update(lambda state: state["operations"][operation_id].update(phase="unknown", result={"error": "Exchange outcome unknown; reconcile exact identities, do not resubmit"}))
+            if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+        return self.state.snapshot()["operations"][operation_id]
+
+
     async def _dispatch(self, operation_id, request, build, deadline=None, sender=None, nonce_override=None, allow_existing_nonce=False, prepare_guard=None, async_prepare_guard=None):
         if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 160:
             raise AqlaError("Operation identity must contain 1..160 characters")
@@ -434,14 +542,7 @@ class Hyperliquid:
         async with self.mutations:
             previous = self.state.read("operations", entries={"operations": [operation_id]})["operations"].get(operation_id)
             if previous:
-                self.state.assert_operation_binding(self.settings, previous)
-                matches = previous["request_hash"] == request_hash
-                if not matches and request.get("operation") and "signing_scope" not in previous["request"]:
-                    legacy_request = {key: value for key, value in request.items() if key not in ("principal", "signing_scope")}
-                    matches = previous["request"] == legacy_request and previous["request_hash"] == digest(legacy_request)
-                if not matches:
-                    raise AqlaError("Operation ID already identifies a different request")
-                return previous
+                return self.existing_dispatch(previous, request, request_hash)
             if deadline is not None and now_ms() >= deadline:
                 raise AqlaError("Operation deadline has expired")
             from aqla_agent.observations import read_observation
@@ -467,77 +568,16 @@ class Hyperliquid:
                     raise AqlaError("Operation deadline has expired before preparation")
                 state["operations"][operation_id] = record
             self.state.update(prepare)
-            if async_prepare_guard is not None:
-                try:
-                    if invalidate := getattr(async_prepare_guard, "invalidate_account", None):
-                        invalidate()
-                    await async_prepare_guard()
-                except BaseException as error:
-                    from aqla_agent.observations import not_sent
-                    fact = not_sent(error, "prepared_guard")
-                    self.state.update(lambda state, fact=fact: state["operations"][operation_id].update(phase="rejected", outcome="not_sent", result=fact))
-                    if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-                        raise
-                    return self.state.snapshot()["operations"][operation_id]
-            try:
-                def begin_send(state):
-                    self.state.assert_operation_binding(self.settings, record)
-                    if prepare_guard is not None:
-                        prepare_guard(state)
-                    if deadline is not None and now_ms() >= deadline:
-                        raise AqlaError("Entry deadline expired before exchange send")
-                    state["operations"][operation_id].update(phase="sending")
-                self.state.update(begin_send)
-                # The durable sending write itself may be slow. Observe again
-                # after it, then make the last synchronous check at transport.
-                if async_prepare_guard is not None:
-                    await async_prepare_guard()
-                if prepare_guard is not None:
-                    prepare_guard(self.state.snapshot())
-                if deadline is not None and now_ms() >= deadline:
-                    raise AqlaError("Entry deadline expired before exchange transport")
-                if payload.get("expiresAfter") is not None and now_ms() >= payload["expiresAfter"]:
-                    from aqla_agent.observations import TemporaryObservation
-                    raise TemporaryObservation("wire_expired", "transport_guard")
-            except BaseException as error:
-                from aqla_agent.observations import not_sent
-                fact = not_sent(error, "transport_guard")
-                self.state.update(lambda state, fact=fact: state["operations"][operation_id].update(phase="rejected", outcome="not_sent", result=fact))
-                if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-                    raise
-                return self.state.snapshot()["operations"][operation_id]
-            try:
-                if sender is None:
-                    response = await self.client.post("/exchange", json=payload)
-                    response.raise_for_status()
-                    result = response.json()
-                else:
-                    result = await sender(payload)
-                phase, outcome, legs = self.decode_result(payload["action"], result)
-                self.state.update(lambda state: state["operations"][operation_id].update(phase=phase, outcome=outcome, legs=legs, result=result))
-            except BaseException as error:
-                self.state.update(lambda state: state["operations"][operation_id].update(phase="unknown", result={"error": "Exchange outcome unknown; reconcile exact identities, do not resubmit"}))
-                if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-                    raise
-            return self.state.snapshot()["operations"][operation_id]
+            rejected = await self.prepared_dispatch_guard(async_prepare_guard, operation_id)
+            if rejected is not None:
+                return rejected
+            rejected = await self.dispatch_transport_guard(record, operation_id, prepare_guard, async_prepare_guard, deadline, payload)
+            if rejected is not None:
+                return rejected
+            return await self.send_dispatch(operation_id, payload, sender)
 
     @staticmethod
-    def decode_result(action, result):
-        if not isinstance(result, dict) or result.get("status") not in ("ok", "err"):
-            return "unknown", "unknown", []
-        if result["status"] == "err":
-            return "rejected", "rejected", []
-        response = result.get("response")
-        if not isinstance(response, dict):
-            return "unknown", "unknown", []
-        data = response.get("data", {})
-        if not isinstance(data, dict):
-            return "unknown", "unknown", []
-        status = data.get("status")
-        if isinstance(status, dict) and isinstance(status.get("error"), str):
-            if response.get("type") != action.get("type"):
-                return "unknown", "unknown", []
-            return "rejected", "rejected", [{"index": 0, "disposition": "rejected", "status": status}]
+    def decode_special_result(action, response, data, status):
         if action.get("type") in ("twapOrder", "twapCancel"):
             if response.get("type") != action["type"]:
                 return "unknown", "unknown", []
@@ -551,19 +591,10 @@ class Hyperliquid:
             if response.get("type") == "trailingStop" and type(data.get("oid")) is int and data["oid"] > 0:
                 return "acknowledged", "accepted", []
             return "unknown", "unknown", []
-        statuses = data.get("statuses")
-        expected = len(action.get("orders", action.get("modifies", action.get("cancels", []))))
-        if action.get("type") == "modify":
-            expected = 1
-        if statuses is None:
-            if expected:
-                return "unknown", "unknown", []
-            return ("acknowledged", "accepted", []) if response.get("type") == "default" else ("unknown", "unknown", [])
-        response_type = {"order": "order", "modify": "order", "batchModify": "order", "cancel": "cancel", "cancelByCloid": "cancel"}.get(action.get("type"))
-        if response_type is None or response.get("type") != response_type:
-            return "unknown", "unknown", []
-        if not isinstance(statuses, list) or expected and len(statuses) != expected:
-            return "unknown", "unknown", []
+
+
+    @staticmethod
+    def decode_result_legs(statuses):
         legs = []
         for index, status in enumerate(statuses):
             if isinstance(status, dict) and isinstance(status.get("error"), str):
@@ -582,30 +613,48 @@ class Hyperliquid:
             return "rejected", "rejected", legs
         return "acknowledged", "partial" if "rejected" in outcomes else "accepted", legs
 
-    async def prepare_sdk_action(self, operation_id, request, *, multisig=False, target_account=None):
-        from .catalog import SDK_HELPERS, SDK_METHODS, cloid_arguments, validate_sdk
 
-        params = validate_sdk(request)
-        operation = params.pop("operation")
-        api_wallet_methods = {"order", "bulk_orders", "modify_order", "bulk_modify_orders_new", "market_open", "market_close",
-                              "cancel", "cancel_by_cloid", "bulk_cancel", "bulk_cancel_by_cloid", "schedule_cancel",
-                              "update_leverage", "update_isolated_margin", "agent_enable_dex_abstraction", "agent_set_abstraction", "noop"}
-        if not multisig and self.settings.signer_role != "master" and operation not in api_wallet_methods:
-            raise AqlaError("This operation requires a master signer")
-        signing_scope = sdk_signing_scope(operation)
-        request_binding = {"network": self.settings.network, "account": self.account.lower(), "operation": operation, "params": params,
-                           "principal": self.settings.account.lower(), "signing_scope": signing_scope}
-        # Fill in optional client identities before SDK signing, never after it.
-        if operation in ("order", "market_open", "market_close", "modify_order") and params.get("cloid") is None:
-            params["cloid"] = self.cloid(operation_id)
-        for i, order in enumerate(params.get("order_requests", [])):
-            if order.get("cloid") is None:
-                order["cloid"] = self.cloid(operation_id, i)
-        market_operations = {"order", "bulk_orders", "modify_order", "bulk_modify_orders_new", "market_open", "market_close",
-                             "cancel", "cancel_by_cloid", "bulk_cancel", "bulk_cancel_by_cloid", "update_leverage", "update_isolated_margin"}
-        if operation in market_operations:
-            await self.markets("perp")
-            await self.markets("spot")
+    @staticmethod
+    def decode_order_result(action, response, data):
+        statuses = data.get("statuses")
+        expected = len(action.get("orders", action.get("modifies", action.get("cancels", []))))
+        if action.get("type") == "modify":
+            expected = 1
+        if statuses is None:
+            if expected:
+                return "unknown", "unknown", []
+            return ("acknowledged", "accepted", []) if response.get("type") == "default" else ("unknown", "unknown", [])
+        response_type = {"order": "order", "modify": "order", "batchModify": "order", "cancel": "cancel", "cancelByCloid": "cancel"}.get(action.get("type"))
+        if response_type is None or response.get("type") != response_type:
+            return "unknown", "unknown", []
+        if not isinstance(statuses, list) or expected and len(statuses) != expected:
+            return "unknown", "unknown", []
+        return Hyperliquid.decode_result_legs(statuses)
+
+
+    @staticmethod
+    def decode_result(action, result):
+        if not isinstance(result, dict) or result.get("status") not in ("ok", "err"):
+            return "unknown", "unknown", []
+        if result["status"] == "err":
+            return "rejected", "rejected", []
+        response = result.get("response")
+        if not isinstance(response, dict):
+            return "unknown", "unknown", []
+        data = response.get("data", {})
+        if not isinstance(data, dict):
+            return "unknown", "unknown", []
+        status = data.get("status")
+        if isinstance(status, dict) and isinstance(status.get("error"), str):
+            if response.get("type") != action.get("type"):
+                return "unknown", "unknown", []
+            return "rejected", "rejected", [{"index": 0, "disposition": "rejected", "status": status}]
+        if action.get("type") in ("twapOrder", "twapCancel", "trailingStop"):
+            return Hyperliquid.decode_special_result(action, response, data, status)
+        return Hyperliquid.decode_order_result(action, response, data)
+
+    @staticmethod
+    def sdk_market_names(params):
         names = []
 
         def gather(value):
@@ -620,6 +669,99 @@ class Hyperliquid:
                     gather(item)
 
         gather(params)
+        return names
+
+
+    @staticmethod
+    def sdk_slippage_override(sdk, metadata):
+        def slippage_price(name, is_buy, slippage, px=None):
+            market = metadata[name]
+            price = float(market.mid) if not px else px
+            price *= (1 + slippage) if is_buy else (1 - slippage)
+            decimals = (6 if market.product == "perp" else 8) - market.size_decimals
+            return round(float(f"{price:.5g}"), decimals)
+
+        # An isolated facade override: HIP-3 IDs are above the spot range,
+        # but their price precision still follows the perpetual contract.
+        # Pinned SDK helper used only after explicit native action/scope validation.
+        # skipcq: PYL-W0212
+        sdk._slippage_price = slippage_price
+
+
+    def sdk_capture_override(self, sdk, nonce, expires, signing_scope):
+        def capture(action, signature, timestamp):
+            if timestamp != nonce:
+                raise AqlaError("SDK signing timestamp differs from the durable nonce; action was not sent")
+            payload = {"action": action, "signature": signature, "nonce": timestamp}
+            if "signatureChainId" not in action:
+                if signing_scope == "user":
+                    raise AqlaError("SDK action differs from its documented signing scope")
+                payload["vaultAddress"] = None if signing_scope == "principal" else self.settings.vault_address
+                payload["expiresAfter"] = expires
+            elif signing_scope != "user":
+                raise AqlaError("SDK action differs from its documented signing scope")
+            return payload
+
+        # Pinned SDK helper used only after explicit native action/scope validation.
+        # skipcq: PYL-W0212
+        sdk._post_action = capture
+
+
+    def sdk_action_builder(self, PreparedInfo, target_account, metadata, signing_scope, params, operation):
+        from .catalog import SDK_HELPERS, SDK_METHODS, cloid_arguments
+        def build(nonce, expires):
+            sdk = object.__new__(Exchange)
+            sdk.wallet, sdk.base_url = self.wallet, self.settings.base_url
+            sdk.vault_address, sdk.account_address = self.settings.vault_address, target_account or self.settings.account
+            sdk.info, sdk.expires_after = PreparedInfo(), expires
+            # Bind isolated SDK function globals. No global timestamp monkeypatch or second dispatcher.
+            for name, method in (SDK_METHODS | SDK_HELPERS).items():
+                globals_copy = dict(method.__globals__, get_timestamp_ms=lambda: nonce)
+                function = types.FunctionType(method.__code__, globals_copy, method.__name__, method.__defaults__, method.__closure__)
+                function.__kwdefaults__ = method.__kwdefaults__
+                setattr(sdk, name, types.MethodType(function, sdk))
+
+            self.sdk_slippage_override(sdk, metadata)
+            self.sdk_capture_override(sdk, nonce, expires, signing_scope)
+            arguments = cloid_arguments(params)
+            if operation == "noop":
+                arguments["nonce"] = nonce
+            payload = vars(sdk)[operation](**arguments)
+            if not isinstance(payload, dict) or "action" not in payload or "signature" not in payload:
+                raise AqlaError("SDK operation did not produce exactly one signed action")
+            return payload
+        return build
+
+
+    def assign_sdk_cloids(self, operation, params, operation_id):
+        if operation in ("order", "market_open", "market_close", "modify_order") and params.get("cloid") is None:
+            params["cloid"] = self.cloid(operation_id)
+        for i, order in enumerate(params.get("order_requests", [])):
+            if order.get("cloid") is None:
+                order["cloid"] = self.cloid(operation_id, i)
+
+
+    async def prepare_sdk_action(self, operation_id, request, *, multisig=False, target_account=None):
+        from .catalog import validate_sdk
+
+        params = validate_sdk(request)
+        operation = params.pop("operation")
+        api_wallet_methods = {"order", "bulk_orders", "modify_order", "bulk_modify_orders_new", "market_open", "market_close",
+                              "cancel", "cancel_by_cloid", "bulk_cancel", "bulk_cancel_by_cloid", "schedule_cancel",
+                              "update_leverage", "update_isolated_margin", "agent_enable_dex_abstraction", "agent_set_abstraction", "noop"}
+        if not multisig and self.settings.signer_role != "master" and operation not in api_wallet_methods:
+            raise AqlaError("This operation requires a master signer")
+        signing_scope = sdk_signing_scope(operation)
+        request_binding = {"network": self.settings.network, "account": self.account.lower(), "operation": operation, "params": params,
+                           "principal": self.settings.account.lower(), "signing_scope": signing_scope}
+        # Fill in optional client identities before SDK signing, never after it.
+        self.assign_sdk_cloids(operation, params, operation_id)
+        market_operations = {"order", "bulk_orders", "modify_order", "bulk_modify_orders_new", "market_open", "market_close",
+                             "cancel", "cancel_by_cloid", "bulk_cancel", "bulk_cancel_by_cloid", "update_leverage", "update_isolated_margin"}
+        if operation in market_operations:
+            await self.markets("perp")
+            await self.markets("spot")
+        names = self.sdk_market_names(params)
         for name in names if operation in market_operations else []:
             if ":" in name:
                 await self.markets("perp", name.split(":", 1)[0])
@@ -654,55 +796,7 @@ class Hyperliquid:
 
         self_account = effective_account
 
-        def build(nonce, expires):
-            sdk = object.__new__(Exchange)
-            sdk.wallet, sdk.base_url = self.wallet, self.settings.base_url
-            sdk.vault_address, sdk.account_address = self.settings.vault_address, target_account or self.settings.account
-            sdk.info, sdk.expires_after = PreparedInfo(), expires
-            # Bind isolated SDK function globals. No global timestamp monkeypatch or second dispatcher.
-            for name, method in (SDK_METHODS | SDK_HELPERS).items():
-                globals_copy = dict(method.__globals__, get_timestamp_ms=lambda: nonce)
-                function = types.FunctionType(method.__code__, globals_copy, method.__name__, method.__defaults__, method.__closure__)
-                function.__kwdefaults__ = method.__kwdefaults__
-                setattr(sdk, name, types.MethodType(function, sdk))
-
-            def slippage_price(name, is_buy, slippage, px=None):
-                market = metadata[name]
-                price = float(market.mid) if not px else px
-                price *= (1 + slippage) if is_buy else (1 - slippage)
-                decimals = (6 if market.product == "perp" else 8) - market.size_decimals
-                return round(float(f"{price:.5g}"), decimals)
-
-            # An isolated facade override: HIP-3 IDs are above the spot range,
-            # but their price precision still follows the perpetual contract.
-            # Pinned SDK helper used only after explicit native action/scope validation.
-            # skipcq: PYL-W0212
-            sdk._slippage_price = slippage_price
-
-            def capture(action, signature, timestamp):
-                if timestamp != nonce:
-                    raise AqlaError("SDK signing timestamp differs from the durable nonce; action was not sent")
-                payload = {"action": action, "signature": signature, "nonce": timestamp}
-                if "signatureChainId" not in action:
-                    if signing_scope == "user":
-                        raise AqlaError("SDK action differs from its documented signing scope")
-                    payload["vaultAddress"] = None if signing_scope == "principal" else self.settings.vault_address
-                    payload["expiresAfter"] = expires
-                elif signing_scope != "user":
-                    raise AqlaError("SDK action differs from its documented signing scope")
-                return payload
-
-            # Pinned SDK helper used only after explicit native action/scope validation.
-            # skipcq: PYL-W0212
-            sdk._post_action = capture
-            arguments = cloid_arguments(params)
-            if operation == "noop":
-                arguments["nonce"] = nonce
-            payload = vars(sdk)[operation](**arguments)
-            if not isinstance(payload, dict) or "action" not in payload or "signature" not in payload:
-                raise AqlaError("SDK operation did not produce exactly one signed action")
-            return payload
-
+        build = self.sdk_action_builder(PreparedInfo, target_account, metadata, signing_scope, params, operation)
         return request_binding, build
 
     async def sdk_action(self, operation_id, request, *, sender=None, prepare_guard=None):
@@ -728,6 +822,25 @@ class Hyperliquid:
         return await self._dispatch(operation_id, request_binding,
                                     lambda nonce, expires: sign_native(self.wallet, action, nonce, expires, self.settings), sender=sender, prepare_guard=prepare_guard)
 
+    @staticmethod
+    def reconciliation_proves(action, identity, row):
+        detail = row.get("order", {})
+        order = detail.get("order", {})
+        matches = type(order.get("oid")) is int and order["oid"] == identity if type(identity) is int else str(order.get("cloid", "")).lower() == identity.lower()
+        terminal = action.get("type") not in ("cancel", "cancelByCloid") or detail.get("status") in TERMINAL_ORDER
+        return row.get("status") == "order" and matches and terminal and detail.get("status") not in (None, "unknownOid")
+
+
+    @staticmethod
+    def reconciliation_identities(action):
+        identities = [order["c"] for order in action.get("orders", []) if order.get("c")]
+        if action.get("type") == "cancelByCloid":
+            identities = [order["cloid"] for order in action["cancels"]]
+        if action.get("type") == "cancel":
+            identities = [order["o"] for order in action["cancels"]]
+        return identities
+
+
     async def reconcile(self, operation_id):
         self.state.assert_binding(self.settings)
         record = self.state.snapshot()["operations"].get(operation_id)
@@ -738,18 +851,10 @@ class Hyperliquid:
             return {"operation": record, "evidence": record["evidence"], "resolved": True,
                     "resubmitted": False, "absence_is_proof": True}
         action = record["wire_action"]
-        identities = [order["c"] for order in action.get("orders", []) if order.get("c")]
-        if action.get("type") == "cancelByCloid":
-            identities = [order["cloid"] for order in action["cancels"]]
-        if action.get("type") == "cancel":
-            identities = [order["o"] for order in action["cancels"]]
+        identities = self.reconciliation_identities(action)
         observations = [await self.order_status(identity, record["request"].get("account")) for identity in identities]
         def proves(identity, row):
-            detail = row.get("order", {})
-            order = detail.get("order", {})
-            matches = type(order.get("oid")) is int and order["oid"] == identity if type(identity) is int else str(order.get("cloid", "")).lower() == identity.lower()
-            terminal = action.get("type") not in ("cancel", "cancelByCloid") or detail.get("status") in TERMINAL_ORDER
-            return row.get("status") == "order" and matches and terminal and detail.get("status") not in (None, "unknownOid")
+            return self.reconciliation_proves(action, identity, row)
         proven = bool(identities) and all(proves(identity, row) for identity, row in zip(identities, observations, strict=True))
         if proven:
             self.state.update(lambda state: state["operations"][operation_id].update(phase="reconciled", evidence=observations))

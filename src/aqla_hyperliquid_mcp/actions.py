@@ -481,6 +481,39 @@ USER_SIGNED_TYPES = {
 }
 
 
+def _perp_deploy_payload(values):
+    for key in ("setFundingMultipliers", "setFundingInterestRates", "setFundingClamps", "setMarginTableIds", "setOpenInterestCaps", "setMarginModes", "setDeployerFees"):
+        if key in values:
+            values[key] = sorted(values[key], key=lambda pair: pair[0])
+    for key in ("registerAsset", "registerAsset2"):
+        if (values.get(key, {}).get("schema") or {}).get("isStar"):
+            values["testnet_only"] = True
+    if "star" in values:
+        values["testnet_only"] = True
+    if "setOracle" in values:
+        oracle = values["setOracle"]
+        for key in ("oraclePxs", "externalPerpPxs"):
+            oracle[key] = sorted(oracle[key], key=lambda pair: pair[0])
+        oracle["markPxs"] = [sorted(rows, key=lambda pair: pair[0]) for rows in oracle["markPxs"]]
+    for key, minimum, maximum in (("setFundingMultipliers", 0, 10), ("setFundingInterestRates", Decimal("-0.01"), Decimal("0.01")), ("setFundingClamps", 0, Decimal("0.01"))):
+        if key in values and any(not minimum <= Decimal(row[1]) <= maximum for row in values[key]):
+            raise AqlaError(f"{key} is outside its documented range")
+
+
+def _sorted_native_pairs(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in ("keywordToValue", "oraclePxs", "externalPerpPxs"):
+                if len({pair[0] for pair in item}) != len(item):
+                    raise AqlaError("Duplicate key in documented tuple-list contract")
+                value[key] = sorted(item, key=lambda pair: pair[0])
+            else:
+                _sorted_native_pairs(item)
+    elif isinstance(value, list):
+        for item in value:
+            _sorted_native_pairs(item)
+
+
 def native_payload(request):
     model = NATIVE_ADAPTER.validate_python(request)
     values = model.model_dump(mode="json", by_alias=True, exclude_unset=True)
@@ -493,39 +526,11 @@ def native_payload(request):
     if model.type == "agentSendAsset":
         values.setdefault("fromSubAccount", model.fromSubAccount)
     if model.type == "perpDeploy":
-        for key in ("setFundingMultipliers", "setFundingInterestRates", "setFundingClamps", "setMarginTableIds", "setOpenInterestCaps", "setMarginModes", "setDeployerFees"):
-            if key in values:
-                values[key] = sorted(values[key], key=lambda pair: pair[0])
-        for key in ("registerAsset", "registerAsset2"):
-            if (values.get(key, {}).get("schema") or {}).get("isStar"):
-                values["testnet_only"] = True
-        if "star" in values:
-            values["testnet_only"] = True
-        if "setOracle" in values:
-            oracle = values["setOracle"]
-            for key in ("oraclePxs", "externalPerpPxs"):
-                oracle[key] = sorted(oracle[key], key=lambda pair: pair[0])
-            oracle["markPxs"] = [sorted(rows, key=lambda pair: pair[0]) for rows in oracle["markPxs"]]
-        for key, minimum, maximum in (("setFundingMultipliers", 0, 10), ("setFundingInterestRates", Decimal("-0.01"), Decimal("0.01")), ("setFundingClamps", 0, Decimal("0.01"))):
-            if key in values and any(not minimum <= Decimal(row[1]) <= maximum for row in values[key]):
-                raise AqlaError(f"{key} is outside its documented range")
+        _perp_deploy_payload(values)
     if model.type in ("activateOutcomeDeployer", "outcomeDeploy"):
         values["testnet_only"] = True
 
-    def sorted_pairs(value):
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key in ("keywordToValue", "oraclePxs", "externalPerpPxs"):
-                    if len({pair[0] for pair in item}) != len(item):
-                        raise AqlaError("Duplicate key in documented tuple-list contract")
-                    value[key] = sorted(item, key=lambda pair: pair[0])
-                else:
-                    sorted_pairs(item)
-        elif isinstance(value, list):
-            for item in value:
-                sorted_pairs(item)
-
-    sorted_pairs(values)
+    _sorted_native_pairs(values)
     return values
 
 

@@ -120,7 +120,7 @@ async def test_failed_unchanged_job_does_not_restart_model_work(native_processor
 @pytest.mark.asyncio
 async def test_unverified_trade_cannot_enter_executor(native_processor, signal):
     server, _, fake = native_processor
-    source, interpretation = signal
+    _source, interpretation = signal
     job = (await rpc(server, "source_prepare", processing_version="p"))["job"]
     result = DecisionResult(model="inception/mercury-decide:free", interpretation=interpretation)
     with pytest.raises(Exception, match="second verification"):
@@ -499,7 +499,7 @@ async def test_semantic_failure_is_not_a_provider_retry_and_diagnostics_remove_p
 
 @pytest.mark.asyncio
 async def test_identical_later_edit_reuses_nonactionable_interpretation_but_true_change_invalidates(native_processor):
-    server, state, fake = native_processor
+    server, _state, fake = native_processor
     source = SourceEvent(chat_id="channel", message_id=61, sent_at=now_ms(), text="Result report.")
     server.aqla_trading.ingest(source)
     original = (await rpc(server, "source_prepare", processing_version="p"))["job"]
@@ -519,7 +519,7 @@ async def test_identical_later_edit_reuses_nonactionable_interpretation_but_true
 
 @pytest.mark.asyncio
 async def test_identical_unsubmitted_signal_edit_rebinds_evidence_and_executes_once(native_processor, signal):
-    server, state, fake = native_processor
+    server, _state, fake = native_processor
     source, interpretation = signal
     original = (await rpc(server, "source_prepare", processing_version="p"))["job"]
     await rpc(server, "source_record", job_id=original["job_id"], decision_result=DecisionResult(

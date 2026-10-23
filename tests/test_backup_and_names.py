@@ -27,7 +27,7 @@ def missing(signal, *fields):
 
 @pytest.mark.parametrize('number,expected', [('12.78',12), ('12,78',12), ('20.99',20), ('1.99',1)])
 def test_decimal_leverage_is_evidenced_before_rounding(setup,signal,number,expected):
-    _,state,*_=setup
+    _,_state,*_=setup
     source,original=signal
     source=source.model_copy(update={'text':source.text+' '+number+'x'})
     value=Interpretation.model_validate({**original.model_dump(mode='json'),'leverage':number,
@@ -95,7 +95,7 @@ async def test_missing_fields_use_backup_without_changing_risk(setup,signal):
 
 @pytest.mark.asyncio
 async def test_blank_backup_fields_fail_before_exchange_action(setup,signal):
-    _,state,fake,_,trading=setup
+    _,_state,fake,_,trading=setup
     source,value=signal
     with pytest.raises(AqlaError,match='Backup SL percentage'):
         await trading.preview(source.event_id,missing(value,'stop_loss'))

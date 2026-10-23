@@ -64,6 +64,15 @@ def setting_value(value):
     return number(value) if isinstance(value, Decimal) else str(value)
 
 
+def _command_aliases(text):
+    aliases = {"/aqla": ("home",), "/aqla_status": ("dashboard",), "/aqla_journal": ("journal",), "/aqla_profile": ("profiles",), "/aqla_kanaele": ("sources",), "/aqla_funktionen": ("help",)}
+    if len(text.split(maxsplit=1)) == 1:
+        aliases.update({"/aqla_limits": ("limits_selection",), "/aqla_parameter": ("profiles",),
+            "/aqla_hinzufuegen": ("prompt", "add_source", ""), "/aqla_entfernen": ("prompt", "remove_source", ""),
+            "/aqla_kanalname": ("prompt", "rename_source", ""), "/aqla_konflikt": ("conflicts",), "/aqla_konflikt_loesen": ("conflicts",)})
+    return aliases
+
+
 class TelegramMenu:
     def __init__(self, commands):
         self.commands, self.extension = commands, commands.extension
@@ -96,6 +105,122 @@ class TelegramMenu:
     async def config(self):
         return await self.rpc("status", view="configuration", context_auth=self.commands.auth())
 
+    async def _edit_display(self, bot, payload):
+        try:
+            await asyncio.wait_for(bot.edit_message_text(message_id=self.message_id, **payload), 10)
+            return True
+        except Exception as error:
+            if "message is not modified" in str(error).lower():
+                return True
+            if not any(code in str(error).lower() for code in ("message to edit not found", "message can't be edited", "message_id_invalid")):
+                raise AqlaError("Telegram-Menü vorübergehend nicht aktualisierbar") from None
+        return False
+
+    async def _field_settings(self, bot, kind, identity, field, data):
+        from .command_catalog import parameter_unit
+        models = {"profile": Parameters, "ranking": RankingPolicy}
+        if kind == "profile":
+            values = Parameters.model_validate(data["profiles"][identity]["parameters"]).model_dump(mode="json")
+            current = getattr(Parameters.model_validate(values), field)
+            revision = data["configuration_revision"]
+            schema = models[kind].model_json_schema()["properties"][field]
+            unit = parameter_unit(field, values)
+        elif kind == "ranking":
+            field, _, subfield = field.partition(".")
+            values, revision = data["ranking_policy"], data["ranking_revision"]
+            current = values[field][subfield] if subfield else values[field]
+            schema = RankingPolicy.model_json_schema()["properties"][field]
+            if subfield:
+                schema = schema["additionalProperties"]
+            field += "." + subfield if subfield else ""
+            unit = "Wert"
+        elif kind == "limits":
+            values, revision = data["execution_accounts"][identity]["limits"], data["configuration_revision"]
+            if values is None:
+                await self.run(bot, "prompt", "initial_limits", identity)
+                return None
+            current = values[field]
+            schema, unit = AccountLimits.model_json_schema()["properties"][field], "Trades" if field == "max_open_trades" else "%"
+        else:
+            from .runtime_controls import RuntimeControls, TechnicalSettings
+            runtime = RuntimeControls(self.extension).read()
+            current, revision = runtime["values"][field], runtime["revision"]
+            schema, unit = TechnicalSettings.model_json_schema()["properties"][field], "Wert"
+        return field, current, revision, schema, unit
+
+    async def _save_profile_prompt(self, bot, action, identity, text, data, revision):
+        if action == "create_profile":
+            if data["profiles"]["standard"].get("parameters") is None:
+                self.pending = None
+                await self.profile(bot, "standard")
+                return False
+            profile = TradingProfile(id="p_" + secrets.token_hex(6), name=text.strip(), parameters=Parameters.model_validate(data["profiles"]["standard"]["parameters"]))
+        else:
+            row = data["profiles"][identity]
+            profile = TradingProfile(id=identity, name=text.strip(), parameters=Parameters.model_validate(row["parameters"]))
+        await self.commands.control(action="set_profile", profile=profile.model_dump(mode="json"), expected_revision=revision)
+
+    async def _save_pipeline_prompt(self, action, identity, text, data, revision):
+        if action == "create_pipeline":
+            pipeline = Pipeline(id="r_" + secrets.token_hex(6), name=text.strip(), sources=["*"], targets=[{"exchange": "hyperliquid", "profile_id": "standard"}], enabled=False)
+        else:
+            row = data["pipelines"][identity]
+            values = {key: value for key, value in row.items() if key in Pipeline.model_fields}
+            values["sources" if action == "pipeline_sources" else "name"] = [part.strip() for part in text.split(";") if part.strip()] if action == "pipeline_sources" else text.strip()
+            pipeline = Pipeline.model_validate(values)
+        await self.commands.control(action="set_pipeline", pipeline=pipeline.model_dump(mode="json"), expected_revision=revision)
+
+    async def _intercept_callback(self, query, bot):
+        user, message = query.from_user, query.message
+        chat = getattr(message, "chat", None)
+        if not self._private_callback_owner(user, chat):
+            await query.answer()
+            return True
+        selection = self.tokens.pop(query.data, None) if self.live() and message.message_id == self.message_id else None
+        if selection is None:
+            if self.recovered and message.message_id == self.message_id:
+                await query.answer()
+                async with self.serial:
+                    await self.home(bot)
+                return True
+            await query.answer(text="Diese Schaltfläche wurde ersetzt. Bitte das aktuelle Menü verwenden.")
+            return True
+        await query.answer()
+        action, args = selection
+        self.tokens.clear()
+        if action not in ("input", "manage_apply", "text_page"):
+            self.pending = None
+            self.commands.cancel()
+        try:
+            if action == "pause":
+                await self.run(bot, action, *args)
+            else:
+                async with self.serial:
+                    await self.run(bot, action, *args)
+        except ValueError as error:
+            await self.display(bot, "Änderung nicht ausgeführt.\n" + str(error)[:600] + "\nFür geschützte Änderungen Setup öffnen.", [("Setup", "setup")])
+        except Exception:
+            self.pending = None
+            await self.display(bot, "Menü vorübergehend nicht verfügbar. Ein möglicherweise angenommener Handelsauftrag wird mit derselben Identität abgeglichen.")
+        return True
+
+    async def _save_initial_limits(self, bot, identity, text, revision):
+        parts = [part.strip().replace(",", ".") for part in text.split(";")]
+        if len(parts) != 2:
+            raise ValueError("Beide Werte senden: maximale offene Trades; Gesamtrisiko (%)")
+        limits = AccountLimits(max_open_trades=int(parts[0]), max_total_risk_percent=parts[1])
+        await self.commands.control(action="set_account_limits", account_key=identity, limits=limits.model_dump(mode="json"), expected_revision=revision)
+        self.pending = None
+        return await self.display(bot, "Kontolimits gespeichert. Der bestehende Aktivierungsstatus bleibt unverändert.", [("Konten", "accounts")])
+
+    def _authentic_input(self, update, message):
+        return self.extension.setup.private_owner(message) and not any(
+            getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))
+
+    def _private_callback_owner(self, user, chat):
+        return bool(user and chat and not user.is_bot and str(user.id) == self.extension.owner
+                    and str(chat.id) == self.extension.owner and chat.type == "private")
+
     async def display(self, bot, text, buttons=(), *, raw=False, page=0):
         self.tokens.clear()
         self.recovered = False
@@ -115,14 +240,8 @@ class TelegramMenu:
         payload = {"chat_id": self.extension.owner, "text": text, "parse_mode": None, "reply_markup": {"inline_keyboard": rows}}
         previous = self.message_id
         if self.message_id is not None and not self.fresh:
-            try:
-                await asyncio.wait_for(bot.edit_message_text(message_id=self.message_id, **payload), 10)
+            if await self._edit_display(bot, payload):
                 return
-            except Exception as error:
-                if "message is not modified" in str(error).lower():
-                    return
-                if not any(code in str(error).lower() for code in ("message to edit not found", "message can't be edited", "message_id_invalid")):
-                    raise AqlaError("Telegram-Menü vorübergehend nicht aktualisierbar") from None
         sent = await asyncio.wait_for(bot.send_message(**payload), 10)
         self.message_id = sent.message_id
         self.fresh = False
@@ -240,35 +359,11 @@ class TelegramMenu:
         await self.paged(bot, title, rows, "profile_field", (identity,))
 
     async def field(self, bot, kind, identity, field):
-        from .command_catalog import parameter_unit
         data = await self.config()
-        models = {"profile": Parameters, "ranking": RankingPolicy}
-        if kind == "profile":
-            values = Parameters.model_validate(data["profiles"][identity]["parameters"]).model_dump(mode="json")
-            current = getattr(Parameters.model_validate(values), field)
-            revision = data["configuration_revision"]
-            schema = models[kind].model_json_schema()["properties"][field]
-            unit = parameter_unit(field, values)
-        elif kind == "ranking":
-            field, _, subfield = field.partition(".")
-            values, revision = data["ranking_policy"], data["ranking_revision"]
-            current = values[field][subfield] if subfield else values[field]
-            schema = RankingPolicy.model_json_schema()["properties"][field]
-            if subfield:
-                schema = schema["additionalProperties"]
-            field += "." + subfield if subfield else ""
-            unit = "Wert"
-        elif kind == "limits":
-            values, revision = data["execution_accounts"][identity]["limits"], data["configuration_revision"]
-            if values is None:
-                return await self.run(bot, "prompt", "initial_limits", identity)
-            current = values[field]
-            schema, unit = AccountLimits.model_json_schema()["properties"][field], "Trades" if field == "max_open_trades" else "%"
-        else:
-            from .runtime_controls import RuntimeControls, TechnicalSettings
-            runtime = RuntimeControls(self.extension).read()
-            current, revision = runtime["values"][field], runtime["revision"]
-            schema, unit = TechnicalSettings.model_json_schema()["properties"][field], "Wert"
+        settings = await self._field_settings(bot, kind, identity, field, data)
+        if settings is None:
+            return None
+        field, current, revision, schema, unit = settings
         self.pending = {"kind": kind, "identity": identity, "field": field, "schema": schema, "revision": revision}
         selected = next((row for row in schema.get("anyOf", [schema]) if row.get("type") != "null"), schema)
         options = selected.get("enum")
@@ -778,13 +873,7 @@ class TelegramMenu:
         data = await self.config()
         revision = pending["revision"]
         if action == "initial_limits":
-            parts = [part.strip().replace(",", ".") for part in text.split(";")]
-            if len(parts) != 2:
-                raise ValueError("Beide Werte senden: maximale offene Trades; Gesamtrisiko (%)")
-            limits = AccountLimits(max_open_trades=int(parts[0]), max_total_risk_percent=parts[1])
-            await self.commands.control(action="set_account_limits", account_key=identity, limits=limits.model_dump(mode="json"), expected_revision=revision)
-            self.pending = None
-            return await self.display(bot, "Kontolimits gespeichert. Der bestehende Aktivierungsstatus bleibt unverändert.", [("Konten", "accounts")])
+            return await self._save_initial_limits(bot, identity, text, revision)
         if action.startswith("filter_"):
             column = {"filter_symbol": "Symbol", "filter_source": "Quelle", "filter_status": "Status"}[action]
             self.pending = None
@@ -792,84 +881,37 @@ class TelegramMenu:
         if action in ("add_source", "remove_source", "rename_source"):
             await self.commands.source_change(bot, {"add_source": "aqla_hinzufuegen", "remove_source": "aqla_entfernen", "rename_source": "aqla_kanalname"}[action], text.strip())
         elif action in ("create_profile", "rename_profile"):
-            if action == "create_profile":
-                if data["profiles"]["standard"].get("parameters") is None:
-                    self.pending = None
-                    return await self.profile(bot, "standard")
-                profile = TradingProfile(id="p_" + secrets.token_hex(6), name=text.strip(), parameters=Parameters.model_validate(data["profiles"]["standard"]["parameters"]))
-            else:
-                row = data["profiles"][identity]
-                profile = TradingProfile(id=identity, name=text.strip(), parameters=Parameters.model_validate(row["parameters"]))
-            await self.commands.control(action="set_profile", profile=profile.model_dump(mode="json"), expected_revision=revision)
+            if await self._save_profile_prompt(bot, action, identity, text, data, revision) is False:
+                return None
         else:
-            if action == "create_pipeline":
-                pipeline = Pipeline(id="r_" + secrets.token_hex(6), name=text.strip(), sources=["*"], targets=[{"exchange": "hyperliquid", "profile_id": "standard"}], enabled=False)
-            else:
-                row = data["pipelines"][identity]
-                values = {key: value for key, value in row.items() if key in Pipeline.model_fields}
-                values["sources" if action == "pipeline_sources" else "name"] = [part.strip() for part in text.split(";") if part.strip()] if action == "pipeline_sources" else text.strip()
-                pipeline = Pipeline.model_validate(values)
-            await self.commands.control(action="set_pipeline", pipeline=pipeline.model_dump(mode="json"), expected_revision=revision)
+            await self._save_pipeline_prompt(action, identity, text, data, revision)
         self.pending = None
         await self.display(bot, "Gespeichert.", [("Zur Übersicht", "sources" if "source" in action or "pipeline" in action else "profiles")])
+
+    def _relevant_input(self, command, aliases, text):
+        return command in aliases or self.pending is not None and not text.startswith("/")
 
     async def intercept(self, update, bot):
         query = getattr(update, "callback_query", None)
         if query and str(getattr(query, "data", "")).startswith(PREFIX):
-            user, message = query.from_user, query.message
-            chat = getattr(message, "chat", None)
-            if not (user and chat and not user.is_bot and str(user.id) == self.extension.owner and str(chat.id) == self.extension.owner and chat.type == "private"):
-                await query.answer()
-                return True
-            selection = self.tokens.pop(query.data, None) if self.live() and message.message_id == self.message_id else None
-            if selection is None:
-                if self.recovered and message.message_id == self.message_id:
-                    await query.answer()
-                    async with self.serial:
-                        await self.home(bot)
-                    return True
-                await query.answer(text="Diese Schaltfläche wurde ersetzt. Bitte das aktuelle Menü verwenden.")
-                return True
-            await query.answer()
-            action, args = selection
-            self.tokens.clear()
-            if action not in ("input", "manage_apply", "text_page"):
-                self.pending = None
-                self.commands.cancel()
-            try:
-                if action == "pause":
-                    await self.run(bot, action, *args)
-                else:
-                    async with self.serial:
-                        await self.run(bot, action, *args)
-            except ValueError as error:
-                await self.display(bot, "Änderung nicht ausgeführt.\n" + str(error)[:600] + "\nFür geschützte Änderungen Setup öffnen.", [("Setup", "setup")])
-            except Exception:
-                self.pending = None
-                await self.display(bot, "Menü vorübergehend nicht verfügbar. Ein möglicherweise angenommener Handelsauftrag wird mit derselben Identität abgeglichen.")
-            return True
+            return await self._intercept_callback(query, bot)
         message = getattr(update, "effective_message", None)
         text = getattr(message, "text", "") or ""
         head = text.split(maxsplit=1)[0] if text else ""
         command = head.split("@", 1)[0].lower()
-        aliases = {"/aqla": ("home",), "/aqla_status": ("dashboard",), "/aqla_journal": ("journal",), "/aqla_profile": ("profiles",), "/aqla_kanaele": ("sources",), "/aqla_funktionen": ("help",)}
-        if len(text.split(maxsplit=1)) == 1:
-            aliases.update({"/aqla_limits": ("limits_selection",), "/aqla_parameter": ("profiles",),
-                "/aqla_hinzufuegen": ("prompt", "add_source", ""), "/aqla_entfernen": ("prompt", "remove_source", ""),
-                "/aqla_kanalname": ("prompt", "rename_source", ""), "/aqla_konflikt": ("conflicts",), "/aqla_konflikt_loesen": ("conflicts",)})
+        aliases = _command_aliases(text)
         from .native_setup import addressed_to_bot
         if not addressed_to_bot(head, bot):
             return command in aliases
         from .command_catalog import COMMANDS
-        if (text.startswith("/") and command.lstrip("/") in COMMANDS and self.extension.setup.private_owner(message)
-                and not any(getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))):
+        if (text.startswith("/") and command.lstrip("/") in COMMANDS and self._authentic_input(update, message)):
             self.fresh = True
-        relevant = command in aliases or self.pending is not None and not text.startswith("/")
+        relevant = self._relevant_input(command, aliases, text)
         if not relevant:
             if text.startswith("/"):
                 self.pending = None
             return False
-        if not self.extension.setup.private_owner(message) or any(getattr(update, key, None) for key in ("edited_message", "edited_channel_post")):
+        if not self._authentic_input(update, message):
             return True
         try:
             async with self.serial:

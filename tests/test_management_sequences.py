@@ -36,7 +36,7 @@ async def test_reserved_child_identity_survives_a_crash_before_operation_creatio
 @pytest.mark.asyncio
 async def test_roi_is_not_a_reduction_fraction_and_cannot_send_either_step(setup, signal):
     from aqla_hyperliquid_mcp.models import AqlaError
-    _, state, fake, _, engine = setup
+    _, _state, fake, _, engine = setup
     source, value = signal
     plan = await engine.preview(source.event_id, value)
     await engine.execute(plan["plan_id"])

@@ -193,7 +193,7 @@ class OutputStore:
         return removed
 
 
-def select_json(text, sections, record_ids):
+def _validate_selection(sections, record_ids):
     if (not isinstance(sections, list) or not 1 <= len(sections) <= 8
             or any(not isinstance(key, str) or not 1 <= len(key) <= 100 for key in sections)
             or len(set(sections)) != len(sections)):
@@ -202,31 +202,46 @@ def select_json(text, sections, record_ids):
             or any(not isinstance(key, str) or not 1 <= len(key) <= 256 for key in record_ids)
             or len(set(record_ids)) != len(record_ids) or len(sections) != 1):
         raise ValueError("Select 1–8 distinct record IDs within exactly one section")
+
+
+def _selectable_root(text):
+    root = json.loads(text)
+    for _ in range(4):
+        if isinstance(root, dict) and set(root) in ({"result"}, {"data"}):
+            root = require_first(iter(root.values()))
+            if isinstance(root, str):
+                root = json.loads(root)
+        else:
+            break
+    return root
+
+
+def _record_identity(row):
+    return next((row[key] for key in ("event_id", "trade_id", "ID", "id", "record_id") if key in row), None) if isinstance(row, dict) else None
+
+
+def _select_records(records, record_ids):
+    if isinstance(records, dict):
+        chosen = {key: records[key] for key in record_ids if key in records}
+        missing = [key for key in record_ids if key not in records]
+    elif isinstance(records, list):
+        chosen = [row for row in records if _record_identity(row) in record_ids]
+        missing = [key for key in record_ids if not any(_record_identity(row) == key for row in chosen)]
+    else:
+        raise ValueError("Selected section has no addressable records")
+    return chosen, missing
+
+
+def select_json(text, sections, record_ids):
+    _validate_selection(sections, record_ids)
     try:
-        root = json.loads(text)
-        for _ in range(4):
-            if isinstance(root, dict) and set(root) in ({"result"}, {"data"}):
-                root = require_first(iter(root.values()))
-                if isinstance(root, str):
-                    root = json.loads(root)
-            else:
-                break
+        root = _selectable_root(text)
         if not isinstance(root, dict) or any(key not in root for key in sections):
             raise ValueError("Selected JSON section unavailable; read the full immutable result or re-query a specific view")
         selected = {key: root[key] for key in sections}
         missing = []
         if record_ids is not None:
-            records = root[sections[0]]
-            if isinstance(records, dict):
-                chosen = {key: records[key] for key in record_ids if key in records}
-                missing = [key for key in record_ids if key not in records]
-            elif isinstance(records, list):
-                def identity(row):
-                    return next((row[key] for key in ("event_id", "trade_id", "ID", "id", "record_id") if key in row), None) if isinstance(row, dict) else None
-                chosen = [row for row in records if identity(row) in record_ids]
-                missing = [key for key in record_ids if not any(identity(row) == key for row in chosen)]
-            else:
-                raise ValueError("Selected section has no addressable records")
+            chosen, missing = _select_records(root[sections[0]], record_ids)
             selected[sections[0]] = chosen
         return encoded(selected).decode(), {"sections": sections, "record_ids": record_ids,
                                             "missing_ids": missing, "unselected_content_omitted": True}

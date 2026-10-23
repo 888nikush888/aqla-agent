@@ -140,6 +140,124 @@ def _selected_record_current(data, key, fallback, history):
     return fallback["all"].get(key)
 
 
+def _financial_owners(data, table):
+    owners = {}
+    for trade_id, trade in data["trades"].items():
+        if table == "Orders":
+            from aqla_agent.managed_entries import all_order_rows
+            for cloid in [row["cloid"] for row in all_order_rows(trade)]:
+                owners[cloid] = trade_id
+        else:
+            from aqla_agent.manual_accounting import verified_manual_accounting
+            manual = verified_manual_accounting(trade)
+            for fill_id in {**trade.get("fill_events", {}), **(manual["exit_allocations"] if manual else {})}:
+                owners[fill_id] = trade_id
+    return owners
+
+
+def _trade_fees(plan, fills, fee_facts):
+    quote = plan["market"].get("quote_token", "USDC")
+    fees_known = bool(fills) and all(fact.get("fee") is not None and fact.get("feeToken") == quote for fact in fee_facts.values())
+    fees = sum((Decimal(fact["fee"]) for fact in fee_facts.values()), Decimal(0)) if fees_known else None
+    return fees
+
+
+def _trade_summary_record(identity, trade, plan, aliases, fills, fee_facts):
+    entry = Decimal(trade["entry_vwap"]) if trade.get("entry_vwap") else None
+    exits = [fill for fill in fills.values() if fill["kind"] != "entry"]
+    gross = sum((Decimal(fill["sz"]) * (Decimal(fill["px"]) - entry) * (1 if plan["side"] == "long" else -1) for fill in exits), Decimal(0)) if entry is not None else None
+    fees = _trade_fees(plan, fills, fee_facts)
+    net = gross - fees if gross is not None and fees is not None else None
+    if accounting_issues(trade, {**trade, **accounting_facts(trade)}):
+        net = None
+    return record("Trades", identity, aliases.get(trade["chat_id"], trade["chat_id"]), plan["market"]["symbol"], plan["side"], trade["status"], timestamp(plan["created_at"]), number(plan["entry_price"]), number(entry), number(plan["quantity"]), number(trade["filled_quantity"]), number(trade["remaining_quantity"]), number(trade["stop_price"]), text(trade.get("targets", plan["take_profits"])), number(plan["risk_usdc"]), number(trade["reserved_risk"]), number(gross), number(fees), number(net), text(plan["source_refs"]))
+
+
+def _execution_records(data, selected, aliases, actions):
+    for identity, event in data["events"].items() if "Signale" in selected else ():
+        if is_source_row(event):
+            yield _signal_record(data, identity, event, aliases)
+    for identity, trade in data["trades"].items() if selected.intersection(("Trades", "Orders", "Fills")) else ():
+        yield from _trade_records(data, identity, trade, aliases, actions, tables=selected)
+    for identity, operation in data["operations"].items() if "Vorgänge" in selected else ():
+        yield _operation_record(identity, operation)
+
+
+def _pipeline_records(data, selected):
+    for identity, pipeline in data.get("pipelines", {}).items() if "Pipelines" in selected else ():
+        for target in pipeline["targets"]:
+            yield record("Pipelines", identity + ":" + target["exchange"], pipeline["name"], text(pipeline["sources"]), target["exchange"],
+                       target["profile_id"], pipeline["enabled"], data["venue_enabled"].get(target["exchange"], False), pipeline["revision"],
+                       text([]), "Rang: C+ Mainnet, D/E/F Testnet")
+
+
+def _ranking_records(data):
+    from aqla_agent.ranking import FACTORS, source_key
+    for source, rank in data.get("source_ranks", {}).items():
+        metrics = rank.get("metrics", {})
+        resolved = source_key(data, source)
+        tier = rank["tier"]
+        yield record("Ränge", source, data.get("source_names", {}).get(resolved, resolved), tier, rank.get("bootstrap", False),
+                   number(metrics.get("score")), len(rank.get("evidence", [])), metrics.get("count", 0), number(metrics.get("mean_r")),
+                   metrics.get("profit_factor", ""), number(metrics.get("drawdown_r")), number(metrics.get("win_rate")),
+                   data["ranking_policy"]["factors"].get(tier, FACTORS[tier]), "mainnet" if tier in ("C", "B", "A", "S") else "testnet",
+                   rank["revision"], data["ranking_revision"], len(rank.get("exclusions", [])))
+    for identity, event in data.get("ranking_history", {}).items():
+        yield record("Ranghistorie", identity, event["source_id"], data.get("source_names", {}).get(event["source_id"], event["source_id"]), timestamp(event["time"]),
+                   event["old"], event["new"], number(event["metrics"].get("score")), number(event["metrics"].get("drawdown_r")), event["network"], event["revision"],
+                   event.get("reason"), event.get("proof_total"), event.get("factor"))
+
+
+def _read_headers(table, offset, limit, filters, columns):
+    if table not in HEADERS or not 0 <= offset or not 1 <= limit <= 100:
+        raise AqlaError("Select an existing journal table and a bounded page")
+    headers = HEADERS[table]
+    if any(name not in headers for name in (filters or {})) or columns is not None and (
+            not columns or len(set(columns)) != len(columns) or any(name not in headers for name in columns)):
+        raise AqlaError("Select existing journal columns")
+    return headers
+
+
+def _read_row_matches(row, table, trade_id, operations, account_key, filters):
+    if trade_id and (table == "Vorgänge" and row["ID"] not in operations or table in ("Orders", "Fills") and row["Trade-ID"] != trade_id or table == "Trades" and row["ID"] != trade_id):
+        return False
+    if account_key and row.get("Börse", "") + ":" + row.get("Netzwerk", "") != account_key:
+        return False
+    if any(str(row.get(key)) != str(value) for key, value in (filters or {}).items()):
+        return False
+    return True
+
+
+def _trade_target_details(data, row, trade, plan, venue, table):
+    backup = plan.get("backup_values") or {}
+    final = trade.get("backup_finalization") or {}
+    details_start = HEADERS[table].index("Quellenname")
+    row["values"][details_start:details_start + len(TRADE_DETAILS)] = [data.get("source_names", {}).get(trade["chat_id"], ""), plan.get("source_symbol") or plan["market"]["symbol"],
+        number(plan.get("signal_leverage_original", plan.get("signal_leverage"))), number(plan.get("signal_leverage")), number(plan.get("effective_leverage")),
+        text(plan.get("backup_fields", [])), number(final.get("reference_entry")), number(backup.get("fallback_stop_loss_percent")), text(backup.get("fallback_take_profit_percentages", []))]
+    rank = plan.get("rank_snapshot") or {}
+    base = plan.get("base_parameters") or {}
+    rank_start = HEADERS[table].index(RANK_DETAILS[0])
+    row["values"][rank_start:rank_start + len(RANK_DETAILS)] = [plan.get("account_key", venue + ":" + plan["network"]), plan.get("setup_id", ""), plan.get("requested_exchange", venue), plan.get("routing_leg_id", ""),
+               plan.get("fallback_reason", ""), rank.get("tier", ""), number(rank.get("score")), rank.get("factor", ""),
+               number(base.get("risk_percent")), number(plan["policy"]["risk_percent"]), number(trade.get("initial_sl_risk", {}).get("amount")),
+               trade.get("source_tp_override", plan.get("source_tp", {})).get("unit", "price"),
+               text({"original": plan.get("source_tp"), "final": trade.get("percent_finalization"), "updates": trade.get("percent_updates", {}), "current": trade.get("source_tp_override")} if plan.get("source_tp") or trade.get("percent_updates") else {})]
+    row["values"][-2:] = [plan.get("entry_execution", "standard"), plan.get("take_profit_execution", "standard")]
+
+
+def _target_binding(data, row, table, plan, operation):
+    venue = plan.get("exchange", operation.get("exchange", "hyperliquid"))
+    binding = data.get("venue_accounts", {}).get(venue, {})
+    if operation:
+        binding = {**binding, **{key: operation["request"][key] for key in ("network", "account") if operation.get("request", {}).get(key)}}
+    start = HEADERS[table].index("Börse")
+    row["values"][start:start + 7] = [venue, plan.get("network", binding.get("network", data["network"])), plan.get("account", binding.get("account", data["account"])),
+                          plan.get("pipeline_id") or operation.get("pipeline_id") or "legacy", plan.get("profile_id") or operation.get("profile_id") or "standard",
+                          plan.get("profile_revision") or operation.get("profile_revision") or "", plan.get("market", {}).get("quote_token", "USDT" if venue == "aster" else "USDC")]
+    return venue
+
+
 def _financial_record(data, table, identity, cache):
     if table == "Vorgänge":
         operation = data["operations"].get(identity)
@@ -149,17 +267,7 @@ def _financial_record(data, table, identity, cache):
     else:
         index_key = ("owners", table)
         if index_key not in cache:
-            owners = {}
-            for trade_id, trade in data["trades"].items():
-                if table == "Orders":
-                    from aqla_agent.managed_entries import all_order_rows
-                    for cloid in [row["cloid"] for row in all_order_rows(trade)]:
-                        owners[cloid] = trade_id
-                else:
-                    from aqla_agent.manual_accounting import verified_manual_accounting
-                    manual = verified_manual_accounting(trade)
-                    for fill_id in {**trade.get("fill_events", {}), **(manual["exit_allocations"] if manual else {})}:
-                        owners[fill_id] = trade_id
+            owners = _financial_owners(data, table)
             cache[index_key] = owners
         trade_id = cache[index_key].get(identity)
     trade = data["trades"].get(trade_id)
@@ -189,16 +297,7 @@ def _trade_records(_data, identity, trade, aliases, actions, tables=("Trades", "
         fills = {**trade.get("fill_events", {}), **(manual["exit_allocations"] if manual else {})}
         fee_facts = {identity: trade.get("report_fee_evidence", {}).get(fill_identity(fill), fill) for identity, fill in fills.items()}
     if "Trades" in tables:
-        entry = Decimal(trade["entry_vwap"]) if trade.get("entry_vwap") else None
-        exits = [fill for fill in fills.values() if fill["kind"] != "entry"]
-        gross = sum((Decimal(fill["sz"]) * (Decimal(fill["px"]) - entry) * (1 if plan["side"] == "long" else -1) for fill in exits), Decimal(0)) if entry is not None else None
-        quote = plan["market"].get("quote_token", "USDC")
-        fees_known = bool(fills) and all(fact.get("fee") is not None and fact.get("feeToken") == quote for fact in fee_facts.values())
-        fees = sum((Decimal(fact["fee"]) for fact in fee_facts.values()), Decimal(0)) if fees_known else None
-        net = gross - fees if gross is not None and fees is not None else None
-        if accounting_issues(trade, {**trade, **accounting_facts(trade)}):
-            net = None
-        yield record("Trades", identity, aliases.get(trade["chat_id"], trade["chat_id"]), plan["market"]["symbol"], plan["side"], trade["status"], timestamp(plan["created_at"]), number(plan["entry_price"]), number(entry), number(plan["quantity"]), number(trade["filled_quantity"]), number(trade["remaining_quantity"]), number(trade["stop_price"]), text(trade.get("targets", plan["take_profits"])), number(plan["risk_usdc"]), number(trade["reserved_risk"]), number(gross), number(fees), number(net), text(plan["source_refs"]))
+        yield _trade_summary_record(identity, trade, plan, aliases, fills, fee_facts)
     if "Orders" in tables:
         from aqla_agent.managed_entries import all_order_rows
         for order in all_order_rows(trade):
@@ -215,6 +314,24 @@ def _operation_record(identity, operation):
     return record("Vorgänge", identity, timestamp(operation["created_at"]), operation["wire_action"].get("type", ""), operation["phase"], operation.get("outcome", ""), str(operation["nonce"]), timestamp(operation.get("expires_after")), text(operation["request"]), text(operation.get("result")))
 
 
+def _merge_journal_history(data, rows, selected):
+    for row in data.get("journal_order_archive", {}).values():
+        if row["table"] in selected:
+            rows.setdefault(record_key(row), row)
+    for row in data.get("journal_signal_archive", {}).values():
+        if row["table"] in selected:
+            rows.setdefault(record_key(row), row)
+    for row in data.get("journal_history", {}).values():
+        if row["table"] in selected:
+            rows[record_key(row)] = row
+
+
+def _selected_ranking_records(data, selected):
+    if data.get("ranking_policy") and selected.intersection(("Ränge", "Ranghistorie")):
+        return _ranking_records(data)
+    return ()
+
+
 def project(data, *, include_retired=False, tables=None):
     selected = set(HEADERS) if tables is None else set(tables)
     rows = {}
@@ -223,48 +340,19 @@ def project(data, *, include_retired=False, tables=None):
             rows[record_key(row)] = row
     aliases = {value: name for name, value in data.get("source_aliases", {}).items()}
     actions = _order_actions(data) if "Orders" in selected else {}
-    for identity, event in data["events"].items() if "Signale" in selected else ():
-        if is_source_row(event):
-            add(_signal_record(data, identity, event, aliases))
-    for identity, trade in data["trades"].items() if selected.intersection(("Trades", "Orders", "Fills")) else ():
-        for row in _trade_records(data, identity, trade, aliases, actions, tables=selected):
-            add(row)
-    for identity, operation in data["operations"].items() if "Vorgänge" in selected else ():
-        add(_operation_record(identity, operation))
+    for row in _execution_records(data, selected, aliases, actions):
+        add(row)
     if "Regeln" in selected:
         add(record("Regeln", "aktuell", data["network"], data["account"], data["policy_revision"], data["paused"], text(data["sources"]), text(data["policy"])))
     for values in parameter_values(data) if "Handelsparameter" in selected else ():
         add(record("Handelsparameter", *values))
-    for identity, pipeline in data.get("pipelines", {}).items() if "Pipelines" in selected else ():
-        for target in pipeline["targets"]:
-            add(record("Pipelines", identity + ":" + target["exchange"], pipeline["name"], text(pipeline["sources"]), target["exchange"],
-                       target["profile_id"], pipeline["enabled"], data["venue_enabled"].get(target["exchange"], False), pipeline["revision"],
-                       text([]), "Rang: C+ Mainnet, D/E/F Testnet"))
-    if data.get("ranking_policy") and selected.intersection(("Ränge", "Ranghistorie")):
-        from aqla_agent.ranking import FACTORS, source_key
-        for source, rank in data.get("source_ranks", {}).items():
-            metrics = rank.get("metrics", {})
-            resolved = source_key(data, source)
-            tier = rank["tier"]
-            add(record("Ränge", source, data.get("source_names", {}).get(resolved, resolved), tier, rank.get("bootstrap", False),
-                       number(metrics.get("score")), len(rank.get("evidence", [])), metrics.get("count", 0), number(metrics.get("mean_r")),
-                       metrics.get("profit_factor", ""), number(metrics.get("drawdown_r")), number(metrics.get("win_rate")),
-                       data["ranking_policy"]["factors"].get(tier, FACTORS[tier]), "mainnet" if tier in ("C", "B", "A", "S") else "testnet",
-                       rank["revision"], data["ranking_revision"], len(rank.get("exclusions", []))))
-        for identity, event in data.get("ranking_history", {}).items():
-            add(record("Ranghistorie", identity, event["source_id"], data.get("source_names", {}).get(event["source_id"], event["source_id"]), timestamp(event["time"]),
-                       event["old"], event["new"], number(event["metrics"].get("score")), number(event["metrics"].get("drawdown_r")), event["network"], event["revision"],
-                       event.get("reason"), event.get("proof_total"), event.get("factor")))
+    for row in _pipeline_records(data, selected):
+        add(row)
+    for row in _selected_ranking_records(data, selected):
+        add(row)
     for row in rows.values():
         _target_record(data, row)
-    for row in data.get("journal_order_archive", {}).values():
-        if row["table"] in selected:
-            rows.setdefault(record_key(row), row)
-    for row in data.get("journal_signal_archive", {}).values():
-        if row["table"] in selected:
-            rows.setdefault(record_key(row), row)
-    for row in data.get("journal_history", {}).values():
-        add(row)
+    _merge_journal_history(data, rows, selected)
     return {key: row for key, row in rows.items() if include_retired or not _retired_record(data, row)}
 
 
@@ -317,23 +405,14 @@ def trade_operation_ids(data, trade_id):
 
 def read_page(data, table, *, offset=0, limit=20, filters=None, account_key=None, columns=None, trade_id=None):
     """Bounded, exact local evidence. Historical execution accounts remain readable."""
-    if table not in HEADERS or not 0 <= offset or not 1 <= limit <= 100:
-        raise AqlaError("Select an existing journal table and a bounded page")
-    headers = HEADERS[table]
-    if any(name not in headers for name in (filters or {})) or columns is not None and (
-            not columns or len(set(columns)) != len(columns) or any(name not in headers for name in columns)):
-        raise AqlaError("Select existing journal columns")
+    headers = _read_headers(table, offset, limit, filters, columns)
     rows = []
     operations = trade_operation_ids(data, trade_id) if trade_id and table == "Vorgänge" else None
     for item in project(data, include_retired=True, tables=[table]).values():
         if item["table"] != table:
             continue
         row = dict(zip(headers, item["values"], strict=True))
-        if trade_id and (table == "Vorgänge" and row["ID"] not in operations or table in ("Orders", "Fills") and row["Trade-ID"] != trade_id or table == "Trades" and row["ID"] != trade_id):
-            continue
-        if account_key and row.get("Börse", "") + ":" + row.get("Netzwerk", "") != account_key:
-            continue
-        if any(str(row.get(key)) != str(value) for key, value in (filters or {}).items()):
+        if not _read_row_matches(row, table, trade_id, operations, account_key, filters):
             continue
         row["_fingerprint"] = item["fingerprint"]
         if table == "Trades":
@@ -355,30 +434,9 @@ def _target_record(data, row):
     trade = data["trades"].get(identity if table == "Trades" else row["values"][1])
     plan = trade["plan"] if trade else {}
     operation = data["operations"].get(identity, {}) if table == "Vorgänge" else {}
-    venue = plan.get("exchange", operation.get("exchange", "hyperliquid"))
-    binding = data.get("venue_accounts", {}).get(venue, {})
-    if operation:
-        binding = {**binding, **{key: operation["request"][key] for key in ("network", "account") if operation.get("request", {}).get(key)}}
-    start = HEADERS[table].index("Börse")
-    row["values"][start:start + 7] = [venue, plan.get("network", binding.get("network", data["network"])), plan.get("account", binding.get("account", data["account"])),
-                          plan.get("pipeline_id") or operation.get("pipeline_id") or "legacy", plan.get("profile_id") or operation.get("profile_id") or "standard",
-                          plan.get("profile_revision") or operation.get("profile_revision") or "", plan.get("market", {}).get("quote_token", "USDT" if venue == "aster" else "USDC")]
+    venue = _target_binding(data, row, table, plan, operation)
     if table == "Trades":
-        backup = plan.get("backup_values") or {}
-        final = trade.get("backup_finalization") or {}
-        details_start = HEADERS[table].index("Quellenname")
-        row["values"][details_start:details_start + len(TRADE_DETAILS)] = [data.get("source_names", {}).get(trade["chat_id"], ""), plan.get("source_symbol") or plan["market"]["symbol"],
-            number(plan.get("signal_leverage_original", plan.get("signal_leverage"))), number(plan.get("signal_leverage")), number(plan.get("effective_leverage")),
-            text(plan.get("backup_fields", [])), number(final.get("reference_entry")), number(backup.get("fallback_stop_loss_percent")), text(backup.get("fallback_take_profit_percentages", []))]
-        rank = plan.get("rank_snapshot") or {}
-        base = plan.get("base_parameters") or {}
-        rank_start = HEADERS[table].index(RANK_DETAILS[0])
-        row["values"][rank_start:rank_start + len(RANK_DETAILS)] = [plan.get("account_key", venue + ":" + plan["network"]), plan.get("setup_id", ""), plan.get("requested_exchange", venue), plan.get("routing_leg_id", ""),
-                   plan.get("fallback_reason", ""), rank.get("tier", ""), number(rank.get("score")), rank.get("factor", ""),
-                   number(base.get("risk_percent")), number(plan["policy"]["risk_percent"]), number(trade.get("initial_sl_risk", {}).get("amount")),
-                   trade.get("source_tp_override", plan.get("source_tp", {})).get("unit", "price"),
-                   text({"original": plan.get("source_tp"), "final": trade.get("percent_finalization"), "updates": trade.get("percent_updates", {}), "current": trade.get("source_tp_override")} if plan.get("source_tp") or trade.get("percent_updates") else {})]
-        row["values"][-2:] = [plan.get("entry_execution", "standard"), plan.get("take_profit_execution", "standard")]
+        _trade_target_details(data, row, trade, plan, venue, table)
     elif table == "Fills":
         role = trade.get("fill_execution_roles", {}).get(identity, "unknown")
         row["values"][-1] = role if role in ("maker", "taker", "unknown") else "unknown"

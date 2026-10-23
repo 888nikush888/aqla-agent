@@ -58,17 +58,8 @@ class SourceProcessor:
     def configure(self, mode, owner, *, retry_max_attempts=3, retry_backoff_seconds=15, retry_max_age_seconds=900, decision_status=None):
         if mode not in ("legacy", "shadow", "hybrid") or not isinstance(owner, str) or not owner or len(owner) > 100:
             raise AqlaError("Invalid native source processing configuration")
-        if (type(retry_max_attempts) is not int or not 1 <= retry_max_attempts <= 5
-                or type(retry_backoff_seconds) is not int or not 1 <= retry_backoff_seconds <= 300
-                or type(retry_max_age_seconds) is not int or not 30 <= retry_max_age_seconds <= 3600):
-            raise AqlaError("Invalid bounded source retry configuration")
-        status = self.decision_status
-        if isinstance(decision_status, dict):
-            permissions = decision_status.get("permissions", {})
-            status = {"provider": "openrouter", "model": str(decision_status.get("model", ""))[:200],
-                "validated": decision_status.get("validated") is True,
-                "permissions": {str(source)[:100]: [kind for kind in kinds if kind in KINDS]
-                    for source, kinds in list(permissions.items())[:100] if isinstance(kinds, list)} if isinstance(permissions, dict) else {}}
+        self.check_retry_configuration(retry_max_attempts, retry_backoff_seconds, retry_max_age_seconds)
+        status = self.configuration_status(decision_status)
         # Admission ownership changes only after every proposed field is valid.
         if (mode, owner) != (self.mode, self.owner):
             self.policy_version = None
@@ -77,16 +68,25 @@ class SourceProcessor:
         self.decision_status = status
         return {"mode": mode}
 
-    def require_owner(self, owner):
-        if self.express is not None and self.express.owns(owner):
-            return
-        if self.mode == "legacy" or owner != self.owner:
-            raise AqlaError("Source processor ownership changed")
+    @staticmethod
+    def check_retry_configuration(retry_max_attempts, retry_backoff_seconds, retry_max_age_seconds):
+        if (type(retry_max_attempts) is not int or not 1 <= retry_max_attempts <= 5
+                or type(retry_backoff_seconds) is not int or not 1 <= retry_backoff_seconds <= 300
+                or type(retry_max_age_seconds) is not int or not 30 <= retry_max_age_seconds <= 3600):
+            raise AqlaError("Invalid bounded source retry configuration")
 
-    def context(self, event_id, *, source_refs=()):
-        context = self.trading.context(event_id, decision=True)
-        snapshot = self.state.snapshot()
-        chat_id = context["event"]["source"]["chat_id"]
+    def configuration_status(self, decision_status):
+        status = self.decision_status
+        if isinstance(decision_status, dict):
+            permissions = decision_status.get("permissions", {})
+            status = {"provider": "openrouter", "model": str(decision_status.get("model", ""))[:200],
+                "validated": decision_status.get("validated") is True,
+                "permissions": {str(source)[:100]: [kind for kind in kinds if kind in KINDS]
+                    for source, kinds in list(permissions.items())[:100] if isinstance(kinds, list)} if isinstance(permissions, dict) else {}}
+        return status
+
+    @staticmethod
+    def bound_source_refs(snapshot, chat_id):
         trade_ids = {identity for identity, trade in snapshot["trades"].items() if trade.get("chat_id") == chat_id}
         bound_refs = {ref for identity in trade_ids for ref in snapshot["trades"][identity]["plan"].get("source_refs", [])}
         bindings = [snapshot.get("bindings", {}), *snapshot.get("account_bindings", {}).values(),
@@ -98,6 +98,60 @@ class SourceProcessor:
                 row = snapshot["events"].get(key.removeprefix("update:"))
                 if is_source_row(row) and row["source"]["chat_id"] == chat_id:
                     bound_refs.add(row["source_id"])
+        return bound_refs
+
+    def check_result_contract(self, result, packet):
+        if result.question_version != VERSION:
+            raise AqlaError("Decision questions changed; a current interpretation is required")
+        if result.model == "python":
+            anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+            if anchor["text"].strip() or result.interpretation.kind != "incomplete":
+                raise AqlaError("Python-only interpretation is restricted to missing original text")
+        if result.collection_only and self.mode != "shadow":
+            raise AqlaError("Collection-only decisions cannot authorize production processing")
+        if not result.collection_only and not result.fallback and result.interpretation.kind in ("new_signal", "trade_update") and not result.verified:
+            raise AqlaError("Actionable decision needs its second verification")
+
+    def check_application_job(self, job, express):
+        if self.mode != "hybrid" and not express:
+            raise AqlaError("Shadow source jobs cannot execute")
+        resume_preview = job.status == "waiting_preview"
+        if job.status not in ("interpreted", "waiting_preview") or job.result is None:
+            raise AqlaError("Source job is not a validated unsubmitted interpretation")
+        if job.result.collection_only:
+            raise AqlaError("Collection-only decisions cannot execute")
+        policy_version = self.express.policy_version if express else self.policy_version
+        if job.policy_version != policy_version or job.version != VERSION or job.result.question_version != VERSION:
+            raise AqlaError("Source processing policy changed; no new submission")
+        return resume_preview
+
+    def application_context(self, job, resume_preview, express):
+        # This read happens immediately before the existing transactional source/entry guards.
+        context, packet, fingerprint = self.context(job.event_id)
+        if not resume_preview and fingerprint != job.fingerprint:
+            raise AqlaError("Source context changed before application")
+        if resume_preview:
+            snapshot = self.state.snapshot()
+            self.check_intent(job, snapshot)
+            if not self.pending_previews(snapshot, job) and not self.unsubmitted_plans(snapshot, job):
+                raise AqlaError("No proven unsubmitted preview target or saved plan remains")
+        else:
+            validate_interpretation(packet, job.result.interpretation)
+        if not resume_preview and job.event_id not in queue_overview(self.state.snapshot(), limit=100000, include_express=express)["ready"]:
+            raise AqlaError("Source job is no longer ready; recover existing operations")
+        return context
+
+    def require_owner(self, owner):
+        if self.express is not None and self.express.owns(owner):
+            return
+        if self.mode == "legacy" or owner != self.owner:
+            raise AqlaError("Source processor ownership changed")
+
+    def context(self, event_id, *, source_refs=()):
+        context = self.trading.context(event_id, decision=True)
+        snapshot = self.state.snapshot()
+        chat_id = context["event"]["source"]["chat_id"]
+        bound_refs = self.bound_source_refs(snapshot, chat_id)
         context["bound_source_refs"] = sorted(bound_refs)
         own_refs = {ref for trade in context.get("trades", []) for ref in trade["plan"].get("source_refs", [])} | set(source_refs)
         included = {row["event_id"] for row in context["messages"]}
@@ -148,6 +202,11 @@ class SourceProcessor:
                 or job.event_id in operation.get("request", {}).get("source_revisions", {}).values()
                 or operation.get("trade_id") is not None and operation.get("trade_id") in trade_ids]
 
+    @staticmethod
+    def current_job_policy(job, version):
+        return (job.result is not None and job.policy_version == version
+                and job.version == VERSION and job.result.question_version == VERSION)
+
     def reconcile_jobs(self, owner, version, snapshot):
         """Finish durable outcomes before queue selection; never dispatch/recover orders."""
         for record in snapshot.get("source_jobs", {}).values():
@@ -155,64 +214,82 @@ class SourceProcessor:
                 continue
             if record["status"] not in ("applying", "recovering", "retry_wait") or record["job_id"] in self.active_jobs:
                 continue
-            job = SourceJob.model_validate(record)
-            event = snapshot["events"].get(job.event_id, {})
-            operations = self.event_operations(snapshot, job)
-            uncertain = any(row.get("phase") in ("prepared", "sending", "unknown") for row in operations)
-            if uncertain or event.get("status") == "needs_reconciliation":
-                job.status, job.outcome = "recovering", "engine_recovery"
-                self.save(job)
-                continue
-            if event.get("status") in ("rejected", "cancelled", "superseded", "unrouted", "report", "unrelated", "ambiguous", "incomplete", "updated", "executed"):
-                if self.pending_previews(snapshot, job) or self.unsubmitted_plans(snapshot, job):
-                    if job.policy_version == version and job.version == VERSION and job.result and job.result.question_version == VERSION:
-                        job.status = "waiting_preview"
-                    else:
-                        job.status, job.outcome = "review", "source_policy_changed"
+            self.reconcile_job(owner, version, snapshot, record)
+
+    def reconcile_terminal(self, job, event, snapshot, version):
+        if event.get("status") in ("rejected", "cancelled", "superseded", "unrouted", "report", "unrelated", "ambiguous", "incomplete", "updated", "executed"):
+            if self.pending_previews(snapshot, job) or self.unsubmitted_plans(snapshot, job):
+                if self.current_job_policy(job, version):
+                    job.status = "waiting_preview"
                 else:
-                    job.status, job.outcome = "done", event["status"]
-                self.save(job)
-                continue
-            if job.status == "retry_wait":
-                try:
-                    context, packet, _ = self.context(job.event_id)
-                    job.retry_deadline_at = min(job.retry_deadline_at or 0, self.retry_deadline(context, packet, job.created_at))
-                    self.save(job)
-                except AqlaError:
-                    job.status, job.outcome = "review", "retry_source_changed"
-                    self.save(job)
-                    continue
-                if (job.policy_version != version or job.version != VERSION or now_ms() >= (job.retry_deadline_at or 0)
-                        or job.attempt_count >= self.retry_max_attempts):
-                    job.status, job.outcome = "review", "provider_retry_exhausted"
-                    self.save(job)
-                continue
-            # Financially known work belongs exclusively to engine recovery. A
-            # partially dispatched entry can resume only independently unsent legs.
-            started = any(self.trading.target_started(snapshot, row) for row in event.get("targets", {}).values())
-            if operations or started:
-                job.status, job.outcome = ("waiting_preview", "partial_application") if (
-                    self.pending_previews(snapshot, job) or self.unsubmitted_plans(snapshot, job)) else ("done", "engine_owned")
-                self.save(job)
-                continue
-            if job.result is None or job.policy_version != version or job.version != VERSION or job.result.question_version != VERSION:
-                job.status, job.outcome = "review", "source_policy_changed"
-                self.save(job)
-                continue
-            if job.result.interpretation.kind == "trade_update" and event.get("interpretation"):
-                candidate_groups = [engine.update_candidates(job.event_id, job.result.interpretation) for engine in self.trading.engines.values()]
-                candidates = [trade for rows in candidate_groups for trade in rows]
-                families = {tuple(sorted(row["plan"]["source_refs"])) for row in candidates}
-                if len(families) != 1 or any(len(rows) > 1 for rows in candidate_groups) or any(row.get("status") in ("conflicted", "cleanup") for row in candidates):
-                    job.status, job.outcome = "review", "update_binding_review"
-                    self.save(job)
-                    continue
-            if job.event_id in queue_overview(snapshot, limit=len(snapshot["events"]) + 1)["ready"]:
-                job.status, job.owner, job.processor_instance = "interpreted", owner, self.instance
-                self.save(job)
+                    job.status, job.outcome = "review", "source_policy_changed"
             else:
-                job.status, job.outcome = "review", "application_not_ready"
+                job.status, job.outcome = "done", event["status"]
+            self.save(job)
+            return True
+        return False
+
+    def reconcile_retry(self, job, version):
+        try:
+            context, packet, _ = self.context(job.event_id)
+            job.retry_deadline_at = min(job.retry_deadline_at or 0, self.retry_deadline(context, packet, job.created_at))
+            self.save(job)
+        except AqlaError:
+            job.status, job.outcome = "review", "retry_source_changed"
+            self.save(job)
+            return
+        if (job.policy_version != version or job.version != VERSION or now_ms() >= (job.retry_deadline_at or 0)
+                or job.attempt_count >= self.retry_max_attempts):
+            job.status, job.outcome = "review", "provider_retry_exhausted"
+            self.save(job)
+        return
+
+    def reconcile_update_binding(self, job, event):
+        if job.result.interpretation.kind == "trade_update" and event.get("interpretation"):
+            candidate_groups = [engine.update_candidates(job.event_id, job.result.interpretation) for engine in self.trading.engines.values()]
+            candidates = [trade for rows in candidate_groups for trade in rows]
+            families = {tuple(sorted(row["plan"]["source_refs"])) for row in candidates}
+            if len(families) != 1 or any(len(rows) > 1 for rows in candidate_groups) or any(row.get("status") in ("conflicted", "cleanup") for row in candidates):
+                job.status, job.outcome = "review", "update_binding_review"
                 self.save(job)
+                return True
+        return False
+
+    def reconcile_job(self, owner, version, snapshot, record):
+        job = SourceJob.model_validate(record)
+        event = snapshot["events"].get(job.event_id, {})
+        operations = self.event_operations(snapshot, job)
+        uncertain = any(row.get("phase") in ("prepared", "sending", "unknown") for row in operations)
+        if uncertain or event.get("status") == "needs_reconciliation":
+            job.status, job.outcome = "recovering", "engine_recovery"
+            self.save(job)
+            return
+        if self.reconcile_terminal(job, event, snapshot, version):
+            return
+        if job.status == "retry_wait":
+            self.reconcile_retry(job, version)
+            return
+        # Financially known work belongs exclusively to engine recovery. A
+        # partially dispatched entry can resume only independently unsent legs.
+        started = any(self.trading.target_started(snapshot, row) for row in event.get("targets", {}).values())
+        if operations or started:
+            job.status, job.outcome = ("waiting_preview", "partial_application") if (
+                self.pending_previews(snapshot, job) or self.unsubmitted_plans(snapshot, job)) else ("done", "engine_owned")
+            self.save(job)
+            return
+        if not self.current_job_policy(job, version):
+            job.status, job.outcome = "review", "source_policy_changed"
+            self.save(job)
+            return
+        if self.reconcile_update_binding(job, event):
+            return
+        if job.event_id in queue_overview(snapshot, limit=len(snapshot["events"]) + 1)["ready"]:
+            job.status, job.owner, job.processor_instance = "interpreted", owner, self.instance
+            self.save(job)
+        else:
+            job.status, job.outcome = "review", "application_not_ready"
+            self.save(job)
+
 
     def prepare(self, owner, version):
         self.require_owner(owner)
@@ -224,111 +301,146 @@ class SourceProcessor:
             self.reconcile_jobs(owner, version, snapshot)
             snapshot = self.state.snapshot()
             for record in snapshot.get("source_jobs", {}).values():
-                if record.get("execution_path") == "express":
-                    continue
-                if record["status"] != "waiting_preview" or record["job_id"] in self.active_jobs:
-                    continue
-                job = SourceJob.model_validate(record)
-                if job.policy_version != version or job.version != VERSION or job.result is None or job.result.question_version != VERSION:
-                    # A policy change revokes ONLY the right to submit remaining
-                    # legs. Already sent operations stay owned by engine recovery.
-                    job.status, job.failure_code = "failed", "source_policy_changed"
-                    self.save(job)
-                    self.fail(owner, job.job_id, job.failure_code)
-                    continue
-                targets = self.pending_previews(snapshot, job)
-                if not targets and not self.unsubmitted_plans(snapshot, job):
-                    job.status = "done"
-                    self.save(job)
-                    continue
-                if not self.unsubmitted_plans(snapshot, job) and not any(retry_due(row["observation_retry"]) or now_ms() >= row["observation_retry"]["deadline_at"]
-                           or row["observation_retry"].get("configuration_revision") != snapshot["configuration_revision"]
-                           or row["observation_retry"].get("ranking_revision") != snapshot["ranking_revision"] for row in targets):
-                    continue
-                try:
-                    self.check_intent(job, snapshot)
-                    if job.processor_instance != self.instance:
-                        # Only a read-only preview lease is reclaimed. Financial
-                        # operations retain the trading engine's recovery guards.
-                        def reclaim_preview(data, selected_job=job):
-                            for target in self.pending_previews(data, selected_job):
-                                if not self.trading.target_started(data, target):
-                                    target.pop("preview_inflight_until", None)
-                        self.state.update(reclaim_preview)
-                    _, packet, job.fingerprint = self.context(job.event_id, source_refs=job.result.interpretation.source_refs)
-                    job.owner, job.processor_instance = owner, self.instance
-                    self.save(job)
-                    return self.response(job, packet)
-                except AqlaError:
-                    job.status = "failed"
-                    job.failure_code = "accepted_source_changed"
-                    self.save(job)
+                response = self.prepare_preview(owner, version, snapshot, record)
+                if response is not None:
+                    return response
         ready = queue_overview(snapshot, limit=len(snapshot["events"]) + 1)["ready"]
         ready.sort(key=lambda identity: (snapshot["events"][identity]["source"].get("received_at", 0), identity))
         jobs = snapshot.get("source_jobs", {})
         for event_id in ready:
-            prior = [row for row in jobs.values() if row["event_id"] == event_id
-                     and row.get("policy_version") == version and row.get("processing_mode") == self.mode]
-            if any(row["status"] in ("done", "shadow", "waiting_preview", "review", "recovering") for row in prior):
-                continue
-            # Unrelated new context must not reopen an indefinitely failing anchor.
-            # A new source revision or explicitly changed policy owns a fresh budget.
-            if sum(row["status"] == "failed" for row in prior) >= 3:
-                continue
-            context, packet, fingerprint = self.context(event_id)
-            job_id = digest([event_id, fingerprint, version, self.mode])
-            previous = jobs.get(job_id)
-            pending_retry = next((row for row in prior if row["status"] == "retry_wait"), None)
-            if pending_retry and pending_retry["job_id"] != job_id:
-                changed = SourceJob.model_validate(pending_retry)
-                changed.status, changed.outcome = "review", "retry_context_changed"
-                self.save(changed)
-                continue
-            if previous and previous["status"] in ("done", "failed", "shadow"):
-                continue
-            if previous and previous["status"] == "retry_wait":
-                if now_ms() < (previous.get("next_retry_at") or 0):
-                    continue
-                previous = {**previous, "status": "prepared", "attempt_count": previous.get("attempt_count", 1) + 1,
-                            "owner": owner, "processor_instance": self.instance}
-                self.state.update_metadata(("source_jobs",), lambda data, identity=job_id, value=previous:
-                                           data["source_jobs"].__setitem__(identity, value))
-            if previous and previous["status"] == "applying":
-                continue
-            job = SourceJob.model_validate(previous) if previous else SourceJob(
-                job_id=job_id, event_id=event_id, fingerprint=fingerprint, created_at=now_ms(), owner=owner,
-                processor_instance=self.instance, policy_version=version, processing_mode=self.mode,
-                content_fingerprint=self.content_identity(context, packet), retry_deadline_at=now_ms() + self.retry_max_age_seconds * 1000)
-            if not previous:
-                job.retry_deadline_at = self.retry_deadline(context, packet, job.created_at)
-                if self.mode == "hybrid" and now_ms() >= job.retry_deadline_at:
-                    job.status, job.outcome = "review", "source_retry_deadline_expired"
-                    job.review_sources = {packet["anchor_source_id"]: event_id}
-                    self.save(job)
-                    continue
-                # Reuse only exact semantics under the same complete admission
-                # policy. Binding changes invalidate identity; entries already
-                # consumed by any owned setup must never become a second trade.
-                cached = next((row for row in reversed(list(jobs.values())) if row.get("result")
-                    and row.get("event_id") != event_id and row.get("content_fingerprint") == job.content_fingerprint
-                    and row.get("policy_version") == version and row.get("processing_mode") == self.mode
-                    and row.get("version") == VERSION and row.get("status") in ("done", "interpreted")
-                    and row.get("job_id") not in self.active_jobs
-                    and (row["result"]["interpretation"]["kind"] not in ("new_signal", "trade_update") or row["status"] == "interpreted")
-                    and not row["result"].get("collection_only")), None)
-                if cached and not (cached["result"]["interpretation"]["kind"] == "new_signal" and (
-                        packet["anchor_setup_bound"] or any(packet["anchor_source_id"] in saved.get("plan", {}).get("source_refs", [])
-                                                          for saved in [*snapshot["trades"].values(), *snapshot["plans"].values()]))):
-                    reused = DecisionResult.model_validate(cached["result"])
-                    validate_interpretation(packet, reused.interpretation)
-                    job.result, job.status, job.cache_reused_from = reused, "interpreted", cached["job_id"]
-                    job.intent_revisions = {ref: row["event_id"] for ref, row in latest_sources(
-                        snapshot["events"], reused.interpretation.source_refs).items()}
-                record = job.model_dump(mode="json")
-                self.state.update_metadata(("source_jobs",), lambda data, identity=job_id, value=record:
-                                           data["source_jobs"].__setitem__(identity, value))
-            return self.response(job, packet)
+            response = self.prepare_event(owner, version, snapshot, jobs, event_id)
+            if response is not None:
+                return response
         return {"job": None}
+
+    def prepare_preview(self, owner, version, snapshot, record):
+        if record.get("execution_path") == "express":
+            return None
+        if record["status"] != "waiting_preview" or record["job_id"] in self.active_jobs:
+            return None
+        job = SourceJob.model_validate(record)
+        if not self.current_job_policy(job, version):
+            # A policy change revokes ONLY the right to submit remaining
+            # legs. Already sent operations stay owned by engine recovery.
+            job.status, job.failure_code = "failed", "source_policy_changed"
+            self.save(job)
+            self.fail(owner, job.job_id, job.failure_code)
+            return None
+        targets = self.pending_previews(snapshot, job)
+        if not targets and not self.unsubmitted_plans(snapshot, job):
+            job.status = "done"
+            self.save(job)
+            return None
+        if not self.preview_retry_ready(snapshot, job, targets):
+            return None
+        try:
+            self.check_intent(job, snapshot)
+            self.reclaim_preview_lease(job)
+            _, packet, job.fingerprint = self.context(job.event_id, source_refs=job.result.interpretation.source_refs)
+            job.owner, job.processor_instance = owner, self.instance
+            self.save(job)
+            return self.response(job, packet)
+        except AqlaError:
+            job.status = "failed"
+            job.failure_code = "accepted_source_changed"
+            self.save(job)
+        return None
+
+    def reclaim_preview_lease(self, job):
+        if job.processor_instance != self.instance:
+            # Only a read-only preview lease is reclaimed. Financial
+            # operations retain the trading engine's recovery guards.
+            def reclaim_preview(data, selected_job=job):
+                for target in self.pending_previews(data, selected_job):
+                    if not self.trading.target_started(data, target):
+                        target.pop("preview_inflight_until", None)
+            self.state.update(reclaim_preview)
+
+    def preview_retry_ready(self, snapshot, job, targets):
+        return self.unsubmitted_plans(snapshot, job) or any(retry_due(row["observation_retry"]) or now_ms() >= row["observation_retry"]["deadline_at"]
+                   or row["observation_retry"].get("configuration_revision") != snapshot["configuration_revision"]
+                   or row["observation_retry"].get("ranking_revision") != snapshot["ranking_revision"] for row in targets)
+
+    def prepare_previous(self, previous, owner, job_id):
+        if previous and previous["status"] in ("done", "failed", "shadow"):
+            return False, previous
+        if previous and previous["status"] == "retry_wait":
+            if now_ms() < (previous.get("next_retry_at") or 0):
+                return False, previous
+            previous = {**previous, "status": "prepared", "attempt_count": previous.get("attempt_count", 1) + 1,
+                        "owner": owner, "processor_instance": self.instance}
+            self.state.update_metadata(("source_jobs",), lambda data, identity=job_id, value=previous:
+                                       data["source_jobs"].__setitem__(identity, value))
+        if previous and previous["status"] == "applying":
+            return False, previous
+        return True, previous
+
+    def cache_eligible(self, row, event_id, job, version):
+        return (row.get("result")
+            and row.get("event_id") != event_id and row.get("content_fingerprint") == job.content_fingerprint
+            and row.get("policy_version") == version and row.get("processing_mode") == self.mode
+            and row.get("version") == VERSION and row.get("status") in ("done", "interpreted")
+            and row.get("job_id") not in self.active_jobs
+            and (row["result"]["interpretation"]["kind"] not in ("new_signal", "trade_update") or row["status"] == "interpreted")
+            and not row["result"].get("collection_only"))
+
+    def reuse_cached_result(self, job, packet, snapshot, jobs, version, event_id):
+        cached = next((row for row in reversed(list(jobs.values())) if self.cache_eligible(row, event_id, job, version)), None)
+        if cached and not (cached["result"]["interpretation"]["kind"] == "new_signal" and (
+                packet["anchor_setup_bound"] or any(packet["anchor_source_id"] in saved.get("plan", {}).get("source_refs", [])
+                                                  for saved in [*snapshot["trades"].values(), *snapshot["plans"].values()]))):
+            reused = DecisionResult.model_validate(cached["result"])
+            validate_interpretation(packet, reused.interpretation)
+            job.result, job.status, job.cache_reused_from = reused, "interpreted", cached["job_id"]
+            job.intent_revisions = {ref: row["event_id"] for ref, row in latest_sources(
+                snapshot["events"], reused.interpretation.source_refs).items()}
+
+    def available_prior_jobs(self, jobs, event_id, version):
+        prior = [row for row in jobs.values() if row["event_id"] == event_id
+                 and row.get("policy_version") == version and row.get("processing_mode") == self.mode]
+        if any(row["status"] in ("done", "shadow", "waiting_preview", "review", "recovering") for row in prior):
+            return None
+        # Unrelated new context must not reopen an indefinitely failing anchor.
+        # A new source revision or explicitly changed policy owns a fresh budget.
+        if sum(row["status"] == "failed" for row in prior) >= 3:
+            return None
+        return prior
+
+    def prepare_event(self, owner, version, snapshot, jobs, event_id):
+        prior = self.available_prior_jobs(jobs, event_id, version)
+        if prior is None:
+            return None
+        context, packet, fingerprint = self.context(event_id)
+        job_id = digest([event_id, fingerprint, version, self.mode])
+        previous = jobs.get(job_id)
+        pending_retry = next((row for row in prior if row["status"] == "retry_wait"), None)
+        if pending_retry and pending_retry["job_id"] != job_id:
+            changed = SourceJob.model_validate(pending_retry)
+            changed.status, changed.outcome = "review", "retry_context_changed"
+            self.save(changed)
+            return None
+        eligible, previous = self.prepare_previous(previous, owner, job_id)
+        if not eligible:
+            return None
+        job = SourceJob.model_validate(previous) if previous else SourceJob(
+            job_id=job_id, event_id=event_id, fingerprint=fingerprint, created_at=now_ms(), owner=owner,
+            processor_instance=self.instance, policy_version=version, processing_mode=self.mode,
+            content_fingerprint=self.content_identity(context, packet), retry_deadline_at=now_ms() + self.retry_max_age_seconds * 1000)
+        if not previous:
+            job.retry_deadline_at = self.retry_deadline(context, packet, job.created_at)
+            if self.mode == "hybrid" and now_ms() >= job.retry_deadline_at:
+                job.status, job.outcome = "review", "source_retry_deadline_expired"
+                job.review_sources = {packet["anchor_source_id"]: event_id}
+                self.save(job)
+                return None
+            # Reuse only exact semantics under the same complete admission
+            # policy. Binding changes invalidate identity; entries already
+            # consumed by any owned setup must never become a second trade.
+            self.reuse_cached_result(job, packet, snapshot, jobs, version, event_id)
+            record = job.model_dump(mode="json")
+            self.state.update_metadata(("source_jobs",), lambda data, identity=job_id, value=record:
+                                       data["source_jobs"].__setitem__(identity, value))
+        return self.response(job, packet)
 
     @staticmethod
     def response(job, packet):
@@ -398,16 +510,7 @@ class SourceProcessor:
         if job.fingerprint != fingerprint:
             raise AqlaError("Source job context changed; prepare a current job")
         validate_interpretation(packet, result.interpretation)
-        if result.question_version != VERSION:
-            raise AqlaError("Decision questions changed; a current interpretation is required")
-        if result.model == "python":
-            anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
-            if anchor["text"].strip() or result.interpretation.kind != "incomplete":
-                raise AqlaError("Python-only interpretation is restricted to missing original text")
-        if result.collection_only and self.mode != "shadow":
-            raise AqlaError("Collection-only decisions cannot authorize production processing")
-        if not result.collection_only and not result.fallback and result.interpretation.kind in ("new_signal", "trade_update") and not result.verified:
-            raise AqlaError("Actionable decision needs its second verification")
+        self.check_result_contract(result, packet)
         if job.result is not None and job.result != result:
             raise AqlaError("An already recorded interpretation cannot be replaced")
         job.result, job.status = result, "shadow" if self.mode == "shadow" else "interpreted"
@@ -485,27 +588,8 @@ class SourceProcessor:
             raise AqlaError("Shadow source jobs cannot execute")
         if job.status == "done":
             return {"status": "done", "already_processed": True}
-        resume_preview = job.status == "waiting_preview"
-        if job.status not in ("interpreted", "waiting_preview") or job.result is None:
-            raise AqlaError("Source job is not a validated unsubmitted interpretation")
-        if job.result.collection_only:
-            raise AqlaError("Collection-only decisions cannot execute")
-        policy_version = self.express.policy_version if express else self.policy_version
-        if job.policy_version != policy_version or job.version != VERSION or job.result.question_version != VERSION:
-            raise AqlaError("Source processing policy changed; no new submission")
-        # This read happens immediately before the existing transactional source/entry guards.
-        context, packet, fingerprint = self.context(job.event_id)
-        if not resume_preview and fingerprint != job.fingerprint:
-            raise AqlaError("Source context changed before application")
-        if resume_preview:
-            snapshot = self.state.snapshot()
-            self.check_intent(job, snapshot)
-            if not self.pending_previews(snapshot, job) and not self.unsubmitted_plans(snapshot, job):
-                raise AqlaError("No proven unsubmitted preview target or saved plan remains")
-        else:
-            validate_interpretation(packet, job.result.interpretation)
-        if not resume_preview and job.event_id not in queue_overview(self.state.snapshot(), limit=100000, include_express=express)["ready"]:
-            raise AqlaError("Source job is no longer ready; recover existing operations")
+        resume_preview = self.check_application_job(job, express)
+        context = self.application_context(job, resume_preview, express)
         # Keep pending preview work discoverable if this read is interrupted
         # after another venue already opened its position.
         job.status = "waiting_preview" if resume_preview else "applying"
@@ -517,30 +601,33 @@ class SourceProcessor:
         elif interpretation.kind == "trade_update":
             await self.trading.update_trade(job.event_id, interpretation)
         else:
-            execute_ids = self.unsubmitted_plans(self.state.snapshot(), job) if resume_preview else job.plan_ids.copy()
-            if not job.plan_ids or resume_preview and self.pending_previews(self.state.snapshot(), job):
-                preview = await self.trading.preview(job.event_id, interpretation)
-                self.require_owner(owner)
-                targets = preview.get("targets", {})
-                targets = list(targets.values()) if isinstance(targets, dict) else targets
-                # A successful retry can retain a historical error on its target row.
-                # Only a freshly returned, validated plan proves new admission.
-                execute_ids += [row["plan_id"] for row in targets if row.get("plan_id") and isinstance(row.get("plan"), dict)
-                                and row.get("status") == "planned" and row["plan_id"] not in job.plan_ids]
-                execute_ids = list(dict.fromkeys(execute_ids))
-                if not targets and preview.get("plan_id"):
-                    execute_ids = [preview["plan_id"]]
-                job.plan_ids = list(dict.fromkeys([*job.plan_ids, *execute_ids]))
-                if self.pending_previews(self.state.snapshot(), job):
-                    # Persist remaining preview work BEFORE a healthy leg can be sent.
-                    job.status = "waiting_preview"
-                self.save(job)
-            self.require_owner(owner)
-            if execute_ids:
-                await self.trading.execute_many(execute_ids)
+            await self.execute_signal(owner, job, resume_preview)
         job.status = "waiting_preview" if self.pending_previews(self.state.snapshot(), job) else "done"
         self.save(job)
         return {"status": job.status, "job_id": job_id, "plan_ids": job.plan_ids}
+
+    async def execute_signal(self, owner, job, resume_preview):
+        execute_ids = self.unsubmitted_plans(self.state.snapshot(), job) if resume_preview else job.plan_ids.copy()
+        if not job.plan_ids or resume_preview and self.pending_previews(self.state.snapshot(), job):
+            preview = await self.trading.preview(job.event_id, job.result.interpretation)
+            self.require_owner(owner)
+            targets = preview.get("targets", {})
+            targets = list(targets.values()) if isinstance(targets, dict) else targets
+            # A successful retry can retain a historical error on its target row.
+            # Only a freshly returned, validated plan proves new admission.
+            execute_ids += [row["plan_id"] for row in targets if row.get("plan_id") and isinstance(row.get("plan"), dict)
+                            and row.get("status") == "planned" and row["plan_id"] not in job.plan_ids]
+            execute_ids = list(dict.fromkeys(execute_ids))
+            if not targets and preview.get("plan_id"):
+                execute_ids = [preview["plan_id"]]
+            job.plan_ids = list(dict.fromkeys([*job.plan_ids, *execute_ids]))
+            if self.pending_previews(self.state.snapshot(), job):
+                # Persist remaining preview work BEFORE a healthy leg can be sent.
+                job.status = "waiting_preview"
+            self.save(job)
+        self.require_owner(owner)
+        if execute_ids:
+            await self.trading.execute_many(execute_ids)
 
     def overview(self):
         rows = list(self.state.read("source_jobs").get("source_jobs", {}).values())

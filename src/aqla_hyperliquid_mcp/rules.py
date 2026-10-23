@@ -112,6 +112,40 @@ def effective_leverage(signal: Interpretation, market: Market, policy: Policy, b
     return policy.leverage
 
 
+def backup_roe_leverage(market, leverage):
+    try:
+        effective = (
+            Decimal(leverage) if leverage is not None and not isinstance(leverage, bool) else Decimal(0)
+        )
+    except (InvalidOperation, ValueError, TypeError):
+        effective = Decimal(0)
+    if (
+        market.product != "perp"
+        or not effective.is_finite()
+        or effective < 1
+        or effective != effective.to_integral_value()
+    ):
+        raise AqlaError("Backup ROE requires valid effective perpetual leverage")
+    return effective
+
+
+def backup_course_percentages(market, stop_percent, percentages, stop_unit, take_profit_unit, leverage):
+    uses_roe = (
+        stop_percent is not None
+        and stop_unit == "roe_percent"
+        or percentages
+        and take_profit_unit == "roe_percent"
+    )
+    if uses_roe:
+        effective = backup_roe_leverage(market, leverage)
+        effective = margin_leverage(effective, market)
+        if stop_percent is not None and stop_unit == "roe_percent":
+            stop_percent /= effective
+        if take_profit_unit == "roe_percent":
+            percentages = [value / effective for value in percentages]
+    return stop_percent, percentages
+
+
 def backup_prices(
     reference,
     side,
@@ -124,31 +158,7 @@ def backup_prices(
     leverage=None,
 ):
     """Nominal ROE uses the original position margin; grid away from entry."""
-    uses_roe = (
-        stop_percent is not None
-        and stop_unit == "roe_percent"
-        or percentages
-        and take_profit_unit == "roe_percent"
-    )
-    if uses_roe:
-        try:
-            effective = (
-                Decimal(leverage) if leverage is not None and not isinstance(leverage, bool) else Decimal(0)
-            )
-        except (InvalidOperation, ValueError, TypeError):
-            effective = Decimal(0)
-        if (
-            market.product != "perp"
-            or not effective.is_finite()
-            or effective < 1
-            or effective != effective.to_integral_value()
-        ):
-            raise AqlaError("Backup ROE requires valid effective perpetual leverage")
-        effective = margin_leverage(effective, market)
-        if stop_percent is not None and stop_unit == "roe_percent":
-            stop_percent /= effective
-        if take_profit_unit == "roe_percent":
-            percentages = [value / effective for value in percentages]
+    stop_percent, percentages = backup_course_percentages(market, stop_percent, percentages, stop_unit, take_profit_unit, leverage)
     long = side == "long"
     stop = (
         price_grid(reference * (1 + (-1 if long else 1) * stop_percent / 100), market, up=not long)
@@ -175,6 +185,33 @@ def latest_sources(events: dict, refs=None):
     return canonical_sources(events, refs)
 
 
+def verify_update_value_anchor(signal, anchor_source_id):
+    changed = UPDATE_VALUE_FIELDS.get(signal.update_action)
+    if changed and any(
+        proof.source_id != anchor_source_id
+        and (proof.field == changed or proof.field.startswith(changed + "."))
+        for proof in signal.evidence
+    ):
+        raise AqlaError(
+            "Changed update values for "
+            + changed
+            + " need evidence from the current anchor, not copied parent values. Keep parents for market identity or own setup binding; re-read and quote only the newly instructed value"
+        )
+
+
+def verify_parent_symbol_references(signal, anchor_source_id, own_setup_refs):
+    if signal.kind == "trade_update" and any(
+        proof.field == "symbol" and proof.source_id == anchor_source_id for proof in signal.evidence
+    ):
+        for ref in set(signal.source_refs) - {anchor_source_id} - own_setup_refs:
+            if {proof.field for proof in signal.evidence if proof.source_id == ref} - {"classification"} == {
+                "symbol"
+            }:
+                raise AqlaError(
+                    "source_refs include a redundant parent symbol: the current update already evidences its market. Remove only that duplicate parent reference and its symbol proof; retain genuine parent contributions and existing own setup bindings"
+                )
+
+
 def verify_setup_references(signal, anchor_source_id, own_setup_refs=()):
     if signal.kind not in ("new_signal", "trade_update"):
         if set(signal.source_refs) != {anchor_source_id}:
@@ -189,31 +226,12 @@ def verify_setup_references(signal, anchor_source_id, own_setup_refs=()):
     own_setup_refs = set(own_setup_refs)
     if signal.kind == "trade_update":
         supported.update(own_setup_refs)
-        changed = UPDATE_VALUE_FIELDS.get(signal.update_action)
-        if changed and any(
-            proof.source_id != anchor_source_id
-            and (proof.field == changed or proof.field.startswith(changed + "."))
-            for proof in signal.evidence
-        ):
-            raise AqlaError(
-                "Changed update values for "
-                + changed
-                + " need evidence from the current anchor, not copied parent values. Keep parents for market identity or own setup binding; re-read and quote only the newly instructed value"
-            )
+        verify_update_value_anchor(signal, anchor_source_id)
     if signal.kind in ("new_signal", "trade_update") and set(signal.source_refs) - supported:
         raise AqlaError(
             "Actionable source_refs include context without setup evidence; classification quotes alone do not contribute a setup field. Remove that parent reference and its classification proof; retain original field contributions and existing own setup bindings"
         )
-    if signal.kind == "trade_update" and any(
-        proof.field == "symbol" and proof.source_id == anchor_source_id for proof in signal.evidence
-    ):
-        for ref in set(signal.source_refs) - {anchor_source_id} - own_setup_refs:
-            if {proof.field for proof in signal.evidence if proof.source_id == ref} - {"classification"} == {
-                "symbol"
-            }:
-                raise AqlaError(
-                    "source_refs include a redundant parent symbol: the current update already evidences its market. Remove only that duplicate parent reference and its symbol proof; retain genuine parent contributions and existing own setup bindings"
-                )
+    verify_parent_symbol_references(signal, anchor_source_id, own_setup_refs)
 
 
 def verify_entry_shape(signal):
@@ -257,30 +275,7 @@ def verify_update_shape(signal):
         )
 
 
-def verify_evidence(signal: Interpretation, events: dict):
-    if signal.management_steps:
-        for child in management_steps(signal):
-            verify_evidence(child, events)
-        return
-    texts = {ref: row["source"]["text"] for ref, row in latest_sources(events, signal.source_refs).items()}
-    if any(ref not in texts for ref in signal.source_refs):
-        raise AqlaError("Unknown source reference")
-    fields: dict[str, list[str]] = {}
-    for proof in signal.evidence:
-        if proof.source_id not in signal.source_refs or proof.quote not in texts[proof.source_id]:
-            raise AqlaError("Evidence does not occur in its original source")
-        fields.setdefault(proof.field, []).append(proof.quote)
-    errors = []
-    unsupported = sorted(set(fields) - set(EVIDENCE_FIELDS))
-    if unsupported:
-        errors.append("Unsupported source evidence fields: " + ", ".join(unsupported))
-    if signal.kind == "new_signal":
-        for field in ("symbol", "side"):
-            if not fields.get(field):
-                errors.append(f"Missing contextual source evidence for {field}")
-    numeric = {"stop_loss": signal.stop_loss}
-    numeric.update({f"take_profits.{i}": value for i, value in enumerate(signal.take_profits)})
-    numeric.update({f"entry_prices.{i}": value for i, value in enumerate(signal.entry_prices)})
+def collect_entry_leg_evidence(signal, fields, errors, numeric):
     for index, leg in enumerate(signal.entry_legs):
         numeric[f"entry_legs.{index}.price"] = leg.price
         if leg.weight_percent is not None:
@@ -301,6 +296,9 @@ def verify_evidence(signal: Interpretation, events: dict):
             errors.append(f"Entry leg form needs original contextual evidence: entry_legs.{index}.kind")
         if leg.timing == "deferred" and not fields.get(f"entry_legs.{index}.timing"):
             errors.append(f"Deferred leg needs original timing evidence: entry_legs.{index}.timing")
+
+
+def verify_numeric_evidence(signal, fields, texts, numeric, errors):
     for field, value in numeric.items():
         if value is None:
             continue
@@ -316,6 +314,9 @@ def verify_evidence(signal: Interpretation, events: dict):
             errors.append(
                 f"Numeric source evidence must isolate one number: {field} (complete compatible original value; numbering labels are not prices)"
             )
+
+
+def verify_reduction_evidence(signal, fields, errors):
     if signal.reduce_percent is not None:
         from aqla_agent.evidence import position_fractions
 
@@ -330,6 +331,10 @@ def verify_evidence(signal: Interpretation, events: dict):
                 reduction_supported = True
         if not reduction_supported:
             errors.append("Reduction percentage is not supported by source evidence: reduce_percent")
+
+
+def verify_contextual_evidence(signal, fields, errors):
+    verify_reduction_evidence(signal, fields, errors)
     if signal.leverage is not None and not any(
         signal.leverage in set(quoted_leverage_numbers(quote)) for quote in fields.get("leverage", [])
     ):
@@ -346,13 +351,9 @@ def verify_evidence(signal: Interpretation, events: dict):
         and not fields.get("take_profit_unit")
     ):
         errors.append("Percentage TP unit needs contextual source evidence")
-    if errors:
-        required = [field for field, value in numeric.items() if value is not None]
-        repair = "; use one exact original quote per field, including % when present"
-        if required:
-            repair += "; numeric fields required: " + ", ".join(required)
-        # Model fields bound this list to 25 required paths and 60 submitted paths.
-        raise AqlaError("; ".join(errors) + repair)
+
+
+def verify_actionable_entry_evidence(signal, texts):
     if signal.kind == "new_signal":
         from aqla_agent.semantic_contract import analysis_only_entry_evidence
 
@@ -370,6 +371,9 @@ def verify_evidence(signal: Interpretation, events: dict):
                 analysis_only_entry_evidence(texts[proof.source_id], proof.quote, value) for proof in proofs
             ):
                 raise AqlaError("Entry evidence selects only an analysis level: " + field)
+
+
+def verify_percentage_unit_evidence(signal, fields):
     if signal.take_profit_unit not in ("price", "roe_percent") and signal.take_profits:
         unit_proof = " ".join(fields["take_profit_unit"])
         roi = re.search(r"\b(?:ROI|ROE)\b|return on (?:equity|investment)|рентабельност", unit_proof, re.I)
@@ -386,6 +390,40 @@ def verify_evidence(signal: Interpretation, events: dict):
             r"annuali[sz]ed|net ROI|net ROE|netto|годов|после (?:комисс|издерж)", unit_proof, re.I
         ):
             raise AqlaError("This ROI definition cannot be converted as nominal linear ROI before costs")
+
+
+def collect_price_percentage_modes(proof, texts, field, value, modes):
+    original = texts[proof.source_id]
+    tokens = [match.span() for match in SOURCE_NUMBERS.finditer(original)]
+    for occurrence in re.finditer(re.escape(proof.quote), original):
+        for number in SOURCE_NUMBERS.finditer(proof.quote):
+            if not _complete_numeric_span(
+                original,
+                occurrence.start() + number.start(),
+                occurrence.start() + number.end(),
+                tokens,
+            ):
+                continue
+            if number_is_ordinal(
+                original, occurrence.start() + number.start(), occurrence.start() + number.end()
+            ):
+                continue
+            if value not in set(quoted_numbers(number.group())):
+                continue
+            if field.startswith("take_profits."):
+                from aqla_agent.percent_targets import percentage_intervals
+
+                position = (occurrence.start() + number.start(), occurrence.start() + number.end())
+                if any(
+                    position in (interval.span("lower"), interval.span("upper"))
+                    for interval in percentage_intervals(original)
+                ):
+                    raise AqlaError("TP evidence selects a percentage-interval endpoint: " + field)
+            tail = original[occurrence.start() + number.end() :]
+            modes.append(bool(re.match(r"\s*%", tail)))
+
+
+def verify_price_percentage_spans(signal, texts, numeric):
     for field, value in numeric.items():
         if value is None or not (field == "stop_loss" or field.startswith("take_profits.")):
             continue
@@ -394,43 +432,59 @@ def verify_evidence(signal: Interpretation, events: dict):
         for proof in signal.evidence:
             if proof.field != field:
                 continue
-            original = texts[proof.source_id]
-            tokens = [match.span() for match in SOURCE_NUMBERS.finditer(original)]
-            for occurrence in re.finditer(re.escape(proof.quote), original):
-                for number in SOURCE_NUMBERS.finditer(proof.quote):
-                    if not _complete_numeric_span(
-                        original,
-                        occurrence.start() + number.start(),
-                        occurrence.start() + number.end(),
-                        tokens,
-                    ):
-                        continue
-                    if number_is_ordinal(
-                        original, occurrence.start() + number.start(), occurrence.start() + number.end()
-                    ):
-                        continue
-                    if value not in set(quoted_numbers(number.group())):
-                        continue
-                    if field.startswith("take_profits."):
-                        from aqla_agent.percent_targets import percentage_intervals
-
-                        position = (occurrence.start() + number.start(), occurrence.start() + number.end())
-                        if any(
-                            position in (interval.span("lower"), interval.span("upper"))
-                            for interval in percentage_intervals(original)
-                        ):
-                            raise AqlaError("TP evidence selects a percentage-interval endpoint: " + field)
-                    tail = original[occurrence.start() + number.end() :]
-                    modes.append(bool(re.match(r"\s*%", tail)))
+            collect_price_percentage_modes(proof, texts, field, value, modes)
         if not modes or any(mode != percentage for mode in modes):
             raise AqlaError(f"Source percentage/price evidence needs a precise original span: {field}")
-    if signal.take_profit_unit == "roe_percent" and signal.take_profits:
-        if re.search(
+
+
+def source_evidence_fields(signal, events):
+    texts = {ref: row["source"]["text"] for ref, row in latest_sources(events, signal.source_refs).items()}
+    if any(ref not in texts for ref in signal.source_refs):
+        raise AqlaError("Unknown source reference")
+    fields: dict[str, list[str]] = {}
+    for proof in signal.evidence:
+        if proof.source_id not in signal.source_refs or proof.quote not in texts[proof.source_id]:
+            raise AqlaError("Evidence does not occur in its original source")
+        fields.setdefault(proof.field, []).append(proof.quote)
+    errors = []
+    unsupported = sorted(set(fields) - set(EVIDENCE_FIELDS))
+    if unsupported:
+        errors.append("Unsupported source evidence fields: " + ", ".join(unsupported))
+    if signal.kind == "new_signal":
+        for field in ("symbol", "side"):
+            if not fields.get(field):
+                errors.append(f"Missing contextual source evidence for {field}")
+    return texts, fields, errors
+
+
+def verify_evidence(signal: Interpretation, events: dict):
+    if signal.management_steps:
+        for child in management_steps(signal):
+            verify_evidence(child, events)
+        return
+    texts, fields, errors = source_evidence_fields(signal, events)
+    numeric = {"stop_loss": signal.stop_loss}
+    numeric.update({f"take_profits.{i}": value for i, value in enumerate(signal.take_profits)})
+    numeric.update({f"entry_prices.{i}": value for i, value in enumerate(signal.entry_prices)})
+    collect_entry_leg_evidence(signal, fields, errors, numeric)
+    verify_numeric_evidence(signal, fields, texts, numeric, errors)
+    verify_contextual_evidence(signal, fields, errors)
+    if errors:
+        required = [field for field, value in numeric.items() if value is not None]
+        repair = "; use one exact original quote per field, including % when present"
+        if required:
+            repair += "; numeric fields required: " + ", ".join(required)
+        # Model fields bound this list to 25 required paths and 60 submitted paths.
+        raise AqlaError("; ".join(errors) + repair)
+    verify_actionable_entry_evidence(signal, texts)
+    verify_percentage_unit_evidence(signal, fields)
+    verify_price_percentage_spans(signal, texts, numeric)
+    if signal.take_profit_unit == "roe_percent" and signal.take_profits and re.search(
             r"annuali[sz]ed|net ROI|net ROE|netto|годов|после (?:комисс|издерж)",
             " ".join(texts.values()),
             re.I,
         ):
-            raise AqlaError("Special percentage definition cannot be converted as nominal ROE before costs")
+        raise AqlaError("Special percentage definition cannot be converted as nominal ROE before costs")
 
 
 @dataclass(frozen=True)
@@ -440,6 +494,23 @@ class EntryPrices:
     limit: Decimal
 
 
+def source_limit_price(signal, market, policy, long):
+    if len(signal.entry_prices) != (2 if signal.entry == "range" else 1):
+        raise AqlaError("Entry prices do not match entry type")
+    low, high = signal.entry_prices[0], signal.entry_prices[-1]
+    if policy.entry_range_choice == "midpoint":
+        price = (low + high) / 2
+    else:
+        price = (
+            (high if long else low) if policy.entry_range_choice == "near" else (low if long else high)
+        )
+    price = price_grid(price, market, up=not long)
+    if policy.entry_execution == "maker_only" and signal.entry == "range" and not low <= price <= high:
+        raise AqlaError("No maker price grid point satisfies the source entry range")
+    limit = price
+    return price, limit
+
+
 def entry_prices(
     signal: Interpretation, market: Market, policy: Policy, *, maker_price: Decimal | None = None
 ) -> EntryPrices:
@@ -447,19 +518,7 @@ def entry_prices(
     long = signal.side == "long"
     kind: Literal["limit", "market"] = "limit" if signal.entry in ("limit", "range") else "market"
     if kind == "limit":
-        if len(signal.entry_prices) != (2 if signal.entry == "range" else 1):
-            raise AqlaError("Entry prices do not match entry type")
-        low, high = signal.entry_prices[0], signal.entry_prices[-1]
-        if policy.entry_range_choice == "midpoint":
-            price = (low + high) / 2
-        else:
-            price = (
-                (high if long else low) if policy.entry_range_choice == "near" else (low if long else high)
-            )
-        price = price_grid(price, market, up=not long)
-        if policy.entry_execution == "maker_only" and signal.entry == "range" and not low <= price <= high:
-            raise AqlaError("No maker price grid point satisfies the source entry range")
-        limit = price
+        price, limit = source_limit_price(signal, market, policy, long)
     else:
         if policy.entry_execution == "maker_only":
             if maker_price is None:

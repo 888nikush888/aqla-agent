@@ -211,14 +211,7 @@ async def test_last_local_admission_can_refresh_once_without_skipping_rechecks(s
     assert state.snapshot()["plans"][plan.plan_id]["plan"] == plan.model_dump(mode="json")
 
 
-# Sequential safety assertions; control flow (including test doubles): 14.
-# skipcq: PY-R1000
-@pytest.mark.asyncio
-@pytest.mark.parametrize("delay_at", ["signing", "audit_write", "sending_write"])
-async def test_slow_local_preparation_reobserves_before_entry_transport(setup, signal, clocked, monkeypatch, delay_at):
-    _, state, fake, exchange, engine = setup
-    source, interpretation = signal
-    plan = await engine.preview(source.event_id, interpretation)
+def inject_local_preparation_delay(state, plan, clocked, monkeypatch, delay_at):
     original_update, original_sign = state.update, api.signing.sign_l1_action
     injected = False
     def update(callback):
@@ -242,6 +235,16 @@ async def test_slow_local_preparation_reobserves_before_entry_transport(setup, s
     monkeypatch.setattr(state, "update", update)
     if delay_at == "signing":
         monkeypatch.setattr(api.signing, "sign_l1_action", signing)
+    return lambda: injected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delay_at", ["signing", "audit_write", "sending_write"])
+async def test_slow_local_preparation_reobserves_before_entry_transport(setup, signal, clocked, monkeypatch, delay_at):
+    _, state, fake, exchange, engine = setup
+    source, interpretation = signal
+    plan = await engine.preview(source.event_id, interpretation)
+    was_injected = inject_local_preparation_delay(state, plan, clocked, monkeypatch, delay_at)
     original_transport = fake.handle
     def transport(request):
         if request.url.path == "/exchange":
@@ -259,6 +262,7 @@ async def test_slow_local_preparation_reobserves_before_entry_transport(setup, s
     monkeypatch.setattr(exchange, "price_snapshot", quote)
     exchange.client._transport = httpx.MockTransport(transport)
     result = await engine.execute(plan["plan_id"])
+    injected = was_injected()
     assert injected and result["status"] == "open" and len(entries(fake)) == 1
     assert state.snapshot()["plans"][plan["plan_id"]]["plan"] == plan
 

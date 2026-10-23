@@ -128,7 +128,7 @@ async def test_actual_trade_json_import_does_not_resend_orders(setup, signal, tm
 
 
 def test_old_json_and_new_sqlite_configuration_share_one_writer(setup):
-    settings, state, *_ = setup
+    settings, _state, *_ = setup
     with pytest.raises(AqlaError, match='already owns'):
         State(settings.model_copy(update={'state_path': database_path(settings.state_path)}))
 

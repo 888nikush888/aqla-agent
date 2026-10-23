@@ -96,7 +96,6 @@ def test_future_price_changes_cannot_change_an_earlier_replay_prefix():
 
 def test_recorder_budget_is_reported_and_retention_keeps_active_until_target_setups(tmp_path):
     from aqla_agent.waverider import capture
-    from aqla_hyperliquid_mcp.models import now_ms
     path = tmp_path / "replay.sqlite3"
     stamp = now_ms()
     old = stamp - 3 * 86400000

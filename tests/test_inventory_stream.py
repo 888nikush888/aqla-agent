@@ -226,7 +226,6 @@ async def test_unproved_aggregate_snapshot_cannot_admit_entry(failure):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("first_clock", ["stale", "unclocked"])
 async def test_followup_aggregate_within_same_subscription_recovers(first_clock):
-    import copy
     adapter, names, frames = inputs()
     followup = copy.deepcopy(frames[0])
     if first_clock == "stale":
@@ -246,7 +245,6 @@ async def test_followup_aggregate_within_same_subscription_recovers(first_clock)
 
 @pytest.mark.asyncio
 async def test_nonempty_rest_details_recheck_exchange_age_and_consume_fresh_aggregate(monkeypatch):
-    import copy
 
     from aqla_agent import inventory_stream
     adapter, names, frames = inputs()

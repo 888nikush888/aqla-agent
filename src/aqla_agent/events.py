@@ -174,30 +174,23 @@ class HermesExtension:
             args["accepted"] = accepted
         return await self.mcp_call(self.server, "integration", args)
 
-    async def mcp_call(self, server, tool, args):
-        claim = self.turn_claim.get()
-        # Native internal requests may include bounded account and source recovery.
-        call_options = (
-            {"timeout": 120} if server == self.server and tool == "integration" else {})
-        def invoke():
-            if claim and claim.read():
-                return self.ctx.call_mcp(server, tool, args, **call_options)
-            try:
-                from tools.interrupt import acting_for_tid, clear_current_thread_interrupt
-            except ImportError:
-                return self.ctx.call_mcp(server, tool, args, **call_options)
-            # Fresh background work cannot inherit a stopped agent's pooled thread.
-            clear_current_thread_interrupt()
-            token = acting_for_tid.set(None)
-            try:
-                return self.ctx.call_mcp(server, tool, args, **call_options)
-            finally:
-                acting_for_tid.reset(token)
-        result = await asyncio.to_thread(invoke)
-        if not result.get("ok"):
-            raise AqlaError("Native MCP integration call failed")
-        if result.get("truncated"):
-            raise AqlaError("Native MCP integration result was truncated; do not acknowledge partial journal data")
+    def _invoke_mcp(self, claim, server, tool, args, call_options):
+        if claim and claim.read():
+            return self.ctx.call_mcp(server, tool, args, **call_options)
+        try:
+            from tools.interrupt import acting_for_tid, clear_current_thread_interrupt
+        except ImportError:
+            return self.ctx.call_mcp(server, tool, args, **call_options)
+        # Fresh background work cannot inherit a stopped agent's pooled thread.
+        clear_current_thread_interrupt()
+        token = acting_for_tid.set(None)
+        try:
+            return self.ctx.call_mcp(server, tool, args, **call_options)
+        finally:
+            acting_for_tid.reset(token)
+
+    @staticmethod
+    def _mcp_value(result):
         value = result.get("structuredContent", result.get("result"))
         for _ in range(4):
             if isinstance(value, str):
@@ -214,6 +207,18 @@ class HermesExtension:
         if not isinstance(value, dict):
             raise AqlaError("Native MCP returned no structured integration result")
         return value
+
+    async def mcp_call(self, server, tool, args):
+        claim = self.turn_claim.get()
+        # Native internal requests may include bounded account and source recovery.
+        call_options = (
+            {"timeout": 120} if server == self.server and tool == "integration" else {})
+        result = await asyncio.to_thread(self._invoke_mcp, claim, server, tool, args, call_options)
+        if not result.get("ok"):
+            raise AqlaError("Native MCP integration call failed")
+        if result.get("truncated"):
+            raise AqlaError("Native MCP integration result was truncated; do not acknowledge partial journal data")
+        return self._mcp_value(result)
 
     async def setup_request(self, action, **arguments):
         return await self.mcp_call(self.server, "integration", {"action": action, "token": self.authority.key.decode(), **arguments})
@@ -438,6 +443,15 @@ class HermesExtension:
         if get_pending_for_session(self.session_key, include_choice_prompts=True):
             clear_session(self.session_key)
 
+    @staticmethod
+    def _message_origin(event, source, metadata):
+        stamped = metadata.get("aqla_origin")
+        if stamped in ("operator", "source"):
+            return stamped, str(metadata.get("aqla_message_id") or getattr(event, "message_id", None) or source.message_id or "")
+        raw = getattr(event, "raw_message", None)
+        forwarded = any(metadata.get(key) or (raw.get(key) if isinstance(raw, dict) else getattr(raw, key, None)) for key in ("forward_origin", "forward_from", "forward_date"))
+        return ("source" if forwarded else "operator"), str(getattr(event, "message_id", None) or source.message_id or "")
+
     def origin(self, event):
         if event is None:
             return None
@@ -453,12 +467,7 @@ class HermesExtension:
             return "source", str(getattr(event, "message_id", None) or metadata.get("gateway_session_id") or "wake")
         if str(source.user_id) != self.owner:
             return None
-        stamped = metadata.get("aqla_origin")
-        if stamped in ("operator", "source"):
-            return stamped, str(metadata.get("aqla_message_id") or getattr(event, "message_id", None) or source.message_id or "")
-        raw = getattr(event, "raw_message", None)
-        forwarded = any(metadata.get(key) or (raw.get(key) if isinstance(raw, dict) else getattr(raw, key, None)) for key in ("forward_origin", "forward_from", "forward_date"))
-        return ("source" if forwarded else "operator"), str(getattr(event, "message_id", None) or source.message_id or "")
+        return self._message_origin(event, source, metadata)
 
     def stamp(self, event):
         """Called on native events before batching, never inferred from message text."""
@@ -567,6 +576,47 @@ class HermesExtension:
         self.attach(event, gateway)
         return None
 
+    def _authorize_trade_tool(self, short, args, origin, claim):
+        if not origin or (short in ("control", "conflict_review", "operator_manage") and origin[0] != "operator"):
+            return {"action": "block", "message": "An authenticated operator request is required"}
+        claim = self.turn_claim.get()
+        if not claim.can_change() and short != "notifications_ack":
+            return {"action": "block", "message": "Unanswered or cancelled clarification is not authorization; send a fresh owner request"}
+        setup = self.setup.claims() if origin[0] == "operator" else None
+        if short == "notifications_ack" and claim.automatic:
+            versions = args.get("versions") or {}
+            observed = {identity: version for selected, _ in claim.notification_messages for identity, version in selected.items()}
+            if any(identity not in observed or versions.get(identity) != observed[identity] for identity in args.get("notification_ids", [])):
+                return {"action": "block", "message": "Read rendered notifications and supply their current versions before acknowledgement"}
+        return {"action": "modify", "args": {"context_auth": self.authority.sign(*origin, setup=setup)}}
+
+    def _authorize_skill(self, args, origin):
+        from .skill_review import master_content, native_background_review
+
+        if not (origin and origin[0] == "operator") and not native_background_review():
+            return {"action": "block", "message": "Only owner requests or native background skill proposals are allowed"}
+        claim = self.turn_claim.get()
+        if origin and origin[0] == "operator" and claim and not claim.can_change():
+            return {"action": "block", "message": "A fresh owner request is required after unanswered clarification"}
+        try:
+            master_content(args, self.master_path)
+        except (ValueError, OSError) as error:
+            return {"action": "block", "message": str(error)}
+        return None
+
+    def _status_tool_args(self, short, origin, claim):
+        setup = self.setup.claims() if origin and origin[0] == "operator" else None
+        return {"action": "modify", "args": {"context_auth": self.authority.sign(*origin, setup=setup) if origin and origin[0] == "operator" else "",
+            **({"view": "summary"} if short == "status" and claim and claim.automatic else {})}}
+
+    @staticmethod
+    def _authorize_interaction(tool_name, args, origin):
+        if not origin or origin[0] != "operator":
+            return {"action": "block", "message": "Operator interaction tools are unavailable to source processing"}
+        if tool_name == "session_search" and args.get("profile") is not None:
+            return {"action": "block", "message": "Search only this Aqla profile's conversation history"}
+        return None
+
     def before_tool(self, tool_name, args, **_):
         short = tool_name.removeprefix("mcp__aqla__").removeprefix("mcp_aqla_")
         origin = self.active_context
@@ -579,41 +629,16 @@ class HermesExtension:
             except ValueError as error:
                 return {"action": "block", "message": str(error)}
         if short in ("status", "setup_status"):
-            setup = self.setup.claims() if origin and origin[0] == "operator" else None
-            return {"action": "modify", "args": {"context_auth": self.authority.sign(*origin, setup=setup) if origin and origin[0] == "operator" else "",
-                **({"view": "summary"} if short == "status" and claim and claim.automatic else {})}}
+            return self._status_tool_args(short, origin, claim)
         if tool_name in ("clarify", "todo_list", "session_search"):
-            if not origin or origin[0] != "operator":
-                return {"action": "block", "message": "Operator interaction tools are unavailable to source processing"}
-            if tool_name == "session_search" and args.get("profile") is not None:
-                return {"action": "block", "message": "Search only this Aqla profile's conversation history"}
+            if blocked := self._authorize_interaction(tool_name, args, origin):
+                return blocked
         if short == "integration" or short.startswith("hl_") or tool_name.startswith(("delegate", "terminal")):
             return {"action": "block", "message": "Tool is outside aqla's signal-trading authority"}
         if short in TRADE_TOOLS:
-            if not origin or (short in ("control", "conflict_review", "operator_manage") and origin[0] != "operator"):
-                return {"action": "block", "message": "An authenticated operator request is required"}
-            claim = self.turn_claim.get()
-            if not claim.can_change() and short != "notifications_ack":
-                return {"action": "block", "message": "Unanswered or cancelled clarification is not authorization; send a fresh owner request"}
-            setup = self.setup.claims() if origin[0] == "operator" else None
-            if short == "notifications_ack" and claim.automatic:
-                versions = args.get("versions") or {}
-                observed = {identity: version for selected, _ in claim.notification_messages for identity, version in selected.items()}
-                if any(identity not in observed or versions.get(identity) != observed[identity] for identity in args.get("notification_ids", [])):
-                    return {"action": "block", "message": "Read rendered notifications and supply their current versions before acknowledgement"}
-            return {"action": "modify", "args": {"context_auth": self.authority.sign(*origin, setup=setup)}}
+            return self._authorize_trade_tool(short, args, origin, claim)
         if tool_name == "skill_manage":
-            from .skill_review import master_content, native_background_review
-
-            if not (origin and origin[0] == "operator") and not native_background_review():
-                return {"action": "block", "message": "Only owner requests or native background skill proposals are allowed"}
-            claim = self.turn_claim.get()
-            if origin and origin[0] == "operator" and claim and not claim.can_change():
-                return {"action": "block", "message": "A fresh owner request is required after unanswered clarification"}
-            try:
-                master_content(args, self.master_path)
-            except (ValueError, OSError) as error:
-                return {"action": "block", "message": str(error)}
+            return self._authorize_skill(args, origin)
         if short == "monthly_report" and isinstance(args.get("diagnostics_only"), str):
             return {"action": "modify", "args": {"diagnostics_only": diagnostic}}
         return None
@@ -623,6 +648,31 @@ class HermesExtension:
         if claim:
             claim.revoke()
 
+    @staticmethod
+    def _notification_result(result):
+        value = result
+        for _ in range(8):
+            if isinstance(value, str):
+                value = json.loads(value)
+            elif isinstance(value, dict) and set(value) == {"result"}:
+                value = value["result"]
+            elif isinstance(value, dict) and "structuredContent" in value:
+                value = value["structuredContent"]
+            elif isinstance(value, dict) and "content" in value:
+                value = json.loads(next(block["text"] for block in value["content"] if block.get("type") == "text"))
+            else:
+                break
+        return value
+
+    @staticmethod
+    def _record_notification_messages(claim, value):
+        for message in value.get("telegram_view", {}).get("messages", []):
+            versions = message.get("notification_versions", value.get("notification_versions", {}))
+            ids = message.get("notification_ids", [])
+            texts = message.get("texts", [])
+            if ids and all(identity in versions for identity in ids) and texts and all(isinstance(text, str) for text in texts):
+                claim.notification_messages.append(({identity: versions[identity] for identity in ids}, list(texts)))
+
     def after_tool(self, tool_name, args, result, **_):
         claim = self.turn_claim.get()
         if not claim or not (origin := claim.read()) or origin[0] != "source":
@@ -631,18 +681,7 @@ class HermesExtension:
         if short not in ("status", "notifications_read", "notifications_ack"):
             return
         try:
-            value = result
-            for _ in range(8):
-                if isinstance(value, str):
-                    value = json.loads(value)
-                elif isinstance(value, dict) and set(value) == {"result"}:
-                    value = value["result"]
-                elif isinstance(value, dict) and "structuredContent" in value:
-                    value = value["structuredContent"]
-                elif isinstance(value, dict) and "content" in value:
-                    value = json.loads(next(block["text"] for block in value["content"] if block.get("type") == "text"))
-                else:
-                    break
+            value = self._notification_result(result)
             if not isinstance(value, dict):
                 return
             with claim.lock:
@@ -652,12 +691,7 @@ class HermesExtension:
                         if version:
                             claim.notification_acks[identity] = version
                 else:
-                    for message in value.get("telegram_view", {}).get("messages", []):
-                        versions = message.get("notification_versions", value.get("notification_versions", {}))
-                        ids = message.get("notification_ids", [])
-                        texts = message.get("texts", [])
-                        if ids and all(identity in versions for identity in ids) and texts and all(isinstance(text, str) for text in texts):
-                            claim.notification_messages.append(({identity: versions[identity] for identity in ids}, list(texts)))
+                    self._record_notification_messages(claim, value)
         except (ValueError, TypeError, KeyError, StopIteration):
             return
 
@@ -722,6 +756,11 @@ def rebind_native_adapter(gateway, platform, adapter):
 
 
 
+def _automatic_source(incoming, origin):
+    return bool(incoming and origin and origin[0] == "source"
+                and (getattr(incoming, "metadata", None) or {}).get("hermes_plugin_injection") is True)
+
+
 async def run_native_turn(gateway, source, callback):
     extension = gateway_extension(gateway)
     if extension is None:
@@ -744,11 +783,9 @@ async def run_native_turn(gateway, source, callback):
     try:
         with extension.claim_scope(origin):
             claim = extension.turn_claim.get()
-            claim.automatic = bool(incoming and origin and origin[0] == "source"
-                and (getattr(incoming, "metadata", None) or {}).get("hermes_plugin_injection") is True)
+            claim.automatic = _automatic_source(incoming, origin)
             result = await callback()
-            if (isinstance(result, dict) and incoming and origin and origin[0] == "source"
-                    and (getattr(incoming, "metadata", None) or {}).get("hermes_plugin_injection") is True):
+            if isinstance(result, dict) and _automatic_source(incoming, origin):
                 result["final_response"] = extension.source_reply(claim)
                 result["response_transformed"] = True
             return result
@@ -773,38 +810,46 @@ def stamp_native_event(event):
     return event
 
 
-async def intercept_native_setup(adapter, update, context):
-    """Called by a native PTB handler before any Hermes admission work."""
-    for extension in tuple(EXTENSIONS):
-        if extension.binding and extension.binding[0] is adapter:
-            message = getattr(update, "effective_message", None)
-            text = getattr(message, "text", None) or ""
-            from .native_setup import addressed_to_bot
-            if text and text.split(maxsplit=1)[0].split("@", 1)[0].lower() == "/setup":
-                if (extension.setup.private_owner(message) and addressed_to_bot(text.split(maxsplit=1)[0], context.bot)
-                        and not any(getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))):
-                    extension.commands.cancel()
-            # Password admission always runs first; neither commands nor Hermes
-            # receives a candidate, including slash/forwarded/edited candidates.
-            if await extension.setup.intercept(update, context.bot):
-                return True
-            return await extension.commands.intercept(update, context.bot)
-    # Polling can begin before finish_wiring, or after plugin unload. Explain
-    # unavailable system commands and still delete replies to known prompts.
+async def _intercept_bound_setup(extension, update, context):
+    message = getattr(update, "effective_message", None)
+    text = getattr(message, "text", None) or ""
+    from .native_setup import addressed_to_bot
+    if text and text.split(maxsplit=1)[0].split("@", 1)[0].lower() == "/setup":
+        if (extension.setup.private_owner(message) and addressed_to_bot(text.split(maxsplit=1)[0], context.bot)
+                and not any(getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))):
+            extension.commands.cancel()
+    # Password admission always runs first; neither commands nor Hermes
+    # receives a candidate, including slash/forwarded/edited candidates.
+    if await extension.setup.intercept(update, context.bot):
+        return True
+    return await extension.commands.intercept(update, context.bot)
+
+
+def _late_setup_reply(message, bot, user):
+    from .native_setup import SETUP_PROMPT
+    prompt = getattr(message, "reply_to_message", None)
+    author = getattr(prompt, "from_user", None)
+    try:
+        late = bool(author and author.is_bot and author.id == bot.id and prompt.text == SETUP_PROMPT
+                    and str(prompt.chat.id) == str(user.id) and prompt.chat.type == "private")
+    except (AttributeError, RuntimeError):
+        late = False
+    return late
+
+
+def _private_setup_owner(user, chat, owners):
+    return bool(user and chat and not user.is_bot and str(user.id) in owners
+                and str(chat.id) == str(user.id) and chat.type == "private")
+
+
+async def _intercept_unbound_setup(adapter, update, context):
     from .native_commands import COMMANDS
-    from .native_setup import SETUP_PROMPT, addressed_to_bot
+    from .native_setup import addressed_to_bot
     message = getattr(update, "effective_message", None)
     user, chat = getattr(message, "from_user", None), getattr(message, "chat", None)
     owners = {*getattr(adapter, "_aqla_owners", ()), *(extension.owner for extension in EXTENSIONS)}
-    if (user and chat and not user.is_bot and str(user.id) in owners
-            and str(chat.id) == str(user.id) and chat.type == "private"):
-        prompt = getattr(message, "reply_to_message", None)
-        author = getattr(prompt, "from_user", None)
-        try:
-            late = bool(author and author.is_bot and author.id == context.bot.id and prompt.text == SETUP_PROMPT
-                        and str(prompt.chat.id) == str(user.id) and prompt.chat.type == "private")
-        except (AttributeError, RuntimeError):
-            late = False
+    if _private_setup_owner(user, chat, owners):
+        late = _late_setup_reply(message, context.bot, user)
         if late:
             try:
                 await asyncio.wait_for(context.bot.delete_message(chat_id=str(user.id), message_id=message.message_id), 10)
@@ -816,6 +861,15 @@ async def intercept_native_setup(adapter, update, context):
             await asyncio.wait_for(context.bot.send_message(chat_id=str(user.id), text="Native aqla-Steuerung ist noch nicht bereit. Starte den Befehl nach dem Gateway-Start neu."), 10)
     return True
 
+
+async def intercept_native_setup(adapter, update, context):
+    """Called by a native PTB handler before any Hermes admission work."""
+    for extension in tuple(EXTENSIONS):
+        if extension.binding and extension.binding[0] is adapter:
+            return await _intercept_bound_setup(extension, update, context)
+    # Polling can begin before finish_wiring, or after plugin unload. Explain
+    # unavailable system commands and still delete replies to known prompts.
+    return await _intercept_unbound_setup(adapter, update, context)
 
 def ingress_identity(event):
     metadata = getattr(event, "metadata", None) or {}

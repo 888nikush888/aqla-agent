@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -81,6 +82,59 @@ async def packets():
             state.close()
 
 
+def _verify_replay_interpretation(result, rows, case):
+    if result.kind in ("report", "unrelated", "incomplete", "ambiguous"):
+        INVARIANTS.assertTrue(result.reason.strip() and any(proof.field == 'classification' and proof.source_id == rows[-1]['source_id'] and (proof.quote in rows[-1]['source']['text']) for proof in result.evidence), 'classification_proof')
+    for field, expected in case["expected"].items():
+        actual = getattr(result, field)
+        if isinstance(actual, Decimal):
+            expected = Decimal(expected)
+        elif field == "take_profits":
+            expected = [Decimal(value) for value in expected]
+        INVARIANTS.assertTrue(actual == expected, field)
+
+
+def _replay_mode(AIAgent, key, mode, master, context, instruction, rows, case):
+    from aqla_hyperliquid_mcp.models import AqlaError, Interpretation
+    from aqla_hyperliquid_mcp.rules import verify_evidence
+    print(json.dumps({"replay_case": case["id"], "mode": mode, "started": True}), file=sys.__stdout__, flush=True)
+    agent = AIAgent(model="deepseek/deepseek-v4.1-flash", provider="openrouter", base_url="https://openrouter.ai/api/v1", api_key=key,
+                    enabled_toolsets=[], max_iterations=1, session_db=None, ephemeral_system_prompt=master + instruction,
+                    reasoning_config={"enabled": True, "effort": "ultra"}, skip_memory=True, skip_background_review=True,
+                    quiet_mode=True, save_trajectories=False)
+    result = None
+    try:
+        response = agent.run_conversation(user_message=json.dumps(context, ensure_ascii=False))["final_response"].strip()
+        if response.startswith("```"):
+            response = response.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        result = Interpretation.model_validate_json(response)
+        verify_evidence(result, {row["event_id"]: row for row in rows})
+        _verify_replay_interpretation(result, rows, case)
+        return {"mode": mode, "passed": True, "kind": result.kind, **{name: getattr(agent, "session_" + name, None)
+                        for name in ("input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens", "api_calls")}}
+    except Exception as error:
+        return {"mode": mode, "passed": False, "error_type": type(error).__name__,
+                        **({"validation_reason": str(error)[:200]} if isinstance(error, (AqlaError, AssertionError)) else {}),
+                        **({"synthetic_interpretation": result.model_dump(mode="json")} if result is not None else {})}
+    finally:
+        agent.close()
+
+
+def _compare_replay_results(results):
+    non_action = {"report", "unrelated", "incomplete", "ambiguous"}
+    for row in results:
+        previous, current = row["results"]
+        # Preserve exact fixture results wherever the baseline meets them.
+        # Existing ambiguous/incomplete/report label variation is reported,
+        # never silently counted as an exact fixture pass.
+        before_kind = previous.get("kind", previous.get("synthetic_interpretation", {}).get("kind"))
+        after_kind = current.get("kind", current.get("synthetic_interpretation", {}).get("kind"))
+        row["existing_non_action_label_variation"] = (not previous["passed"] and not current["passed"]
+            and previous.get("validation_reason") == current.get("validation_reason") == "kind"
+            and before_kind == after_kind and before_kind in non_action)
+        row["no_regression"] = (previous["passed"] and current["passed"]) or row["existing_non_action_label_variation"]
+
+
 def replay(hermes_source, output_home, key, *, limit=8, selected_ids=None):
     """Fresh native agents, no tools/state database/trajectories or real orders."""
     sys.path.insert(0, str(hermes_source))
@@ -96,10 +150,12 @@ def replay(hermes_source, output_home, key, *, limit=8, selected_ids=None):
     from run_agent import AIAgent
 
     from aqla_agent.efficiency import decision_context
-    from aqla_hyperliquid_mcp.models import AqlaError, Interpretation, SourceEvent, now_ms
-    from aqla_hyperliquid_mcp.rules import verify_evidence
+    from aqla_hyperliquid_mcp.models import Interpretation, SourceEvent, now_ms
 
-    before = subprocess.check_output(["git", "show", BASE + ":skills/aqla-master/SKILL.md"], cwd=ROOT).decode()
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("Git is required for the frozen benchmark baseline")
+    before = subprocess.check_output([git, "show", BASE + ":skills/aqla-master/SKILL.md"], cwd=ROOT).decode()
     after = (ROOT / "skills/aqla-master/SKILL.md").read_text(encoding="utf-8")
     selected = {"de-long", "comma-decimals", "reply-completes", "break-even", "edit-update", "result-report", "missing-direction", "injection"}
     if selected_ids:
@@ -116,49 +172,10 @@ def replay(hermes_source, output_home, key, *, limit=8, selected_ids=None):
         projected = decision_context(full)
         reports = []
         for mode, master, context in (("before", before, full), ("after", after, projected)):
-            print(json.dumps({"replay_case": case["id"], "mode": mode, "started": True}), file=sys.__stdout__, flush=True)
-            agent = AIAgent(model="deepseek/deepseek-v4.1-flash", provider="openrouter", base_url="https://openrouter.ai/api/v1", api_key=key,
-                            enabled_toolsets=[], max_iterations=1, session_db=None, ephemeral_system_prompt=master + instruction,
-                            reasoning_config={"enabled": True, "effort": "ultra"}, skip_memory=True, skip_background_review=True,
-                            quiet_mode=True, save_trajectories=False)
-            result = None
-            try:
-                response = agent.run_conversation(user_message=json.dumps(context, ensure_ascii=False))["final_response"].strip()
-                if response.startswith("```"):
-                    response = response.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-                result = Interpretation.model_validate_json(response)
-                verify_evidence(result, {row["event_id"]: row for row in rows})
-                if result.kind in ("report", "unrelated", "incomplete", "ambiguous"):
-                    INVARIANTS.assertTrue(result.reason.strip() and any(proof.field == 'classification' and proof.source_id == rows[-1]['source_id'] and (proof.quote in rows[-1]['source']['text']) for proof in result.evidence), 'classification_proof')
-                for field, expected in case["expected"].items():
-                    actual = getattr(result, field)
-                    if isinstance(actual, Decimal):
-                        expected = Decimal(expected)
-                    elif field == "take_profits":
-                        expected = [Decimal(value) for value in expected]
-                    INVARIANTS.assertTrue(actual == expected, field)
-                reports.append({"mode": mode, "passed": True, "kind": result.kind, **{name: getattr(agent, "session_" + name, None)
-                                for name in ("input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens", "api_calls")}})
-            except Exception as error:
-                reports.append({"mode": mode, "passed": False, "error_type": type(error).__name__,
-                                **({"validation_reason": str(error)[:200]} if isinstance(error, (AqlaError, AssertionError)) else {}),
-                                **({"synthetic_interpretation": result.model_dump(mode="json")} if result is not None else {})})
-            finally:
-                agent.close()
+            reports.append(_replay_mode(AIAgent, key, mode, master, context, instruction, rows, case))
         results.append({"case": case["id"], "results": reports})
         print(json.dumps(results[-1]), file=sys.__stdout__, flush=True)
-    non_action = {"report", "unrelated", "incomplete", "ambiguous"}
-    for row in results:
-        previous, current = row["results"]
-        # Preserve exact fixture results wherever the baseline meets them.
-        # Existing ambiguous/incomplete/report label variation is reported,
-        # never silently counted as an exact fixture pass.
-        before_kind = previous.get("kind", previous.get("synthetic_interpretation", {}).get("kind"))
-        after_kind = current.get("kind", current.get("synthetic_interpretation", {}).get("kind"))
-        row["existing_non_action_label_variation"] = (not previous["passed"] and not current["passed"]
-            and previous.get("validation_reason") == current.get("validation_reason") == "kind"
-            and before_kind == after_kind and before_kind in non_action)
-        row["no_regression"] = (previous["passed"] and current["passed"]) or row["existing_non_action_label_variation"]
+    _compare_replay_results(results)
     return {"model": "deepseek/deepseek-v4.1-flash", "reasoning_effort": "ultra", "order_tools_available": False,
             "cases": results, "exact_fixture_passed": all(report["passed"] for row in results for report in row["results"]),
             "passed": all(row["no_regression"] for row in results)}

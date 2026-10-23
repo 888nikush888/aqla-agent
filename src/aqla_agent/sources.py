@@ -21,11 +21,15 @@ def supported_source(data, selector):
     raise AqlaError("Unknown source title; use its Telegram ID, @username or register its name first")
 
 
-def change_sources(data, action, selectors, revision):
+def _validate_source_change(data, action, selectors, revision):
     if action not in ("set_sources", "add_sources", "remove_sources") or type(revision) is not int or revision != data["configuration_revision"]:
         raise AqlaError("Read the current configuration revision before changing sources")
     if selectors is None or not isinstance(selectors, list) or len(selectors) > 250 or (not selectors and action != "set_sources"):
         raise AqlaError("Supply explicit Telegram source selectors (at most 250)")
+
+
+def change_sources(data, action, selectors, revision):
+    _validate_source_change(data, action, selectors, revision)
     selected = {supported_source(data, item) for item in selectors}
     existing = set(data["sources"])
     aliases = data.get("source_aliases", {})

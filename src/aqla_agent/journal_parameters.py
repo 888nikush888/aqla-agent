@@ -89,6 +89,14 @@ def parameter_values(data):
     yield "sources", "Betrieb", "Freigegebene Quellen", sources, "", "Eigene Telegram-Quellen", "Keine", "Abonnierte Quellen; zusätzlich sind vom Betreiber an den Bot weitergeleitete Signale möglich."
     yield "policy_selected", "Betrieb", "Handelsregeln festgelegt", "Ja" if current is not None else "Nein", "", "Ja / Nein", "Nein", "Ohne festgelegte Handelsregeln werden keine neuen Trades eröffnet. Änderungen erfolgen über Telegram/Hermes."
     yield "policy_revision", "Betrieb", "Regelstand", data["policy_revision"], "Revision", "Automatisch", "0", "Version der aktiven Handelsregeln; wird beim Ändern der Regeln erhöht."
+    yield from _policy_parameter_values(data, current)
+    yield from _profile_parameter_values(data)
+    yield from _venue_limit_values(data)
+    yield from _account_limit_values(data)
+    yield from _ranking_parameter_values(data)
+
+
+def _policy_parameter_values(data, current):
     defaults = Policy().model_dump()
     for field, (category, label, unit, allowed, description) in PARAMETERS.items():
         default = "course_percent" if field in ("fallback_stop_loss_unit", "fallback_take_profit_unit") else "standard"
@@ -101,6 +109,9 @@ def parameter_values(data):
         if field == "take_profit_weights" and current is not None and current["take_profit_allocation"] != "custom":
             value = "Nicht verwendet"
         yield field, category, label, value, unit, allowed, display(defaults.get(field, default), field), description, "standard", "hyperliquid", "USDC", data.get("profiles", {}).get("standard", {}).get("revision", data["policy_revision"])
+
+
+def _profile_parameter_values(data):
     for identity, profile in data.get("profiles", {}).items():
         if identity == "standard" or profile.get("parameters") is None:
             continue
@@ -109,14 +120,23 @@ def parameter_values(data):
             category, label, unit, allowed, description = PARAMETERS[legacy]
             unit = backup_unit(field, profile["parameters"], unit)
             yield "profile:" + identity + ":" + field, category, label, display(value, legacy), "Abrechnungswährung" if field.endswith("_quote") else unit, allowed, "", description, identity, "", "Je Börsenziel", profile["revision"]
+
+
+def _venue_limit_values(data):
     for venue, limits in data.get("venue_limits", {}).items():
         for field in ("max_open_trades", "max_total_risk_percent"):
             category, label, unit, allowed, description = PARAMETERS[field]
             yield "limits:" + venue + ":" + field, "Börsenlimits", label, display(limits[field]) if limits else "Nicht festgelegt", unit, allowed, "", "Gemeinsam für alle Pipelines auf diesem Börsenkonto.", "", venue, "", data.get("configuration_revision", 0)
+
+
+def _account_limit_values(data):
     for key, limits in data.get("account_limits", {}).items():
         for field in ("max_open_trades", "max_total_risk_percent"):
             category, label, unit, allowed, description = PARAMETERS[field]
             yield "account:" + key + ":" + field, "Kontolimits", label, display(limits[field]) if limits else "Nicht festgelegt", unit, allowed, "", "Gemeinsam je Börse/Netzwerk/Konto, einschließlich Reservierungen.", "", key, "", data.get("configuration_revision", 0)
+
+
+def _ranking_parameter_values(data):
     ranking = data.get("ranking_policy")
     if ranking:
         for tier, factor in ranking["factors"].items():

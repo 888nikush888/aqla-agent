@@ -25,6 +25,20 @@ def canonical_symbol(value):
     return value
 
 
+def _comparison_values(field, left, right):
+    if field == "symbol":
+        left, right = canonical_symbol(left), canonical_symbol(right)
+    elif field == "source_refs":
+        left, right = sorted(left or []), sorted(right or [])
+    elif field == "source_exchange":
+        left, right = (left or "").casefold(), (right or "").casefold()
+    elif field == "entry_legs":
+        from aqla_hyperliquid_mcp.models import SourceEntryLeg
+        left = [SourceEntryLeg.model_validate(row) for row in left or []]
+        right = [SourceEntryLeg.model_validate(row) for row in right or []]
+    return left, right
+
+
 def mismatches(interpretation, expected):
     actual = complete_fields(interpretation)
     fields = ("kind", "source_refs") if expected["kind"] not in ("new_signal", "trade_update") else (
@@ -35,16 +49,7 @@ def mismatches(interpretation, expected):
     errors = []
     for field in fields:
         left, right = actual.get(field), expected.get(field)
-        if field == "symbol":
-            left, right = canonical_symbol(left), canonical_symbol(right)
-        elif field == "source_refs":
-            left, right = sorted(left or []), sorted(right or [])
-        elif field == "source_exchange":
-            left, right = (left or "").casefold(), (right or "").casefold()
-        elif field == "entry_legs":
-            from aqla_hyperliquid_mcp.models import SourceEntryLeg
-            left = [SourceEntryLeg.model_validate(row) for row in left or []]
-            right = [SourceEntryLeg.model_validate(row) for row in right or []]
+        left, right = _comparison_values(field, left, right)
         if not equal(left, right):
             errors.append(field)
     return errors

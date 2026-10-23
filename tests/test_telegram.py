@@ -25,10 +25,12 @@ async def test_100_live_events_do_not_repeat_dialog_or_history_work(missing):
             counts["dialogs"] += 1
             async for item in super().iter_dialogs():
                 yield item
-        async def get_messages(self, entity, ids):
+        @staticmethod
+        async def get_messages(entity, ids):
             counts["rereads"] += 1
             return [message(identity) for identity in ids]
-        async def iter_messages(self, entity, **kwargs):
+        @staticmethod
+        async def iter_messages(entity, **kwargs):
             for item in ():
                 yield item
     async def snapshot():
@@ -106,7 +108,8 @@ class ReaderClient:
         self.message = message(1)
         self.entity = SimpleNamespace(username="SignalA")
 
-    async def connect(self):
+    @staticmethod
+    async def connect():
         pass
 
     @staticmethod
@@ -127,7 +130,8 @@ class ReaderClient:
     async def get_messages(entity, ids):
         return [message(identity, edited=True) for identity in ids]
 
-    async def disconnect(self):
+    @staticmethod
+    async def disconnect():
         pass
 
 
@@ -200,7 +204,8 @@ async def test_failed_low_message_cannot_be_skipped_by_later_live_cursor(tmp_pat
         configuration["cursors"][source.chat_id] = source.message_id
 
     class Client(ReaderClient):
-        async def iter_messages(self, entity, **kwargs):
+        @staticmethod
+        async def iter_messages(entity, **kwargs):
             for identity in (2, 3):
                 if identity > kwargs.get("min_id", 0):
                     yield message(identity)
@@ -238,11 +243,13 @@ async def test_initial_history_stays_historical_after_interrupted_seed(tmp_path)
             received.append((source.message_id, source.historical))
         configuration["cursors"][source.chat_id] = max(source.message_id, configuration["cursors"].get(source.chat_id, 0))
     class Client(ReaderClient):
-        async def iter_messages(self, entity, **kwargs):
+        @staticmethod
+        async def iter_messages(entity, **kwargs):
             for identity in ([3, 2, 1] if "min_id" not in kwargs else [2, 3, 4]):
                 if identity > kwargs.get("min_id", 0):
                     yield message(identity)
-        async def get_messages(self, entity, ids):
+        @staticmethod
+        async def get_messages(entity, ids):
             return [message(identity) for identity in ids]
     reader = TelegramReader(settings, deliver, snapshot, bootstrap=bootstrap)
     reader.client = Client()
@@ -290,7 +297,8 @@ async def test_live_recovery_only_queries_affected_subscribed_source():
     async def deliver(source):
         pass
     class Client(ReaderClient):
-        async def iter_messages(self, entity, **kwargs):
+        @staticmethod
+        async def iter_messages(entity, **kwargs):
             queries.append(entity)
             for item in ():
                 yield item
@@ -328,7 +336,8 @@ async def test_failed_first_seed_retries_only_persisted_context_ids_and_newer_po
         delivered.append((source.message_id, source.historical))
         configuration["cursors"][source.chat_id] = max(configuration["cursors"][source.chat_id], source.message_id)
     class Client(ReaderClient):
-        async def iter_messages(self, entity, **kwargs):
+        @staticmethod
+        async def iter_messages(entity, **kwargs):
             queries.append(kwargs)
             if "limit" in kwargs:
                 for identity in (10000, 9999):
@@ -336,7 +345,8 @@ async def test_failed_first_seed_retries_only_persisted_context_ids_and_newer_po
             else:
                 assert kwargs["min_id"] == 10000
                 yield message(10001)
-        async def get_messages(self, entity, ids):
+        @staticmethod
+        async def get_messages(entity, ids):
             assert ids == [9999, 10000]
             return [message(identity) for identity in ids]
     settings = Settings(network="testnet", account="0x" + "0" * 40, max_context_messages=2)
@@ -409,14 +419,16 @@ async def test_legacy_seed_recovers_bounded_selection_with_original_cutoff(curso
     async def deliver(source):
         delivered.append((source.message_id, source.historical))
     class Client(ReaderClient):
-        async def iter_messages(self, entity, **kwargs):
+        @staticmethod
+        async def iter_messages(entity, **kwargs):
             queries.append(kwargs)
             if "limit" in kwargs:
                 yield message(10000)
                 yield message(9999)
             else:
                 yield message(10006)
-        async def get_messages(self, entity, ids):
+        @staticmethod
+        async def get_messages(entity, ids):
             assert ids == [9999, 10000]
             return [message(identity) for identity in reversed(ids)]
     reader = TelegramReader(Settings(network="testnet", account="0x" + "0" * 40, max_context_messages=2), deliver, snapshot, bootstrap=bootstrap)
@@ -443,7 +455,8 @@ async def test_unavailable_subscription_does_not_block_accessible_source_and_rec
                 yield dialog
             if self.available:
                 yield SimpleNamespace(id=-100456, entity=SimpleNamespace(username="missing"))
-        async def iter_messages(self, entity, **kwargs):
+        @staticmethod
+        async def iter_messages(entity, **kwargs):
             if "limit" in kwargs:
                 item = message(1)
                 item.chat_id = -100123 if entity.username == "SignalA" else -100456
@@ -559,7 +572,8 @@ async def test_global_reader_rpc_failures_still_escape_with_actionable_status(fa
     async def snapshot():
         return {"sources": ["@signala"], "cursors": {}, "tracked_ids": {}}
     class Client(ReaderClient):
-        async def iter_messages(self, entity, **kwargs):
+        @staticmethod
+        async def iter_messages(entity, **kwargs):
             for item in ():
                 yield item
             raise getattr(errors, failure)(request="sensitive-rpc-details")

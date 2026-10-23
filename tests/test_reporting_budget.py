@@ -26,6 +26,12 @@ class Clock:
         return self.wall
 
 
+def _funding_payment_reader(facts):
+    async def payments(*_args):
+        return copy.deepcopy(facts)
+    return payments
+
+
 def fake_state(snapshot):
     return SimpleNamespace(snapshot=lambda: copy.deepcopy(snapshot), update=lambda callback: callback(snapshot))
 
@@ -402,8 +408,7 @@ async def test_refresh_full_financial_coverage_fingerprint_report_and_json_types
             if case == "outage":
                 raise OSError("synthetic inaccessible transport")
             return copy.deepcopy(observed)
-        async def payments(*args, facts=facts):
-            return copy.deepcopy(facts)
+        payments = _funding_payment_reader(facts)
         state = fake_state(snapshot)
         adapter = SimpleNamespace(info=info, funding_payments=payments, account="owner")
         engine = SimpleNamespace(exchange=adapter, state=state, assert_plan_binding=lambda *_: None)

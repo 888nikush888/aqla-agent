@@ -162,8 +162,7 @@ def migrate(data):
     return True
 
 
-def retire_execution_configuration(data):
-    """Keep historical finance intact while retiring unsupported execution configuration."""
+def _check_retirement_safe(data):
     for trade in data.get("trades", {}).values():
         if (trade.get("plan", {}).get("exchange", "hyperliquid") != "hyperliquid"
                 and (trade["status"] not in ("closed", "rejected", "cancelled", "expired")
@@ -172,14 +171,9 @@ def retire_execution_configuration(data):
     if any(row.get("exchange", "hyperliquid") != "hyperliquid" and row["phase"] in ("prepared", "sending", "unknown")
            for row in data.get("operations", {}).values()):
         raise AqlaError("An unsupported account still has an unresolved operation")
-    retired = {}
-    for name in ("execution_accounts", "account_limits", "account_enabled", "account_recovery", "venue_accounts", "venue_limits", "venue_enabled"):
-        values = data.get(name, {})
-        removed = {key: value for key, value in values.items() if key != "hyperliquid" and not key.startswith("hyperliquid:")}
-        if removed:
-            retired[name] = copy.deepcopy(removed)
-            for key in removed:
-                values.pop(key)
+
+
+def _retire_pipeline_targets(data, retired):
     for key, pipeline in list(data.get("pipelines", {}).items()):
         original = copy.deepcopy(pipeline)
         targets = [row for row in pipeline["targets"] if row["exchange"] == "hyperliquid"]
@@ -191,6 +185,20 @@ def retire_execution_configuration(data):
             pipeline["targets"] = targets
         if not targets or original != pipeline:
             retired.setdefault("pipelines", {})[key] = original
+
+
+def retire_execution_configuration(data):
+    """Keep historical finance intact while retiring unsupported execution configuration."""
+    _check_retirement_safe(data)
+    retired = {}
+    for name in ("execution_accounts", "account_limits", "account_enabled", "account_recovery", "venue_accounts", "venue_limits", "venue_enabled"):
+        values = data.get(name, {})
+        removed = {key: value for key, value in values.items() if key != "hyperliquid" and not key.startswith("hyperliquid:")}
+        if removed:
+            retired[name] = copy.deepcopy(removed)
+            for key in removed:
+                values.pop(key)
+    _retire_pipeline_targets(data, retired)
     if not retired:
         return False
     for name, values in retired.items():
@@ -206,6 +214,58 @@ def sync_legacy_policy(data):
     data["venue_limits"]["hyperliquid"] = {key: selected[key] for key in ("max_open_trades", "max_total_risk_percent")} if selected else None
 
 
+def _set_profile(data, profile):
+    if profile is None:
+        raise AqlaError("A complete profile is required")
+    if profile.id == "backup" and profile.parameters.leverage_mode != "fixed":
+        raise AqlaError("The global Backup profile requires a fixed leverage")
+    previous = data["profiles"].get(profile.id, {})
+    data["profiles"][profile.id] = {**profile.model_dump(mode="json"), "revision": previous.get("revision", 0) + 1}
+    if profile.id == "standard":
+        if data["venue_limits"]["hyperliquid"]:
+            data["policy"] = profile.parameters.policy(AccountLimits(**data["venue_limits"]["hyperliquid"])).model_dump(mode="json")
+        data["policy_revision"] = max(data["policy_revision"], previous.get("revision", 0)) + 1
+        data["profiles"]["standard"]["revision"] = data["policy_revision"]
+
+
+def _set_pipeline(data, pipeline):
+    if pipeline is None or any(target.profile_id not in data["profiles"] for target in pipeline.targets):
+        raise AqlaError("A complete pipeline with existing profiles is required")
+    from .sources import resolve_source
+    pipeline = pipeline.model_copy(update={"sources": [resolve_source(data, source) for source in pipeline.sources]})
+    if len(set(pipeline.sources)) != len(pipeline.sources):
+        raise AqlaError("Pipeline sources resolve to duplicate Telegram IDs")
+    if any(source not in ("*", "owner_forward") and source not in {*data["sources"], *data.get("source_aliases", {}).values()} for source in pipeline.sources):
+        raise AqlaError("Subscribe the requested Telegram sources first")
+    previous = data["pipelines"].get(pipeline.id, {})
+    data["pipelines"][pipeline.id] = {**pipeline.model_dump(mode="json"), "revision": previous.get("revision", 0) + 1}
+
+
+def _set_exchange_limits(data, exchange, limits):
+    if exchange is None or limits is None:
+        raise AqlaError("Exchange and complete account limits are required")
+    data["venue_limits"][exchange] = limits.model_dump(mode="json")
+    if exchange == "hyperliquid" and data.get("policy"):
+        data["policy"].update(limits.model_dump(mode="json"))
+        data["policy_revision"] += 1
+
+
+def _set_exchange_enabled(data, exchange, enabled):
+    if exchange is None or enabled is None:
+        raise AqlaError("Exchange and explicit enabled value are required")
+    if enabled and data["venue_limits"].get(exchange) is None:
+        raise AqlaError("Set explicit account limits before activating the exchange")
+    data["venue_enabled"][exchange] = enabled
+
+
+def _delete_routing_entry(data, action, identity):
+    if identity in ("legacy", "standard", "backup"):
+        raise AqlaError("Keep the migration compatibility entries; disable the legacy pipeline instead")
+    if action == "delete_profile" and any(target["profile_id"] == identity for row in data["pipelines"].values() for target in row["targets"]):
+        raise AqlaError("Remove pipeline references before deleting a profile")
+    data["pipelines" if action == "delete_pipeline" else "profiles"].pop(identity, None)
+
+
 def route_control(data, action, *, expected_revision, profile=None, pipeline=None, exchange=None, limits=None, enabled=None, identity=None):
     if exchange is not None and exchange != "hyperliquid":
         raise AqlaError("Only Hyperliquid exchange limits and activation are supported")
@@ -214,47 +274,15 @@ def route_control(data, action, *, expected_revision, profile=None, pipeline=Non
     if expected_revision != data["configuration_revision"]:
         raise AqlaError("Read configuration_revision and submit a complete current configuration change")
     if action == "set_profile":
-        if profile is None:
-            raise AqlaError("A complete profile is required")
-        if profile.id == "backup" and profile.parameters.leverage_mode != "fixed":
-            raise AqlaError("The global Backup profile requires a fixed leverage")
-        previous = data["profiles"].get(profile.id, {})
-        data["profiles"][profile.id] = {**profile.model_dump(mode="json"), "revision": previous.get("revision", 0) + 1}
-        if profile.id == "standard":
-            if data["venue_limits"]["hyperliquid"]:
-                data["policy"] = profile.parameters.policy(AccountLimits(**data["venue_limits"]["hyperliquid"])).model_dump(mode="json")
-            data["policy_revision"] = max(data["policy_revision"], previous.get("revision", 0)) + 1
-            data["profiles"]["standard"]["revision"] = data["policy_revision"]
+        _set_profile(data, profile)
     elif action == "set_pipeline":
-        if pipeline is None or any(target.profile_id not in data["profiles"] for target in pipeline.targets):
-            raise AqlaError("A complete pipeline with existing profiles is required")
-        from .sources import resolve_source
-        pipeline = pipeline.model_copy(update={"sources": [resolve_source(data, source) for source in pipeline.sources]})
-        if len(set(pipeline.sources)) != len(pipeline.sources):
-            raise AqlaError("Pipeline sources resolve to duplicate Telegram IDs")
-        if any(source not in ("*", "owner_forward") and source not in {*data["sources"], *data.get("source_aliases", {}).values()} for source in pipeline.sources):
-            raise AqlaError("Subscribe the requested Telegram sources first")
-        previous = data["pipelines"].get(pipeline.id, {})
-        data["pipelines"][pipeline.id] = {**pipeline.model_dump(mode="json"), "revision": previous.get("revision", 0) + 1}
+        _set_pipeline(data, pipeline)
     elif action == "set_exchange_limits":
-        if exchange is None or limits is None:
-            raise AqlaError("Exchange and complete account limits are required")
-        data["venue_limits"][exchange] = limits.model_dump(mode="json")
-        if exchange == "hyperliquid" and data.get("policy"):
-            data["policy"].update(limits.model_dump(mode="json"))
-            data["policy_revision"] += 1
+        _set_exchange_limits(data, exchange, limits)
     elif action == "set_exchange_enabled":
-        if exchange is None or enabled is None:
-            raise AqlaError("Exchange and explicit enabled value are required")
-        if enabled and data["venue_limits"].get(exchange) is None:
-            raise AqlaError("Set explicit account limits before activating the exchange")
-        data["venue_enabled"][exchange] = enabled
+        _set_exchange_enabled(data, exchange, enabled)
     elif action in ("delete_pipeline", "delete_profile"):
-        if identity in ("legacy", "standard", "backup"):
-            raise AqlaError("Keep the migration compatibility entries; disable the legacy pipeline instead")
-        if action == "delete_profile" and any(target["profile_id"] == identity for row in data["pipelines"].values() for target in row["targets"]):
-            raise AqlaError("Remove pipeline references before deleting a profile")
-        data["pipelines" if action == "delete_pipeline" else "profiles"].pop(identity, None)
+        _delete_routing_entry(data, action, identity)
     else:
         raise AqlaError("Unknown routing control")
     data["configuration_revision"] += 1
@@ -300,16 +328,13 @@ class VenueState:
             self.preview_basis.reset(basis_token)
             self.route.reset(token)
 
-    def project(self, data):
-        result = dict(data)
-        for key in ("trades", "plans", "operations"):
-            result[key] = {identity: row for identity, row in data[key].items() if self.record_key(row, operation=key == "operations", default_network=self.settings.network) == self.account_key}
-        legacy = self.legacy_context(data)
+    def project_account_state(self, result, data, legacy):
         result["bindings"] = data["bindings"] if self.exchange == "hyperliquid" and legacy else data["account_bindings"].get(self.account_key, data["venue_bindings"].get(self.exchange, {}) if legacy else {})
         result["nonces"] = data["nonces"] if self.exchange == "hyperliquid" and legacy else data["account_nonces"].get(self.account_key, data.get("venue_nonces", {}).get(self.exchange, {}) if legacy else {})
         event_states = data["account_events"].get(self.account_key, data["venue_events"].get(self.exchange, {}) if legacy else {})
         result["events"] = {key: {**value, **event_states.get(key, {})} for key, value in data["events"].items()}
-        route = self.route.get()
+
+    def project_policy(self, result, data, route, legacy):
         profile = data["profiles"].get(route["profile_id"] if route else "standard", {})
         limits = data["venue_limits"].get(self.exchange) if legacy else data["account_limits"].get(self.account_key)
         parameters = profile.get("parameters")
@@ -318,6 +343,15 @@ class VenueState:
             parameters = weighted_parameters(parameters, route["rank_snapshot"])
         result["policy"] = Parameters(**parameters).policy(AccountLimits(**limits)).model_dump(mode="json") if parameters and limits else None
         result["policy_revision"] = profile.get("revision", 0)
+
+    def project(self, data):
+        result = dict(data)
+        for key in ("trades", "plans", "operations"):
+            result[key] = {identity: row for identity, row in data[key].items() if self.record_key(row, operation=key == "operations", default_network=self.settings.network) == self.account_key}
+        legacy = self.legacy_context(data)
+        self.project_account_state(result, data, legacy)
+        route = self.route.get()
+        self.project_policy(result, data, route, legacy)
         target = getattr(self.settings, "vault_address", None) or self.settings.account
         result["network"], result["account"], result["trading_account"] = self.settings.network, self.settings.account.lower(), target.lower()
         result["paused"] = data["paused"] or not (data["venue_enabled"].get(self.exchange, False) if legacy else data["account_enabled"].get(self.account_key, False))
@@ -424,6 +458,27 @@ class VenueState:
                 plan.setup_id = route["setup_id"]
                 plan.rank_revision = route["rank_snapshot"]["source_revision"]
 
+    @staticmethod
+    def validate_legacy_route(data, plan):
+        if not data["pipelines"]["legacy"]["enabled"]:
+            raise AqlaError("The legacy entry pipeline is disabled")
+        anchors = [row for row in data["events"].values() if row["source_id"] in plan.source_refs]
+        aliases = {value: key for key, value in data.get("source_aliases", {}).items()}
+        if any(pipeline["id"] != "legacy" and pipeline["enabled"] and any(
+            "*" in pipeline["sources"] or row["source"]["chat_id"] in pipeline["sources"]
+            or aliases.get(row["source"]["chat_id"]) in pipeline["sources"] or row.get("native_forward") and "owner_forward" in pipeline["sources"]
+            for row in anchors) for pipeline in data["pipelines"].values()):
+            raise AqlaError("Explicit routing replaced this legacy unsent plan")
+
+    def validate_profile_route(self, data, plan):
+        profile = data["profiles"].get(plan.profile_id, {})
+        pipeline = data["pipelines"].get(plan.pipeline_id, {})
+        if not pipeline.get("enabled") or profile.get("revision") != plan.profile_revision or pipeline.get("revision") != plan.pipeline_revision:
+            raise AqlaError("Relevant pipeline/profile changed; create a new unsent plan")
+        requested = plan.requested_exchange or self.exchange
+        if not any(target["exchange"] == requested and target["profile_id"] == plan.profile_id for target in pipeline.get("targets", [])):
+            raise AqlaError("The plan no longer belongs to the configured pipeline target")
+
     def validate_route(self, plan, *, snapshot=None):
         data = snapshot if snapshot is not None and plan.pipeline_id else self.root.snapshot()
         validate_ranking_binding(data, plan)
@@ -433,23 +488,9 @@ class VenueState:
         if data["paused"] or not enabled:
             raise AqlaError("New entries are paused on this exchange")
         if self.exchange == "hyperliquid" and plan.pipeline_id in (None, "legacy"):
-            if not data["pipelines"]["legacy"]["enabled"]:
-                raise AqlaError("The legacy entry pipeline is disabled")
-            anchors = [row for row in data["events"].values() if row["source_id"] in plan.source_refs]
-            aliases = {value: key for key, value in data.get("source_aliases", {}).items()}
-            if any(pipeline["id"] != "legacy" and pipeline["enabled"] and any(
-                "*" in pipeline["sources"] or row["source"]["chat_id"] in pipeline["sources"]
-                or aliases.get(row["source"]["chat_id"]) in pipeline["sources"] or row.get("native_forward") and "owner_forward" in pipeline["sources"]
-                for row in anchors) for pipeline in data["pipelines"].values()):
-                raise AqlaError("Explicit routing replaced this legacy unsent plan")
+            self.validate_legacy_route(data, plan)
         if plan.pipeline_id:
-            profile = data["profiles"].get(plan.profile_id, {})
-            pipeline = data["pipelines"].get(plan.pipeline_id, {})
-            if not pipeline.get("enabled") or profile.get("revision") != plan.profile_revision or pipeline.get("revision") != plan.pipeline_revision:
-                raise AqlaError("Relevant pipeline/profile changed; create a new unsent plan")
-            requested = plan.requested_exchange or self.exchange
-            if not any(target["exchange"] == requested and target["profile_id"] == plan.profile_id for target in pipeline.get("targets", [])):
-                raise AqlaError("The plan no longer belongs to the configured pipeline target")
+            self.validate_profile_route(data, plan)
         elif data["policy_revision"] != plan.policy_revision:
             raise AqlaError("Policy changed; legacy unsent plan cannot execute")
 

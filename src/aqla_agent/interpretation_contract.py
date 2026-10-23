@@ -25,28 +25,58 @@ ENTRY_FORM_MARKERS = re.compile(
 
 
 
+def _reject_pnl_quantity(proof, original):
+    for occurrence in re.finditer(re.escape(proof.quote), original):
+        for percentage in re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)*\s*%", proof.quote):
+            before = original[:occurrence.start() + percentage.start()].rstrip()
+            after = original[occurrence.start() + percentage.end():]
+            if (before.endswith(("-", "−")) or re.search(r"(?:at|на|в)\s*\+\s*$", before, re.I)
+                    or re.match(r"\s*(?:ROI|ROE|PNL)\b", after, re.I)
+                    or re.search(r"\b(?:ROI|ROE|PNL)\s*[:=@]?\s*$", before, re.I)):
+                raise DecisionFailure("pnl_percentage_is_not_reduction_quantity")
+
+
+def _reduction_proof_supports(proof, value):
+    quantities = [(match.span(), {value}) for match, value in position_fractions(proof.quote)]
+    for match in re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)*\s*%", proof.quote):
+        quantities.append((match.span(), set(quoted_leverage_numbers(match.group()))))
+    if len(quantities) == 1 and value in quantities[0][1]:
+        return True
+    return False
+
+
 def validate_reduction_quantity(packet, interpretation):
-    if interpretation.reduce_percent is not None:
-        supported = False
-        for proof in interpretation.evidence:
-            if proof.field != "reduce_percent":
-                continue
-            original = require_first(row["text"] for row in packet["messages"] if row["source_id"] == proof.source_id)
-            for occurrence in re.finditer(re.escape(proof.quote), original):
-                for percentage in re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)*\s*%", proof.quote):
-                    before = original[:occurrence.start() + percentage.start()].rstrip()
-                    after = original[occurrence.start() + percentage.end():]
-                    if (before.endswith(("-", "−")) or re.search(r"(?:at|на|в)\s*\+\s*$", before, re.I)
-                            or re.match(r"\s*(?:ROI|ROE|PNL)\b", after, re.I)
-                            or re.search(r"\b(?:ROI|ROE|PNL)\s*[:=@]?\s*$", before, re.I)):
-                        raise DecisionFailure("pnl_percentage_is_not_reduction_quantity")
-            quantities = [(match.span(), {value}) for match, value in position_fractions(proof.quote)]
-            for match in re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)*\s*%", proof.quote):
-                quantities.append((match.span(), set(quoted_leverage_numbers(match.group()))))
-            if len(quantities) == 1 and interpretation.reduce_percent in quantities[0][1]:
-                supported = True
-        if not supported:
-            raise DecisionFailure("reduction_quantity_proof_missing")
+    if interpretation.reduce_percent is None:
+        return
+    supported = False
+    for proof in interpretation.evidence:
+        if proof.field != "reduce_percent":
+            continue
+        original = require_first(row["text"] for row in packet["messages"] if row["source_id"] == proof.source_id)
+        _reject_pnl_quantity(proof, original)
+        if _reduction_proof_supports(proof, interpretation.reduce_percent):
+            supported = True
+    if not supported:
+        raise DecisionFailure("reduction_quantity_proof_missing")
+
+
+
+def _validate_anchor(packet, interpretation, anchor):
+    if not anchor["text"].strip() and interpretation.kind != "incomplete":
+        raise DecisionFailure("empty_source_requires_incomplete")
+    if interpretation.kind == "new_signal" and packet.get("anchor_setup_bound"):
+        raise DecisionFailure("bound_setup_cannot_reenter")
+    if interpretation.kind == "new_signal" and interpretation.entry == "unspecified" and ENTRY_FORM_MARKERS.search(anchor["text"]):
+        raise DecisionFailure("explicit_entry_form_requires_review")
+
+
+def _validate_classification(interpretation, anchor):
+    if interpretation.kind not in ("new_signal", "trade_update"):
+        from .source_disposition import verify_classification_policy
+        if anchor["text"].strip() and (not interpretation.reason.strip() or not any(
+                p.field == "classification" and p.source_id == anchor["source_id"] for p in interpretation.evidence)):
+            raise DecisionFailure("classification_proof_missing")
+        verify_classification_policy(interpretation, anchor["text"])
 
 
 def validate_interpretation(packet, interpretation, *, own_setup_refs=()):
@@ -65,12 +95,7 @@ def validate_interpretation(packet, interpretation, *, own_setup_refs=()):
     verify_setup_references(interpretation, packet["anchor_source_id"],
                             [*own_setup_refs, *(ref for trade in packet.get("trades", []) for ref in trade["source_refs"])])
     anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
-    if not anchor["text"].strip() and interpretation.kind != "incomplete":
-        raise DecisionFailure("empty_source_requires_incomplete")
-    if interpretation.kind == "new_signal" and packet.get("anchor_setup_bound"):
-        raise DecisionFailure("bound_setup_cannot_reenter")
-    if interpretation.kind == "new_signal" and interpretation.entry == "unspecified" and ENTRY_FORM_MARKERS.search(anchor["text"]):
-        raise DecisionFailure("explicit_entry_form_requires_review")
+    _validate_anchor(packet, interpretation, anchor)
     from aqla_hyperliquid_mcp.rules import management_steps
     for child in management_steps(interpretation) if interpretation.management_steps else [interpretation]:
         validate_reduction_quantity(packet, child)
@@ -81,11 +106,6 @@ def validate_interpretation(packet, interpretation, *, own_setup_refs=()):
         raise DecisionFailure(failure)
     verify_entry_shape(interpretation)
     verify_update_shape(interpretation)
-    if interpretation.kind not in ("new_signal", "trade_update"):
-        from .source_disposition import verify_classification_policy
-        if anchor["text"].strip() and (not interpretation.reason.strip() or not any(
-                p.field == "classification" and p.source_id == anchor["source_id"] for p in interpretation.evidence)):
-            raise DecisionFailure("classification_proof_missing")
-        verify_classification_policy(interpretation, anchor["text"])
+    _validate_classification(interpretation, anchor)
     if interpretation.bound_trade_id is not None:
         raise DecisionFailure("source_cannot_choose_operator_trade")

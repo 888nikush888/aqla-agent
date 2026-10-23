@@ -80,25 +80,7 @@ async def prepare(exchange, operation_id, multisig_user: Address, request: SdkRe
             "sent": False, "nonce_reserved": False}
 
 
-async def submit(exchange, operation_id, multisig_user, request, nonce, signatures, expires_after=None, *, prepare_guard=None):
-    if nonce is None or not signatures:
-        raise AqlaError("Supply the exact prepared nonce and collected multisig signatures")
-    if exchange.wallet is None:
-        raise AqlaError("Signing key is not configured")
-    if isinstance(request, dict):
-        from .actions import NATIVE_ADAPTER
-        from .catalog import SDK_ADAPTER
-        request = SDK_ADAPTER.validate_python(request) if "operation" in request else NATIVE_ADAPTER.validate_python(request)
-    signatures = [Signature.model_validate(value).model_dump() for value in signatures]
-    request_binding = {"network": exchange.settings.network, "account": multisig_user.lower(), "leader": exchange.wallet.address.lower(),
-                       "inner_request": request.model_dump(mode="json", by_alias=True), "signatures": signatures,
-                       "nonce": nonce, "expires_after": expires_after}
-    existing = exchange.state.snapshot()["operations"].get(operation_id)
-    if existing:
-        if existing["request_hash"] != digest(request_binding):
-            raise AqlaError("Operation ID already identifies a different multisig request")
-        return existing
-    prepared = await prepare(exchange, operation_id, multisig_user, request, nonce, expires_after)
+async def verified_multisig_signatures(exchange, multisig_user, prepared, signatures):
     group = await exchange.info("userToMultiSigSigners", user=multisig_user)
     if not isinstance(group, dict) or type(group.get("threshold")) is not int or not 1 <= group["threshold"] <= 10 or not group.get("authorizedUsers"):
         raise AqlaError("The target has no verified multisig signer configuration")
@@ -121,6 +103,29 @@ async def submit(exchange, operation_id, multisig_user, request, nonce, signatur
         supplied.append(value)
     if len(recovered) < group["threshold"]:
         raise AqlaError("Collected signatures do not meet the verified threshold")
+    return supplied
+
+
+async def submit(exchange, operation_id, multisig_user, request, nonce, signatures, expires_after=None, *, prepare_guard=None):
+    if nonce is None or not signatures:
+        raise AqlaError("Supply the exact prepared nonce and collected multisig signatures")
+    if exchange.wallet is None:
+        raise AqlaError("Signing key is not configured")
+    if isinstance(request, dict):
+        from .actions import NATIVE_ADAPTER
+        from .catalog import SDK_ADAPTER
+        request = SDK_ADAPTER.validate_python(request) if "operation" in request else NATIVE_ADAPTER.validate_python(request)
+    signatures = [Signature.model_validate(value).model_dump() for value in signatures]
+    request_binding = {"network": exchange.settings.network, "account": multisig_user.lower(), "leader": exchange.wallet.address.lower(),
+                       "inner_request": request.model_dump(mode="json", by_alias=True), "signatures": signatures,
+                       "nonce": nonce, "expires_after": expires_after}
+    existing = exchange.state.snapshot()["operations"].get(operation_id)
+    if existing:
+        if existing["request_hash"] != digest(request_binding):
+            raise AqlaError("Operation ID already identifies a different multisig request")
+        return existing
+    prepared = await prepare(exchange, operation_id, multisig_user, request, nonce, expires_after)
+    supplied = await verified_multisig_signatures(exchange, multisig_user, prepared, signatures)
     inner = _multi_sig_payload_action(prepared["inner_action"])
 
     def build(timestamp, _):

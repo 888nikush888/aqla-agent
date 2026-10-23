@@ -196,13 +196,19 @@ def target_label(plan, index):
     return ""
 
 
+def complete_pnl_fills(fills, quote):
+    if any(decimal(row.get("fee")) is None or row.get("feeToken") not in (None, quote) for row in fills):
+        return False
+    if any(decimal(row.get("sz")) is None or decimal(row.get("px")) is None for row in fills):
+        return False
+    return True
+
+
 def pnl(trade):
     entry = decimal(trade.get("entry_vwap"))
     fills = list(trade.get("fill_events", {}).values())
     quote = trade["plan"]["market"].get("quote_token", "USDC")
-    if entry is None or not fills or any(decimal(row.get("fee")) is None or row.get("feeToken") not in (None, quote) for row in fills):
-        return None
-    if any(decimal(row.get("sz")) is None or decimal(row.get("px")) is None for row in fills):
+    if entry is None or not fills or not complete_pnl_fills(fills, quote):
         return None
     entered = sum((decimal(row["sz"]) for row in fills if row["kind"] == "entry"), Decimal(0))
     exited = sum((decimal(row["sz"]) for row in fills if row["kind"] != "entry"), Decimal(0))
@@ -213,43 +219,37 @@ def pnl(trade):
     return gross - sum((decimal(row["fee"]) for row in fills), Decimal(0))
 
 
-def trade_block(data, trade, notices, *, detailed=False):
-    plan, stage = trade["plan"], trade["status"]
-    plan = {**plan, "source_tp": trade.get("source_tp_override", plan.get("source_tp"))}
-    market = literal(plan["market"]["symbol"])
-    direction = "LONG" if plan["side"] == "long" else "SHORT"
-    changes = {key: value for notice in notices for key, value in notice.get("change", {}).items()}
-    previous = {key: value for notice in reversed(notices) for key, value in notice.get("previous", {}).items()}
-    opening = any((notice.get("previous", {}).get("status") in ("opening", "preparing") and notice.get("change", {}).get("status") in ("open", "protecting"))
+def opening_notice(notices):
+    return any((notice.get("previous", {}).get("status") in ("opening", "preparing") and notice.get("change", {}).get("status") in ("open", "protecting"))
                   or (decimal(notice.get("previous", {}).get("filled_quantity")) == 0 and (decimal(notice.get("change", {}).get("filled_quantity")) or 0) > 0) for notice in notices)
-    filled = decimal(trade.get("filled_quantity")) or Decimal(0)
-    planned = decimal(plan.get("quantity"))
-    facts = trade_outcome(trade, data.get("operations", {}))
-    if stage == "conflicted":
-        title = "⚠️ **Manueller Marktkonflikt**"
-    elif stage == "unknown":
-        title = "⏳ **Ausführung ungeklärt**"
-    elif facts["state"] == "pending_observation":
-        title = "⏳ **Technische Prüfung ausstehend**"
-    elif stage in ("closing", "cleanup"):
-        title = "⏳ **Schließung wird abgeglichen**"
-    elif stage in ("closed", "cancelled", "rejected"):
-        title = {"closed": "🏁 **Trade geschlossen**", "cancelled": "⚪ **Entry storniert**", "rejected": "⚠️ **Trade abgelehnt**"}[stage]
-    elif facts["historical_fill_evidence_missing"]:
-        title = "⚠️ **Ausführungsbelege fehlen**"
-    elif facts["state"] == "unknown":
-        title = "⏳ **Belegabgleich ungeklärt**"
-    elif stage == "waiting_entry":
-        title = "🕓 **Warte auf Einstieg**"
-    elif filled == 0:
-        title = "🕓 **Entry wartet**"
-    elif planned and filled < planned:
-        title = "🟡 **Entry teilweise ausgeführt**" if opening else "🔄 **Trade aktualisiert**"
-    elif stage != "open":
-        title = "⏳ **Schutz wird abgeglichen**"
-    else:
-        title = "✅ **Trade eröffnet**" if opening else "🔄 **Trade aktualisiert**"
-    lines = [f"{title} · {market} {direction}", context(data, plan)]
+
+
+def trade_title(stage, facts, filled, planned, opening):
+    if stage in ("conflicted", "unknown"):
+        return {"conflicted": "⚠️ **Manueller Marktkonflikt**", "unknown": "⏳ **Ausführung ungeklärt**"}[stage]
+    if facts["state"] == "pending_observation":
+        return "⏳ **Technische Prüfung ausstehend**"
+    if stage in ("closing", "cleanup"):
+        return "⏳ **Schließung wird abgeglichen**"
+    if stage in ("closed", "cancelled", "rejected"):
+        return {"closed": "🏁 **Trade geschlossen**", "cancelled": "⚪ **Entry storniert**", "rejected": "⚠️ **Trade abgelehnt**"}[stage]
+    if facts["historical_fill_evidence_missing"]:
+        return "⚠️ **Ausführungsbelege fehlen**"
+    if facts["state"] == "unknown":
+        return "⏳ **Belegabgleich ungeklärt**"
+    if stage == "waiting_entry":
+        return "🕓 **Warte auf Einstieg**"
+    if filled == 0:
+        return "🕓 **Entry wartet**"
+    if planned and filled < planned:
+        return "🟡 **Entry teilweise ausgeführt**" if opening else "🔄 **Trade aktualisiert**"
+    if stage != "open":
+        return "⏳ **Schutz wird abgeglichen**"
+    return "✅ **Trade eröffnet**" if opening else "🔄 **Trade aktualisiert**"
+
+
+def execution_evidence_lines(trade, stage, facts):
+    lines = []
     if facts["historical_fill_evidence_missing"]:
         lines.append("**Eigene Entry-Fills:** historisch nicht vollständig belegt; gespeicherte Mengen allein bestätigen keine Ausführung.")
     elif facts["state"] == "unknown" and stage != "unknown":
@@ -260,100 +260,144 @@ def trade_block(data, trade, notices, *, detailed=False):
         lines.append("**Eigene Restposition:** wegen Konflikt nicht zuverlässig bestätigt.")
     if facts["state"] == "unknown" and facts["observation_retry"] and not facts["observation_retry"].get("exhausted"):
         lines.append("**Wiederaufnahme:** gesperrt, bis der ungeklärte Börsenausgang beziehungsweise Mengenabgleich geklärt ist.")
-    elif observation_lines(trade):
-        lines.append(observation_lines(trade))
+    elif technical := observation_lines(trade):
+        lines.append(technical)
     lines.append(execution_lines(trade))
-    if risk_block(trade):
-        lines.append(risk_block(trade))
+    if risk := risk_block(trade):
+        lines.append(risk)
     if stage == "waiting_entry":
         lines.append("**Status:** lokaler Wartezustand · noch keine Börsenorder")
-    quote = literal(plan["market"].get("quote_token", "USDC"))
-    full = detailed or opening or filled == 0 or stage in ("unknown", "protecting")
-    if full:
-        receipt_filled = facts["entry_fill_confirmed"] is True
-        entry = trade.get("entry_vwap") if filled else plan.get("entry_price")
-        label = "Entry realisiert" if filled and receipt_filled else "Entry gespeichert · unbelegt" if filled else "Entry geplant"
-        lines.append(f"**{label}:** {number(entry)} {quote} · **Hebel:** {number(plan.get('effective_leverage', plan.get('policy', {}).get('leverage')))}×")
-        if filled and receipt_filled and planned and filled < planned:
-            lines.append(f"**Gefüllt:** {number(filled / planned * 100, places=2)} % der geplanten Menge")
-        if trade.get("admission_refresh_from"):
-            lines.append("**Menge vor Versand:** an das aktuelle Kontobudget angepasst")
-        lines.append(f"**SL:** {number(trade.get('stop_price', plan.get('stop_loss')))} {quote}" + (" · vorgesehen" if stage == "waiting_entry" else " · Bestätigung ausstehend" if stage in ("unknown", "protecting", "opening") else ""))
-        if plan.get("entry_legs"):
-            entry_lines = [f"Entry {leg['index'] + 1}: {number(leg['price'])} {quote} · {number(leg['quantity'])} · "
-                           + ("Markt" if leg['kind'] == 'market' else "Limit") for leg in plan["entry_legs"]]
-            lines.append("**Ursprüngliche Entries**\n" + "\n".join(entry_lines))
-        if plan.get("policy", {}).get("management_mode") == "waverider":
-            wave = trade.get("waverider", {})
-            mode = "Shadow" if wave.get("shadow", True) else "Live"
-            lines.append(f"**Waverider:** {mode} · {literal(wave.get('phase', 'warming_up'))} · Flex {number(plan['policy'].get('waverider_flex_percent', 50))} %")
-            lifetime = " oder ursprüngliche Signalfrist" if plan["policy"].get("waverider_lifetime", "signal_deadline") == "signal_deadline" else " · unabhängig von der Entry-Frist"
-            lines.append(f"**Waverider-Ende:** TP {literal(plan['policy'].get('waverider_until_tp', 1))}" + lifetime)
-            if wave.get("reason"):
-                lines.append("**Waverider-Prüfung:** " + literal(wave["reason"]))
-        targets = trade.get("targets", plan.get("take_profits", []))
-        budgets = trade.get("target_budgets") or plan.get("tp_quantities", [])
-        total = sum((decimal(value) or Decimal(0) for value in budgets), Decimal(0))
-        legs = [f"TP{index + 1}: {number(price)} {quote}" + target_label(plan, index) + (f" · {number((decimal(budgets[index]) or Decimal(0)) / total * 100, places=2)} % Position" if total and index < len(budgets) else " · Anteil nicht bestätigt") for index, price in enumerate(targets)]
-        if legs:
-            lines.append("**Ziele · Positionsanteil**\n" + "\n".join(legs))
-            source_count = plan.get("source_take_profit_count")
-            if plan.get("policy", {}).get("take_profit_allocation") == "adaptive" and source_count and source_count > len(targets):
-                lines.append(f"**Adaptive TP-Auswahl:** {len(targets)} von {source_count} Signalzielen")
-        raw, rounded, effective = plan.get("signal_leverage_original", plan.get("signal_leverage")), plan.get("signal_leverage"), plan.get("effective_leverage")
-        if raw is not None and (decimal(raw) != decimal(rounded) or decimal(rounded) != decimal(effective)):
-            lines.append(f"**Hebel angepasst:** Signal {number(raw)}× → abgerundet {number(rounded)}× → wirksam {number(effective)}×")
-        if plan.get("backup_fields"):
-            labels = {"leverage": "Hebel", "entry": "Entry", "stop_loss": "SL", "take_profits": "TPs"}
-            lines.append("**Backup verwendet:** " + ", ".join(labels.get(field, literal(field)) for field in plan["backup_fields"]))
-            if set(plan["backup_fields"]) & {"stop_loss", "take_profits"}:
-                lines.append("**Backup-Preise:** " + ("endgültig ab realem Entry" if trade.get("backup_finalization", {}).get("phase") == "applied" else "vorläufig"))
-                backup = plan.get("backup_values") or {}
-                roe = []
-                if "stop_loss" in plan["backup_fields"] and backup.get("fallback_stop_loss_unit") == "roe_percent":
-                    roe.append("SL: " + number(backup.get("fallback_stop_loss_percent")) + " % Marginverlust")
-                if "take_profits" in plan["backup_fields"] and backup.get("fallback_take_profit_unit") == "roe_percent":
-                    roe.append("TPs: " + ", ".join(number(value) for value in backup.get("fallback_take_profit_percentages", [])[:len(targets)]) + " % ROE")
-                if roe:
-                    lines.append("**Backup-Ziele:** " + " · ".join(roe) + "\nBasis: ursprüngliche Positionsmargin vor Gebühren und Funding.")
+    return lines
+
+
+def entry_detail_lines(trade, plan, quote, filled, planned, facts, stage):
+    lines = []
+    receipt_filled = facts["entry_fill_confirmed"] is True
+    entry = trade.get("entry_vwap") if filled else plan.get("entry_price")
+    label = "Entry realisiert" if filled and receipt_filled else "Entry gespeichert · unbelegt" if filled else "Entry geplant"
+    lines.append(f"**{label}:** {number(entry)} {quote} · **Hebel:** {number(plan.get('effective_leverage', plan.get('policy', {}).get('leverage')))}×")
+    if filled and receipt_filled and planned and filled < planned:
+        lines.append(f"**Gefüllt:** {number(filled / planned * 100, places=2)} % der geplanten Menge")
+    if trade.get("admission_refresh_from"):
+        lines.append("**Menge vor Versand:** an das aktuelle Kontobudget angepasst")
+    lines.append(f"**SL:** {number(trade.get('stop_price', plan.get('stop_loss')))} {quote}" + (" · vorgesehen" if stage == "waiting_entry" else " · Bestätigung ausstehend" if stage in ("unknown", "protecting", "opening") else ""))
+    return lines
+
+
+def original_entry_lines(plan, quote):
+    lines = []
+    if plan.get("entry_legs"):
+        entry_lines = [f"Entry {leg['index'] + 1}: {number(leg['price'])} {quote} · {number(leg['quantity'])} · "
+                       + ("Markt" if leg['kind'] == 'market' else "Limit") for leg in plan["entry_legs"]]
+        lines.append("**Ursprüngliche Entries**\n" + "\n".join(entry_lines))
+    return lines
+
+
+def wave_detail_lines(trade, plan):
+    lines = []
+    if plan.get("policy", {}).get("management_mode") == "waverider":
+        wave = trade.get("waverider", {})
+        mode = "Shadow" if wave.get("shadow", True) else "Live"
+        lines.append(f"**Waverider:** {mode} · {literal(wave.get('phase', 'warming_up'))} · Flex {number(plan['policy'].get('waverider_flex_percent', 50))} %")
+        lifetime = " oder ursprüngliche Signalfrist" if plan["policy"].get("waverider_lifetime", "signal_deadline") == "signal_deadline" else " · unabhängig von der Entry-Frist"
+        lines.append(f"**Waverider-Ende:** TP {literal(plan['policy'].get('waverider_until_tp', 1))}" + lifetime)
+        if wave.get("reason"):
+            lines.append("**Waverider-Prüfung:** " + literal(wave["reason"]))
+    return lines
+
+
+def target_detail_lines(trade, plan, quote, targets):
+    lines = []
+    budgets = trade.get("target_budgets") or plan.get("tp_quantities", [])
+    total = sum((decimal(value) or Decimal(0) for value in budgets), Decimal(0))
+    legs = [f"TP{index + 1}: {number(price)} {quote}" + target_label(plan, index) + (f" · {number((decimal(budgets[index]) or Decimal(0)) / total * 100, places=2)} % Position" if total and index < len(budgets) else " · Anteil nicht bestätigt") for index, price in enumerate(targets)]
+    if legs:
+        lines.append("**Ziele · Positionsanteil**\n" + "\n".join(legs))
+        source_count = plan.get("source_take_profit_count")
+        if plan.get("policy", {}).get("take_profit_allocation") == "adaptive" and source_count and source_count > len(targets):
+            lines.append(f"**Adaptive TP-Auswahl:** {len(targets)} von {source_count} Signalzielen")
+    return lines
+
+
+def leverage_detail_lines(plan):
+    lines = []
+    raw, rounded, effective = plan.get("signal_leverage_original", plan.get("signal_leverage")), plan.get("signal_leverage"), plan.get("effective_leverage")
+    if raw is not None and (decimal(raw) != decimal(rounded) or decimal(rounded) != decimal(effective)):
+        lines.append(f"**Hebel angepasst:** Signal {number(raw)}× → abgerundet {number(rounded)}× → wirksam {number(effective)}×")
+    return lines
+
+
+def backup_detail_lines(trade, plan, targets):
+    lines = []
+    if plan.get("backup_fields"):
+        labels = {"leverage": "Hebel", "entry": "Entry", "stop_loss": "SL", "take_profits": "TPs"}
+        lines.append("**Backup verwendet:** " + ", ".join(labels.get(field, literal(field)) for field in plan["backup_fields"]))
+        if set(plan["backup_fields"]) & {"stop_loss", "take_profits"}:
+            lines.append("**Backup-Preise:** " + ("endgültig ab realem Entry" if trade.get("backup_finalization", {}).get("phase") == "applied" else "vorläufig"))
+            backup = plan.get("backup_values") or {}
+            roe = []
+            if "stop_loss" in plan["backup_fields"] and backup.get("fallback_stop_loss_unit") == "roe_percent":
+                roe.append("SL: " + number(backup.get("fallback_stop_loss_percent")) + " % Marginverlust")
+            if "take_profits" in plan["backup_fields"] and backup.get("fallback_take_profit_unit") == "roe_percent":
+                roe.append("TPs: " + ", ".join(number(value) for value in backup.get("fallback_take_profit_percentages", [])[:len(targets)]) + " % ROE")
+            if roe:
+                lines.append("**Backup-Ziele:** " + " · ".join(roe) + "\nBasis: ursprüngliche Positionsmargin vor Gebühren und Funding.")
+    return lines
+
+
+def compact_stop_lines(trade, quote, changes, previous, filled):
+    lines = []
+    if "stop_price" in changes:
+        old = previous.get("stop_price")
+        text = (number(old) + " → " if old is not None else "") + number(trade["stop_price"]) + " " + quote
+        if filled and decimal(trade.get("stop_price")) == decimal(trade.get("entry_vwap")):
+            text += " · Einstand"
+        lines.append("**SL:** " + text)
+    return lines
+
+
+def compact_target_lines(trade, previous):
+    lines = []
+    before = previous.get("tp_filled", [])
+    for index, value in enumerate(trade.get("tp_filled", [])):
+        if index < len(before) and (decimal(value) or 0) > (decimal(before[index]) or 0):
+            budget = (trade.get("target_budgets") or [])[index] if index < len(trade.get("target_budgets", [])) else None
+            complete = budget is not None and decimal(value) >= decimal(budget)
+            lines.append(f"**TP{index + 1}:** " + ("vollständig ausgeführt" if complete else "teilweise ausgeführt"))
+    return lines
+
+
+def compact_remaining_lines(trade, changes, filled, facts):
+    lines = []
+    if "remaining_quantity" in changes and filled and facts["current_ownership_confirmed"]:
+        lines.append(f"**Position verbleibend:** {number((decimal(trade.get('remaining_quantity')) or 0) / filled * 100, places=2)} %")
+    return lines
+
+
+def closed_trade_lines(trade, quote):
+    lines = []
+    from .lifecycle import close_reason
+    lines.append("**Grund:** " + literal(trade.get("close_reason", close_reason(trade))["label"]))
+    result = pnl(trade)
+    if result is not None:
+        lines.append(f"**Netto vor Funding:** {number(result)} {quote}")
     else:
-        if "stop_price" in changes:
-            old = previous.get("stop_price")
-            text = (number(old) + " → " if old is not None else "") + number(trade["stop_price"]) + " " + quote
-            if filled and decimal(trade.get("stop_price")) == decimal(trade.get("entry_vwap")):
-                text += " · Einstand"
-            lines.append("**SL:** " + text)
-        if "tp_filled" in changes:
-            before = previous.get("tp_filled", [])
-            for index, value in enumerate(trade.get("tp_filled", [])):
-                if index < len(before) and (decimal(value) or 0) > (decimal(before[index]) or 0):
-                    budget = (trade.get("target_budgets") or [])[index] if index < len(trade.get("target_budgets", [])) else None
-                    complete = budget is not None and decimal(value) >= decimal(budget)
-                    lines.append(f"**TP{index + 1}:** " + ("vollständig ausgeführt" if complete else "teilweise ausgeführt"))
-        if "remaining_quantity" in changes and filled and facts["current_ownership_confirmed"]:
-            lines.append(f"**Position verbleibend:** {number((decimal(trade.get('remaining_quantity')) or 0) / filled * 100, places=2)} %")
-    if stage == "closed":
-        from .lifecycle import close_reason
-        lines.append("**Grund:** " + literal(trade.get("close_reason", close_reason(trade))["label"]))
-        result = pnl(trade)
-        if result is not None:
-            lines.append(f"**Netto vor Funding:** {number(result)} {quote}")
-        else:
-            lines.append("**Ergebnis:** PnL nicht vollständig bestätigt")
-    if trade.get("unsent_reason") and not (facts["observation_retry"] and not facts["observation_retry"].get("exhausted")):
-        lines.append("**Grund:** " + literal(ERRORS.get(trade["unsent_reason"], trade["unsent_reason"])))
+        lines.append("**Ergebnis:** PnL nicht vollständig bestätigt")
+    return lines
+
+
+def maker_failure_lines(trade, stage):
+    lines = []
     remaining = decimal(trade.get("remaining_quantity")) or Decimal(0)
     if trade.get("maker_target_rejection") and stage in ("open", "protecting", "unknown", "conflicted") and remaining > 0:
-        stop_confirmed = stage in ("open", "protecting") and not trade.get("execution_incident") and any(
-            order.get("kind") == "sl" and not order.get("retired")
-            and trade.get("order_observations", {}).get(order["cloid"], {}).get("status") == "open"
-            and (decimal(order.get("quantity")) or Decimal(0)) >= remaining
-            and decimal(order.get("price")) == decimal(trade.get("stop_price"))
-            for order in trade.get("orders", []))
+        stop_confirmed = confirmed_display_stop(trade, stage, remaining)
         lines.append("**TP abgelehnt:** Maker-Ziel bleibt unausgeführt; "
                      + ("vorhandener SL bleibt aktiv." if stop_confirmed else "SL-Schutz wird abgeglichen."))
-    if trade.get("external_conflict"):
-        lines.append("**Verwaltung angehalten:** " + literal(trade['external_conflict']))
+    return lines
+
+
+def stop_request_lines(trade, notices, quote):
+    lines = []
     stop_requests = [notice["stop_update"] for notice in notices if notice.get("stop_update")]
     if not stop_requests and trade.get("pending_stop_update"):
         stop_requests = [trade["pending_stop_update"]]
@@ -364,6 +408,60 @@ def trade_block(data, trade, notices, *, detailed=False):
     for request in stop_requests:
         lines.append("**" + stop_labels[request["phase"]] + ":** " + number(request["stop"]) + " " + quote
                      + ("\n**Grund:** " + literal(request["reason"]) if request.get("reason") else ""))
+    return lines
+
+
+def confirmed_display_stop(trade, stage, remaining):
+    return stage in ("open", "protecting") and not trade.get("execution_incident") and any(
+        order.get("kind") == "sl" and not order.get("retired")
+        and trade.get("order_observations", {}).get(order["cloid"], {}).get("status") == "open"
+        and (decimal(order.get("quantity")) or Decimal(0)) >= remaining
+        and decimal(order.get("price")) == decimal(trade.get("stop_price"))
+        for order in trade.get("orders", []))
+
+
+def notice_changes(notices):
+    changes = {key: value for notice in notices for key, value in notice.get("change", {}).items()}
+    previous = {key: value for notice in reversed(notices) for key, value in notice.get("previous", {}).items()}
+    return changes, previous
+
+
+def trade_block(data, trade, notices, *, detailed=False):
+    plan, stage = trade["plan"], trade["status"]
+    plan = {**plan, "source_tp": trade.get("source_tp_override", plan.get("source_tp"))}
+    market = literal(plan["market"]["symbol"])
+    direction = "LONG" if plan["side"] == "long" else "SHORT"
+    changes, previous = notice_changes(notices)
+    opening = opening_notice(notices)
+    filled = decimal(trade.get("filled_quantity")) or Decimal(0)
+    planned = decimal(plan.get("quantity"))
+    facts = trade_outcome(trade, data.get("operations", {}))
+    title = trade_title(stage, facts, filled, planned, opening)
+    lines = [f"{title} · {market} {direction}", context(data, plan)]
+    lines.extend(execution_evidence_lines(trade, stage, facts))
+    quote = literal(plan["market"].get("quote_token", "USDC"))
+    full = detailed or opening or filled == 0 or stage in ("unknown", "protecting")
+    if full:
+        lines.extend(entry_detail_lines(trade, plan, quote, filled, planned, facts, stage))
+        lines.extend(original_entry_lines(plan, quote))
+        lines.extend(wave_detail_lines(trade, plan))
+        targets = trade.get("targets", plan.get("take_profits", []))
+        lines.extend(target_detail_lines(trade, plan, quote, targets))
+        lines.extend(leverage_detail_lines(plan))
+        lines.extend(backup_detail_lines(trade, plan, targets))
+    else:
+        lines.extend(compact_stop_lines(trade, quote, changes, previous, filled))
+        if "tp_filled" in changes:
+            lines.extend(compact_target_lines(trade, previous))
+        lines.extend(compact_remaining_lines(trade, changes, filled, facts))
+    if stage == "closed":
+        lines.extend(closed_trade_lines(trade, quote))
+    if trade.get("unsent_reason") and not (facts["observation_retry"] and not facts["observation_retry"].get("exhausted")):
+        lines.append("**Grund:** " + literal(ERRORS.get(trade["unsent_reason"], trade["unsent_reason"])))
+    lines.extend(maker_failure_lines(trade, stage))
+    if trade.get("external_conflict"):
+        lines.append("**Verwaltung angehalten:** " + literal(trade['external_conflict']))
+    lines.extend(stop_request_lines(trade, notices, quote))
     return "\n\n".join(lines)
 
 
@@ -371,6 +469,28 @@ def _berlin_time(timestamp):
     from datetime import datetime
     from zoneinfo import ZoneInfo
     return datetime.fromtimestamp(timestamp / 1000, ZoneInfo("Europe/Berlin")).strftime("%d.%m.%Y %H:%M:%S")
+
+
+def closed_lifecycle_text(data, trade, plan, time):
+    result = trade_block(data, trade, [{"change": {"status": "closed"}}]) + "\n\n**Schließung:** " + time + " · Berlin"
+    exits = [row for row in trade.get("fill_events", {}).values() if row["kind"] != "entry"]
+    size = sum((decimal(row["sz"]) for row in exits), Decimal(0))
+    if size:
+        exit_price = sum((decimal(row["sz"]) * decimal(row["px"]) for row in exits), Decimal(0)) / size
+        result += "\n\n**Exit realisiert:** " + number(exit_price) + " " + literal(plan["market"].get("quote_token", "USDC"))
+    return result
+
+
+def lifecycle_target_lines(trade, plan, quote):
+    lines = []
+    targets = trade.get("targets", plan.get("take_profits", []))
+    budgets = trade.get("target_budgets") or plan.get("tp_quantities", [])
+    total = sum((decimal(value) or Decimal(0) for value in budgets), Decimal(0))
+    if targets:
+        lines.append("**Ziele vorgesehen · Positionsanteil**\n" + "\n".join(
+            f"TP{index + 1}: {number(price)} {quote}" + target_label(plan, index) + (" · " + number((decimal(budgets[index]) or 0) / total * 100, places=2) + " % Position" if total and index < len(budgets) else "")
+            for index, price in enumerate(targets)))
+    return lines
 
 
 def lifecycle_block(data, event):
@@ -385,13 +505,7 @@ def lifecycle_block(data, event):
     plan = {**plan, "source_tp": trade.get("source_tp_override", plan.get("source_tp"))}
     time = _berlin_time(event["time"])
     if event["kind"] == "closed":
-        result = trade_block(data, trade, [{"change": {"status": "closed"}}]) + "\n\n**Schließung:** " + time + " · Berlin"
-        exits = [row for row in trade.get("fill_events", {}).values() if row["kind"] != "entry"]
-        size = sum((decimal(row["sz"]) for row in exits), Decimal(0))
-        if size:
-            exit_price = sum((decimal(row["sz"]) * decimal(row["px"]) for row in exits), Decimal(0)) / size
-            result += "\n\n**Exit realisiert:** " + number(exit_price) + " " + literal(plan["market"].get("quote_token", "USDC"))
-        return result
+        return closed_lifecycle_text(data, trade, plan, time)
     title = literal(plan["market"]["symbol"]) + " " + ("LONG" if plan["side"] == "long" else "SHORT")
     quote = literal(plan["market"].get("quote_token", "USDC"))
     protected = trade.get("entry_stop_confirmed", False)
@@ -407,14 +521,39 @@ def lifecycle_block(data, event):
     if plan.get("source_exchange"):
         lines.append("**Signalbörse:** " + literal(plan["source_exchange"]))
     lines.append(execution_lines(trade))
-    targets = trade.get("targets", plan.get("take_profits", []))
-    budgets = trade.get("target_budgets") or plan.get("tp_quantities", [])
-    total = sum((decimal(value) or Decimal(0) for value in budgets), Decimal(0))
-    if targets:
-        lines.append("**Ziele vorgesehen · Positionsanteil**\n" + "\n".join(
-            f"TP{index + 1}: {number(price)} {quote}" + target_label(plan, index) + (" · " + number((decimal(budgets[index]) or 0) / total * 100, places=2) + " % Position" if total and index < len(budgets) else "")
-            for index, price in enumerate(targets)))
+    lines.extend(lifecycle_target_lines(trade, plan, quote))
     return "\n\n".join(lines)
+
+
+def source_rank_status_lines(data):
+    lines = []
+    if data.get("ranking_policy", {}).get("enabled"):
+        from .ranking import status_view
+        ranks = status_view(data)
+        lines.append("**Kanalränge:** " + " · ".join(f"{source_name(data, source)}: {literal(row['tier'])}" + (" (Startfreigabe)" if row.get("bootstrap") and row.get("metrics", {}).get("score") is None else "") for source, row in ranks.items()))
+    return lines
+
+
+def inventory_status_lines(inventory):
+    lines = []
+    for venue, row in inventory.items():
+        if not row.get('available'):
+            lines.append(f"**{VENUES.get(venue, venue)}-Konto:** vollständige Übersicht nicht verfügbar")
+            continue
+        lines.append(f"**Kontoplätze:** {row['occupied_count']} / {row['limit']} · **Frei:** {row['free_slots']}\n"
+                     f"**Manuell:** {len(row['manual_markets'])} · **Aqla:** {len(row['aqla_markets'])} · **Reserviert:** {len(row['reserved_markets'])}\n"
+                     f"**Freie Margin:** {number(row['available_margin_usdc'])} USDC")
+        if row['conflicted_markets']:
+            lines.append("**Marktkonflikte:** " + ', '.join(literal(value) for value in row['conflicted_markets']))
+    return lines
+
+
+def active_trade_status_lines(active):
+    lines = []
+    for trade in active:
+        plan = trade["plan"]
+        lines.append(f"• {literal(plan['market']['symbol'])} {plan['side'].upper()} · {VENUES.get(plan.get('exchange', 'hyperliquid'), literal(plan.get('exchange')))} · {literal(trade['status'])}")
+    return lines
 
 
 def status_text(data, exchanges, inventory):
@@ -426,27 +565,14 @@ def status_text(data, exchanges, inventory):
     enabled = any(row.get("enabled") and row.get("configured") for row in exchanges.values())
     lines = ["📊 **Aqla · Systemstatus**", "**Entries:** " + ("pausiert" if data["paused"] else "nach Profilregeln freigegeben" if enabled else "keine Börse freigegeben")]
     lines += [f"**{VENUES.get(row.get('exchange', venue), literal(venue))}:** {literal(row.get('network', ''))} · " + ("aktiv" if row.get("enabled") and row.get("configured") else "Einrichtung fehlt" if not row.get("configured") else "deaktiviert") for venue, row in exchanges.items()]
-    if data.get("ranking_policy", {}).get("enabled"):
-        from .ranking import status_view
-        ranks = status_view(data)
-        lines.append("**Kanalränge:** " + " · ".join(f"{source_name(data, source)}: {literal(row['tier'])}" + (" (Startfreigabe)" if row.get("bootstrap") and row.get("metrics", {}).get("score") is None else "") for source, row in ranks.items()))
+    lines.extend(source_rank_status_lines(data))
     counts = execution_counts(data)
     lines.append(f"**Belegte eigene offene Positionen:** {counts['known_own_open']} · **Entries ausstehend:** {counts['pending_entries']} · **Eigene Position ungeklärt:** {counts['unsettled_ownership']}\n"
                  f"**Aktive Trade-Vorgänge:** {len(active)} · **Ausstehende Quellen:** {pending} · **Blockierte Quellen:** {source_queue['blocked_total']}\n"
                  f"**Quellen-Recovery:** {source_queue['recovery_source_total']} · **Ungeklärte Vorgänge:** {unknown}\nBasis: gespeicherte eigene Fills; Gesamtbestand der Börsenkonten separat.")
     lines.append("**Journal:** lokal gespeichert · /aqla")
-    for venue, row in inventory.items():
-        if not row.get('available'):
-            lines.append(f"**{VENUES.get(venue, venue)}-Konto:** vollständige Übersicht nicht verfügbar")
-            continue
-        lines.append(f"**Kontoplätze:** {row['occupied_count']} / {row['limit']} · **Frei:** {row['free_slots']}\n"
-                     f"**Manuell:** {len(row['manual_markets'])} · **Aqla:** {len(row['aqla_markets'])} · **Reserviert:** {len(row['reserved_markets'])}\n"
-                     f"**Freie Margin:** {number(row['available_margin_usdc'])} USDC")
-        if row['conflicted_markets']:
-            lines.append("**Marktkonflikte:** " + ', '.join(literal(value) for value in row['conflicted_markets']))
-    for trade in active:
-        plan = trade["plan"]
-        lines.append(f"• {literal(plan['market']['symbol'])} {plan['side'].upper()} · {VENUES.get(plan.get('exchange', 'hyperliquid'), literal(plan.get('exchange')))} · {literal(trade['status'])}")
+    lines.extend(inventory_status_lines(inventory))
+    lines.extend(active_trade_status_lines(active))
     return "\n\n".join(lines)
 
 
@@ -488,6 +614,140 @@ def summary_block(notice):
     return "\n\n".join(lines)
 
 
+def notice_group_key(identity, notice, trade, event):
+    if notice.get("detail_level") == "summary":
+        key = ("summary", identity)
+    elif "recovery_reports" in notice or "reports" in notice or "source_notice" in notice:
+        key = ("recovery", identity)
+    elif notice.get("rank_change"):
+        key = ("rank", identity)
+    elif notice.get("monthly_report"):
+        key = ("monthly", identity)
+    elif identity.startswith("protection:"):
+        key = ("urgent", identity)
+    elif notice.get("lifecycle"):
+        key = ("lifecycle", notice["lifecycle"]["kind"], tuple(sorted(trade["plan"].get("source_refs", [trade["trade_id"]]))))
+    elif trade:
+        key = ("signal", tuple(sorted(trade["plan"].get("source_refs", [trade["trade_id"]]))))
+    else:
+        key = ("event", (event or {}).get("source_id", identity))
+    if event and key[0] == "event":
+        refs = (event.get("interpretation") or {}).get("source_refs", [])
+        if refs:
+            key = ("signal", tuple(sorted(refs)))
+    return key
+
+
+def group_notification_rows(data, notifications, chosen):
+    groups = {}
+    for identity in chosen:
+        notice = notifications[identity]
+        trade = data["trades"].get(notice.get("trade_id"))
+        event = data["events"].get(notice.get("event_id") or (trade or {}).get("event_id"))
+        key = notice_group_key(identity, notice, trade, event)
+        groups.setdefault(key, []).append((identity, notice, trade, event))
+    return groups
+
+
+def notice_message(ids, text, severity="normal"):
+    return {"notification_ids": ids, "severity": severity, "texts": split_blocks(text)}
+
+
+def recovery_group_message(items, ids):
+    notice = items[0][1]
+    if "source_notice" in notice:
+        code = notice["source_notice"].get("code", "source_status_changed")
+        text = "ℹ️ **Quellenstatus**\n" + literal(ERRORS.get(code, code))
+        sources = notice["source_notice"].get("sources", [])
+        if sources:
+            text += "\nKanäle: " + ", ".join(literal(value) for value in sources)
+    else:
+        text = recovery_block(notice)
+    return notice_message(ids, text, notice.get("severity", "normal"))
+
+
+def rank_group_message(data, items, ids):
+    event = items[0][1]["rank_change"]
+    score = event["metrics"].get("score")
+    text = "🏅 **Kanalrang geändert** · " + source_name(data, event["source_id"])
+    text += "\n\n**Rang:** " + event["old"] + " → " + event["new"]
+    text += "\n**Score:** " + number(score) + " · **Drawdown:** " + number(event["metrics"]["drawdown_r"]) + " R"
+    if event.get("reason"):
+        text += "\n**Grund:** " + literal(event["reason"])
+    text += "\n**Neue Entries:** " + event["network"].capitalize() + " · **Risikofaktor:** " + number(event.get("factor", data["ranking_policy"]["factors"][event["new"]])) + "×"
+    text += "\nBestehende Positionen behalten ihre Ausführung und Parameter."
+    return notice_message(ids, text)
+
+
+def urgent_group_message(items, ids):
+    notice = items[0][1]
+    text = "🚨 **Schutzvorfall**\n\n**Börse:** " + VENUES.get(notice.get("exchange"), literal(notice.get("exchange", "nicht zugeordnet"))) + "\n**Entries:** gesperrt\n\n**Grund:** " + literal(ERRORS.get(notice.get("error"), notice.get("error", "Schutz nicht bestätigt")))
+    return notice_message(ids, text, "urgent")
+
+
+def unowned_target_text(data, event, target):
+    plan = {name: target.get(name) for name in ("exchange", "network", "profile_id", "rank_snapshot", "requested_exchange", "fallback_reason")}
+    signal = (event or {}).get("interpretation") or {}
+    title = literal(signal.get("symbol") or "Markt nicht zugeordnet")
+    reason = target.get("error", "Ergebnis nicht bestätigt")
+    retry = retry_view(target)
+    pending_retry = retry and not retry.get("exhausted") and target.get("status") not in ("unknown", "needs_reconciliation")
+    heading = "⏳ **Technische Prüfung ausstehend**" if pending_retry else "⏳ **Börsenziel ungeklärt**" if target.get("status") in ("unknown", "pending", "planned", "opening", "protecting", "needs_reconciliation") else "⚠️ **Signal abgelehnt**"
+    detail = observation_lines(target) if pending_retry else "**Grund:** " + literal(ERRORS.get(reason, reason))
+    if retry and retry.get("exhausted"):
+        detail += "\n\n" + observation_lines(target)
+    return f"{heading} · {title}\n\n{context(data, plan)}\n\n{detail}"
+
+
+def append_target_notice(data, notice, target, event, by_trade, blocks):
+    leg = target.get("leg_id") or target.get("pipeline_id", "legacy") + ":" + target.get("requested_exchange", target.get("exchange", "hyperliquid"))
+    target = (event or {}).get("targets", {}).get(leg, target)
+    if target.get("trade_id") in by_trade:
+        return
+    if trade := data["trades"].get(target.get("trade_id")):
+        by_trade[trade["trade_id"]] = (trade, [notice])
+        blocks.append(trade_block(data, trade, [notice]))
+        return
+    blocks.append(unowned_target_text(data, event, target))
+
+
+def signal_group_message(data, items, ids):
+    chat = next((row[2]["chat_id"] if row[2] else row[3]["source"]["chat_id"] for row in items
+                 if row[2] or row[3] and is_source_row(row[3])), None)
+    blocks = ["**Quelle:** " + source_name(data, chat)]
+    by_trade = {}
+    for _, notice, trade, _ in items:
+        if trade:
+            by_trade.setdefault(trade["trade_id"], (trade, []))[1].append(notice)
+    blocks += [trade_block(data, trade, notices) for trade, notices in by_trade.values()]
+    for _, notice, _, event in items:
+        for target in notice.get("targets", []):
+            append_target_notice(data, notice, target, event, by_trade, blocks)
+    if not by_trade and len(blocks) == 1:
+        notice = items[0][1]
+        blocks.append("ℹ️ **Systemmeldung**\n" + literal(notice.get("error") or "Gespeichertes Ereignis ohne vollständige Trade-Zuordnung"))
+    return notice_message(ids, "\n\n".join(blocks))
+
+
+def grouped_notice_message(data, key, items):
+    ids = [row[0] for row in items]
+    if key[0] == "recovery":
+        return recovery_group_message(items, ids)
+    if key[0] == "summary":
+        return notice_message(ids, summary_block(items[0][1]), "urgent" if ids[0].startswith("protection:") else "normal")
+    if key[0] == "rank":
+        return rank_group_message(data, items, ids)
+    if key[0] == "lifecycle":
+        blocks = ["**Quelle:** " + source_name(data, items[0][2]["chat_id"])]
+        blocks += [lifecycle_block(data, row[1]["lifecycle"]) for row in items]
+        return notice_message(ids, "\n\n".join(blocks))
+    if key[0] == "monthly":
+        return notice_message(ids, monthly_message(items[0][1]["monthly_report"]))
+    if key[0] == "urgent":
+        return urgent_group_message(items, ids)
+    return signal_group_message(data, items, ids)
+
+
 def telegram_view(data, exchanges, *, inventory=None, notification_versions=None, include_status=True):
     from aqla_hyperliquid_mcp.models import digest
 
@@ -495,109 +755,8 @@ def telegram_view(data, exchanges, *, inventory=None, notification_versions=None
     notifications = data.get("notifications", {})
     # Urgent protection notices are independent of signal batching.
     chosen = sorted(notifications, key=lambda identity: notification_sort_key(identity, notifications[identity]))[:MAX_NOTIFICATIONS]
-    groups = {}
-    for identity in chosen:
-        notice = notifications[identity]
-        trade = data["trades"].get(notice.get("trade_id"))
-        event = data["events"].get(notice.get("event_id") or (trade or {}).get("event_id"))
-        if notice.get("detail_level") == "summary":
-            key = ("summary", identity)
-        elif "recovery_reports" in notice or "reports" in notice or "source_notice" in notice:
-            key = ("recovery", identity)
-        elif notice.get("rank_change"):
-            key = ("rank", identity)
-        elif notice.get("monthly_report"):
-            key = ("monthly", identity)
-        elif identity.startswith("protection:"):
-            key = ("urgent", identity)
-        elif notice.get("lifecycle"):
-            key = ("lifecycle", notice["lifecycle"]["kind"], tuple(sorted(trade["plan"].get("source_refs", [trade["trade_id"]]))))
-        elif trade:
-            key = ("signal", tuple(sorted(trade["plan"].get("source_refs", [trade["trade_id"]]))))
-        else:
-            key = ("event", (event or {}).get("source_id", identity))
-        if event and key[0] == "event":
-            refs = (event.get("interpretation") or {}).get("source_refs", [])
-            if refs:
-                key = ("signal", tuple(sorted(refs)))
-        groups.setdefault(key, []).append((identity, notice, trade, event))
-    messages = []
-    for key, items in groups.items():
-        ids = [row[0] for row in items]
-        if key[0] == "recovery":
-            notice = items[0][1]
-            if "source_notice" in notice:
-                code = notice["source_notice"].get("code", "source_status_changed")
-                text = "ℹ️ **Quellenstatus**\n" + literal(ERRORS.get(code, code))
-                sources = notice["source_notice"].get("sources", [])
-                if sources:
-                    text += "\nKanäle: " + ", ".join(literal(value) for value in sources)
-            else:
-                text = recovery_block(notice)
-            messages.append({"notification_ids": ids, "severity": notice.get("severity", "normal"), "texts": split_blocks(text)})
-            continue
-        if key[0] == "summary":
-            messages.append({"notification_ids": ids, "severity": "urgent" if ids[0].startswith("protection:") else "normal",
-                             "texts": split_blocks(summary_block(items[0][1]))})
-            continue
-        if key[0] == "rank":
-            event = items[0][1]["rank_change"]
-            score = event["metrics"].get("score")
-            text = "🏅 **Kanalrang geändert** · " + source_name(data, event["source_id"])
-            text += "\n\n**Rang:** " + event["old"] + " → " + event["new"]
-            text += "\n**Score:** " + number(score) + " · **Drawdown:** " + number(event["metrics"]["drawdown_r"]) + " R"
-            if event.get("reason"):
-                text += "\n**Grund:** " + literal(event["reason"])
-            text += "\n**Neue Entries:** " + event["network"].capitalize() + " · **Risikofaktor:** " + number(event.get("factor", data["ranking_policy"]["factors"][event["new"]])) + "×"
-            text += "\nBestehende Positionen behalten ihre Ausführung und Parameter."
-            messages.append({"notification_ids": ids, "severity": "normal", "texts": split_blocks(text)})
-            continue
-        if key[0] == "lifecycle":
-            blocks = ["**Quelle:** " + source_name(data, items[0][2]["chat_id"])]
-            blocks += [lifecycle_block(data, row[1]["lifecycle"]) for row in items]
-            messages.append({"notification_ids": ids, "severity": "normal", "texts": split_blocks("\n\n".join(blocks))})
-            continue
-        if key[0] == "monthly":
-            messages.append({"notification_ids": ids, "severity": "normal", "texts": split_blocks(monthly_message(items[0][1]["monthly_report"]))})
-            continue
-        if key[0] == "urgent":
-            notice = items[0][1]
-            text = "🚨 **Schutzvorfall**\n\n**Börse:** " + VENUES.get(notice.get("exchange"), literal(notice.get("exchange", "nicht zugeordnet"))) + "\n**Entries:** gesperrt\n\n**Grund:** " + literal(ERRORS.get(notice.get("error"), notice.get("error", "Schutz nicht bestätigt")))
-            messages.append({"notification_ids": ids, "severity": "urgent", "texts": split_blocks(text)})
-            continue
-        chat = next((row[2]["chat_id"] if row[2] else row[3]["source"]["chat_id"] for row in items
-                     if row[2] or row[3] and is_source_row(row[3])), None)
-        blocks = ["**Quelle:** " + source_name(data, chat)]
-        by_trade = {}
-        for _, notice, trade, _ in items:
-            if trade:
-                by_trade.setdefault(trade["trade_id"], (trade, []))[1].append(notice)
-        blocks += [trade_block(data, trade, notices) for trade, notices in by_trade.values()]
-        for _, notice, _, event in items:
-            for target in notice.get("targets", []):
-                leg = target.get("leg_id") or target.get("pipeline_id", "legacy") + ":" + target.get("requested_exchange", target.get("exchange", "hyperliquid"))
-                target = (event or {}).get("targets", {}).get(leg, target)
-                if target.get("trade_id") in by_trade:
-                    continue
-                if trade := data["trades"].get(target.get("trade_id")):
-                    by_trade[trade["trade_id"]] = (trade, [notice])
-                    blocks.append(trade_block(data, trade, [notice]))
-                    continue
-                plan = {name: target.get(name) for name in ("exchange", "network", "profile_id", "rank_snapshot", "requested_exchange", "fallback_reason")}
-                signal = (event or {}).get("interpretation") or {}
-                title = literal(signal.get("symbol") or "Markt nicht zugeordnet")
-                reason = target.get("error", "Ergebnis nicht bestätigt")
-                retry = retry_view(target)
-                pending_retry = retry and not retry.get("exhausted") and target.get("status") not in ("unknown", "needs_reconciliation")
-                heading = "⏳ **Technische Prüfung ausstehend**" if pending_retry else "⏳ **Börsenziel ungeklärt**" if target.get("status") in ("unknown", "pending", "planned", "opening", "protecting", "needs_reconciliation") else "⚠️ **Signal abgelehnt**"
-                detail = observation_lines(target) if pending_retry else "**Grund:** " + literal(ERRORS.get(reason, reason))
-                if retry and retry.get("exhausted"):
-                    detail += "\n\n" + observation_lines(target)
-                blocks.append(f"{heading} · {title}\n\n{context(data, plan)}\n\n{detail}")
-        if not by_trade and len(blocks) == 1:
-            notice = items[0][1]
-            blocks.append("ℹ️ **Systemmeldung**\n" + literal(notice.get("error") or "Gespeichertes Ereignis ohne vollständige Trade-Zuordnung"))
-        messages.append({"notification_ids": ids, "severity": "normal", "texts": split_blocks("\n\n".join(blocks))})
+    groups = group_notification_rows(data, notifications, chosen)
+    messages = [grouped_notice_message(data, key, items) for key, items in groups.items()]
     for message in messages:
         message["notification_versions"] = {identity: notification_versions[identity] if notification_versions is not None else digest(notifications[identity])
                                             for identity in message["notification_ids"]}

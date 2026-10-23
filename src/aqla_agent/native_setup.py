@@ -92,33 +92,123 @@ class NativeSetup:
         # Never interpolate candidate text, exceptions or private verifier data.
         return await asyncio.wait_for(bot.send_message(chat_id=self.owner, text=text), timeout=10)
 
-    async def intercept(self, update, bot):
-        message = getattr(update, "effective_message", None)
-        if not self.owner_dm(message):
-            return False
+    async def _open_challenge(self, bot):
+        await self.revoke()
+        binding = self.binding()
+        registered = await self.request("setup_bind", setup_binding=asdict(binding))
+        if registered.get("locked_seconds", 0):
+            self.locked_until = self.now() + registered["locked_seconds"]
+            await self.reply(bot, "Setup ist nach fünf Fehlversuchen für 15 Minuten gesperrt.")
+            return
+        self.generation = registered["generation"]
+        deadline = self.now() + CHALLENGE_SECONDS
+        prompt = await self.reply(bot, SETUP_PROMPT)
+        if self.binding() == binding and self.now() < deadline:
+            self.challenge = Challenge(binding, deadline, prompt.message_id)
+            self.old_prompts.add(prompt.message_id)
+
+    async def _setup_command(self, bot, suffix):
+        if suffix == "aus":
+            await self.revoke()
+            await self.reply(bot, "Setup ist aus.")
+        elif suffix == "status":
+            status = await self.request("setup_status", setup_binding=asdict(self.binding()), lease_id=(self.lease[0] if self.lease else None))
+            await self.reply(bot, f"Setup: {'aktiv' if status['active'] else 'aus'}; {status['remaining_seconds']} Sekunden übrig; Sperre: {status['locked_seconds']} Sekunden.")
+        elif suffix:
+            await self.reply(bot, "Nutze /setup, /setup status oder /setup aus. Das Passwort erst nach der Nachfrage senden.")
+        elif self.now() < self.locked_until:
+            await self.reply(bot, "Setup ist nach fünf Fehlversuchen für 15 Minuten gesperrt.")
+        elif self.verifier is None:
+            await self.reply(bot, "Der private Setup-Prüfhash ist nicht verfügbar.")
+        else:
+            await self._open_challenge(bot)
+        return True
+
+    async def _grant(self, bot, challenge):
+        identity, expiry = secrets.token_hex(32), self.now() + GRANT_SECONDS
+        revision = self.revision
+        self.challenge = None
+        # MCP creates its own exact 300-second deadline. Local admission
+        # expires from RPC start, conservatively earlier after any RTT.
+        await self.request("setup_grant", setup_binding=asdict(challenge.binding), lease_id=identity,
+                           generation=self.generation)
+        if self.revision != revision or self.binding() != challenge.binding or self.now() >= expiry:
+            await self.revoke()
+            return True
+        self.lease = identity, challenge.binding, expiry
+        self.failures = 0
+        await self.reply(bot, "Setup ist für 300 Sekunden aktiv.")
+
+    async def _admit_candidate(self, bot, message, text, authentic, deleted, old_reply):
+        challenge = self.challenge
+        if old_reply and challenge and getattr(message.reply_to_message, "message_id", None) != challenge.prompt_id:
+            await self.reply(bot, "Diese alte Setup-Antwort ist abgelaufen.")
+            return True
+        if self._candidate_expired(challenge, old_reply, message):
+            self.challenge = None
+            await self.reply(bot, "Diese Setup-Nachfrage ist abgelaufen. Starte mit /setup neu.")
+            return True
+        verified = bool(authentic and deleted and self.verifier and await self.verifier.verify(text))
+        if self.challenge != challenge or self.binding() != challenge.binding or self.now() >= challenge.deadline:
+            self.challenge = None
+            return True
+        if not verified:
+            self.failures += 1
+            await self.request("setup_failed", setup_binding=asdict(challenge.binding))
+            if self.failures >= 5:
+                self.locked_until = self.now() + LOCKOUT_SECONDS
+                self.failures = 0
+                self.challenge = None
+            await self.reply(bot, "Setup nicht freigegeben. Passwortprüfung oder bestätigtes Löschen fehlgeschlagen.")
+            return True
+        await self._grant(bot, challenge)
+
+    def _admission_fields(self, update, bot, message):
         text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
         head = text.split(maxsplit=1)[0] if text else ""
         addressed = addressed_to_bot(head, bot)
         command = head.split("@", 1)[0].lower() if text.startswith("/") else ""
         authentic = self.private_owner(message) and not any(
             getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))
+        suffix = text.split(maxsplit=1)[1].strip().lower() if len(text.split(maxsplit=1)) == 2 else ""
+        return text, command, authentic, addressed, suffix
+
+    async def _interrupts_setup(self, command, authentic, addressed):
         if authentic and addressed and command == "/aqla_pause":
-            return False
+            return True
         if authentic and addressed and command in ("/stop", "/new", "/reset", "/restart"):
             try:
                 await self.revoke()
             except Exception:
                 pass  # Local authority was already removed; MCP expiry still fails closed.
-            return False
-        suffix = text.split(maxsplit=1)[1].strip().lower() if len(text.split(maxsplit=1)) == 2 else ""
+            return True
+        return False
+
+    def _candidate_expired(self, challenge, old_reply, message):
+        return (challenge is None or old_reply and getattr(message.reply_to_message, "message_id", None) != challenge.prompt_id
+                or self.binding() != challenge.binding or self.now() >= challenge.deadline or self.now() < self.locked_until)
+
+    def _classify_request(self, command, suffix, authentic, addressed, old_reply):
         setup_command = authentic and addressed and command == "/setup" and suffix in ("", "status", "aus")
-        old_reply = self.old_prompt_reply(message, bot)
         candidate = bool(self.challenge or old_reply) and not setup_command
-        if not candidate and not (authentic and addressed and command == "/setup"):
+        admitted = candidate or authentic and addressed and command == "/setup"
+        delete = candidate or command == "/setup" and suffix not in ("", "status", "aus")
+        return candidate, admitted, delete
+
+    async def intercept(self, update, bot):
+        message = getattr(update, "effective_message", None)
+        if not self.owner_dm(message):
+            return False
+        text, command, authentic, addressed, suffix = self._admission_fields(update, bot, message)
+        if await self._interrupts_setup(command, authentic, addressed):
+            return False
+        old_reply = self.old_prompt_reply(message, bot)
+        candidate, admitted, delete = self._classify_request(command, suffix, authentic, addressed, old_reply)
+        if not admitted:
             return False
         # Delete BEFORE waiting for serialized admission or the bounded hash worker.
         deleted = False
-        if candidate or command == "/setup" and suffix not in ("", "status", "aus"):
+        if delete:
             try:
                 deleted = await asyncio.wait_for(bot.delete_message(chat_id=self.owner, message_id=message.message_id), timeout=10) is True
             except Exception:
@@ -126,69 +216,8 @@ class NativeSetup:
         try:
             async with self._serial:
                 if authentic and command == "/setup" and not candidate:
-                    suffix = text.split(maxsplit=1)[1].strip().lower() if len(text.split(maxsplit=1)) == 2 else ""
-                    if suffix == "aus":
-                        await self.revoke()
-                        await self.reply(bot, "Setup ist aus.")
-                    elif suffix == "status":
-                        status = await self.request("setup_status", setup_binding=asdict(self.binding()), lease_id=(self.lease[0] if self.lease else None))
-                        await self.reply(bot, f"Setup: {'aktiv' if status['active'] else 'aus'}; {status['remaining_seconds']} Sekunden übrig; Sperre: {status['locked_seconds']} Sekunden.")
-                    elif suffix:
-                        await self.reply(bot, "Nutze /setup, /setup status oder /setup aus. Das Passwort erst nach der Nachfrage senden.")
-                    elif self.now() < self.locked_until:
-                        await self.reply(bot, "Setup ist nach fünf Fehlversuchen für 15 Minuten gesperrt.")
-                    elif self.verifier is None:
-                        await self.reply(bot, "Der private Setup-Prüfhash ist nicht verfügbar.")
-                    else:
-                        await self.revoke()
-                        binding = self.binding()
-                        registered = await self.request("setup_bind", setup_binding=asdict(binding))
-                        if registered.get("locked_seconds", 0):
-                            self.locked_until = self.now() + registered["locked_seconds"]
-                            await self.reply(bot, "Setup ist nach fünf Fehlversuchen für 15 Minuten gesperrt.")
-                            return True
-                        self.generation = registered["generation"]
-                        deadline = self.now() + CHALLENGE_SECONDS
-                        prompt = await self.reply(bot, SETUP_PROMPT)
-                        if self.binding() == binding and self.now() < deadline:
-                            self.challenge = Challenge(binding, deadline, prompt.message_id)
-                            self.old_prompts.add(prompt.message_id)
-                    return True
-                challenge = self.challenge
-                if old_reply and challenge and getattr(message.reply_to_message, "message_id", None) != challenge.prompt_id:
-                    await self.reply(bot, "Diese alte Setup-Antwort ist abgelaufen.")
-                    return True
-                if (challenge is None or old_reply and getattr(message.reply_to_message, "message_id", None) != challenge.prompt_id
-                        or self.binding() != challenge.binding or self.now() >= challenge.deadline or self.now() < self.locked_until):
-                    self.challenge = None
-                    await self.reply(bot, "Diese Setup-Nachfrage ist abgelaufen. Starte mit /setup neu.")
-                    return True
-                verified = bool(authentic and deleted and self.verifier and await self.verifier.verify(text))
-                if self.challenge != challenge or self.binding() != challenge.binding or self.now() >= challenge.deadline:
-                    self.challenge = None
-                    return True
-                if not verified:
-                    self.failures += 1
-                    await self.request("setup_failed", setup_binding=asdict(challenge.binding))
-                    if self.failures >= 5:
-                        self.locked_until = self.now() + LOCKOUT_SECONDS
-                        self.failures = 0
-                        self.challenge = None
-                    await self.reply(bot, "Setup nicht freigegeben. Passwortprüfung oder bestätigtes Löschen fehlgeschlagen.")
-                    return True
-                identity, expiry = secrets.token_hex(32), self.now() + GRANT_SECONDS
-                revision = self.revision
-                self.challenge = None
-                # MCP creates its own exact 300-second deadline. Local admission
-                # expires from RPC start, conservatively earlier after any RTT.
-                await self.request("setup_grant", setup_binding=asdict(challenge.binding), lease_id=identity,
-                                   generation=self.generation)
-                if self.revision != revision or self.binding() != challenge.binding or self.now() >= expiry:
-                    await self.revoke()
-                    return True
-                self.lease = identity, challenge.binding, expiry
-                self.failures = 0
-                await self.reply(bot, "Setup ist für 300 Sekunden aktiv.")
+                    return await self._setup_command(bot, suffix)
+                await self._admit_candidate(bot, message, text, authentic, deleted, old_reply)
         except asyncio.CancelledError:
             self.lease = None
             self.challenge = None

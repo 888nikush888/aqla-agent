@@ -154,10 +154,8 @@ class Trading:
 
         return self.state.update(insert)
 
-    def prune_events(self, state, *, inserted_event=None):
-        maximum = self.exchange.settings.max_events
-        if len(state["events"]) <= maximum:
-            return
+    @staticmethod
+    def protected_source_events(state):
         protected_refs = {ref for trade in state["trades"].values() if trade["status"] in OPEN for ref in trade["plan"]["source_refs"]}
         protected_events = {event for plan in state["plans"].values() if plan["plan"]["deadline_at"] > now_ms() for event in plan["plan"].get("source_revisions", {}).values()}
         for trade in state["trades"].values():
@@ -171,6 +169,14 @@ class Trading:
                 protected_events.add(pending["event_id"])
                 protected_events.update(pending["source_revisions"].values())
                 protected_refs.update(pending["source_revisions"])
+        return protected_refs, protected_events
+
+
+    def prune_events(self, state, *, inserted_event=None):
+        maximum = self.exchange.settings.max_events
+        if len(state["events"]) <= maximum:
+            return
+        protected_refs, protected_events = self.protected_source_events(state)
         if inserted_event:
             protected_events.add(inserted_event)
         by_chat = {}
@@ -243,74 +249,95 @@ class Trading:
                 result["source_read_error"] = str(error)
         return result
 
+    @staticmethod
+    def validate_actionable_anchor(snapshot, row, event_id, interpretation):
+        if not row["source"].get("text", "").strip():
+            raise AqlaError("Live anchor has no textual source intent; read source_context and classify incomplete")
+        if row["source"].get("historical"):
+            raise AqlaError("Historical context cannot authorize an exchange action")
+        if row["source_id"] not in interpretation.source_refs:
+            raise AqlaError("An actionable interpretation must reference its live anchor event")
+        if latest_sources(snapshot["events"], [row["source_id"]])[row["source_id"]]["event_id"] != event_id:
+            raise AqlaError("An actionable interpretation must use the latest anchor revision")
+
+
+    def validate_interpretation_sources(self, snapshot, row, event_id, interpretation):
+        refs = [item for item in snapshot["events"].values() if is_source_row(item) and item["source_id"] in interpretation.source_refs]
+        if not refs or any(item["source"]["chat_id"] != row["source"]["chat_id"] for item in refs):
+            raise AqlaError("A setup may only combine messages from the same source")
+        if interpretation.kind in ("new_signal", "trade_update"):
+            self.validate_actionable_anchor(snapshot, row, event_id, interpretation)
+        verify_evidence(interpretation, snapshot["events"])
+        verify_entry_shape(interpretation)
+        verify_update_shape(interpretation)
+        if interpretation.kind not in ("new_signal", "trade_update"):
+            from .source_disposition import verify_classification_policy
+            verify_classification_policy(interpretation, row["source"].get("text", ""))
+
+
+    def validate_interpretation_intent(self, snapshot, row, event_id, interpretation):
+        from .semantic_contract import (
+            supported_action_failure,
+            unbound_setup_update_failure,
+            update_identity_failure,
+        )
+        failure = supported_action_failure(row["source"].get("text", ""), interpretation)
+        if failure is None and interpretation.kind == "trade_update":
+            from .source_candidates import build_packet
+            packet = build_packet(self.context(event_id, snapshot=snapshot))
+            failure = unbound_setup_update_failure(packet, interpretation) or update_identity_failure(packet, interpretation)
+        if failure:
+            raise AqlaError(failure)
+        if interpretation.take_profit_unit in ("course_percent", "roi_percent") and interpretation.take_profits:
+            raise AqlaError("New source TP percentages must use roe_percent under source-roe-v1")
+
+
+    @staticmethod
+    def validate_interpretation_setup_refs(snapshot, row, interpretation):
+        own_refs = (ref for trade in snapshot["trades"].values()
+                    if trade["chat_id"] == row["source"]["chat_id"] and interpretation.bound_trade_id in (None, trade["trade_id"])
+                    for ref in trade["plan"]["source_refs"])
+        verify_setup_references(interpretation, row["source_id"], own_refs)
+
+
+    def commit_interpretation(self, snapshot, event_id, interpretation, read_receipt, result_view):
+        row = snapshot["events"].get(event_id)
+        if not is_source_row(row):
+            raise AqlaError("Unknown source event")
+        from .express import require_source_access
+        require_source_access(snapshot, event_id)
+        previous = row.get("interpretation")
+        from .efficiency import classification_ack
+        def result():
+            changed = previous != row.get("interpretation")
+            return classification_ack(row, changed) if result_view == "ack" else row
+        if row["status"] in ("executed", "updated"):
+            previous = Interpretation.model_validate(previous).model_dump(mode="json") if previous is not None else None
+            if previous != interpretation.model_dump(mode="json"):
+                raise AqlaError("An executed revision is immutable; interpret the edit as a new update revision")
+            return result()
+        from .source_queue import recovery_ids
+        if event_id in recovery_ids(snapshot):
+            prior = Interpretation.model_validate(previous).model_dump(mode="json") if previous is not None else None
+            if prior == interpretation.model_dump(mode="json"):
+                return result()
+            raise AqlaError("Financial recovery revision is immutable; reconcile its existing operations")
+        if interpretation.kind not in ("new_signal", "trade_update") and getattr(self, "disposition_key", None):
+            from .source_disposition import verify_disposition
+            verify_disposition(snapshot, event_id, interpretation, read_receipt, self.disposition_key)
+        self.validate_interpretation_sources(snapshot, row, event_id, interpretation)
+        self.validate_interpretation_setup_refs(snapshot, row, interpretation)
+        self.validate_interpretation_intent(snapshot, row, event_id, interpretation)
+        row.update(interpretation=interpretation.model_dump(mode="json"),
+                   status=interpretation.kind if interpretation.kind not in ("new_signal", "trade_update") else "interpreted")
+        if interpretation.kind not in ("new_signal", "trade_update"):
+            row.pop("last_error", None)
+        return result()
+
+
     def record_interpretation(self, event_id, interpretation: Interpretation, *, read_receipt="", result_view="full"):
         def commit(snapshot):
-
-            row = snapshot["events"].get(event_id)
-            if not is_source_row(row):
-                raise AqlaError("Unknown source event")
-            from .express import require_source_access
-            require_source_access(snapshot, event_id)
-            previous = row.get("interpretation")
-            from .efficiency import classification_ack
-            def result():
-                changed = previous != row.get("interpretation")
-                return classification_ack(row, changed) if result_view == "ack" else row
-            if row["status"] in ("executed", "updated"):
-                previous = Interpretation.model_validate(previous).model_dump(mode="json") if previous is not None else None
-                if previous != interpretation.model_dump(mode="json"):
-                    raise AqlaError("An executed revision is immutable; interpret the edit as a new update revision")
-                return result()
-            from .source_queue import recovery_ids
-            if event_id in recovery_ids(snapshot):
-                prior = Interpretation.model_validate(previous).model_dump(mode="json") if previous is not None else None
-                if prior == interpretation.model_dump(mode="json"):
-                    return result()
-                raise AqlaError("Financial recovery revision is immutable; reconcile its existing operations")
-            if interpretation.kind not in ("new_signal", "trade_update") and getattr(self, "disposition_key", None):
-                from .source_disposition import verify_disposition
-                verify_disposition(snapshot, event_id, interpretation, read_receipt, self.disposition_key)
-            refs = [item for item in snapshot["events"].values() if is_source_row(item) and item["source_id"] in interpretation.source_refs]
-            if not refs or any(item["source"]["chat_id"] != row["source"]["chat_id"] for item in refs):
-                raise AqlaError("A setup may only combine messages from the same source")
-            if interpretation.kind in ("new_signal", "trade_update"):
-                if not row["source"].get("text", "").strip():
-                    raise AqlaError("Live anchor has no textual source intent; read source_context and classify incomplete")
-                if row["source"].get("historical"):
-                    raise AqlaError("Historical context cannot authorize an exchange action")
-                if row["source_id"] not in interpretation.source_refs:
-                    raise AqlaError("An actionable interpretation must reference its live anchor event")
-                if latest_sources(snapshot["events"], [row["source_id"]])[row["source_id"]]["event_id"] != event_id:
-                    raise AqlaError("An actionable interpretation must use the latest anchor revision")
-            verify_evidence(interpretation, snapshot["events"])
-            verify_entry_shape(interpretation)
-            verify_update_shape(interpretation)
-            if interpretation.kind not in ("new_signal", "trade_update"):
-                from .source_disposition import verify_classification_policy
-                verify_classification_policy(interpretation, row["source"].get("text", ""))
-            own_refs = (ref for trade in snapshot["trades"].values()
-                        if trade["chat_id"] == row["source"]["chat_id"] and interpretation.bound_trade_id in (None, trade["trade_id"])
-                        for ref in trade["plan"]["source_refs"])
-            verify_setup_references(interpretation, row["source_id"], own_refs)
-            from .semantic_contract import (
-                supported_action_failure,
-                unbound_setup_update_failure,
-                update_identity_failure,
-            )
-            failure = supported_action_failure(row["source"].get("text", ""), interpretation)
-            if failure is None and interpretation.kind == "trade_update":
-                from .source_candidates import build_packet
-                packet = build_packet(self.context(event_id, snapshot=snapshot))
-                failure = unbound_setup_update_failure(packet, interpretation) or update_identity_failure(packet, interpretation)
-            if failure:
-                raise AqlaError(failure)
-            if interpretation.take_profit_unit in ("course_percent", "roi_percent") and interpretation.take_profits:
-                raise AqlaError("New source TP percentages must use roe_percent under source-roe-v1")
-            row.update(interpretation=interpretation.model_dump(mode="json"),
-                       status=interpretation.kind if interpretation.kind not in ("new_signal", "trade_update") else "interpreted")
-            if interpretation.kind not in ("new_signal", "trade_update"):
-                row.pop("last_error", None)
-            return result()
+            return self.commit_interpretation(snapshot, event_id, interpretation, read_receipt, result_view)
         return (self.state.update_if_changed if hasattr(self.state, "update_if_changed") else self.state.update)(commit)
 
     def preview_policy(self, snapshot):
@@ -466,18 +493,23 @@ class Trading:
         self.state.update(partial(self.persist_preview_plan, event_id, plan, _refresh_from))
         return plan.model_dump(mode="json")
 
-    def budget_refresh_trade(self, snapshot, plan):
-        trade = snapshot["trades"].get(plan.trade_id)
-        if not trade:
-            return None
-        saved = snapshot["plans"][plan.plan_id]
-        leverage = snapshot["operations"].get(trade.get("leverage_operation_id", "leverage:" + plan.trade_id))
+    @staticmethod
+    def validate_unsent_budget_refresh(snapshot, plan, trade, saved, leverage):
         if (saved.get("refreshed_plan_id") or saved.get("refreshed_from_plan_id")
                 or trade["plan"]["plan_id"] != plan.plan_id or trade["status"] != "preparing"
                 or plan.entry_timing != "standard" or Decimal(trade["filled_quantity"]) or trade.get("orders")
                 or any(key == "entry:" + plan.trade_id or key.startswith("entry:" + plan.trade_id + ":") for key in snapshot["operations"])
                 or leverage and (leverage["phase"] not in ("acknowledged", "reconciled") or leverage.get("outcome") != "accepted")):
             raise EntryBudgetChanged("Budget refresh requires a completely unsent entry and is allowed only once")
+
+
+    def budget_refresh_trade(self, snapshot, plan):
+        trade = snapshot["trades"].get(plan.trade_id)
+        if not trade:
+            return None
+        saved = snapshot["plans"][plan.plan_id]
+        leverage = snapshot["operations"].get(trade.get("leverage_operation_id", "leverage:" + plan.trade_id))
+        self.validate_unsent_budget_refresh(snapshot, plan, trade, saved, leverage)
         if trade.get("lifecycle_version") == 2 and trade.get("management_revision"):
             raise EntryBudgetChanged("A managed source update prevents automatic budget-plan replacement")
         self.validate_admission(snapshot, plan, owned=True)
@@ -715,11 +747,11 @@ class Trading:
                 saved = self.state.read("plans", entries={"plans": [plan_id]})["plans"][plan_id]
                 return self.retain_observation_retry(saved.get("refreshed_plan_id", plan_id), error)
 
-    async def retry_unsent_admission_budget(self, saved, plan, plan_id, refresh_budget):
+    async def retry_unsent_admission_budget(self, saved, plan, plan_id, refresh_budget, error):
         current = self.state.snapshot()
         if (not refresh_budget or plan.trade_id in current["trades"]
                 or any(prefix + plan.trade_id in current["operations"] for prefix in ("entry:", "leverage:"))):
-            raise
+            raise error
         signal = Interpretation.model_validate(current["events"][saved["event_id"]]["interpretation"])
         fresh = await self.preview(saved["event_id"], signal, _refresh_from=plan_id)
         fresh = TradePlan.model_validate(fresh)
@@ -764,8 +796,8 @@ class Trading:
 
         try:
             self.state.update(admit)
-        except EntryBudgetChanged:
-            return await self.retry_unsent_admission_budget(saved, plan, plan_id, refresh_budget)
+        except EntryBudgetChanged as error:
+            return await self.retry_unsent_admission_budget(saved, plan, plan_id, refresh_budget, error)
         self.invoke_hook("entry_wake")
         if plan.entry_timing == "deferred":
             self.state.update(lambda data: data["notifications"].setdefault("entry-waiting:" + plan.trade_id,
@@ -774,16 +806,7 @@ class Trading:
         return await self.guarded_entry_steps(plan, trade)
 
 
-    async def check_waiting_entry(self, trade_id):
-        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-        if marker := trade.get("observation_retry"):
-            if not marker.get("completed") and not marker["exhausted"] and not retry_due(marker):
-                return trade
-        plan = TradePlan.model_validate(trade["plan"])
-        snapshot = self.state.snapshot()
-        if now_ms() >= plan.deadline_at or self.source_revisions(snapshot, plan.source_refs) != plan.source_revisions:
-            self.patch_trade(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Waiting entry expired or its source changed")
-            return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+    def waiting_configuration_changed(self, plan, snapshot):
         configuration = self.state.root.snapshot() if hasattr(self.state, "root") else snapshot
         changed = (plan.profile_id is not None and configuration["profiles"].get(plan.profile_id, {}).get("revision") != plan.profile_revision
                    or plan.pipeline_id is not None and configuration["pipelines"].get(plan.pipeline_id, {}).get("revision") != plan.pipeline_revision
@@ -791,16 +814,27 @@ class Trading:
                    or plan.ranking_policy_revision != configuration["ranking_revision"]
                    or plan.ranking_enabled != configuration["ranking_policy"]["enabled"]
                    or plan.backup_fields and configuration["profiles"]["backup"]["revision"] != plan.backup_profile_revision)
-        if changed:
-            self.patch_trade(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Waiting entry configuration changed")
-            return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-        if snapshot["paused"] or any(row.get("protection_observation_pending") and row["status"] in OPEN for row in snapshot["trades"].values()):
-            return trade
+        return changed
+
+
+    async def activate_waiting_entry(self, trade_id, plan, trade):
         try:
-            self.validate_admission(snapshot, plan, owned=True)
+            account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
+            self.validate_admission(self.state.snapshot(), plan, account, owned=True)
+            quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
+            validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=trade["targets"])
+            self.patch_trade(trade_id, status="preparing", gate_activated_at=now_ms())
+            return await self.guarded_entry_steps(plan, self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id])
+        except TemporaryObservation as error:
+            return self.retain_observation_retry(plan.plan_id, error)
         except AqlaError as error:
-            self.patch_trade(trade_id, status="cancelled", reserved_risk="0", unsent_reason=str(error))
-            return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+            if self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]["entry_operation_id"] not in self.state.read("operations")["operations"]:
+                self.patch_trade(trade_id, status="rejected", reserved_risk="0", unsent_reason=str(error))
+                return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+            raise
+
+
+    async def observe_waiting_entry(self, trade_id, trade, plan):
         try:
             quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
             state = gate_state(plan, quote)
@@ -816,20 +850,55 @@ class Trading:
         if state == "missed":
             self.patch_trade(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Deferred entry was missed outside the source slippage tolerance")
             return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        return await self.activate_waiting_entry(trade_id, plan, trade)
+
+
+    async def check_waiting_entry(self, trade_id):
+        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        if (
+            ((marker := trade.get('observation_retry')))
+            and (not marker.get('completed') and (not marker['exhausted']) and (not retry_due(marker)))
+        ):
+            return trade
+        plan = TradePlan.model_validate(trade["plan"])
+        snapshot = self.state.snapshot()
+        if now_ms() >= plan.deadline_at or self.source_revisions(snapshot, plan.source_refs) != plan.source_revisions:
+            self.patch_trade(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Waiting entry expired or its source changed")
+            return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        changed = self.waiting_configuration_changed(plan, snapshot)
+        if changed:
+            self.patch_trade(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Waiting entry configuration changed")
+            return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        if snapshot["paused"] or any(row.get("protection_observation_pending") and row["status"] in OPEN for row in snapshot["trades"].values()):
+            return trade
         try:
-            account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
-            self.validate_admission(self.state.snapshot(), plan, account, owned=True)
-            quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
-            validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=trade["targets"])
-            self.patch_trade(trade_id, status="preparing", gate_activated_at=now_ms())
-            return await self.guarded_entry_steps(plan, self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id])
-        except TemporaryObservation as error:
-            return self.retain_observation_retry(plan.plan_id, error)
+            self.validate_admission(snapshot, plan, owned=True)
         except AqlaError as error:
-            if self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]["entry_operation_id"] not in self.state.read("operations")["operations"]:
-                self.patch_trade(trade_id, status="rejected", reserved_risk="0", unsent_reason=str(error))
-                return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-            raise
+            self.patch_trade(trade_id, status="cancelled", reserved_risk="0", unsent_reason=str(error))
+            return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        return await self.observe_waiting_entry(trade_id, trade, plan)
+
+    async def fresh_entry_guard(self, plan, dispatch_operation, account, allowed, waverider, quote, targets):
+        for attempt in range(2):
+            self.validate_admission(self.state.snapshot(), plan, account, owned=True, allowed_prepared=allowed, allowed_sending=(dispatch_operation,), waverider=waverider)
+            try:
+                quote.fresh()
+                # Leave time for atomic preparation; the transport's 2 s limit stays unchanged.
+                if not attempt and now_ms() - min(quote.exchange_time, quote.started_at, quote.observed_at) > 1000:
+                    raise TemporaryObservation("price_stale", "price")
+                return account, quote
+            except TemporaryObservation:
+                if attempt:
+                    raise
+                # Local checks can age a valid quote; refresh once and recheck every guard.
+                quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
+                trade = self.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
+                validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=targets)
+                if waverider:
+                    from .waverider import ended
+                    if ended(plan, trade, quote):
+                        raise AqlaError("Waverider endpoint was reached before reentry") from None
+
 
     async def live_entry_guard(self, plan, *, dispatch_operation=None, account=None, audit=False, waverider=False):
         # Refresh before the remaining checks can consume the existing 10 s account window.
@@ -855,25 +924,7 @@ class Trading:
             raise
         if audit:
             self.state.update(lambda data: data["trades"][plan.trade_id].setdefault("price_checks", []).append({"phase": "before_send", "snapshot": quote.model_dump(mode="json"), "result": result}))
-        for attempt in range(2):
-            self.validate_admission(self.state.snapshot(), plan, account, owned=True, allowed_prepared=allowed, allowed_sending=(dispatch_operation,), waverider=waverider)
-            try:
-                quote.fresh()
-                # Leave time for atomic preparation; the transport's 2 s limit stays unchanged.
-                if not attempt and now_ms() - min(quote.exchange_time, quote.started_at, quote.observed_at) > 1000:
-                    raise TemporaryObservation("price_stale", "price")
-                return account, quote
-            except TemporaryObservation:
-                if attempt:
-                    raise
-                # Local checks can age a valid quote; refresh once and recheck every guard.
-                quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
-                trade = self.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
-                validate_entry_prices(plan, quote, stop=trade["stop_price"], targets=targets)
-                if waverider:
-                    from .waverider import ended
-                    if ended(plan, trade, quote):
-                        raise AqlaError("Waverider endpoint was reached before reentry") from None
+        return await self.fresh_entry_guard(plan, dispatch_operation, account, allowed, waverider, quote, targets)
 
     async def guarded_entry_steps(self, plan, trade):
         try:
@@ -898,9 +949,7 @@ class Trading:
                 self.patch_trade(plan.trade_id, status="rejected", reserved_risk="0", orders=[], unsent_reason="Entry preparation failed before any entry send", entry_diagnostic=diagnostic(error, "entry_preparation"))
             raise
 
-    async def _entry_steps(self, plan, trade):
-        if trade.get("lifecycle_version") == 2:
-            return await managed_entries.start(self, plan, trade)
+    async def validate_unsent_market(self, plan):
         current_market = await read_observation(lambda: self.exchange.market(plan.market.symbol, plan.market.product), "market")
         identity_fields = ("asset_id", "size_decimals", "quote_token", "price_tick", "quantity_step", "margin_leverage_scale")
         if any(getattr(current_market, key) != getattr(plan.market, key) for key in identity_fields) or plan.effective_leverage > current_market.max_leverage:
@@ -909,6 +958,34 @@ class Trading:
                 or current_market.max_quantity is not None and plan.quantity > current_market.max_quantity
                 or any(size < current_market.min_quantity or size * price < current_market.min_notional for size, price in zip(plan.tp_quantities, plan.take_profits, strict=True))):
             raise AqlaError("Exchange minimum/maximum order sizes changed while entry was unsent")
+
+
+    async def complete_entry_dispatch(self, plan, result):
+        if result["phase"] == "unknown":
+            self.patch_trade(plan.trade_id, status="unknown")
+        if result.get("outcome") == "not_sent":
+            self.raise_temporary_not_sent(result)
+            self.patch_trade(plan.trade_id, status="rejected", reserved_risk="0", unsent_reason=result["result"]["error"], orders=[])
+            return self.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
+        self.complete_observation_retry(plan.trade_id)
+        if any(leg["index"] == 1 and leg["disposition"] == "rejected" for leg in result.get("legs", [])):
+            await self.cancel_entry(plan.trade_id)
+        try:
+            await self.refresh_trade(plan.trade_id)
+        except ExternalInterference as error:
+            self.patch_trade(plan.trade_id, status="conflicted", external_conflict=str(error))
+        current = self.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
+        if current["status"] == "opening" and Decimal(current["filled_quantity"]) == 0 and result["phase"] in ("acknowledged", "reconciled"):
+            self.state.update(lambda data: data["notifications"].setdefault("entry-waiting:" + plan.trade_id,
+                {"trade_id": plan.trade_id, "change": {"status": "opening"}, "previous": {"status": "preparing"}, "observed_at": now_ms(),
+                 "source_id": current["chat_id"], "source_name": data.get("source_names", {}).get(current["chat_id"])}))
+        return current
+
+
+    async def _entry_steps(self, plan, trade):
+        if trade.get("lifecycle_version") == 2:
+            return await managed_entries.start(self, plan, trade)
+        await self.validate_unsent_market(plan)
         latest_account, latest_quote = None, None
         dispatch_operation = trade.get("leverage_operation_id", "leverage:" + plan.trade_id)
         async def live_guard():
@@ -949,25 +1026,7 @@ class Trading:
         dispatch_operation = trade["entry_operation_id"]
         result = await self.exchange.mutate(trade["entry_operation_id"], action, deadline=plan.deadline_at,
                                             prepare_guard=lambda data: final_guard(data, trade["entry_operation_id"]), **guards)
-        if result["phase"] == "unknown":
-            self.patch_trade(plan.trade_id, status="unknown")
-        if result.get("outcome") == "not_sent":
-            self.raise_temporary_not_sent(result)
-            self.patch_trade(plan.trade_id, status="rejected", reserved_risk="0", unsent_reason=result["result"]["error"], orders=[])
-            return self.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
-        self.complete_observation_retry(plan.trade_id)
-        if any(leg["index"] == 1 and leg["disposition"] == "rejected" for leg in result.get("legs", [])):
-            await self.cancel_entry(plan.trade_id)
-        try:
-            await self.refresh_trade(plan.trade_id)
-        except ExternalInterference as error:
-            self.patch_trade(plan.trade_id, status="conflicted", external_conflict=str(error))
-        current = self.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
-        if current["status"] == "opening" and Decimal(current["filled_quantity"]) == 0 and result["phase"] in ("acknowledged", "reconciled"):
-            self.state.update(lambda data: data["notifications"].setdefault("entry-waiting:" + plan.trade_id,
-                {"trade_id": plan.trade_id, "change": {"status": "opening"}, "previous": {"status": "preparing"}, "observed_at": now_ms(),
-                 "source_id": current["chat_id"], "source_name": data.get("source_names", {}).get(current["chat_id"])}))
-        return current
+        return await self.complete_entry_dispatch(plan, result)
 
     @staticmethod
     def raise_temporary_not_sent(operation):
@@ -1054,42 +1113,7 @@ class Trading:
             return trade
         return self.state.update(rearm)
 
-    async def resume_unsent_entry(self, trade_id):
-        snapshot = self.state.snapshot()
-        trade = snapshot["trades"][trade_id]
-        if not Decimal(trade["filled_quantity"]) and any(row.get("protection_observation_pending") and row["status"] in OPEN for row in snapshot["trades"].values()):
-            return trade
-        if marker := trade.get("observation_retry"):
-            operation = snapshot["operations"].get(trade["entry_operation_id"])
-            if operation and operation.get("outcome") != "not_sent":
-                self.complete_observation_retry(trade_id)
-                return await self.refresh_trade(trade_id)
-            if marker.get("completed"):
-                return trade
-            if marker.get("authority") != "execute" or trade["status"] not in OPEN:
-                return trade
-            if marker["exhausted"] or now_ms() >= marker["deadline_at"]:
-                self.patch_trade(trade_id, status="cancelled", reserved_risk="0", orders=[], observation_retry={**marker, "exhausted": True}, unsent_reason="Original entry observation retry deadline/budget expired")
-                return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-            if not retry_due(marker):
-                return trade
-            try:
-                trade = self.rearm_proven_unsent(trade_id)
-                if trade is None:
-                    return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-            except AqlaError as error:
-                self.patch_trade(trade_id, status="cancelled", reserved_risk="0", orders=[], observation_retry={**marker, "exhausted": True}, unsent_reason=str(error), entry_diagnostic=diagnostic(error, "retry_admission"))
-                return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-            snapshot = self.state.snapshot()
-        if trade["status"] == "waiting_entry":
-            return await self.check_waiting_entry(trade_id)
-        plan = TradePlan.model_validate(trade["plan"])
-        if trade["entry_operation_id"] in snapshot["operations"]:
-            return await self.refresh_trade(trade_id)
-        parent = trade.get("configuration_parent_id", trade.get("leverage_operation_id", "leverage:" + trade_id))
-        configuration = snapshot["operations"].get(parent, {})
-        if configuration.get("configuration_retry_needed") and configuration["phase"] in ("prepared", "sending", "unknown"):
-            return await self.repair_unsent_configuration(plan, parent)
+    async def resume_unsent_admission(self, snapshot, plan, trade, trade_id):
         self.assert_plan_binding(snapshot, plan)
         try:
             self.validate_admission(snapshot, plan, owned=True)
@@ -1113,26 +1137,76 @@ class Trading:
             return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         return await self.guarded_entry_steps(plan, trade)
 
+
+    async def resume_entry_observation_retry(self, trade_id, snapshot, trade, marker):
+        operation = snapshot["operations"].get(trade["entry_operation_id"])
+        if operation and operation.get("outcome") != "not_sent":
+            self.complete_observation_retry(trade_id)
+            return False, await self.refresh_trade(trade_id)
+        if marker.get("completed"):
+            return False, trade
+        if marker.get("authority") != "execute" or trade["status"] not in OPEN:
+            return False, trade
+        if marker["exhausted"] or now_ms() >= marker["deadline_at"]:
+            self.patch_trade(trade_id, status="cancelled", reserved_risk="0", orders=[], observation_retry={**marker, "exhausted": True}, unsent_reason="Original entry observation retry deadline/budget expired")
+            return False, self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        if not retry_due(marker):
+            return False, trade
+        try:
+            trade = self.rearm_proven_unsent(trade_id)
+            if trade is None:
+                return False, self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        except AqlaError as error:
+            self.patch_trade(trade_id, status="cancelled", reserved_risk="0", orders=[], observation_retry={**marker, "exhausted": True}, unsent_reason=str(error), entry_diagnostic=diagnostic(error, "retry_admission"))
+            return False, self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        return True, trade
+
+
+    async def resume_unsent_entry(self, trade_id):
+        snapshot = self.state.snapshot()
+        trade = snapshot["trades"][trade_id]
+        if not Decimal(trade["filled_quantity"]) and any(row.get("protection_observation_pending") and row["status"] in OPEN for row in snapshot["trades"].values()):
+            return trade
+        if marker := trade.get("observation_retry"):
+            ready, trade = await self.resume_entry_observation_retry(trade_id, snapshot, trade, marker)
+            if not ready:
+                return trade
+            snapshot = self.state.snapshot()
+        if trade["status"] == "waiting_entry":
+            return await self.check_waiting_entry(trade_id)
+        plan = TradePlan.model_validate(trade["plan"])
+        if trade["entry_operation_id"] in snapshot["operations"]:
+            return await self.refresh_trade(trade_id)
+        parent = trade.get("configuration_parent_id", trade.get("leverage_operation_id", "leverage:" + trade_id))
+        configuration = snapshot["operations"].get(parent, {})
+        if configuration.get("configuration_retry_needed") and configuration["phase"] in ("prepared", "sending", "unknown"):
+            return await self.repair_unsent_configuration(plan, parent)
+        return await self.resume_unsent_admission(snapshot, plan, trade, trade_id)
+
+    def configuration_repair_guard(self, data, plan, parent, child, action, latest_account):
+        current, prior = data["trades"][plan.trade_id], data["operations"][parent]
+        if (prior["wire_action"] != action or Decimal(current["filled_quantity"]) or current.get("orders")
+                or current.get("configuration_parent_id", parent) != parent
+                or current.get("leverage_operation_id", parent) not in (parent, child)
+                or any(key == "entry:" + plan.trade_id or key.startswith("entry:" + plan.trade_id + ":") for key in data["operations"])):
+            raise AqlaError("Configuration correction requires the exact original goal and a completely unsent entry")
+        pending = prior["phase"] in ("prepared", "sending", "unknown")
+        proof = prior.get("configuration_retry_needed")
+        if pending and (not proof or not 0 <= now_ms() - proof[0]["observed_at"] <= 10000):
+            raise TemporaryObservation("account_stale", "configuration")
+        # Only this non-exposure correction may pass its own unresolved
+        # parent. Normal entry admission still sees the complete ledger.
+        basis = {**data, "operations": {key: value for key, value in data["operations"].items() if not pending or key != parent}}
+        self.validate_admission(basis, plan, latest_account, owned=True, allowed_prepared=(child,), allowed_sending=(child,))
+
+
     async def repair_unsent_configuration(self, plan, parent):
         child = "leverage:" + plan.trade_id + ":configuration:1"
         action = {"type": "updateLeverage", "asset": plan.market.asset_id,
                   "isCross": plan.policy.margin_mode == "cross", "leverage": plan.effective_leverage}
         latest_account = None
         def guard(data):
-            current, prior = data["trades"][plan.trade_id], data["operations"][parent]
-            if (prior["wire_action"] != action or Decimal(current["filled_quantity"]) or current.get("orders")
-                    or current.get("configuration_parent_id", parent) != parent
-                    or current.get("leverage_operation_id", parent) not in (parent, child)
-                    or any(key == "entry:" + plan.trade_id or key.startswith("entry:" + plan.trade_id + ":") for key in data["operations"])):
-                raise AqlaError("Configuration correction requires the exact original goal and a completely unsent entry")
-            pending = prior["phase"] in ("prepared", "sending", "unknown")
-            proof = prior.get("configuration_retry_needed")
-            if pending and (not proof or not 0 <= now_ms() - proof[0]["observed_at"] <= 10000):
-                raise TemporaryObservation("account_stale", "configuration")
-            # Only this non-exposure correction may pass its own unresolved
-            # parent. Normal entry admission still sees the complete ledger.
-            basis = {**data, "operations": {key: value for key, value in data["operations"].items() if not pending or key != parent}}
-            self.validate_admission(basis, plan, latest_account, owned=True, allowed_prepared=(child,), allowed_sending=(child,))
+            self.configuration_repair_guard(data, plan, parent, child, action, latest_account)
         async def observe():
             nonlocal latest_account
             await self.exchange.reconcile(parent)
@@ -1247,15 +1321,36 @@ class Trading:
         with order_observations(self.exchange):
             return await self._capture_fills(trade_id, entry_status)
 
-    async def _capture_fills(self, trade_id, entry_status=None):
-        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-        plan = TradePlan.model_validate(trade["plan"])
-        self.assert_plan_binding(self.state.snapshot(), plan)
+    @staticmethod
+    def cached_terminal_order(trade, cloid):
+        fact = trade.get("order_observations", {}).get(cloid, {})
+        if trade.get("lifecycle_version") == 2 and fact.get("status") in TERMINAL_ORDER and fact.get("oid") is not None:
+            return {"status": "order", "order": {"status": fact["status"], "order": {"oid": fact["oid"]}}}
+        return None
+
+
+    async def capture_managed_entry_identities(self, trade, plan, trade_id, entry_status, terminal_cache, observed, mapping):
+        for entry in managed_entries.entry_orders(trade):
+            if entry.get("phase") == "pending" or entry.get("not_sent"):
+                continue
+            status = entry_status if entry["cloid"] == trade["entry_cloid"] else terminal_cache(entry["cloid"]) or await self.order_status(entry["cloid"])
+            observed[entry["cloid"]] = status
+            oid = status.get("order", {}).get("order", {}).get("oid")
+            if oid is not None:
+                mapping[oid] = {"kind": "entry", "entry_role": entry["kind"], "entry_leg": entry["index"]}
+            from .accounting import entry_quantity_evidence
+            confirmed = entry_quantity_evidence(status)
+            if confirmed is not None:
+                def confirm(data, cloid=entry["cloid"], quantity=confirmed):
+                    row = require_first(row for row in data["trades"][trade_id]["entry_orders"] if row["cloid"] == cloid)
+                    row["confirmed_filled"] = quantity
+                    row["phase"] = "terminal"
+                self.state.update(confirm)
+
+
+    async def capture_order_identities(self, trade, plan, trade_id, entry_status):
         def terminal_cache(cloid):
-            fact = trade.get("order_observations", {}).get(cloid, {})
-            if trade.get("lifecycle_version") == 2 and fact.get("status") in TERMINAL_ORDER and fact.get("oid") is not None:
-                return {"status": "order", "order": {"status": fact["status"], "order": {"oid": fact["oid"]}}}
-            return None
+            return self.cached_terminal_order(trade, cloid)
         entry_status = entry_status or terminal_cache(trade["entry_cloid"]) or await self.order_status(trade["entry_cloid"])
         observed = {trade["entry_cloid"]: entry_status}
         mapping = {}
@@ -1263,22 +1358,7 @@ class Trading:
         if entry_oid is not None:
             mapping[entry_oid] = {"kind": "entry"}
         if trade.get("lifecycle_version") == 2:
-            for entry in managed_entries.entry_orders(trade):
-                if entry.get("phase") == "pending" or entry.get("not_sent"):
-                    continue
-                status = entry_status if entry["cloid"] == trade["entry_cloid"] else terminal_cache(entry["cloid"]) or await self.order_status(entry["cloid"])
-                observed[entry["cloid"]] = status
-                oid = status.get("order", {}).get("order", {}).get("oid")
-                if oid is not None:
-                    mapping[oid] = {"kind": "entry", "entry_role": entry["kind"], "entry_leg": entry["index"]}
-                from .monthly import entry_quantity_evidence
-                confirmed = entry_quantity_evidence(status)
-                if confirmed is not None:
-                    def confirm(data, cloid=entry["cloid"], quantity=confirmed):
-                        row = require_first(row for row in data["trades"][trade_id]["entry_orders"] if row["cloid"] == cloid)
-                        row["confirmed_filled"] = quantity
-                        row["phase"] = "terminal"
-                    self.state.update(confirm)
+            await self.capture_managed_entry_identities(trade, plan, trade_id, entry_status, terminal_cache, observed, mapping)
         for order in [*trade["orders"], *trade.get("exit_orders", [])]:
             if order.get("not_sent"):
                 continue
@@ -1287,39 +1367,62 @@ class Trading:
             oid = status.get("order", {}).get("order", {}).get("oid")
             if oid is not None:
                 mapping[oid] = order
+        return entry_status, observed, mapping
+
+
+    @staticmethod
+    def retain_owned_fill(row, trade, mapping, owned):
+        identity = digest([row["oid"], row.get("tid"), row.get("time"), row.get("sz"), row.get("px")])
+        fact = {key: row.get(key) for key in ("oid", "tid", "time", "sz", "px", "fee", "feeToken", "coin")}
+        fact.update(kind=mapping[row["oid"]]["kind"], index=mapping[row["oid"]].get("index"))
+        if trade.get("lifecycle_version") == 2 and fact["kind"] == "entry":
+            fact.update(entry_role=mapping[row["oid"]].get("entry_role", "original"), entry_leg=mapping[row["oid"]].get("entry_leg", 0))
+        if trade.get("lifecycle_version") == 2 and fact["kind"] == "tp" and mapping[row["oid"]].get("pool") == "core":
+            fact["exit_pool"] = "core"
+        if identity in owned and owned[identity] != fact:
+            raise AqlaError("An immutable owned fill changed; reconcile before managing quantities")
+        owned[identity] = fact
+        return identity
+
+
+    async def capture_owned_fill_facts(self, trade, plan, mapping):
         owned = dict(trade.get("fill_events", {}))
         roles = dict(trade.get("fill_execution_roles", {}))
         conflicts = dict(trade.get("fill_execution_role_conflicts", {}))
         for row in await self.fill_history_for_plan(plan):
             if row.get("oid") not in mapping or row.get("coin") != plan.market.symbol:
                 continue
-            identity = digest([row["oid"], row.get("tid"), row.get("time"), row.get("sz"), row.get("px")])
-            fact = {key: row.get(key) for key in ("oid", "tid", "time", "sz", "px", "fee", "feeToken", "coin")}
-            fact.update(kind=mapping[row["oid"]]["kind"], index=mapping[row["oid"]].get("index"))
-            if trade.get("lifecycle_version") == 2 and fact["kind"] == "entry":
-                fact.update(entry_role=mapping[row["oid"]].get("entry_role", "original"), entry_leg=mapping[row["oid"]].get("entry_leg", 0))
-            if trade.get("lifecycle_version") == 2 and fact["kind"] == "tp" and mapping[row["oid"]].get("pool") == "core":
-                fact["exit_pool"] = "core"
-            if identity in owned and owned[identity] != fact:
-                raise AqlaError("An immutable owned fill changed; reconcile before managing quantities")
-            owned[identity] = fact
+            identity = self.retain_owned_fill(row, trade, mapping, owned)
             if all(row.get(key) is not None for key in ("oid", "tid", "time", "sz", "px")):
                 merge_role(roles, conflicts, identity, native_role(getattr(self.exchange.settings, "venue", "hyperliquid"), row))
-        entry_fills = [row for row in owned.values() if row["kind"] == "entry"]
-        total = sum((Decimal(row["sz"]) for row in entry_fills), Decimal(0))
-        cost = sum((Decimal(row["sz"]) * Decimal(row["px"]) for row in entry_fills), Decimal(0))
-        target_fills = [sum((Decimal(row["sz"]) for row in owned.values() if row["kind"] == "tp" and row["index"] == index), Decimal(0)) for index in range(len(plan.take_profits))]
+        return owned, roles, conflicts
+
+
+    @staticmethod
+    def completed_target_prices(trade, plan, target_fills):
         completed_prices = dict(trade.get("completed_target_prices", {}))
         if plan.policy.stop_management == "tp_ladder":
             # Freeze the effective target price before later source updates can change it.
             for index, budget in enumerate(trade.get("target_budgets", [])):
                 if budget is not None and Decimal(budget) > 0 and target_fills[index] >= Decimal(budget):
                     completed_prices.setdefault(str(index), trade.get("targets", plan.take_profits)[index])
+        return completed_prices
+
+
+    def record_owned_fill_totals(self, trade_id, trade, plan, owned, roles, conflicts):
+        entry_fills = [row for row in owned.values() if row["kind"] == "entry"]
+        total = sum((Decimal(row["sz"]) for row in entry_fills), Decimal(0))
+        cost = sum((Decimal(row["sz"]) * Decimal(row["px"]) for row in entry_fills), Decimal(0))
+        target_fills = [sum((Decimal(row["sz"]) for row in owned.values() if row["kind"] == "tp" and row["index"] == index), Decimal(0)) for index in range(len(plan.take_profits))]
+        completed_prices = self.completed_target_prices(trade, plan, target_fills)
         self.patch_trade(trade_id, fill_events=owned, filled_quantity=str(total), tp_filled=[str(size) for size in target_fills],
                     fill_execution_roles=roles, **({"fill_execution_role_conflicts": conflicts} if conflicts else {}),
                     entry_vwap=str(cost / total) if total else trade["entry_vwap"],
                     **({"completed_target_prices": completed_prices} if plan.policy.stop_management == "tp_ladder" else {}))
-        self.observe_orders(trade_id, observed)
+        return total, cost
+
+
+    def record_fill_stop_evidence(self, trade_id, trade, plan, total, observed):
         confirmed_stop = any(order["kind"] == "sl" and observed.get(order["cloid"], {}).get("order", {}).get("status") == "open"
                              and self.stop_matches(observed[order["cloid"]], plan, total, Decimal(trade["stop_price"]))
                              for order in trade["orders"]) if total else False
@@ -1328,29 +1431,45 @@ class Trading:
         from .lifecycle import record_lifecycle
         if total and self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("lifecycle_version") and "entry_fill" not in self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("lifecycle_events", {}):
             self.state.update(lambda data: record_lifecycle(data, trade_id, "entry_fill"))
-        from .monthly import accounting_facts, entry_quantity_evidence
+
+
+    def confirm_managed_fill_quantity(self, trade_id, total):
+        current = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        pending_evidence = False
+        for entry in current["entry_orders"]:
+            if entry.get("not_sent") or entry.get("confirmed_filled") is None:
+                continue
+            oid = current.get("order_observations", {}).get(entry["cloid"], {}).get("oid")
+            entered = sum((Decimal(row["sz"]) for row in current["fill_events"].values() if row["kind"] == "entry" and row["oid"] == oid), Decimal(0))
+            pending_evidence |= entered != Decimal(entry["confirmed_filled"])
+        if pending_evidence:
+            self.patch_trade(trade_id, quantity_evidence_pending=True)
+            raise TemporaryObservation("read_unavailable", "entry_quantity", "transport")
+        confirmed = sum((Decimal(row.get("confirmed_filled") or 0) for row in current["entry_orders"]), Decimal(0)) if managed_entries.entry_final(current) else None
+        self.patch_trade(trade_id, entry_fill_quantity_confirmed=str(confirmed) if confirmed is not None else None)
+        if confirmed is not None and confirmed != total:
+            self.patch_trade(trade_id, quantity_evidence_pending=True)
+            raise TemporaryObservation("read_unavailable", "entry_quantity", "transport")
+        if confirmed is not None:
+            self.patch_trade(trade_id, quantity_evidence_pending=False)
+
+
+    async def _capture_fills(self, trade_id, entry_status=None):
+        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(self.state.snapshot(), plan)
+        entry_status, observed, mapping = await self.capture_order_identities(trade, plan, trade_id, entry_status)
+        owned, roles, conflicts = await self.capture_owned_fill_facts(trade, plan, mapping)
+        total, cost = self.record_owned_fill_totals(trade_id, trade, plan, owned, roles, conflicts)
+        self.observe_orders(trade_id, observed)
+        self.record_fill_stop_evidence(trade_id, trade, plan, total, observed)
+        from .accounting import entry_quantity_evidence
+        from .monthly import accounting_facts
         confirmed_quantity = entry_quantity_evidence(entry_status)
         if confirmed_quantity is not None:
             self.patch_trade(trade_id, entry_fill_quantity_confirmed=confirmed_quantity)
         if trade.get("lifecycle_version") == 2:
-            current = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-            pending_evidence = False
-            for entry in current["entry_orders"]:
-                if entry.get("not_sent") or entry.get("confirmed_filled") is None:
-                    continue
-                oid = current.get("order_observations", {}).get(entry["cloid"], {}).get("oid")
-                entered = sum((Decimal(row["sz"]) for row in current["fill_events"].values() if row["kind"] == "entry" and row["oid"] == oid), Decimal(0))
-                pending_evidence |= entered != Decimal(entry["confirmed_filled"])
-            if pending_evidence:
-                self.patch_trade(trade_id, quantity_evidence_pending=True)
-                raise TemporaryObservation("read_unavailable", "entry_quantity", "transport")
-            confirmed = sum((Decimal(row.get("confirmed_filled") or 0) for row in current["entry_orders"]), Decimal(0)) if managed_entries.entry_final(current) else None
-            self.patch_trade(trade_id, entry_fill_quantity_confirmed=str(confirmed) if confirmed is not None else None)
-            if confirmed is not None and confirmed != total:
-                self.patch_trade(trade_id, quantity_evidence_pending=True)
-                raise TemporaryObservation("read_unavailable", "entry_quantity", "transport")
-            if confirmed is not None:
-                self.patch_trade(trade_id, quantity_evidence_pending=False)
+            self.confirm_managed_fill_quantity(trade_id, total)
         self.patch_trade(trade_id, **accounting_facts(self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]))
         return total, cost
 
@@ -1366,6 +1485,17 @@ class Trading:
         if proposed != previous:
             self.patch_trade(trade_id, order_observations=proposed)
 
+    def validate_owned_exposure(self, observed, owned, signed, plan):
+        if observed > owned or (signed < 0 and plan.side == "long") or (signed > 0 and plan.side == "short" and plan.market.product == "perp"):
+            if getattr(self.exchange.settings, "shared_account", False):
+                raise ExternalInterference("Manual intervention changed this market; Aqla does not manage the mixed position")
+            raise AqlaError("Exchange exposure differs from remaining owned fills; no automatic management")
+        if observed < owned:
+            if getattr(self.exchange.settings, "shared_account", False):
+                raise ExternalInterference("Observed position is smaller than proved own fills; manual intervention requires review")
+            raise AqlaError("Position and owned fills are inconsistent; preserve protection until fresh reconciliation")
+
+
     def owned_remaining(self, trade_id, signed):
         trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
@@ -1377,15 +1507,120 @@ class Trading:
         observed = abs(signed)
         if owned == 0 and entered:
             return Decimal(0)
-        if observed > owned or (signed < 0 and plan.side == "long") or (signed > 0 and plan.side == "short" and plan.market.product == "perp"):
-            if getattr(self.exchange.settings, "shared_account", False):
-                raise ExternalInterference("Manual intervention changed this market; Aqla does not manage the mixed position")
-            raise AqlaError("Exchange exposure differs from remaining owned fills; no automatic management")
-        if observed < owned:
-            if getattr(self.exchange.settings, "shared_account", False):
-                raise ExternalInterference("Observed position is smaller than proved own fills; manual intervention requires review")
-            raise AqlaError("Position and owned fills are inconsistent; preserve protection until fresh reconciliation")
+        self.validate_owned_exposure(observed, owned, signed, plan)
         return observed
+
+    async def effective_stop_coverage(self, trade_id, plan, remaining):
+        current = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        covered = not getattr(self.exchange, "fail_closed_protection", False)
+        if not covered:
+            for order in current["orders"]:
+                if order["kind"] == "sl":
+                    observed = await self.order_status(order["cloid"])
+                    covered |= observed.get("order", {}).get("status") == "open" and self.stop_matches(observed, plan, remaining, Decimal(current["stop_price"]))
+        return current, covered
+
+
+    async def refresh_position_protection(self, trade_id, plan, remaining):
+        if not await self.finalize_backup(trade_id):
+            return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        if not await self.finalize_source_targets(trade_id):
+            return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        await self.validate_actual_entry(trade_id)
+        await self.ensure_protection(trade_id)
+        current, covered = await self.effective_stop_coverage(trade_id, plan, remaining)
+        if not covered and current["status"] not in ("closing", "cleanup", "closed"):
+            raise AqlaError("No confirmed effective stop loss")
+        if covered and current["status"] == "open" and current.get("protection_observation_pending"):
+            self.patch_trade(trade_id, protection_observation_pending=None, waiting_error=None)
+
+
+    def handle_protection_failure(self, trade_id, plan, error):
+        if not getattr(self.exchange, "fail_closed_protection", False) and not set(plan.backup_fields) & {"stop_loss", "take_profits"}:
+            raise error
+        reason = "Protection could not be confirmed; emergency close required: " + (str(error) if isinstance(error, AqlaError) else type(error).__name__)
+        self.patch_trade(trade_id, execution_incident=reason)
+        if hasattr(self.state, "pause_entries"):
+            self.state.pause_entries(reason)
+        else:
+            self.state.update(lambda data: data.update(paused=True))
+
+
+    async def refresh_filled_position(self, trade_id, trade, plan, total, cost, remaining):
+        pending = trade.get("pending_stop_update")
+        closing_pending = trade["status"] == "closing" and pending and pending["phase"] in STOP_UPDATE_ACTIVE
+        self.patch_trade(trade_id, filled_quantity=str(total), remaining_quantity=str(remaining), entry_vwap=str(cost / total),
+                    status="closing" if closing_pending else "open" if trade["status"] == "open" else "protecting")
+        if closing_pending:
+            await self.resume_pending_stop(trade_id)
+            return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        try:
+            return await self.refresh_position_protection(trade_id, plan, remaining)
+        except ExternalInterference:
+            raise
+        except TemporaryObservation as error:
+            self.recovery_checked = False
+            self.patch_trade(trade_id, protection_observation_pending=error.diagnostic(),
+                        waiting_error="Protection observation unavailable; existing orders retained pending reconciliation")
+            raise
+        except StopEvidencePending as error:
+            self.patch_trade(trade_id, status="unknown", waiting_error=str(error))
+            if pending and pending["phase"] in STOP_UPDATE_ACTIVE:
+                self.stop_phase(trade_id, "waiting_fill", str(error))
+            return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        except Exception as error:
+            self.handle_protection_failure(trade_id, plan, error)
+            return await self.close_position(trade_id, Decimal(100), "protection-failure:" + trade_id)
+
+
+    def clear_quantity_evidence(self, trade_id, total):
+        current = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        if (current.get("quantity_evidence_pending") and current.get("entry_fill_quantity_confirmed") is not None
+                and Decimal(current["entry_fill_quantity_confirmed"]) == total):
+            self.patch_trade(trade_id, quantity_evidence_pending=False, waiting_error=None)
+
+
+    async def refresh_unfilled_entry(self, trade_id, plan, stage, total, remaining):
+        if stage == "filled" and not total:
+            self.patch_trade(trade_id, status="unknown", fill_evidence_pending=True)
+        elif stage in TERMINAL_ORDER and not remaining:
+            if not total:
+                self.patch_trade(trade_id, unsent_reason="Entry order terminated without any confirmed fill")
+            self.begin_cleanup(trade_id, "closed" if total else "rejected")
+            await self.finish_cleanup(trade_id)
+        elif remaining and not total:
+            self.patch_trade(trade_id, status="unknown")
+            raise AqlaError("Position exists but its entry fills are not proved; new entries remain blocked")
+        elif now_ms() >= plan.deadline_at and stage == "open":
+            await self.cancel_entry(trade_id)
+            return await self.refresh_trade(trade_id)
+
+
+    async def refresh_legacy_trade(self, trade_id, trade):
+        plan = TradePlan.model_validate(trade["plan"])
+        entry_status = await self.order_status(trade["entry_cloid"])
+        total, cost = await self.capture_fills(trade_id, entry_status)
+        stage = entry_status.get("order", {}).get("status")
+        if total and stage == "open":
+            # Freeze the actual fill budget before installing partial target legs.
+            await self.cancel_entry(trade_id)
+            entry_status = await self.order_status(trade["entry_cloid"])
+            stage = entry_status.get("order", {}).get("status")
+            total, cost = await self.capture_fills(trade_id, entry_status)
+        signed = self.position_size(await self.positions(plan.market), plan.market)
+        remaining = self.owned_remaining(trade_id, signed) if total else abs(signed)
+        self.clear_quantity_evidence(trade_id, total)
+        if total and remaining:
+            result = await self.refresh_filled_position(trade_id, trade, plan, total, cost, remaining)
+            if result is not None:
+                return result
+        else:
+            result = await self.refresh_unfilled_entry(trade_id, plan, stage, total, remaining)
+            if result is not None:
+                return result
+        await self.resume_pending_stop(trade_id)
+        return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+
 
     async def refresh_trade(self, trade_id):
         trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
@@ -1401,85 +1636,37 @@ class Trading:
             return await managed_entries.refresh(self, trade_id)
         if trade["status"] == "cleanup":
             return await self.finish_cleanup(trade_id)
-        plan = TradePlan.model_validate(trade["plan"])
-        entry_status = await self.order_status(trade["entry_cloid"])
-        total, cost = await self.capture_fills(trade_id, entry_status)
-        stage = entry_status.get("order", {}).get("status")
-        if total and stage == "open":
-            # Freeze the actual fill budget before installing partial target legs.
-            await self.cancel_entry(trade_id)
-            entry_status = await self.order_status(trade["entry_cloid"])
-            stage = entry_status.get("order", {}).get("status")
-            total, cost = await self.capture_fills(trade_id, entry_status)
-        signed = self.position_size(await self.positions(plan.market), plan.market)
-        remaining = self.owned_remaining(trade_id, signed) if total else abs(signed)
-        current = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-        if (current.get("quantity_evidence_pending") and current.get("entry_fill_quantity_confirmed") is not None
-                and Decimal(current["entry_fill_quantity_confirmed"]) == total):
-            self.patch_trade(trade_id, quantity_evidence_pending=False, waiting_error=None)
-        if total and remaining:
-            pending = trade.get("pending_stop_update")
-            closing_pending = trade["status"] == "closing" and pending and pending["phase"] in STOP_UPDATE_ACTIVE
-            self.patch_trade(trade_id, filled_quantity=str(total), remaining_quantity=str(remaining), entry_vwap=str(cost / total),
-                        status="closing" if closing_pending else "open" if trade["status"] == "open" else "protecting")
-            if closing_pending:
-                await self.resume_pending_stop(trade_id)
-                return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-            try:
-                if not await self.finalize_backup(trade_id):
-                    return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-                if not await self.finalize_source_targets(trade_id):
-                    return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-                await self.validate_actual_entry(trade_id)
-                await self.ensure_protection(trade_id)
-                current = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-                covered = not getattr(self.exchange, "fail_closed_protection", False)
-                if not covered:
-                    for order in current["orders"]:
-                        if order["kind"] == "sl":
-                            observed = await self.order_status(order["cloid"])
-                            covered |= observed.get("order", {}).get("status") == "open" and self.stop_matches(observed, plan, remaining, Decimal(current["stop_price"]))
-                if not covered and current["status"] not in ("closing", "cleanup", "closed"):
-                    raise AqlaError("No confirmed effective stop loss")
-                if covered and current["status"] == "open" and current.get("protection_observation_pending"):
-                    self.patch_trade(trade_id, protection_observation_pending=None, waiting_error=None)
-            except ExternalInterference:
-                raise
-            except TemporaryObservation as error:
-                self.recovery_checked = False
-                self.patch_trade(trade_id, protection_observation_pending=error.diagnostic(),
-                            waiting_error="Protection observation unavailable; existing orders retained pending reconciliation")
-                raise
-            except StopEvidencePending as error:
-                self.patch_trade(trade_id, status="unknown", waiting_error=str(error))
-                if pending and pending["phase"] in STOP_UPDATE_ACTIVE:
-                    self.stop_phase(trade_id, "waiting_fill", str(error))
-                return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-            except Exception as error:
-                if not getattr(self.exchange, "fail_closed_protection", False) and not set(plan.backup_fields) & {"stop_loss", "take_profits"}:
-                    raise
-                reason = "Protection could not be confirmed; emergency close required: " + (str(error) if isinstance(error, AqlaError) else type(error).__name__)
-                self.patch_trade(trade_id, execution_incident=reason)
-                if hasattr(self.state, "pause_entries"):
-                    self.state.pause_entries(reason)
-                else:
-                    self.state.update(lambda data: data.update(paused=True))
-                return await self.close_position(trade_id, Decimal(100), "protection-failure:" + trade_id)
-        elif stage == "filled" and not total:
-            self.patch_trade(trade_id, status="unknown", fill_evidence_pending=True)
-        elif stage in TERMINAL_ORDER and not remaining:
-            if not total:
-                self.patch_trade(trade_id, unsent_reason="Entry order terminated without any confirmed fill")
-            self.begin_cleanup(trade_id, "closed" if total else "rejected")
-            await self.finish_cleanup(trade_id)
-        elif remaining and not total:
-            self.patch_trade(trade_id, status="unknown")
-            raise AqlaError("Position exists but its entry fills are not proved; new entries remain blocked")
-        elif now_ms() >= plan.deadline_at and stage == "open":
-            await self.cancel_entry(trade_id)
-            return await self.refresh_trade(trade_id)
-        await self.resume_pending_stop(trade_id)
-        return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        return await self.refresh_legacy_trade(trade_id, trade)
+
+    @staticmethod
+    def actual_entry_structure(plan, stop, entry, quote, targets):
+        safe = (stop < min(entry, quote.stop_reference) and all(price > entry for price in targets) if plan.side == "long"
+                else stop > max(entry, quote.stop_reference) and all(price < entry for price in targets))
+        return safe
+
+
+    def other_reserved_risk(self, trade_id):
+        active = [row for identity, row in self.state.read("trades")["trades"].items() if identity != trade_id and row["status"] in OPEN]
+        other_risk = sum((Decimal(row["reserved_risk"]) for row in active), Decimal(0))
+        return other_risk
+
+
+    def actual_entry_limits(self, trade_id, trade, plan, entry, size, stop, targets, account, quote):
+        accepted_equity = Decimal(trade.get("entry_equity_snapshot", {}).get("equity", str(account.equity)))
+        safe = self.actual_entry_structure(plan, stop, entry, quote, targets)
+        notional = entry * size
+        risk = size * (abs(entry - stop) + entry * plan.policy.cost_reserve_bps / 10000)
+        other_risk = self.other_reserved_risk(trade_id)
+        limits = self.state.limits(plan) if hasattr(self.state, "limits") else plan.policy
+        within_entry_band = (plan.entry_timing != "deferred" or
+                             plan.entry_price * (1 - plan.policy.max_slippage_percent / 100) <= entry <= plan.entry_price * (1 + plan.policy.max_slippage_percent / 100))
+        target_sizes = split_targets(size, len(targets), plan.policy, plan.market)
+        targets_feasible = all(amount >= plan.market.min_quantity and amount * price >= plan.market.min_notional for amount, price in zip(target_sizes, targets, strict=True))
+        permitted = (safe and within_entry_band and targets_feasible and notional <= plan.policy.max_notional_usdc and risk <= plan.risk_usdc
+                     and risk <= accepted_equity * plan.policy.risk_percent / 100
+                     and risk + other_risk <= account.equity * limits.max_total_risk_percent / 100)
+        return permitted, notional, risk, accepted_equity
+
 
     async def validate_actual_entry(self, trade_id):
         trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
@@ -1496,21 +1683,7 @@ class Trading:
         targets = [Decimal(price) for price in trade["targets"]]
         account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
         quote = await read_observation(lambda: self.exchange.price_snapshot(plan.market), "price")
-        accepted_equity = Decimal(trade.get("entry_equity_snapshot", {}).get("equity", str(account.equity)))
-        safe = (stop < min(entry, quote.stop_reference) and all(price > entry for price in targets) if plan.side == "long"
-                else stop > max(entry, quote.stop_reference) and all(price < entry for price in targets))
-        notional = entry * size
-        risk = size * (abs(entry - stop) + entry * plan.policy.cost_reserve_bps / 10000)
-        active = [row for identity, row in self.state.read("trades")["trades"].items() if identity != trade_id and row["status"] in OPEN]
-        other_risk = sum((Decimal(row["reserved_risk"]) for row in active), Decimal(0))
-        limits = self.state.limits(plan) if hasattr(self.state, "limits") else plan.policy
-        within_entry_band = (plan.entry_timing != "deferred" or
-                             plan.entry_price * (1 - plan.policy.max_slippage_percent / 100) <= entry <= plan.entry_price * (1 + plan.policy.max_slippage_percent / 100))
-        target_sizes = split_targets(size, len(targets), plan.policy, plan.market)
-        targets_feasible = all(amount >= plan.market.min_quantity and amount * price >= plan.market.min_notional for amount, price in zip(target_sizes, targets, strict=True))
-        permitted = (safe and within_entry_band and targets_feasible and notional <= plan.policy.max_notional_usdc and risk <= plan.risk_usdc
-                     and risk <= accepted_equity * plan.policy.risk_percent / 100
-                     and risk + other_risk <= account.equity * limits.max_total_risk_percent / 100)
+        permitted, notional, risk, accepted_equity = self.actual_entry_limits(trade_id, trade, plan, entry, size, stop, targets, account, quote)
         check = {"phase": "after_fill", "snapshot": quote.model_dump(mode="json"), "entry_vwap": str(entry),
                  "notional": str(notional), "risk": str(risk), "permitted": bool(permitted),
                  "accepted_equity": str(accepted_equity), "observed_equity": str(account.equity)}
@@ -1523,16 +1696,7 @@ class Trading:
             self.patch_trade(trade_id, initial_sl_risk={"amount": str(size * abs(entry - stop)), "entry": str(entry), "stop": str(stop),
                          "quantity": str(size), "currency": plan.market.quote_token, "entry_fingerprint": current["entry_accounting"]["entry_fingerprint"]})
 
-    async def ensure_protection(self, trade_id):
-        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-        plan = TradePlan.model_validate(trade["plan"])
-        self.assert_plan_binding(self.state.snapshot(), plan)
-        remaining = Decimal(trade["remaining_quantity"])
-        if remaining <= 0:
-            return
-        if not await self.finalize_backup(trade_id):
-            return
-        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+    async def ensure_stop_coverage(self, trade_id, trade, plan, remaining):
         status_rows = [(order, await self.order_status(order["cloid"])) for order in trade["orders"] if order["kind"] == "sl"]
         covered = any(row.get("order", {}).get("status") == "open" and self.stop_matches(row, plan, remaining, Decimal(trade["stop_price"])) for _, row in status_rows)
         if trade.get("lifecycle_version") == 2:
@@ -1543,9 +1707,10 @@ class Trading:
             refreshed = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
             if refreshed["status"] in ("protecting", "closing"):
                 return
-        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-        if trade["status"] == "closing":
-            return
+        return True
+
+
+    async def ready_protection_targets(self, trade_id):
         try:
             targets_ready = await self.resume_target_update(trade_id)
         except ExternalInterference:
@@ -1563,24 +1728,29 @@ class Trading:
         if trade.get("suspended_wave_targets"):
             self.patch_trade(trade_id, status="protecting")
             return
-        if not any(order["kind"] == "tp" and not order.get("retired") for order in trade["orders"]):
-            sizes = split_targets(Decimal(trade["remaining_quantity"] if trade.get("lifecycle_version") == 2 else trade["filled_quantity"]), len(plan.take_profits), plan.policy, plan.market)
-            if trade.get("lifecycle_version") == 2 and trade.get("target_budgets"):
-                sizes = [max(Decimal(0), Decimal(budget) - Decimal(spent)) for budget, spent in zip(trade["target_budgets"], trade["tp_filled"], strict=True)]
-            generation = trade.get("managed_target_generation", 0) if trade.get("lifecycle_version") == 2 else 0
-            operation = f"targets:{trade_id}:{generation}"
-            indices = [index for index, size in enumerate(sizes) if size > 0]
-            orders = [self.order(plan, sizes[i], Decimal(trade.get("targets", plan.take_profits)[i]), reduce=True, take_profit=True, cloid=self.exchange.cloid(operation, i)) for i in indices]
-            def stage_initial(state):
-                row = state["trades"][trade_id]
-                row["orders"].extend({"kind": "tp", "cloid": order["c"], "quantity": order["s"], "price": order["p"], "index": i} for i, order in zip(indices, orders, strict=True))
-                if trade.get("lifecycle_version") != 2:
-                    row["target_budgets"] = [str(size) for size in sizes]
-                if previous := row.get("initial_targets"):
-                    row.setdefault("initial_target_history", {})[previous["operation_id"]] = previous
-                row["initial_targets"] = {"operation_id": operation, "action": {"type": "order", "orders": orders, "grouping": "na"}}
-            self.state.update(stage_initial)
-        staged = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("initial_targets")
+        return trade
+
+
+    def stage_initial_targets(self, trade_id, trade, plan):
+        sizes = split_targets(Decimal(trade["remaining_quantity"] if trade.get("lifecycle_version") == 2 else trade["filled_quantity"]), len(plan.take_profits), plan.policy, plan.market)
+        if trade.get("lifecycle_version") == 2 and trade.get("target_budgets"):
+            sizes = [max(Decimal(0), Decimal(budget) - Decimal(spent)) for budget, spent in zip(trade["target_budgets"], trade["tp_filled"], strict=True)]
+        generation = trade.get("managed_target_generation", 0) if trade.get("lifecycle_version") == 2 else 0
+        operation = f"targets:{trade_id}:{generation}"
+        indices = [index for index, size in enumerate(sizes) if size > 0]
+        orders = [self.order(plan, sizes[i], Decimal(trade.get("targets", plan.take_profits)[i]), reduce=True, take_profit=True, cloid=self.exchange.cloid(operation, i)) for i in indices]
+        def stage_initial(state):
+            row = state["trades"][trade_id]
+            row["orders"].extend({"kind": "tp", "cloid": order["c"], "quantity": order["s"], "price": order["p"], "index": i} for i, order in zip(indices, orders, strict=True))
+            if trade.get("lifecycle_version") != 2:
+                row["target_budgets"] = [str(size) for size in sizes]
+            if previous := row.get("initial_targets"):
+                row.setdefault("initial_target_history", {})[previous["operation_id"]] = previous
+            row["initial_targets"] = {"operation_id": operation, "action": {"type": "order", "orders": orders, "grouping": "na"}}
+        self.state.update(stage_initial)
+
+
+    async def dispatch_initial_targets(self, trade_id, plan, staged):
         if staged and staged["operation_id"] not in self.state.read("operations")["operations"]:
             result = await self.exchange.mutate(staged["operation_id"], staged["action"])
             if result["phase"] == "rejected" and "take_profits" in plan.backup_fields and plan.take_profit_execution != "maker_only":
@@ -1589,6 +1759,47 @@ class Trading:
                 self.record_maker_target_rejection(trade_id, plan, result)
                 self.patch_trade(trade_id, status="protecting")
                 return
+        return True
+
+
+    @staticmethod
+    def maker_targets_confirmed(plan, active_targets, observations):
+        confirmed = all(row.get("status") == "order"
+                        and row.get("order", {}).get("order", {}).get("cloid") == order["cloid"]
+                        and row["order"]["order"].get("coin") == plan.market.symbol
+                        and row["order"]["order"].get("side") == ("A" if plan.side == "long" else "B")
+                        and row["order"]["order"].get("reduceOnly") is (plan.market.product == "perp")
+                        and row["order"]["order"].get("isTrigger") is False
+                        and Decimal(row["order"]["order"].get("origSz") or "0") == Decimal(order["quantity"])
+                        for order, row in zip(active_targets, observations, strict=True))
+        return confirmed
+
+
+    async def observe_active_targets(self, trade_id, plan, active_targets, current_operations, active_cloids):
+        observations = [await self.order_status(order["cloid"]) for order in active_targets]
+        if "take_profits" in plan.backup_fields and plan.take_profit_execution != "maker_only" and any(row.get("order", {}).get("status") == "rejected" for row in observations):
+            raise AqlaError("Backup TP could not be installed")
+        if any(row.get("order", {}).get("status") not in {"open", "filled", "triggered"} for row in observations):
+            rejected = {order["cloid"] for order, row in zip(active_targets, observations, strict=True)
+                        if row.get("order", {}).get("status") == "rejected"}
+            for operation in current_operations:
+                self.record_maker_target_rejection(trade_id, plan, operation, rejected_cloids=rejected)
+            self.patch_trade(trade_id, status="protecting")
+            return
+        # An ACK does not resolve a rejection. Only positive observations of
+        # every current own TP identity can resolve the active incident.
+        if plan.take_profit_execution == "maker_only":
+            confirmed = self.maker_targets_confirmed(plan, active_targets, observations)
+            if not confirmed:
+                self.patch_trade(trade_id, status="protecting")
+                return
+            incident = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("maker_target_rejection")
+            if not isinstance(incident, dict) or not active_cloids.intersection(incident["target_cloids"]):
+                self.patch_trade(trade_id, maker_target_rejection=None)
+        return True
+
+
+    async def confirm_active_targets(self, trade_id, plan, staged):
         snapshot = self.state.snapshot()
         trade = snapshot["trades"][trade_id]
         active_targets = [order for order in trade["orders"] if order["kind"] == "tp" and not order.get("retired")]
@@ -1599,33 +1810,48 @@ class Trading:
         for operation in current_operations:
             self.record_maker_target_rejection(trade_id, plan, operation)
         if active_targets:
-            observations = [await self.order_status(order["cloid"]) for order in active_targets]
-            if "take_profits" in plan.backup_fields and plan.take_profit_execution != "maker_only" and any(row.get("order", {}).get("status") == "rejected" for row in observations):
-                raise AqlaError("Backup TP could not be installed")
-            if any(row.get("order", {}).get("status") not in {"open", "filled", "triggered"} for row in observations):
-                rejected = {order["cloid"] for order, row in zip(active_targets, observations, strict=True)
-                            if row.get("order", {}).get("status") == "rejected"}
-                for operation in current_operations:
-                    self.record_maker_target_rejection(trade_id, plan, operation, rejected_cloids=rejected)
-                self.patch_trade(trade_id, status="protecting")
-                return
-            # An ACK does not resolve a rejection. Only positive observations of
-            # every current own TP identity can resolve the active incident.
-            if plan.take_profit_execution == "maker_only":
-                confirmed = all(row.get("status") == "order"
-                                and row.get("order", {}).get("order", {}).get("cloid") == order["cloid"]
-                                and row["order"]["order"].get("coin") == plan.market.symbol
-                                and row["order"]["order"].get("side") == ("A" if plan.side == "long" else "B")
-                                and row["order"]["order"].get("reduceOnly") is (plan.market.product == "perp")
-                                and row["order"]["order"].get("isTrigger") is False
-                                and Decimal(row["order"]["order"].get("origSz") or "0") == Decimal(order["quantity"])
-                                for order, row in zip(active_targets, observations, strict=True))
-                if not confirmed:
-                    self.patch_trade(trade_id, status="protecting")
-                    return
-                incident = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("maker_target_rejection")
-                if not isinstance(incident, dict) or not active_cloids.intersection(incident["target_cloids"]):
-                    self.patch_trade(trade_id, maker_target_rejection=None)
+            return await self.observe_active_targets(trade_id, plan, active_targets, current_operations, active_cloids)
+        return True
+
+
+    async def advance_break_even(self, trade_id, trade, plan):
+        stage = plan.policy.break_even_after_tp
+        if stage is not None:
+            current = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+            budgets = [Decimal(value) if value is not None else Decimal(0) for value in current.get("target_budgets", [])]
+            filled = [Decimal(value) for value in current["tp_filled"]]
+            if stage <= len(budgets) and all(0 < budgets[i] <= filled[i] for i in range(stage)):
+                entry = managed_entries.current_reference(trade)
+                tighter = entry > Decimal(trade["stop_price"]) if plan.side == "long" else entry < Decimal(trade["stop_price"])
+                if tighter:
+                    await self.replace_stop(trade_id, entry, "break-even:" + trade_id + ":" + str(stage))
+
+
+    async def ensure_protection(self, trade_id):
+        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(self.state.snapshot(), plan)
+        remaining = Decimal(trade["remaining_quantity"])
+        if remaining <= 0:
+            return
+        if not await self.finalize_backup(trade_id):
+            return
+        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        if not await self.ensure_stop_coverage(trade_id, trade, plan, remaining):
+            return
+        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        if trade["status"] == "closing":
+            return
+        trade = await self.ready_protection_targets(trade_id)
+        if trade is None:
+            return
+        if not any(order["kind"] == "tp" and not order.get("retired") for order in trade["orders"]):
+            self.stage_initial_targets(trade_id, trade, plan)
+        staged = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("initial_targets")
+        if not await self.dispatch_initial_targets(trade_id, plan, staged):
+            return
+        if not await self.confirm_active_targets(trade_id, plan, staged):
+            return
         self.patch_trade(trade_id, status="open")
         pending = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("pending_stop_update")
         if pending and pending["phase"] in STOP_UPDATE_ACTIVE:
@@ -1633,16 +1859,23 @@ class Trading:
         if plan.policy.stop_management == "tp_ladder":
             await self.advance_stop_ladder(trade_id)
             return
-        stage = plan.policy.break_even_after_tp
-        if stage is not None:
-            current = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-            budgets = [Decimal(value) if value is not None else Decimal(0) for value in current.get("target_budgets", [])]
-            filled = [Decimal(value) for value in current["tp_filled"]]
-            if stage <= len(budgets) and all(budgets[i] > 0 and filled[i] >= budgets[i] for i in range(stage)):
-                entry = managed_entries.current_reference(trade)
-                tighter = entry > Decimal(trade["stop_price"]) if plan.side == "long" else entry < Decimal(trade["stop_price"])
-                if tighter:
-                    await self.replace_stop(trade_id, entry, "break-even:" + trade_id + ":" + str(stage))
+        await self.advance_break_even(trade_id, trade, plan)
+
+    @staticmethod
+    def final_source_target_prices(trade, plan, specification):
+        from .percent_targets import prices
+        reference = specification["reference_entry"] or trade["entry_vwap"]
+        targets = prices(reference, plan.side, plan.market, specification["unit"], specification["values"], specification.get("margin_leverage") if specification["unit"] == "roe_percent" else specification["signal_leverage"])
+        entry = Decimal(trade["entry_vwap"])
+        if any(value <= entry if plan.side == "long" else value >= entry for value in targets):
+            raise AqlaError("Source percentage targets are no longer profitable relative to the executed entry")
+        sizes = split_targets(Decimal(trade["filled_quantity"]), len(targets), plan.policy, plan.market)
+        if any(size < plan.market.min_quantity or size * price < plan.market.min_notional for size, price in zip(sizes, targets, strict=True)):
+            raise AqlaError("Final source percentage TP is below exchange minimum size/notional")
+        final = {**specification, "reference_entry": str(reference), "entry_vwap": trade["entry_vwap"],
+                 "filled_quantity": trade["filled_quantity"], "prices": [str(value) for value in targets], "phase": "applied"}
+        return final
+
 
     async def finalize_source_targets(self, trade_id):
         trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
@@ -1662,19 +1895,57 @@ class Trading:
         trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         if not trade.get("entry_accounting"):
             raise AqlaError("Source percentage targets require confirmed final entry fills")
-        from .percent_targets import prices
-        reference = specification["reference_entry"] or trade["entry_vwap"]
-        targets = prices(reference, plan.side, plan.market, specification["unit"], specification["values"], specification.get("margin_leverage") if specification["unit"] == "roe_percent" else specification["signal_leverage"])
-        entry = Decimal(trade["entry_vwap"])
-        if any(value <= entry if plan.side == "long" else value >= entry for value in targets):
-            raise AqlaError("Source percentage targets are no longer profitable relative to the executed entry")
-        sizes = split_targets(Decimal(trade["filled_quantity"]), len(targets), plan.policy, plan.market)
-        if any(size < plan.market.min_quantity or size * price < plan.market.min_notional for size, price in zip(sizes, targets, strict=True)):
-            raise AqlaError("Final source percentage TP is below exchange minimum size/notional")
-        final = {**specification, "reference_entry": str(reference), "entry_vwap": trade["entry_vwap"],
-                 "filled_quantity": trade["filled_quantity"], "prices": [str(value) for value in targets], "phase": "applied"}
+        final = self.final_source_target_prices(trade, plan, specification)
         self.patch_trade(trade_id, percent_finalization=final, targets=final["prices"])
         return True
+
+    @staticmethod
+    def final_backup_prices(trade, plan, reference):
+        stop, targets = backup_prices(reference, plan.side, plan.market,
+            plan.backup_values.fallback_stop_loss_percent if "stop_loss" in plan.backup_fields else None,
+            selected_targets(plan.backup_values.fallback_take_profit_percentages, plan.policy)[:len(plan.take_profits)] if "take_profits" in plan.backup_fields else (),
+            stop_unit=plan.backup_values.fallback_stop_loss_unit,
+            take_profit_unit=plan.backup_values.fallback_take_profit_unit, leverage=plan.effective_leverage)
+        stop = stop if stop is not None else Decimal(trade["stop_price"])
+        targets = targets if "take_profits" in plan.backup_fields else [Decimal(value) for value in trade["targets"]]
+        if not (stop < reference < min(targets) if plan.side == "long" else stop > reference > max(targets)):
+            raise AqlaError("Final Backup prices have invalid direction")
+        sizes = split_targets(Decimal(trade["filled_quantity"]), len(targets), plan.policy, plan.market)
+        if any(size < plan.market.min_quantity or size * price < plan.market.min_notional for size, price in zip(sizes, targets, strict=True)):
+            raise AqlaError("Final Backup TP is below the exchange minimum")
+        return stop, targets
+
+
+    async def final_backup_risk(self, trade_id, plan, remaining, reference, stop):
+        account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
+        snapshot = self.state.snapshot()
+        limits = self.state.limits(plan) if hasattr(self.state, "limits") else plan.policy
+        others = sum(Decimal(row["reserved_risk"]) for identity, row in snapshot["trades"].items() if identity != trade_id and row["status"] in OPEN)
+        risk = remaining * (abs(reference - stop) + reference * plan.policy.cost_reserve_bps / 10000)
+        if (risk > plan.risk_usdc or risk > account.equity * plan.policy.risk_percent / 100
+                or risk + others > account.equity * limits.max_total_risk_percent / 100
+                or remaining * reference > plan.policy.max_notional_usdc or now_ms() - account.observed_at > 10000
+                or account.position_size != (remaining if plan.side == "long" else -remaining)):
+            raise AqlaError("Final Backup protection exceeds the confirmed risk/notional budget")
+        return risk
+
+
+    async def prepare_final_backup(self, trade_id, plan):
+        await self.cancel_entry(trade_id)
+        await self.capture_fills(trade_id)
+        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        reference = Decimal(trade["entry_vwap"])
+        remaining = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
+        if not remaining:
+            return None
+        stop, targets = self.final_backup_prices(trade, plan, reference)
+        risk = await self.final_backup_risk(trade_id, plan, remaining, reference, stop)
+        final = {"phase": "prepared", "reference_entry": str(reference), "filled_quantity": trade["filled_quantity"], "stop_loss": str(stop),
+                 "take_profits": [str(value) for value in targets], "risk": str(risk), "stop_operation_id": "backup-stop:" + trade_id,
+                 "percentages": plan.backup_values.model_dump(mode="json")}
+        self.patch_trade(trade_id, backup_finalization=final)
+        return final
+
 
     async def finalize_backup(self, trade_id):
         """One durable fill reference, before TP intent construction or SL replacement."""
@@ -1691,39 +1962,9 @@ class Trading:
         if final and final["phase"] == "applied":
             return True
         if final is None:
-            await self.cancel_entry(trade_id)
-            await self.capture_fills(trade_id)
-            trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-            reference = Decimal(trade["entry_vwap"])
-            remaining = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
-            if not remaining:
+            final = await self.prepare_final_backup(trade_id, plan)
+            if final is None:
                 return False
-            stop, targets = backup_prices(reference, plan.side, plan.market,
-                plan.backup_values.fallback_stop_loss_percent if "stop_loss" in plan.backup_fields else None,
-                selected_targets(plan.backup_values.fallback_take_profit_percentages, plan.policy)[:len(plan.take_profits)] if "take_profits" in plan.backup_fields else (),
-                stop_unit=plan.backup_values.fallback_stop_loss_unit,
-                take_profit_unit=plan.backup_values.fallback_take_profit_unit, leverage=plan.effective_leverage)
-            stop = stop if stop is not None else Decimal(trade["stop_price"])
-            targets = targets if "take_profits" in plan.backup_fields else [Decimal(value) for value in trade["targets"]]
-            if not (stop < reference < min(targets) if plan.side == "long" else stop > reference > max(targets)):
-                raise AqlaError("Final Backup prices have invalid direction")
-            sizes = split_targets(Decimal(trade["filled_quantity"]), len(targets), plan.policy, plan.market)
-            if any(size < plan.market.min_quantity or size * price < plan.market.min_notional for size, price in zip(sizes, targets, strict=True)):
-                raise AqlaError("Final Backup TP is below the exchange minimum")
-            account = await read_observation(lambda: self.exchange.account_snapshot(plan.market), "account")
-            snapshot = self.state.snapshot()
-            limits = self.state.limits(plan) if hasattr(self.state, "limits") else plan.policy
-            others = sum(Decimal(row["reserved_risk"]) for identity, row in snapshot["trades"].items() if identity != trade_id and row["status"] in OPEN)
-            risk = remaining * (abs(reference - stop) + reference * plan.policy.cost_reserve_bps / 10000)
-            if (risk > plan.risk_usdc or risk > account.equity * plan.policy.risk_percent / 100
-                    or risk + others > account.equity * limits.max_total_risk_percent / 100
-                    or remaining * reference > plan.policy.max_notional_usdc or now_ms() - account.observed_at > 10000
-                    or account.position_size != (remaining if plan.side == "long" else -remaining)):
-                raise AqlaError("Final Backup protection exceeds the confirmed risk/notional budget")
-            final = {"phase": "prepared", "reference_entry": str(reference), "filled_quantity": trade["filled_quantity"], "stop_loss": str(stop),
-                     "take_profits": [str(value) for value in targets], "risk": str(risk), "stop_operation_id": "backup-stop:" + trade_id,
-                     "percentages": plan.backup_values.model_dump(mode="json")}
-            self.patch_trade(trade_id, backup_finalization=final)
         if "stop_loss" in plan.backup_fields:
             result = await self.replace_stop(trade_id, Decimal(final["stop_loss"]), final["stop_operation_id"], initialize_backup=True)
             if result.get("replacement_unconfirmed") or result.get("already_closed") or self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]["status"] in ("closing", "cleanup", "closed"):
@@ -1731,21 +1972,17 @@ class Trading:
         self.patch_trade(trade_id, targets=final["take_profits"], reserved_risk=final["risk"], backup_finalization={**final, "phase": "applied"})
         return True
 
-    async def advance_stop_ladder(self, trade_id):
-        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-        plan = TradePlan.model_validate(trade["plan"])
+    @staticmethod
+    def reached_stop_stages(trade):
         budgets = [Decimal(value) if value is not None else Decimal(0) for value in trade.get("target_budgets", [])]
         fills = [Decimal(value) for value in trade["tp_filled"]]
         reached = [stage for stage in (1, 3, 4) if stage <= len(budgets) and all(
-            budgets[index] > 0 and fills[index] >= budgets[index] for index in range(stage))]
-        if not reached:
-            return
-        confirmed = trade.get("stop_ladder_stage", 0)
-        intents = trade.get("stop_ladder_intents", {})
-        pending = sorted(int(stage) for stage in intents if int(stage) > confirmed)
-        stage = pending[0] if pending else max(reached)
-        if stage <= confirmed:
-            return
+            0 < budgets[index] <= fills[index] for index in range(stage))]
+        return reached
+
+
+    @staticmethod
+    def stop_ladder_price(trade, stage, intents):
         if str(stage) in intents:
             price = Decimal(intents[str(stage)])
         elif stage == 1:
@@ -1756,6 +1993,22 @@ class Trading:
             if reference is None:
                 raise AqlaError("Completed TP reference is not proved; preserve existing stop")
             price = Decimal(reference)
+        return price
+
+
+    async def advance_stop_ladder(self, trade_id):
+        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        plan = TradePlan.model_validate(trade["plan"])
+        reached = self.reached_stop_stages(trade)
+        if not reached:
+            return
+        confirmed = trade.get("stop_ladder_stage", 0)
+        intents = trade.get("stop_ladder_intents", {})
+        pending = sorted(int(stage) for stage in intents if int(stage) > confirmed)
+        stage = pending[0] if pending else max(reached)
+        if stage <= confirmed:
+            return
+        price = self.stop_ladder_price(trade, stage, intents)
         if str(stage) not in intents:
             self.state.update(lambda data: data["trades"][trade_id].setdefault("stop_ladder_intents", {}).__setitem__(str(stage), str(price)))
         tighter = price > Decimal(trade["stop_price"]) if plan.side == "long" else price < Decimal(trade["stop_price"])
@@ -1867,6 +2120,23 @@ class Trading:
         if confirmed is not None and Decimal(confirmed) != Decimal(trade["filled_quantity"]):
             raise StopEvidencePending("Terminal entry quantity and own fills are not yet reconciled; preserve original protection")
 
+    def accept_stop_update(self, data, trade_id, trade, plan, signal, request, binding):
+        row = data["trades"][trade_id]
+        self.assert_plan_binding(data, plan)
+        if row["management_revision"] != trade["management_revision"] or self.source_revisions(data, signal.source_refs) != request.source_revisions:
+            raise AqlaError("Source or management revision changed before stop acceptance")
+        current = row.get("pending_stop_update")
+        if current and current["phase"] in STOP_UPDATE_ACTIVE:
+            operation = data["operations"].get(current["operation_id"])
+            if current["phase"] == "unknown" or operation and operation.get("outcome") != "not_sent":
+                raise AqlaError("The original stop operation may have been sent; reconcile it first")
+            self.write_stop_phase(data, trade_id, current, "superseded", "A later authorized stop instruction replaced this unsent request")
+        row["management_revision"] = request.management_revision
+        row["pending_stop_update"] = request.model_dump(mode="json", exclude_none=True)
+        data["bindings"][request.operation_id] = binding.model_dump(mode="json")
+        self.write_stop_phase(data, trade_id, row["pending_stop_update"], request.phase)
+
+
     async def queue_stop_update(self, trade_id, event_id, signal, proposed, *, operation_id=None):
         origin = self.state.snapshot()
         source_revisions = self.source_revisions(origin, signal.source_refs)
@@ -1905,20 +2175,7 @@ class Trading:
             management_revision=trade["management_revision"] + 1,
             phase="replacing" if size else "waiting_fill", accepted_at=now_ms())
         def accept(data):
-            row = data["trades"][trade_id]
-            self.assert_plan_binding(data, plan)
-            if row["management_revision"] != trade["management_revision"] or self.source_revisions(data, signal.source_refs) != request.source_revisions:
-                raise AqlaError("Source or management revision changed before stop acceptance")
-            current = row.get("pending_stop_update")
-            if current and current["phase"] in STOP_UPDATE_ACTIVE:
-                operation = data["operations"].get(current["operation_id"])
-                if current["phase"] == "unknown" or operation and operation.get("outcome") != "not_sent":
-                    raise AqlaError("The original stop operation may have been sent; reconcile it first")
-                self.write_stop_phase(data, trade_id, current, "superseded", "A later authorized stop instruction replaced this unsent request")
-            row["management_revision"] = request.management_revision
-            row["pending_stop_update"] = request.model_dump(mode="json", exclude_none=True)
-            data["bindings"][request.operation_id] = binding.model_dump(mode="json")
-            self.write_stop_phase(data, trade_id, row["pending_stop_update"], request.phase)
+            self.accept_stop_update(data, trade_id, trade, plan, signal, request, binding)
         self.state.update(accept)
         if size:
             await self.refresh_trade(trade_id)
@@ -1953,44 +2210,18 @@ class Trading:
         self.write_stop_phase(data, trade_id, current, "superseded", reason)
         row["management_revision"] += 1
 
-    async def resume_pending_stop(self, trade_id):
-        snapshot = self.state.snapshot()
-        trade = snapshot["trades"][trade_id]
-        pending = trade.get("pending_stop_update")
-        if not pending or pending["phase"] not in STOP_UPDATE_ACTIVE:
-            return
-        request = PendingStopUpdate.model_validate(pending)
-        plan = TradePlan.model_validate(trade["plan"])
-        self.assert_plan_binding(snapshot, plan)
-        operation = snapshot["operations"].get(request.operation_id)
-        if trade["status"] not in OPEN:
-            phase = "rejected" if operation and operation["phase"] == "rejected" else "closed_without_application"
-            reason = "Stop replacement was rejected; own exposure closure is confirmed" if phase == "rejected" else "Trade ended without a confirmed application of the requested stop"
-            self.stop_phase(trade_id, phase, reason)
-            return
-        if trade["status"] in ("closing", "cleanup"):
-            self.stop_phase(trade_id, "unknown", "Own exposure closure is not yet confirmed")
-            return
-        binding = snapshot["bindings"].get(request.operation_id)
-        revision_changed = (trade["management_revision"] != request.management_revision
-                            or binding != request.source_binding.model_dump(mode="json")
-                            or self.source_revisions(snapshot, request.source_revisions) != request.source_revisions)
-        if revision_changed:
-            if operation and operation["phase"] in ("prepared", "sending", "unknown"):
-                await self.exchange.reconcile(request.operation_id)
-                operation = self.state.read("operations", entries={"operations": [request.operation_id]})["operations"][request.operation_id]
-                if operation["phase"] in ("prepared", "sending", "unknown"):
-                    self.stop_phase(trade_id, "unknown", "Original stop operation must be reconciled before superseding")
-                    return
-            self.stop_phase(trade_id, "superseded", "Source or independent management revision superseded this request")
-            return
-        if not Decimal(trade["filled_quantity"]):
-            entry = await self.order_status(trade["entry_cloid"])
-            total, _ = await self.capture_fills(trade_id, entry)
-            if not total:
-                if entry.get("order", {}).get("status") in TERMINAL_ORDER:
-                    self.stop_phase(trade_id, "closed_without_application", "Entry ended without any own fill; requested stop was not sent")
+    async def supersede_changed_stop(self, trade_id, request, operation):
+        if operation and operation["phase"] in ("prepared", "sending", "unknown"):
+            await self.exchange.reconcile(request.operation_id)
+            operation = self.state.read("operations", entries={"operations": [request.operation_id]})["operations"][request.operation_id]
+            if operation["phase"] in ("prepared", "sending", "unknown"):
+                self.stop_phase(trade_id, "unknown", "Original stop operation must be reconciled before superseding")
                 return
+        self.stop_phase(trade_id, "superseded", "Source or independent management revision superseded this request")
+        return
+
+
+    async def apply_pending_stop(self, trade_id, request):
         self.stop_phase(trade_id, "replacing")
         try:
             result = await self.replace_stop(trade_id, request.stop, request.operation_id)
@@ -2017,11 +2248,155 @@ class Trading:
         else:
             self.stop_phase(trade_id, "unknown", "Replacement stop is not yet confirmed; original protection retained")
 
-    async def replace_stop(self, trade_id, proposed: Decimal, operation_id=None, *, initialize_backup=False, initial_protection=False):
+
+    async def resume_pending_stop(self, trade_id):
+        snapshot = self.state.snapshot()
+        trade = snapshot["trades"][trade_id]
+        pending = trade.get("pending_stop_update")
+        if not pending or pending["phase"] not in STOP_UPDATE_ACTIVE:
+            return
+        request = PendingStopUpdate.model_validate(pending)
+        plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(snapshot, plan)
+        operation = snapshot["operations"].get(request.operation_id)
+        if trade["status"] not in OPEN:
+            phase = "rejected" if operation and operation["phase"] == "rejected" else "closed_without_application"
+            reason = "Stop replacement was rejected; own exposure closure is confirmed" if phase == "rejected" else "Trade ended without a confirmed application of the requested stop"
+            self.stop_phase(trade_id, phase, reason)
+            return
+        if trade["status"] in ("closing", "cleanup"):
+            self.stop_phase(trade_id, "unknown", "Own exposure closure is not yet confirmed")
+            return
+        binding = snapshot["bindings"].get(request.operation_id)
+        revision_changed = (trade["management_revision"] != request.management_revision
+                            or binding != request.source_binding.model_dump(mode="json")
+                            or self.source_revisions(snapshot, request.source_revisions) != request.source_revisions)
+        if revision_changed:
+            await self.supersede_changed_stop(trade_id, request, operation)
+            return
+        if not Decimal(trade["filled_quantity"]):
+            entry = await self.order_status(trade["entry_cloid"])
+            total, _ = await self.capture_fills(trade_id, entry)
+            if not total:
+                if entry.get("order", {}).get("status") in TERMINAL_ORDER:
+                    self.stop_phase(trade_id, "closed_without_application", "Entry ended without any own fill; requested stop was not sent")
+                return
+        await self.apply_pending_stop(trade_id, request)
+
+    def pending_replacement_stop_guard(self, data, row, plan, stop, operation_id):
+        pending = row.get("pending_stop_update")
+        if pending and pending["operation_id"] == operation_id:
+            if pending["phase"] not in STOP_UPDATE_ACTIVE or pending["management_revision"] != row["management_revision"]:
+                raise AqlaError("Pending stop management revision changed before replacement")
+            if data["bindings"].get(operation_id) != pending["source_binding"] or self.source_revisions(data, pending["source_revisions"]) != pending["source_revisions"]:
+                raise AqlaError("Pending stop source binding changed before replacement")
+            if pending["source_binding"]["kind"] == "break_even" and price_grid(managed_entries.current_reference(row), plan.market, up=plan.side == "long") != stop:
+                raise AqlaError("Break-even reference changed after acceptance; original price identity will not be rebound")
+
+
+    def replacement_stop_guard(self, data, trade_id, plan, stop, remaining, operation_id, entry_fingerprint, initialize_backup, initial_protection):
+        self.assert_plan_binding(data, plan)
+        row = data["trades"][trade_id]
+        if row["status"] not in OPEN or row["status"] in ("closing", "cleanup", "conflicted"):
+            raise AqlaError("Own exposure no longer permits this stop replacement")
+        facts = {key: fill for key, fill in row["fill_events"].items() if fill["kind"] == "entry"}
+        if digest(facts) != entry_fingerprint:
+            raise AqlaError("Own entry facts changed before stop replacement")
+        self.validate_stop_budget(row, plan, stop, remaining, initialize_backup=initialize_backup)
+        if not initial_protection:
+            self.validate_final_stop_quantity(row)
+        self.pending_replacement_stop_guard(data, row, plan, stop, operation_id)
+
+
+    async def accept_replacement_stop(self, trade_id, plan, trade, cloid, remaining, stop, operation_id, result, initialize_backup, initial_protection):
+        pending = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("pending_stop_update")
+        preserve = initialize_backup or initial_protection or pending and pending["operation_id"] == operation_id
+        self.patch_trade(trade_id, stop_price=str(stop), management_revision=trade["management_revision"] + 1,
+                    preserve_pending_stop=preserve)
+        old = [order for order in trade["orders"] if order["kind"] == "sl" and order["cloid"] != cloid]
+        if pending and pending["phase"] in STOP_UPDATE_ACTIVE and (initialize_backup or initial_protection):
+            pending_cloid = self.exchange.cloid(pending["operation_id"])
+            old = [order for order in old if order["cloid"] != pending_cloid]
+        for order in old:
+            await self.exchange.mutate("cancel:" + operation_id + ":" + order["cloid"],
+                                       {"type": "cancelByCloid", "cancels": [{"asset": plan.market.asset_id, "cloid": order["cloid"]}]})
+        self.patch_trade(trade_id, status="open")
+        return {**result, "replacement_confirmed": True}
+
+
+    async def confirm_replacement_stop(self, trade_id, plan, trade, cloid, remaining, stop, operation_id, result, initialize_backup, initial_protection):
+        confirmed = await self.order_status(cloid)
+        if confirmed.get("order", {}).get("status") == "open" and self.stop_matches(confirmed, plan, remaining, stop):
+            return await self.accept_replacement_stop(trade_id, plan, trade, cloid, remaining, stop, operation_id, result, initialize_backup, initial_protection)
+        if result.get("outcome") == "not_sent":
+            return result
+        if result["phase"] == "rejected":
+            if getattr(self.exchange, "fail_closed_protection", False):
+                # Router enables this flag only on its account-scoped state view.
+                cast("VenueState", self.state).pause_entries("Stop loss was rejected; emergency close required")
+            return await self.close_position(trade_id, Decimal(100), operation_id="emergency:" + operation_id)
+        self.patch_trade(trade_id, status="protecting")
+        return {"operation": result, "old_stop_retained": True, "replacement_unconfirmed": True}
+
+
+    @staticmethod
+    def validate_backup_stop_request(trade, plan, proposed, operation_id):
+        final = trade.get("backup_finalization") or {}
+        if (final.get("phase") != "prepared" or "stop_loss" not in plan.backup_fields or str(proposed) != final.get("stop_loss")
+                or operation_id != final.get("stop_operation_id") or any(order["kind"] == "tp" for order in trade["orders"])):
+            raise AqlaError("Only the durable initial Backup SL may be finalized")
+
+
+    async def dispatch_stop_replacement(self, trade_id, trade, plan, remaining, stop, operation_id, initialize_backup, initial_protection):
+        operation_id = operation_id or "stop:" + trade_id + ":" + str(trade["management_revision"])
+        cloid = self.exchange.cloid(operation_id)
+        limit = price_grid(stop * (Decimal("0.95") if plan.side == "long" else Decimal("1.05")), plan.market, up=plan.side == "short")
+        existing = self.state.read("operations")["operations"].get(operation_id)
+        replacement = self.order(plan, remaining, limit, reduce=True, trigger=("sl", stop), cloid=cloid)
+        entry_fingerprint = None
+        def final_guard(data):
+            self.replacement_stop_guard(data, trade_id, plan, stop, remaining, operation_id, entry_fingerprint, initialize_backup, initial_protection)
+        async def live_guard():
+            nonlocal entry_fingerprint
+            await self.capture_fills(trade_id)
+            current_size = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
+            row = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+            if not initial_protection:
+                self.validate_final_stop_quantity(row)
+            self.validate_stop_budget(row, plan, stop, current_size, initialize_backup=initialize_backup)
+            if current_size != remaining:
+                raise AqlaError("Final own position changed; reconcile before stop replacement")
+            entry_fingerprint = digest({key: fill for key, fill in row["fill_events"].items() if fill["kind"] == "entry"})
+            final_guard(self.state.snapshot())
+        if not any(order["cloid"] == cloid for order in trade["orders"]):
+            self.state.update(lambda state: state["trades"][trade_id]["orders"].append(
+                {"kind": "sl", "cloid": cloid, "quantity": str(remaining), "price": str(stop)}))
+        result = existing or await self.exchange.mutate(operation_id, {"type": "order", "orders": [replacement], "grouping": "na"},
+                                                       async_prepare_guard=live_guard, prepare_guard=final_guard)
+        return await self.confirm_replacement_stop(trade_id, plan, trade, cloid, remaining, stop, operation_id, result, initialize_backup, initial_protection)
+
+
+    async def reconcile_stop_replacement(self, operation_id):
         if operation_id:
             operation = self.state.read("operations")["operations"].get(operation_id)
             if operation and operation["phase"] in ("prepared", "sending", "unknown"):
                 await self.exchange.reconcile(operation_id)
+
+
+    async def stop_replacement_position(self, trade_id, plan, stop, initialize_backup, initial_protection):
+        await self.cancel_entry(trade_id, keep_waves=plan.policy.management_mode == "waverider")
+        await self.capture_fills(trade_id)
+        signed = self.position_size(await self.positions(plan.market), plan.market)
+        remaining = self.owned_remaining(trade_id, signed)
+        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        if not initial_protection:
+            self.validate_final_stop_quantity(trade)
+        self.validate_stop_budget(trade, plan, stop, remaining, initialize_backup=initialize_backup)
+        return trade, remaining
+
+
+    async def replace_stop(self, trade_id, proposed: Decimal, operation_id=None, *, initialize_backup=False, initial_protection=False):
+        await self.reconcile_stop_replacement(operation_id)
         trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         plan = TradePlan.model_validate(trade["plan"])
         self.assert_plan_binding(self.state.snapshot(), plan)
@@ -2040,90 +2415,15 @@ class Trading:
                 trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         stop = price_grid(proposed, plan.market, up=plan.side == "long")
         if initialize_backup:
-            final = trade.get("backup_finalization") or {}
-            if (final.get("phase") != "prepared" or "stop_loss" not in plan.backup_fields or str(proposed) != final.get("stop_loss")
-                    or operation_id != final.get("stop_operation_id") or any(order["kind"] == "tp" for order in trade["orders"])):
-                raise AqlaError("Only the durable initial Backup SL may be finalized")
+            self.validate_backup_stop_request(trade, plan, proposed, operation_id)
         self.validate_stop_budget(trade, plan, stop, initialize_backup=initialize_backup)
-        await self.cancel_entry(trade_id, keep_waves=plan.policy.management_mode == "waverider")
-        await self.capture_fills(trade_id)
-        signed = self.position_size(await self.positions(plan.market), plan.market)
-        remaining = self.owned_remaining(trade_id, signed)
-        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-        if not initial_protection:
-            self.validate_final_stop_quantity(trade)
-        self.validate_stop_budget(trade, plan, stop, remaining, initialize_backup=initialize_backup)
+        trade, remaining = await self.stop_replacement_position(trade_id, plan, stop, initialize_backup, initial_protection)
         if not remaining:
             return {"already_closed": True}
         market = await read_observation(lambda: self.exchange.market(plan.market.symbol, plan.market.product), "market")
         if (plan.side == "long" and stop >= market.mid) or (plan.side == "short" and stop <= market.mid):
             return await self.close_position(trade_id, Decimal(100), operation_id="stop-crossed:" + (operation_id or trade_id))
-        operation_id = operation_id or "stop:" + trade_id + ":" + str(trade["management_revision"])
-        cloid = self.exchange.cloid(operation_id)
-        limit = price_grid(stop * (Decimal("0.95") if plan.side == "long" else Decimal("1.05")), plan.market, up=plan.side == "short")
-        existing = self.state.read("operations")["operations"].get(operation_id)
-        replacement = self.order(plan, remaining, limit, reduce=True, trigger=("sl", stop), cloid=cloid)
-        entry_fingerprint = None
-        def final_guard(data):
-            self.assert_plan_binding(data, plan)
-            row = data["trades"][trade_id]
-            if row["status"] not in OPEN or row["status"] in ("closing", "cleanup", "conflicted"):
-                raise AqlaError("Own exposure no longer permits this stop replacement")
-            facts = {key: fill for key, fill in row["fill_events"].items() if fill["kind"] == "entry"}
-            if digest(facts) != entry_fingerprint:
-                raise AqlaError("Own entry facts changed before stop replacement")
-            self.validate_stop_budget(row, plan, stop, remaining, initialize_backup=initialize_backup)
-            if not initial_protection:
-                self.validate_final_stop_quantity(row)
-            pending = row.get("pending_stop_update")
-            if pending and pending["operation_id"] == operation_id:
-                if pending["phase"] not in STOP_UPDATE_ACTIVE or pending["management_revision"] != row["management_revision"]:
-                    raise AqlaError("Pending stop management revision changed before replacement")
-                if data["bindings"].get(operation_id) != pending["source_binding"] or self.source_revisions(data, pending["source_revisions"]) != pending["source_revisions"]:
-                    raise AqlaError("Pending stop source binding changed before replacement")
-                if pending["source_binding"]["kind"] == "break_even" and price_grid(managed_entries.current_reference(row), plan.market, up=plan.side == "long") != stop:
-                    raise AqlaError("Break-even reference changed after acceptance; original price identity will not be rebound")
-        async def live_guard():
-            nonlocal entry_fingerprint
-            await self.capture_fills(trade_id)
-            current_size = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
-            row = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-            if not initial_protection:
-                self.validate_final_stop_quantity(row)
-            self.validate_stop_budget(row, plan, stop, current_size, initialize_backup=initialize_backup)
-            if current_size != remaining:
-                raise AqlaError("Final own position changed; reconcile before stop replacement")
-            entry_fingerprint = digest({key: fill for key, fill in row["fill_events"].items() if fill["kind"] == "entry"})
-            final_guard(self.state.snapshot())
-        if not any(order["cloid"] == cloid for order in trade["orders"]):
-            self.state.update(lambda state: state["trades"][trade_id]["orders"].append(
-                {"kind": "sl", "cloid": cloid, "quantity": str(remaining), "price": str(stop)}))
-        result = existing or await self.exchange.mutate(operation_id, {"type": "order", "orders": [replacement], "grouping": "na"},
-                                                       async_prepare_guard=live_guard, prepare_guard=final_guard)
-        confirmed = await self.order_status(cloid)
-        if confirmed.get("order", {}).get("status") == "open" and self.stop_matches(confirmed, plan, remaining, stop):
-            pending = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("pending_stop_update")
-            preserve = initialize_backup or initial_protection or pending and pending["operation_id"] == operation_id
-            self.patch_trade(trade_id, stop_price=str(stop), management_revision=trade["management_revision"] + 1,
-                        preserve_pending_stop=preserve)
-            old = [order for order in trade["orders"] if order["kind"] == "sl" and order["cloid"] != cloid]
-            if pending and pending["phase"] in STOP_UPDATE_ACTIVE and (initialize_backup or initial_protection):
-                pending_cloid = self.exchange.cloid(pending["operation_id"])
-                old = [order for order in old if order["cloid"] != pending_cloid]
-            for order in old:
-                await self.exchange.mutate("cancel:" + operation_id + ":" + order["cloid"],
-                                           {"type": "cancelByCloid", "cancels": [{"asset": plan.market.asset_id, "cloid": order["cloid"]}]})
-            self.patch_trade(trade_id, status="open")
-            return {**result, "replacement_confirmed": True}
-        if result.get("outcome") == "not_sent":
-            return result
-        if result["phase"] == "rejected":
-            if getattr(self.exchange, "fail_closed_protection", False):
-                # Router enables this flag only on its account-scoped state view.
-                cast("VenueState", self.state).pause_entries("Stop loss was rejected; emergency close required")
-            return await self.close_position(trade_id, Decimal(100), operation_id="emergency:" + operation_id)
-        self.patch_trade(trade_id, status="protecting")
-        return {"operation": result, "old_stop_retained": True, "replacement_unconfirmed": True}
+        return await self.dispatch_stop_replacement(trade_id, trade, plan, remaining, stop, operation_id, initialize_backup, initial_protection)
 
     async def resume_close_intents(self, trade_id):
         trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
@@ -2167,6 +2467,15 @@ class Trading:
         return await self.exchange.mutate(intent["operation_id"], intent["action"],
                                           prepare_guard=lambda data: self.assert_plan_binding(data, plan))
 
+    def stage_close_intent(self, data, plan, trade_id, operation_id, intent, order):
+        self.assert_plan_binding(data, plan)
+        row = data["trades"][trade_id]
+        row.setdefault("close_intents", {})[operation_id] = intent
+        reason = "source_close" if operation_id.startswith("update:") else "operator_close" if operation_id.startswith(("operator:", "operator-close:")) else "protection_failure" if operation_id.startswith(("protection-failure:", "stop-crossed:", "emergency:")) else "unconfirmed"
+        row.setdefault("exit_orders", []).append({"kind": "close", "reason": reason, "cloid": order["c"], "quantity": order["s"], "price": order["p"], "operation_id": operation_id})
+        row.update(status="closing", management_revision=row["management_revision"] + 1)
+
+
     async def close_position(self, trade_id, percent=Decimal(100), operation_id=None, *, quantity=None):
         snapshot = self.state.snapshot()
         trade = snapshot["trades"][trade_id]
@@ -2206,12 +2515,7 @@ class Trading:
         order["t"] = {"limit": {"tif": "Ioc"}}
         intent = {"operation_id": operation_id, "action": {"type": "order", "orders": [order], "grouping": "na"}, "created_at": now_ms()}
         def stage(data):
-            self.assert_plan_binding(data, plan)
-            row = data["trades"][trade_id]
-            row.setdefault("close_intents", {})[operation_id] = intent
-            reason = "source_close" if operation_id.startswith("update:") else "operator_close" if operation_id.startswith(("operator:", "operator-close:")) else "protection_failure" if operation_id.startswith(("protection-failure:", "stop-crossed:", "emergency:")) else "unconfirmed"
-            row.setdefault("exit_orders", []).append({"kind": "close", "reason": reason, "cloid": order["c"], "quantity": order["s"], "price": order["p"], "operation_id": operation_id})
-            row.update(status="closing", management_revision=row["management_revision"] + 1)
+            self.stage_close_intent(data, plan, trade_id, operation_id, intent, order)
         self.state.update(stage)
         return await self.dispatch_close_intent(trade_id, intent)
 
@@ -2280,6 +2584,18 @@ class Trading:
         await self.resume_pending_stop(trade_id)
         return self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
 
+    @staticmethod
+    def same_update_symbol(trade, signal):
+        named = Hyperliquid.canonical_symbol(signal.symbol) if trade["plan"].get("exchange", "hyperliquid") == "hyperliquid" else signal.symbol
+        if trade["plan"]["market"]["product"] == "perp" and ":" not in named:
+            named = named.upper().removesuffix(".P")
+            for suffix in ("/USDT", "/USDC", "USDT", "USDC"):
+                if named.endswith(suffix):
+                    named = named[:-len(suffix)]
+                    break
+        return trade["plan"]["market"]["symbol"] == named
+
+
     def update_candidates(self, event_id, signal: Interpretation):
         context = self.context(event_id)
         snapshot = self.state.snapshot()
@@ -2291,14 +2607,7 @@ class Trading:
             trades = [trade for trade in trades if trade["trade_id"] == binding["trade_id"]]
         if signal.symbol:
             def same_symbol(trade):
-                named = Hyperliquid.canonical_symbol(signal.symbol) if trade["plan"].get("exchange", "hyperliquid") == "hyperliquid" else signal.symbol
-                if trade["plan"]["market"]["product"] == "perp" and ":" not in named:
-                    named = named.upper().removesuffix(".P")
-                    for suffix in ("/USDT", "/USDC", "USDT", "USDC"):
-                        if named.endswith(suffix):
-                            named = named[:-len(suffix)]
-                            break
-                return trade["plan"]["market"]["symbol"] == named
+                return self.same_update_symbol(trade, signal)
             trades = [trade for trade in trades if same_symbol(trade)]
         if signal.side:
             trades = [trade for trade in trades if trade["plan"]["side"] == signal.side]
@@ -2512,92 +2821,83 @@ class Trading:
             raise AqlaError("Targets must be strictly ordered on the profitable side of the actual entry")
         return target_prices
 
-    async def replace_targets(self, trade_id, prices, operation_id, source_tp=None):
-        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-        if trade.get("suspended_wave_targets"):
-            raise AqlaError("Optional Waverider exit must be reconciled before target replacement")
-        plan = TradePlan.model_validate(trade["plan"])
-        self.assert_plan_binding(self.state.snapshot(), plan)
-        target_prices = self.validate_targets(trade, plan, prices)
-        prior = self.state.read("operations")["operations"].get(operation_id)
-        staged = trade.get("target_updates", {}).get(operation_id)
-        if prior and staged is None:
-            return prior
-        if staged is None:
-            request = await self.management_stop_preflight(trade_id, operation_id)
-            if request:
-                self.state.update(lambda data: self.supersede_stop_for_management(data, trade_id, request,
-                    "An authorized target update replaced this unsent stop request"))
-            staged = {"prices": [str(price) for price in target_prices],
-                      "original_orders": [order for order in trade["orders"] if order["kind"] == "tp" and not order.get("retired")],
-                      "action": None, "source_tp": source_tp, "completed": False}
-            def accept(data):
-                row = data["trades"][trade_id]
-                previous = self.pending_target_identity(data, row)
-                if previous and previous != operation_id:
-                    old = row["target_updates"][previous]
-                    old["superseded"] = True
-                    operation = data["operations"].get(previous)
-                    if old.get("action") is not None and (operation is None or operation.get("outcome") == "not_sent"):
-                        unsent = {order["c"] for order in old["action"]["orders"]}
-                        for order in row["orders"]:
-                            if order["cloid"] in unsent:
-                                order["retired"] = True
-                        staged["original_orders"] = old["original_orders"]
-                row.setdefault("target_updates", {})[operation_id] = staged
-                row["pending_target_update"] = operation_id
+    def accept_target_update(self, data, trade_id, operation_id, staged):
+        row = data["trades"][trade_id]
+        previous = self.pending_target_identity(data, row)
+        if previous and previous != operation_id:
+            old = row["target_updates"][previous]
+            old["superseded"] = True
+            operation = data["operations"].get(previous)
+            if old.get("action") is not None and (operation is None or operation.get("outcome") == "not_sent"):
+                unsent = {order["c"] for order in old["action"]["orders"]}
+                for order in row["orders"]:
+                    if order["cloid"] in unsent:
+                        order["retired"] = True
+                staged["original_orders"] = old["original_orders"]
+        row.setdefault("target_updates", {})[operation_id] = staged
+        row["pending_target_update"] = operation_id
+        row["management_revision"] += 1
+        staged["accepted_revision"] = row["management_revision"]
+
+
+    @staticmethod
+    def complete_target_update(data, trade_id, operation_id, result):
+        row = data["trades"][trade_id]
+        saved = row["target_updates"][operation_id]
+        if not saved.get("completed"):
+            saved["completed"] = True
+            saved["rejected"] = result.get("phase") == "rejected"
+            if ("accepted_revision" not in saved and row.get("pending_target_update") in (None, operation_id)
+                    and not saved.get("superseded")):
+                pending = row.get("pending_stop_update")
+                if (pending and pending["phase"] in STOP_UPDATE_ACTIVE
+                        and pending["management_revision"] == row["management_revision"]
+                        and data["bindings"].get(pending["operation_id"]) == pending["source_binding"]):
+                    pending["management_revision"] += 1
                 row["management_revision"] += 1
-                staged["accepted_revision"] = row["management_revision"]
-            self.state.update(accept)
-        elif staged["prices"] != [str(price) for price in target_prices]:
-            raise AqlaError("Target update ID already identifies different prices")
-        elif trade.get("pending_target_update") not in (None, operation_id):
-            return {"target_update_superseded": True}
+        if row.get("pending_target_update") == operation_id:
+            row.pop("pending_target_update")
 
-        def finish(result):
-            self.record_maker_target_rejection(trade_id, plan, result)
-            if result.get("phase") in ("acknowledged", "reconciled", "rejected") or result.get("no_unfilled_targets"):
-                def complete(data):
-                    row = data["trades"][trade_id]
-                    saved = row["target_updates"][operation_id]
-                    if not saved.get("completed"):
-                        saved["completed"] = True
-                        saved["rejected"] = result.get("phase") == "rejected"
-                        if ("accepted_revision" not in saved and row.get("pending_target_update") in (None, operation_id)
-                                and not saved.get("superseded")):
-                            pending = row.get("pending_stop_update")
-                            if (pending and pending["phase"] in STOP_UPDATE_ACTIVE
-                                    and pending["management_revision"] == row["management_revision"]
-                                    and data["bindings"].get(pending["operation_id"]) == pending["source_binding"]):
-                                pending["management_revision"] += 1
-                            row["management_revision"] += 1
-                    if row.get("pending_target_update") == operation_id:
-                        row.pop("pending_target_update")
-                self.state.update(complete)
-            return result
 
-        expected_action = staged["action"]
-        def guard(data):
-            row = data["trades"][trade_id]
-            self.assert_plan_binding(data, plan)
-            if (row["status"] not in ("open", "protecting")
-                    or row.get("pending_target_update") not in (None, operation_id)
-                    or row["target_updates"][operation_id].get("completed") or row["target_updates"][operation_id].get("superseded")):
-                raise AqlaError("Target replacement is no longer the active own management intent")
-            active = {order["cloid"] for order in row["orders"] if order["kind"] == "tp" and not order.get("retired")}
-            action = row["target_updates"][operation_id]["action"]
-            if action is None or action != expected_action or any(order["c"] not in active for order in action["orders"]):
-                raise AqlaError("Target replacement generation was superseded")
-            if sum(Decimal(order["s"]) for order in action["orders"]) > Decimal(row["remaining_quantity"]):
-                raise AqlaError("Saved target replacement exceeds proved own remaining quantity")
+    def finish_target_update(self, result, trade_id, plan, operation_id):
+        self.record_maker_target_rejection(trade_id, plan, result)
+        if result.get("phase") in ("acknowledged", "reconciled", "rejected") or result.get("no_unfilled_targets"):
+            def complete(data):
+                self.complete_target_update(data, trade_id, operation_id, result)
+            self.state.update(complete)
+        return result
 
-        if prior:
-            return finish(prior)
-        if staged.get("completed"):
-            return {"no_unfilled_targets": True}
-        if staged["action"] is not None:
-            result = await self.exchange.mutate(operation_id, staged["action"], prepare_guard=guard) if staged["action"]["orders"] else {"no_unfilled_targets": True}
-            return finish(result)
+
+    def target_replacement_guard(self, data, trade_id, plan, operation_id, expected_action):
+        row = data["trades"][trade_id]
+        self.assert_plan_binding(data, plan)
+        if (row["status"] not in ("open", "protecting")
+                or row.get("pending_target_update") not in (None, operation_id)
+                or row["target_updates"][operation_id].get("completed") or row["target_updates"][operation_id].get("superseded")):
+            raise AqlaError("Target replacement is no longer the active own management intent")
+        active = {order["cloid"] for order in row["orders"] if order["kind"] == "tp" and not order.get("retired")}
+        action = row["target_updates"][operation_id]["action"]
+        if action is None or action != expected_action or any(order["c"] not in active for order in action["orders"]):
+            raise AqlaError("Target replacement generation was superseded")
+        if sum(Decimal(order["s"]) for order in action["orders"]) > Decimal(row["remaining_quantity"]):
+            raise AqlaError("Saved target replacement exceeds proved own remaining quantity")
+
+
+    async def replacement_target_budgets(self, trade_id, plan, trade):
+        current = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
+        budgets = [Decimal(value) for value in trade.get("target_budgets", plan.tp_quantities)]
+        consumed = [Decimal(value) for value in trade["tp_filled"]]
+        outstanding = [max(Decimal(0), budget - spent) for budget, spent in zip(budgets, consumed, strict=True)]
+        total_outstanding = sum(outstanding)
+        if total_outstanding > current:
+            outstanding = [quantity_grid(size * current / total_outstanding, plan.market) for size in outstanding]
+            live_indices = [i for i, size in enumerate(outstanding) if size > 0]
+            if live_indices:
+                outstanding[live_indices[-1]] += current - sum(outstanding)
+        return current, consumed, outstanding
+
+
+    async def replacement_target_orders(self, trade_id, staged, plan, target_prices, operation_id):
         old_orders = staged["original_orders"]
         cancels = [{"asset": plan.market.asset_id, "cloid": order["cloid"]} for order in old_orders]
         if cancels:
@@ -2612,16 +2912,7 @@ class Trading:
                 raise AqlaError("Old target cancellation is not confirmed")
             if status["order"]["status"] != "filled":
                 unfilled.append(order)
-        current = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
-        budgets = [Decimal(value) for value in trade.get("target_budgets", plan.tp_quantities)]
-        consumed = [Decimal(value) for value in trade["tp_filled"]]
-        outstanding = [max(Decimal(0), budget - spent) for budget, spent in zip(budgets, consumed, strict=True)]
-        total_outstanding = sum(outstanding)
-        if total_outstanding > current:
-            outstanding = [quantity_grid(size * current / total_outstanding, plan.market) for size in outstanding]
-            live_indices = [i for i, size in enumerate(outstanding) if size > 0]
-            if live_indices:
-                outstanding[live_indices[-1]] += current - sum(outstanding)
+        current, consumed, outstanding = await self.replacement_target_budgets(trade_id, plan, trade)
         quantity_left = current
         new = []
         for index in sorted({order["index"] for order in unfilled}):
@@ -2631,35 +2922,92 @@ class Trading:
             price = target_prices[index]
             new.append((index, self.order(plan, size, price, reduce=True, take_profit=True, cloid=self.exchange.cloid(operation_id, index))))
             quantity_left -= size
+        return consumed, outstanding, new
 
+
+    @staticmethod
+    def record_target_generation(data, trade_id, operation_id, staged, new, target_prices, consumed, outstanding):
+        row = data["trades"][trade_id]
+        if row.get("pending_target_update") not in (None, operation_id):
+            raise AqlaError("Target replacement generation was superseded before staging")
+        if staged.get("source_tp") is not None:
+            row["source_tp_override"] = staged["source_tp"]
+        for old in row["orders"]:
+            if old["kind"] == "tp":
+                old["retired"] = True
+        row["orders"].extend({"kind": "tp", "cloid": order["c"], "quantity": order["s"], "price": order["p"], "index": index} for index, order in new)
+        row["targets"] = [str(price) for price in target_prices]
+        row["target_budgets"] = [str(spent + future) for spent, future in zip(consumed, outstanding, strict=True)]
+        row["target_updates"][operation_id]["action"] = {"type": "order", "orders": [order for _, order in new], "grouping": "na"}
+
+
+    async def stage_target_update(self, trade_id, operation_id, target_prices, source_tp, trade):
+        request = await self.management_stop_preflight(trade_id, operation_id)
+        if request:
+            self.state.update(lambda data: self.supersede_stop_for_management(data, trade_id, request,
+                "An authorized target update replaced this unsent stop request"))
+        staged = {"prices": [str(price) for price in target_prices],
+                  "original_orders": [order for order in trade["orders"] if order["kind"] == "tp" and not order.get("retired")],
+                  "action": None, "source_tp": source_tp, "completed": False}
+        def accept(data):
+            self.accept_target_update(data, trade_id, operation_id, staged)
+        self.state.update(accept)
+        return staged
+
+
+    async def replace_targets(self, trade_id, prices, operation_id, source_tp=None):
+        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        if trade.get("suspended_wave_targets"):
+            raise AqlaError("Optional Waverider exit must be reconciled before target replacement")
+        plan = TradePlan.model_validate(trade["plan"])
+        self.assert_plan_binding(self.state.snapshot(), plan)
+        target_prices = self.validate_targets(trade, plan, prices)
+        prior = self.state.read("operations")["operations"].get(operation_id)
+        staged = trade.get("target_updates", {}).get(operation_id)
+        if prior and staged is None:
+            return prior
+        if staged is None:
+            staged = await self.stage_target_update(trade_id, operation_id, target_prices, source_tp, trade)
+        elif staged["prices"] != [str(price) for price in target_prices]:
+            raise AqlaError("Target update ID already identifies different prices")
+        elif trade.get("pending_target_update") not in (None, operation_id):
+            return {"target_update_superseded": True}
+
+        def finish(result):
+            return self.finish_target_update(result, trade_id, plan, operation_id)
+        expected_action = staged["action"]
+        def guard(data):
+            self.target_replacement_guard(data, trade_id, plan, operation_id, expected_action)
+        if prior:
+            return finish(prior)
+        if staged.get("completed"):
+            return {"no_unfilled_targets": True}
+        if staged["action"] is not None:
+            result = await self.exchange.mutate(operation_id, staged["action"], prepare_guard=guard) if staged["action"]["orders"] else {"no_unfilled_targets": True}
+            return finish(result)
+        consumed, outstanding, new = await self.replacement_target_orders(trade_id, staged, plan, target_prices, operation_id)
         def record(data):
-            row = data["trades"][trade_id]
-            if row.get("pending_target_update") not in (None, operation_id):
-                raise AqlaError("Target replacement generation was superseded before staging")
-            if staged.get("source_tp") is not None:
-                row["source_tp_override"] = staged["source_tp"]
-            for old in row["orders"]:
-                if old["kind"] == "tp":
-                    old["retired"] = True
-            row["orders"].extend({"kind": "tp", "cloid": order["c"], "quantity": order["s"], "price": order["p"], "index": index} for index, order in new)
-            row["targets"] = [str(price) for price in target_prices]
-            row["target_budgets"] = [str(spent + future) for spent, future in zip(consumed, outstanding, strict=True)]
-            row["target_updates"][operation_id]["action"] = {"type": "order", "orders": [order for _, order in new], "grouping": "na"}
-
+            self.record_target_generation(data, trade_id, operation_id, staged, new, target_prices, consumed, outstanding)
         self.state.update(record)
         expected_action = {"type": "order", "orders": [order for _, order in new], "grouping": "na"}
         result = await self.exchange.mutate(operation_id, expected_action, prepare_guard=guard) if new else {"no_unfilled_targets": True}
         return finish(result)
 
     @staticmethod
+    def legacy_pending_targets(snapshot, trade):
+        active = {order["cloid"] for order in trade["orders"] if order["kind"] == "tp" and not order.get("retired")}
+        legacy = [key for key, saved in trade.get("target_updates", {}).items()
+            if key not in snapshot["operations"] and not saved.get("completed") and not saved.get("superseded") and
+            (any(order["c"] in active for order in (saved.get("action") or {}).get("orders", []))
+             or saved.get("action") is None and {order["cloid"] for order in saved["original_orders"]} == active)]
+        return legacy
+
+
+    @staticmethod
     def pending_target_identity(snapshot, trade):
         identity = trade.get("pending_target_update")
         if identity is None:
-            active = {order["cloid"] for order in trade["orders"] if order["kind"] == "tp" and not order.get("retired")}
-            legacy = [key for key, saved in trade.get("target_updates", {}).items()
-                if key not in snapshot["operations"] and not saved.get("completed") and not saved.get("superseded") and
-                (any(order["c"] in active for order in (saved.get("action") or {}).get("orders", []))
-                 or saved.get("action") is None and {order["cloid"] for order in saved["original_orders"]} == active)]
+            legacy = Trading.legacy_pending_targets(snapshot, trade)
             if not legacy:
                 return None
             if len(legacy) != 1:
@@ -2731,9 +3079,8 @@ class Trading:
         for operation_id, row in snapshot["operations"].items():
             if row["phase"] in ("prepared", "sending", "unknown"):
                 try:
-                    async with self.lock.work(0):
-                        async with asyncio.timeout(getattr(self, "recovery_packet_timeout", 40)):
-                            reports.append(await self.exchange.reconcile(operation_id))
+                    async with self.lock.work(0), asyncio.timeout(getattr(self, 'recovery_packet_timeout', 40)):
+                        reports.append(await self.exchange.reconcile(operation_id))
                 except Exception:
                     reports.append({"operation_id": operation_id, "error": "Exact operation reconciliation is unavailable"})
         trades = list(self.state.read("trades")["trades"].items())
@@ -2751,11 +3098,10 @@ class Trading:
             def save_cursor(part, next_id=next_id):
                 part["cursors"][cursor_key] = next_id
             try:
-                async with self.lock.work(20):
-                    async with asyncio.timeout(getattr(self, "recovery_packet_timeout", 40)):
-                        trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"].get(trade_id)
-                        if trade:
-                            reports.extend(await self._recover_trade(trade_id, trade))
+                async with self.lock.work(20), asyncio.timeout(getattr(self, 'recovery_packet_timeout', 40)):
+                    trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"].get(trade_id)
+                    if trade:
+                        reports.extend(await self._recover_trade(trade_id, trade))
             except TimeoutError:
                 root.update_metadata_if_changed(("cursors",), save_cursor)
                 reports.append({"trade_id": trade_id, "error": "Trade reconciliation packet timed out; existing protection retained"})
@@ -2770,6 +3116,61 @@ class Trading:
                                  and not any(row.get("protection_observation_pending") for row in self.state.read("trades")["trades"].values() if row["status"] in OPEN))
         return reports
 
+    async def recover_conflicted_trade(self, trade_id, trade, reports):
+        from .conflict_review import commit_conflict, observe_conflict
+        try:
+            review, evidence = await observe_conflict(self, trade_id)
+            if not review["resolvable"]:
+                reports.append({"trade_id": trade_id, "market_conflict": True, "market": trade['plan']['market']['symbol']})
+                return None
+            root = getattr(self.state, "root", self.state)
+            root.update(lambda data, identity=trade_id, fact=review, proof=evidence: commit_conflict(self, data, identity, fact, proof))
+            await self.resume_pending_stop(trade_id)
+            reports.append({"trade_id": trade_id, "conflict_resolved": True})
+            trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+        except Exception:
+            reports.append({"trade_id": trade_id, "error": "Conflict closure reconciliation is unavailable"})
+            return None
+        return trade
+
+
+    async def refresh_recovery_state(self, trade_id, trade, reports):
+        if trade["status"] == "cleanup":
+            reports.append(await self.finish_cleanup(trade_id))
+        elif trade["status"] == "waiting_entry":
+            await self.check_waiting_entry(trade_id)
+        elif trade.get("observation_retry") or trade["entry_operation_id"] not in self.state.read("operations")["operations"]:
+            reports.append(await self.resume_unsent_entry(trade_id))
+        else:
+            reports.append(await self.refresh_trade(trade_id))
+
+
+    async def recover_open_trade(self, trade_id, trade, reports):
+        try:
+            if trade.get("lifecycle_version") == 2:
+                reports.append(await self.refresh_trade(trade_id))
+                return True
+            current = self.state.snapshot()
+            entry = current["operations"].get(trade["entry_operation_id"], {})
+            if entry.get("phase") == "rejected" and entry.get("outcome") == "not_sent" and self.entry_not_sent(current, trade):
+                try:
+                    self.raise_temporary_not_sent(entry)
+                except TemporaryObservation as error:
+                    if not trade.get("observation_retry") or trade["observation_retry"].get("attempt_inflight"):
+                        trade = self.retain_observation_retry(trade["plan"]["plan_id"], error)
+                else:
+                    self.patch_trade(trade_id, status="rejected", reserved_risk="0", orders=[],
+                                unsent_reason=entry.get("result", {}).get("error", "Entry guard rejected before exchange transport"),
+                                entry_diagnostic=entry.get("result", {}).get("diagnostic", {}))
+                    return True
+            await self.refresh_recovery_state(trade_id, trade, reports)
+        except ExternalInterference as error:
+            self.patch_trade(trade_id, status="conflicted", external_conflict=str(error))
+            reports.append({"trade_id": trade_id, "market_conflict": True, "market": trade['plan']['market']['symbol']})
+        except Exception as error:
+            reports.append({"trade_id": trade_id, "error": str(error) if isinstance(error, AqlaError) else "Trade reconciliation is unavailable"})
+
+
     async def _recover_trade(self, trade_id, trade):
         reports = []
         try:
@@ -2781,51 +3182,14 @@ class Trading:
             self.begin_cleanup(trade_id, trade["status"])
             trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         if trade["status"] == "conflicted":
-            from .conflict_review import commit_conflict, observe_conflict
-            try:
-                review, evidence = await observe_conflict(self, trade_id)
-                if not review["resolvable"]:
-                    reports.append({"trade_id": trade_id, "market_conflict": True, "market": trade['plan']['market']['symbol']})
-                    return reports
-                root = getattr(self.state, "root", self.state)
-                root.update(lambda data, identity=trade_id, fact=review, proof=evidence: commit_conflict(self, data, identity, fact, proof))
-                await self.resume_pending_stop(trade_id)
-                reports.append({"trade_id": trade_id, "conflict_resolved": True})
-                trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-            except Exception:
-                reports.append({"trade_id": trade_id, "error": "Conflict closure reconciliation is unavailable"})
+            trade = await self.recover_conflicted_trade(trade_id, trade, reports)
+            if trade is None:
                 return reports
-        if trade["status"] in OPEN:
-            try:
-                if trade.get("lifecycle_version") == 2:
-                    reports.append(await self.refresh_trade(trade_id))
-                    return reports
-                current = self.state.snapshot()
-                entry = current["operations"].get(trade["entry_operation_id"], {})
-                if entry.get("phase") == "rejected" and entry.get("outcome") == "not_sent" and self.entry_not_sent(current, trade):
-                    try:
-                        self.raise_temporary_not_sent(entry)
-                    except TemporaryObservation as error:
-                        if not trade.get("observation_retry") or trade["observation_retry"].get("attempt_inflight"):
-                            trade = self.retain_observation_retry(trade["plan"]["plan_id"], error)
-                    else:
-                        self.patch_trade(trade_id, status="rejected", reserved_risk="0", orders=[],
-                                    unsent_reason=entry.get("result", {}).get("error", "Entry guard rejected before exchange transport"),
-                                    entry_diagnostic=entry.get("result", {}).get("diagnostic", {}))
-                        return reports
-                if trade["status"] == "cleanup":
-                    reports.append(await self.finish_cleanup(trade_id))
-                elif trade["status"] == "waiting_entry":
-                    await self.check_waiting_entry(trade_id)
-                elif trade.get("observation_retry") or trade["entry_operation_id"] not in self.state.read("operations")["operations"]:
-                    reports.append(await self.resume_unsent_entry(trade_id))
-                else:
-                    reports.append(await self.refresh_trade(trade_id))
-            except ExternalInterference as error:
-                self.patch_trade(trade_id, status="conflicted", external_conflict=str(error))
-                reports.append({"trade_id": trade_id, "market_conflict": True, "market": trade['plan']['market']['symbol']})
-            except Exception as error:
-                reports.append({"trade_id": trade_id, "error": str(error) if isinstance(error, AqlaError) else "Trade reconciliation is unavailable"})
+        if (
+            (trade['status'] in OPEN)
+            and (await self.recover_open_trade(trade_id, trade, reports))
+        ):
+            return reports
         if self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]["status"] in ("closed", "rejected", "cancelled"):
             try:
                 if not await self.resume_target_update(trade_id):

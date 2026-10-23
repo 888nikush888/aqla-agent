@@ -20,14 +20,21 @@ def exit_reason(trade, fill) -> tuple[str, str]:
     return "unconfirmed", "Grund nicht vollständig belegt"
 
 
-def close_reason(trade):
+def proved_closure_exits(trade):
     fills = list(trade.get("fill_events", {}).values())
     exits = [row for row in fills if row["kind"] != "entry"]
     entered = sum((Decimal(row["sz"]) for row in fills if row["kind"] == "entry"), Decimal(0))
     exited = sum((Decimal(row["sz"]) for row in exits), Decimal(0))
     if not entered or exited != entered or not exits:
-        return {"kind": "unconfirmed", "label": "Grund nicht vollständig belegt"}
+        return None
     if any(not isinstance(row.get("time"), int) or row.get("oid") is None for row in exits):
+        return None
+    return exits
+
+
+def close_reason(trade):
+    exits = proved_closure_exits(trade)
+    if exits is None:
         return {"kind": "unconfirmed", "label": "Grund nicht vollständig belegt"}
     last_time = max(row["time"] for row in exits)
     latest = [row for row in exits if row["time"] == last_time]

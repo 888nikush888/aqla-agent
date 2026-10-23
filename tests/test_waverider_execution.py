@@ -55,7 +55,6 @@ async def wave_trade(setup, signal, monkeypatch, lifetime="signal_deadline"):
     monkeypatch.setattr(exchange.client, "_transport", httpx.MockTransport(boundary.handle))
     monkeypatch.setattr(waverider, "qualification_valid", lambda *_: True)
     async def facts(*_):
-        from aqla_hyperliquid_mcp.models import now_ms
         return {"atr": "1", "fee_rate": ".0004", "observed_at": now_ms()}
     monkeypatch.setattr(waverider, "market_facts", facts)
     state.update(lambda data: data["policy"].update(management_mode="waverider", waverider_lifetime=lifetime))
@@ -293,7 +292,6 @@ async def test_until_target_read_budget_discards_only_a_proved_unsent_wave(setup
 async def test_tick_refreshes_book_aged_by_ordinary_protection_before_optional_wave(setup, signal, monkeypatch, available):
     from aqla_agent.observations import TemporaryObservation
     from aqla_agent.waverider import tick
-    from aqla_hyperliquid_mcp.models import now_ms
     state, boundary, exchange, trading, raw, trade = await wave_trade(setup, signal, monkeypatch)
     original = exchange.price_snapshot
     market = Market.model_validate(raw["market"])

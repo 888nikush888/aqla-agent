@@ -98,13 +98,11 @@ def main():
     assert all(getattr(target, name) is callback for target, name, callback in native_callbacks)
     undo = install_strict_profile()
     assert undo is not undo_twice
-    from agent import background_review as review
+    review = review_before
     from gateway.config import GatewayConfig, Platform
-    from gateway.run import GatewayRunner
     from gateway.session import SessionSource
-    from gateway.slash_commands import GatewaySlashCommandsMixin
-    from tools import skill_manager_tool as manager
-    from tools import write_approval as approval
+    manager = manager_before
+    approval = approval_before
     from tools.skill_provenance import reset_current_write_origin, set_current_write_origin
 
     values = {"owner_id": "12345", "config_path": str(destination / "config.yaml")}

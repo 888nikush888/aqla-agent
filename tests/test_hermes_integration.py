@@ -121,13 +121,14 @@ async def test_reader_worker_auth_backoff_avoids_three_second_reconnect_loop(ext
     ext.reader_retry = ReaderRetry(clock=lambda: clock[0], wall_clock=lambda: 1000, jitter=lambda: 0.5)
     class Reader:
         def __init__(self, *args, **kwargs):
-            pass
+            return None
         @staticmethod
         async def start():
             starts.append(clock[0])
             raise SourceAccessError("reader_session_unauthorized")
-        async def close(self):
-            pass
+        @staticmethod
+        async def close():
+            return None
     async def snapshot(*args, **kwargs):
         return {"sources": ["channel"]}
     async def sleep(seconds):
@@ -152,19 +153,21 @@ async def test_reader_retry_repair_resets_deadline_without_credential_output(ext
     ext.reader_retry = ReaderRetry(clock=lambda: clock[0], wall_clock=lambda: 1000, jitter=lambda: 0.5)
     class Reader:
         def __init__(self, *args, **kwargs):
-            pass
+            return None
         @staticmethod
         async def start():
             starts.append(clock[0])
             if len(starts) == 1:
                 raise SourceAccessError("reader_session_unauthorized")
-        async def sync_sources(self):
-            pass
+        @staticmethod
+        async def sync_sources():
+            return None
         @staticmethod
         def status_error():
             return None
-        async def close(self):
-            pass
+        @staticmethod
+        async def close():
+            return None
     async def snapshot(*args, **kwargs):
         return {"sources": ["a" if clock[0] < 6 else "b"]}
     async def sleep(seconds):
@@ -403,15 +406,16 @@ async def test_reader_and_wake_continue_with_notification_backlog(extension, tmp
     wakes = []
     class Reader:
         def __init__(self, *args, **kwargs):
-            pass
+            return None
         @staticmethod
         async def start():
             started.set()
             if blocked_start:
                 await asyncio.Event().wait()
             raise SourceAccessError("reader_session_unauthorized")
-        async def close(self):
-            pass
+        @staticmethod
+        async def close():
+            return None
     monkeypatch.setattr("aqla_agent.events.TelegramReader", Reader)
     async def snapshot(*args, **kwargs):
         await started.wait()
@@ -486,7 +490,7 @@ async def test_wake_observed_source_work_independent_of_zero_notifications(exten
             raise asyncio.CancelledError
         return {"pending": pending, "notification_pending": 0, "source_queue": queue}
     async def instant_sleep(*args):
-        pass
+        return None
     monkeypatch.setattr("aqla_agent.events.asyncio.sleep", instant_sleep)
     monkeypatch.setattr("aqla_agent.events.time.monotonic", lambda: 100)
     ext.call = snapshot

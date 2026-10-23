@@ -32,6 +32,22 @@ def sanitize_detail(value, code="processing_failed"):
             "field_paths": sorted({path for path in paths if isinstance(path, str) and path in FIELDS})[:20]}
 
 
+def _provider_failure(cause, name, status):
+    if isinstance(cause, (TimeoutError, httpx.TimeoutException)) or name in ("APITimeoutError",):
+        code, retryable = "provider_timeout", True
+        return code, retryable, name
+    if isinstance(cause, (ConnectionError, httpx.TransportError)) or name in ("APIConnectionError",):
+        code, retryable = "provider_transport", True
+        return code, retryable, name
+    if status == 429 or name == "RateLimitError":
+        code, retryable = "provider_rate_limited", True
+        return code, retryable, name
+    if isinstance(status, int) and 500 <= status <= 599:
+        code, retryable = "provider_unavailable", True
+        return code, retryable, name
+    return None
+
+
 def classify_failure(error, phase="validate"):
     """Classify only known types/statuses; never log repr/str of foreign errors."""
     cause, seen = error, set()
@@ -50,21 +66,9 @@ def classify_failure(error, phase="validate"):
         name = type(cause).__name__
         response = getattr(cause, "response", None)
         status = getattr(response, "status_code", None)
-        if isinstance(cause, (TimeoutError, httpx.TimeoutException)) or name in ("APITimeoutError",):
-            code, retryable = "provider_timeout", True
-            exception_type = name
-            break
-        if isinstance(cause, (ConnectionError, httpx.TransportError)) or name in ("APIConnectionError",):
-            code, retryable = "provider_transport", True
-            exception_type = name
-            break
-        if status == 429 or name == "RateLimitError":
-            code, retryable = "provider_rate_limited", True
-            exception_type = name
-            break
-        if isinstance(status, int) and 500 <= status <= 599:
-            code, retryable = "provider_unavailable", True
-            exception_type = name
+        provider = _provider_failure(cause, name, status)
+        if provider is not None:
+            code, retryable, exception_type = provider
             break
         if isinstance(cause, ValidationError):
             exception_type = name

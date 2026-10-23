@@ -414,7 +414,8 @@ class Interpretation(Model):
         return value.replace(",", ".") if isinstance(value, str) else value
 
     @field_serializer("leverage", when_used="json")
-    def serialize_leverage(self, value):
+    @staticmethod
+    def serialize_leverage(value):
         if value is None:
             return None
         value = Decimal(value)
@@ -609,16 +610,20 @@ class TradePlan(Model):
     @model_validator(mode="after")
     def ranking_consistent(self):
         # Missing/partial legacy bindings remain readable, but admission rejects them.
-        if self.ranking_policy_revision is not None and self.ranking_enabled is not None and self.rank_snapshot:
-            if not self.ranking_enabled or self.rank_snapshot.get("policy_revision") != self.ranking_policy_revision:
-                raise ValueError("Source rank snapshot differs from the plan's global ranking binding")
+        if (
+            (self.ranking_policy_revision is not None and self.ranking_enabled is not None and self.rank_snapshot)
+            and (not self.ranking_enabled or self.rank_snapshot.get('policy_revision') != self.ranking_policy_revision)
+        ):
+            raise ValueError("Source rank snapshot differs from the plan's global ranking binding")
         return self
 
     @model_validator(mode="after")
     def leverage_consistent(self):
-        if self.backup_values is not None and self.backup_values.uses_roe(self.backup_fields):
-            if self.market.product != "perp" or self.effective_leverage is None:
-                raise ValueError("Backup ROE requires a perpetual plan with explicit effective leverage")
+        if (
+            (self.backup_values is not None and self.backup_values.uses_roe(self.backup_fields))
+            and (self.market.product != 'perp' or self.effective_leverage is None)
+        ):
+            raise ValueError("Backup ROE requires a perpetual plan with explicit effective leverage")
         if self.signal_leverage_original is not None and self.signal_leverage != int(self.signal_leverage_original.to_integral_value(rounding=ROUND_FLOOR)):
             raise ValueError("Signal leverage differs from the original value rounded down")
         if self.policy.leverage_mode == "signal":

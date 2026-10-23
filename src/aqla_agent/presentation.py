@@ -159,16 +159,46 @@ def _decimal(value):
     return Decimal(str(value)) if value is not None else None
 
 
+def _closed_in_period(closed, start, end):
+    return closed is not None and (start is None or start <= closed) and (end is None or closed < end)
+
+
+def _open_at_period_end(trade, closed, entered, end):
+    return (end is None or entered < end) and (trade["status"] not in CLOSED and closed is None
+            or end is not None and closed is not None and closed >= end)
+
+
+def _no_period_entries(entries, end):
+    return not entries or end is not None and all(
+        isinstance(fill.get("time"), int) and fill["time"] >= end for fill in entries)
+
+
+def _unfilled_cohort(trade, entered, start, end):
+    if (end is None or entered < end) and (trade["status"] not in CLOSED or start is None or start <= entered):
+        return "unfilled"
+    return None
+
+
+def _trade_period_fills(trade, cohort, end):
+    fills = trade.get("fill_events", {})
+    if cohort in ("open", "unfilled") and end is not None:
+        fills = {identity: fill for identity, fill in fills.items() if isinstance(fill.get("time"), int) and fill["time"] < end}
+    return fills
+
+
+def _presentation_exit_price(row, cohort, fills):
+    return _decimal(row["exit_vwap"]) if cohort == "realized" and row.get("exit_vwap") else _price(
+        [fill for fill in fills.values() if fill["kind"] != "entry"]) if cohort == "realized" else None
+
+
 def _cohort(trade, row, start, end):
     closed, entered = row["closed_at"], row["entry_at"] or trade["plan"]["created_at"]
-    if closed is not None and (start is None or start <= closed) and (end is None or closed < end):
+    if _closed_in_period(closed, start, end):
         return "realized"
     entries = [fill for fill in trade.get("fill_events", {}).values() if fill["kind"] == "entry"]
-    if not entries or end is not None and all(isinstance(fill.get("time"), int) and fill["time"] >= end for fill in entries):
-        if (end is None or entered < end) and (trade["status"] not in CLOSED or start is None or start <= entered):
-            return "unfilled"
-        return None
-    if (end is None or entered < end) and (trade["status"] not in CLOSED and closed is None or end is not None and closed is not None and closed >= end):
+    if _no_period_entries(entries, end):
+        return _unfilled_cohort(trade, entered, start, end)
+    if _open_at_period_end(trade, closed, entered, end):
         return "open"
     if closed is None and trade.get("fill_events") and trade["status"] in CLOSED and (end is None or entered < end):
         return "undated"
@@ -182,13 +212,26 @@ def _price(fills):
 
 def _parameters(data):
     result = []
+    result.extend(_profile_parameters(data))
+    result.extend(_limit_parameters(data))
+    for identity, pipeline in sorted(data.get("pipelines", {}).items()):
+        result.append(PresentationParameter(section="Pipeline", name=pipeline.get("name") or identity,
+            value="Aktiv" if pipeline.get("enabled") else "Inaktiv", context=", ".join(target["exchange"] for target in pipeline.get("targets", []))))
+    return result
+
+
+def _profile_parameters(data):
     for identity, profile in sorted(data.get("profiles", {}).items()):
         parameters = profile.get("parameters") or (data.get("policy") if identity == "standard" else None) or {}
         for name, value in sorted(parameters.items()):
-            result.append(PresentationParameter(section="Profil", name=name, value=str(value), context=profile.get("name") or identity))
+            yield PresentationParameter(section="Profil", name=name, value=str(value), context=profile.get("name") or identity)
         for name in ("entry_execution", "take_profit_execution"):
             if name not in parameters:
-                result.append(PresentationParameter(section="Profil", name=name, value="standard", context=profile.get("name") or identity))
+                yield PresentationParameter(section="Profil", name=name, value="standard", context=profile.get("name") or identity)
+
+
+def _limit_parameters(data):
+    result = []
     for identity, limits in sorted(data.get("account_limits", {}).items()):
         for name, value in sorted((limits or {}).items()):
             result.append(PresentationParameter(section="Kontolimit", name=name, value=str(value), context=identity))
@@ -196,16 +239,10 @@ def _parameters(data):
     for identity, limits in sorted(data.get("venue_limits", {}).items()):
         for name, value in sorted((limits or {}).items()):
             result.append(PresentationParameter(section="Börsenlimit", name=name, value=str(value), context=identity))
-    for identity, pipeline in sorted(data.get("pipelines", {}).items()):
-        result.append(PresentationParameter(section="Pipeline", name=pipeline.get("name") or identity,
-            value="Aktiv" if pipeline.get("enabled") else "Inaktiv", context=", ".join(target["exchange"] for target in pipeline.get("targets", []))))
     return result
 
 
-def build_presentation(data, scope: PresentationScope | dict | None = None, clock=None, *, transport_budget=True) -> PresentationSnapshot:
-    """Read only; preserve whole-family net-R eligibility and independent currencies."""
-    scope = PresentationScope.model_validate(scope or {})
-    clock = now_ms() if clock is None else clock
+def _presentation_period(scope, clock):
     current = datetime.fromtimestamp(clock / 1000, BERLIN).strftime("%Y-%m")
     period = current if scope.period == "current" else scope.period
     start: int | None
@@ -216,6 +253,48 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
         start, end = int((today - timedelta(days=days - 1)).timestamp() * 1000), int((today + timedelta(days=1)).timestamp() * 1000)
     else:
         start, end = (None, None) if period == "all" else month_bounds(period)
+    return current, period, start, end
+
+
+def _cohort_report(row, cohort):
+    if cohort == "open":
+        row = {**row, "closed_at": None, "fees": None, "funding": None,
+               "issues": ["Am Periodenende offen; kein realisiertes Ergebnis in dieser Summe"]}
+    elif cohort == "undated":
+        row = {**row, "issues": [*row["issues"], "Schließzeit unbekannt; keiner Monatssumme zugeordnet"]}
+    elif cohort == "unfilled":
+        row = {**row, "entry_at": None, "closed_at": None, "fees": None, "funding": None,
+               "issues": ["Kein eigener Entry-Fill im gewählten Zeitraum belegt"]}
+    return row
+
+
+def _execution_roles(trade, fills):
+    roles: dict[Literal["maker", "taker", "unknown"], int] = {"maker": 0, "taker": 0, "unknown": 0}
+    for identity in fills:
+        role = trade.get("fill_execution_roles", {}).get(identity, "unknown")
+        roles[role if role in roles else "unknown"] += 1
+    return roles
+
+
+def _presentation_trade(data, trade, plan, row, cohort, end, currency, exchange):
+    fills = _trade_period_fills(trade, cohort, end)
+    entries = [fill for fill in fills.values() if fill["kind"] == "entry"]
+    entered = min((fill["time"] for fill in entries if isinstance(fill.get("time"), int)), default=None)
+    roles = _execution_roles(trade, fills)
+    return PresentationTrade(trade_id=trade["trade_id"], source_id=trade["chat_id"],
+        source=data.get("source_names", {}).get(trade["chat_id"], "Kanal ohne Anzeigename"), symbol=row["symbol"], side=row["side"],
+        status=trade["status"], cohort=cohort, entry_at=row["entry_at"] or entered, closed_at=row["closed_at"],
+        entry_price=_price(entries),
+        exit_price=_presentation_exit_price(row, cohort, fills),
+        quantity=sum((Decimal(fill["sz"]) for fill in entries), Decimal(0)) if entries else None,
+        net_pnl=_decimal(row["net_pnl"]) if cohort == "realized" else None,
+        fees=_decimal(row["fees"]), funding=_decimal(row["funding"]), currency=currency, exchange=exchange, network=plan["network"],
+        entry_execution=plan.get("entry_execution", "standard"), take_profit_execution=plan.get("take_profit_execution", "standard"),
+        execution_roles=roles, complete=row["complete"] and cohort == "realized",
+        issues=[*row["issues"], *([row["attribution_note"]] if cohort == "realized" and row.get("attribution_note") else [])])
+
+
+def _presentation_journal(data, scope, start, end):
     journal, selected_ids, report_rows = [], set(), {}
     for trade in data.get("trades", {}).values():
         plan = trade["plan"]
@@ -228,39 +307,14 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
         cohort = _cohort(trade, row, start, end)
         if cohort is None:
             continue
-        if cohort == "open":
-            row = {**row, "closed_at": None, "fees": None, "funding": None,
-                   "issues": ["Am Periodenende offen; kein realisiertes Ergebnis in dieser Summe"]}
-        elif cohort == "undated":
-            row = {**row, "issues": [*row["issues"], "Schließzeit unbekannt; keiner Monatssumme zugeordnet"]}
-        elif cohort == "unfilled":
-            row = {**row, "entry_at": None, "closed_at": None, "fees": None, "funding": None,
-                   "issues": ["Kein eigener Entry-Fill im gewählten Zeitraum belegt"]}
-        fills = trade.get("fill_events", {})
-        if cohort in ("open", "unfilled") and end is not None:
-            fills = {identity: fill for identity, fill in fills.items() if isinstance(fill.get("time"), int) and fill["time"] < end}
-        entries = [fill for fill in fills.values() if fill["kind"] == "entry"]
-        entered = min((fill["time"] for fill in entries if isinstance(fill.get("time"), int)), default=None)
-        roles: dict[Literal["maker", "taker", "unknown"], int] = {"maker": 0, "taker": 0, "unknown": 0}
-        for identity in fills:
-            role = trade.get("fill_execution_roles", {}).get(identity, "unknown")
-            roles[role if role in roles else "unknown"] += 1
-        journal.append(PresentationTrade(trade_id=trade["trade_id"], source_id=trade["chat_id"],
-            source=data.get("source_names", {}).get(trade["chat_id"], "Kanal ohne Anzeigename"), symbol=row["symbol"], side=row["side"],
-            status=trade["status"], cohort=cohort, entry_at=row["entry_at"] or entered, closed_at=row["closed_at"],
-            entry_price=_price(entries),
-            exit_price=_decimal(row["exit_vwap"]) if cohort == "realized" and row.get("exit_vwap") else _price([fill for fill in fills.values() if fill["kind"] != "entry"]) if cohort == "realized" else None,
-            quantity=sum((Decimal(fill["sz"]) for fill in entries), Decimal(0)) if entries else None,
-            net_pnl=_decimal(row["net_pnl"]) if cohort == "realized" else None,
-            fees=_decimal(row["fees"]), funding=_decimal(row["funding"]), currency=currency, exchange=exchange, network=plan["network"],
-            entry_execution=plan.get("entry_execution", "standard"), take_profit_execution=plan.get("take_profit_execution", "standard"),
-            execution_roles=roles, complete=row["complete"] and cohort == "realized",
-            issues=[*row["issues"], *([row["attribution_note"]] if cohort == "realized" and row.get("attribution_note") else [])]))
+        row = _cohort_report(row, cohort)
+        journal.append(_presentation_trade(data, trade, plan, row, cohort, end, currency, exchange))
         selected_ids.add(trade["trade_id"])
     journal.sort(key=lambda row: (row.closed_at or row.entry_at or 0, row.trade_id))
-    evaluated = [row for row in journal if row.cohort in ("realized", "undated")]
-    net, fees, funding = (_metric([getattr(row, field) if row.cohort == "realized" or scope.period == "all" else None for row in evaluated]) for field in ("net_pnl", "fees", "funding"))
-    known = [row for row in evaluated if row.net_pnl is not None]
+    return journal, selected_ids, report_rows
+
+
+def _pnl_charts(evaluated):
     grouped_day, grouped_month = defaultdict(list), defaultdict(list)
     for row in evaluated:
         if row.closed_at is None:
@@ -275,28 +329,66 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
         if point.value is not None:
             running += point.value
         cumulative.append(PresentationPoint(label=point.label, value=running if point.value is not None else None))
-    complete, excluded = outcomes(data, selected_ids=selected_ids, report_rows=report_rows)
-    channels = []
-    sources = set(data.get("source_ranks", {})) | {source_key(data, row.source_id) for row in journal}
+    return {"daily_pnl": daily, "monthly_pnl": months_chart, "cumulative_realized_net": cumulative}
+
+
+def _presentation_totals(journal, scope):
+    evaluated = [row for row in journal if row.cohort in ("realized", "undated")]
+    net, fees, funding = (_metric([getattr(row, field) if row.cohort == "realized" or scope.period == "all" else None for row in evaluated]) for field in ("net_pnl", "fees", "funding"))
+    known = [row for row in evaluated if row.net_pnl is not None]
+    return {"net_pnl": net, "fees": fees, "funding": funding,
+        "hit_rate_percent": Decimal(sum(row.net_pnl > 0 for row in known if row.net_pnl is not None)) / len(known) * 100 if known else None,
+        "open_trades": sum(row.cohort == "open" for row in journal), "complete_trades": sum(row.complete for row in evaluated),
+        "evaluated_trades": len(evaluated), **_pnl_charts(evaluated)}
+
+
+def _ranking_last_changes(data, sources):
     last_changes: dict[str, int] = {}
     if sources:
         for row in data.get("ranking_history", {}).values():
             identity, stamp = row.get("source_id"), row.get("time")
             if isinstance(identity, str) and identity in sources and isinstance(stamp, int):
                 last_changes[identity] = max(last_changes.get(identity, stamp), stamp)
+    return last_changes
+
+
+def _eligible_setups(rows, selected_ids, start, end):
+    return [row for row in rows if selected_ids.intersection(row["trade_ids"])
+                and (start is None or start <= row["closed_at"]) and (end is None or row["closed_at"] < end)]
+
+
+def _presentation_channel(data, identity, selected_ids, complete, excluded, start, end, last_changes):
+    rank = data.get("source_ranks", {}).get(identity, {})
+    stats = rank.get("metrics", {})
+    eligible = _eligible_setups(complete.get(identity, []), selected_ids, start, end)
+    rejected = [row for row in excluded.get(identity, []) if selected_ids.intersection(row["trade_ids"])]
+    origin = rank.get("origin", "bootstrap" if rank.get("bootstrap") else "auto" if rank.get("evaluated") else "unknown")
+    return PresentationChannel(source_id=identity, source=data.get("source_names", {}).get(identity, "Kanal ohne Anzeigename"),
+        rank=rank.get("tier", "F"), origin=origin if origin in ("manual", "auto", "bootstrap", "unknown") else "unknown",
+        score=_decimal(stats.get("score")), proof=len(rank.get("evidence", [])), drawdown_r=_decimal(stats.get("drawdown_r")),
+        last_change=last_changes.get(identity), net_r=sum((Decimal(row["net_r"]) for row in eligible), Decimal(0)) if eligible else None,
+        scope_setups=len(eligible), excluded_setups=len(rejected))
+
+
+def _presentation_channels(data, journal, selected_ids, report_rows, start, end):
+    complete, excluded = outcomes(data, selected_ids=selected_ids, report_rows=report_rows)
+    channels = []
+    sources = set(data.get("source_ranks", {})) | {source_key(data, row.source_id) for row in journal}
+    last_changes = _ranking_last_changes(data, sources)
     for identity in sorted(sources):
-        rank = data.get("source_ranks", {}).get(identity, {})
-        stats = rank.get("metrics", {})
-        eligible = [row for row in complete.get(identity, []) if selected_ids.intersection(row["trade_ids"])
-                    and (start is None or start <= row["closed_at"]) and (end is None or row["closed_at"] < end)]
-        rejected = [row for row in excluded.get(identity, []) if selected_ids.intersection(row["trade_ids"])]
-        origin = rank.get("origin", "bootstrap" if rank.get("bootstrap") else "auto" if rank.get("evaluated") else "unknown")
-        channels.append(PresentationChannel(source_id=identity, source=data.get("source_names", {}).get(identity, "Kanal ohne Anzeigename"),
-            rank=rank.get("tier", "F"), origin=origin if origin in ("manual", "auto", "bootstrap", "unknown") else "unknown",
-            score=_decimal(stats.get("score")), proof=len(rank.get("evidence", [])), drawdown_r=_decimal(stats.get("drawdown_r")),
-            last_change=last_changes.get(identity), net_r=sum((Decimal(row["net_r"]) for row in eligible), Decimal(0)) if eligible else None,
-            scope_setups=len(eligible), excluded_setups=len(rejected)))
+        channels.append(_presentation_channel(data, identity, selected_ids, complete, excluded, start, end, last_changes))
     channels.sort(key=lambda row: (-TIERS.index(row.rank), -(row.score or Decimal(0)), row.source.casefold(), row.source_id))
+    return channels
+
+
+def build_presentation(data, scope: PresentationScope | dict | None = None, clock=None, *, transport_budget=True) -> PresentationSnapshot:
+    """Read only; preserve whole-family net-R eligibility and independent currencies."""
+    scope = PresentationScope.model_validate(scope or {})
+    clock = now_ms() if clock is None else clock
+    current, period, start, end = _presentation_period(scope, clock)
+    journal, selected_ids, report_rows = _presentation_journal(data, scope, start, end)
+    totals = _presentation_totals(journal, scope)
+    channels = _presentation_channels(data, journal, selected_ids, report_rows, start, end)
     currencies = sorted({"USDT", "USDC", *(trade["plan"]["market"].get("quote_token", "USDC") for trade in data.get("trades", {}).values())})
     periods = sorted({current, *data.get("monthly_reports", {}), *(datetime.fromtimestamp((trade.get("closed_at") or trade["plan"]["created_at"]) / 1000, BERLIN).strftime("%Y-%m") for trade in data.get("trades", {}).values())})
     if scope.period not in ("current", "all", "today", "7d", "30d"):
@@ -306,10 +398,7 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
         "available_currencies": currencies, "available_periods": ["current", "today", "7d", "30d", "all", *periods],
         "journal": journal, "channels": channels, "parameters": _parameters(data), "months": [PresentationMonth(month=month, revision=row.get("revision", 0),
             published_at=row.get("published_at")) for month, row in sorted(data.get("monthly_reports", {}).items())],
-        "net_pnl": net, "fees": fees, "funding": funding,
-        "hit_rate_percent": Decimal(sum(row.net_pnl > 0 for row in known if row.net_pnl is not None)) / len(known) * 100 if known else None,
-        "open_trades": sum(row.cohort == "open" for row in journal), "complete_trades": sum(row.complete for row in evaluated),
-        "evaluated_trades": len(evaluated), "daily_pnl": daily, "monthly_pnl": months_chart, "cumulative_realized_net": cumulative,
+        **totals,
         "net_r_basis": "complete_setup_families_as_ranking", "equity_curve": False}
     # Model JSON is the exact fingerprint representation consumed by the publisher.
     values = {key: value.model_dump(mode="json") if isinstance(value, Model) else [row.model_dump(mode="json") if isinstance(row, Model) else row for row in value]

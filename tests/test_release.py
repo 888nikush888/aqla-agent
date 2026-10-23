@@ -433,7 +433,7 @@ def test_without_previous_pair_cleans_failed_publication(release_project, tmp_pa
 
 
 def test_rollback_failure_retains_recovery_pair(release_project, tmp_path, monkeypatch):
-    output, sha, previous = _previous_pair(release_project, tmp_path)
+    output, _sha, previous = _previous_pair(release_project, tmp_path)
     original = release.os.replace
     def replace(source, target):
         if Path(source).name in ("new.sha256", "restore.sha256"):
@@ -473,7 +473,7 @@ def test_interruption_retains_recovery_pair_and_verifier_rejects_mixed_pair(rele
 
 @pytest.mark.parametrize("kind", ["missing_sha", "bad_sha", "bad_zip"])
 def test_invalid_previous_pair_is_preserved(release_project, tmp_path, kind):
-    output, sha, previous = _previous_pair(release_project, tmp_path)
+    output, sha, _previous = _previous_pair(release_project, tmp_path)
     if kind == "missing_sha":
         sha.unlink()
     elif kind == "bad_sha":

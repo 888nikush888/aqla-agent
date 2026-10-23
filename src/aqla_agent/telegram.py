@@ -138,45 +138,43 @@ class TelegramReader:
         async with self.intake_lock:
             return await self._sync_sources(force=force)
 
-    async def _sync_sources(self, *, force=False, chat_id=None, configuration=None, through=None):
-        configuration = await self.snapshot() if configuration is None else configuration
-        selected = configuration["sources"]
-        now = self.clock()
-        changed = selected != self.selected
-        resolve_due = changed or force or (self.missing_sources and (self.last_dialog_scan is None or now - self.last_dialog_scan >= self.dialog_interval))
-        if resolve_due:
-            dialogs = {}
-            async for dialog in self.client.iter_dialogs():
-                dialogs[str(dialog.id)] = (str(dialog.id), dialog.entity)
-                username = getattr(dialog.entity, "username", None)
-                if username:
-                    dialogs["@" + username.lower()] = (str(dialog.id), dialog.entity)
-            resolved = {}
-            unavailable = []
-            for name in selected:
-                match = dialogs.get(self.source_name(name))
-                if match is None:
-                    unavailable.append(name)
-                    continue
-                resolved[name] = match[0]
-            if self.resolve:
-                await self.resolve(resolved)
-            self.aliases = resolved
-            self.entities = {chat: dialogs[chat][1] for chat in resolved.values()}
-            self.selected = list(selected)
-            self.missing_sources = unavailable
-            self.failed_sources = {chat: names for chat, names in self.failed_sources.items() if chat in self.entities}
-            self.update_source_status()
-            self.last_dialog_scan = now
-            if changed:
-                self.history_reads.clear()
-        configuration["source_aliases"] = self.aliases
+    async def _resolve_sources(self, selected, now, changed):
+        dialogs = {}
+        async for dialog in self.client.iter_dialogs():
+            dialogs[str(dialog.id)] = (str(dialog.id), dialog.entity)
+            username = getattr(dialog.entity, "username", None)
+            if username:
+                dialogs["@" + username.lower()] = (str(dialog.id), dialog.entity)
+        resolved = {}
+        unavailable = []
+        for name in selected:
+            match = dialogs.get(self.source_name(name))
+            if match is None:
+                unavailable.append(name)
+                continue
+            resolved[name] = match[0]
+        if self.resolve:
+            await self.resolve(resolved)
+        self.aliases = resolved
+        self.entities = {chat: dialogs[chat][1] for chat in resolved.values()}
+        self.selected = list(selected)
+        self.missing_sources = unavailable
+        self.failed_sources = {chat: names for chat, names in self.failed_sources.items() if chat in self.entities}
+        self.update_source_status()
+        self.last_dialog_scan = now
+        if changed:
+            self.history_reads.clear()
+
+    def _history_due(self, chat, now, force):
+        return force or chat not in self.history_reads or now - self.history_reads[chat] >= self.history_interval
+
+    async def _sync_entities(self, configuration, now, force, chat_id, through):
         delivered = set()
         for chat, entity in self.entities.items():
             if chat_id is not None and chat != chat_id:
                 continue
             try:
-                reread = force or chat not in self.history_reads or now - self.history_reads[chat] >= self.history_interval
+                reread = self._history_due(chat, now, force)
                 if chat in self.failed_sources and not reread:
                     continue
                 if chat_id is None and not reread:
@@ -192,6 +190,45 @@ class TelegramReader:
             else:
                 self.failed_sources.pop(chat, None)
             self.update_source_status()
+        return delivered
+
+    async def _bootstrap_source(self, chat, entity, configuration, deliver):
+        history = [message async for message in self.client.iter_messages(entity, limit=self.settings.max_context_messages)]
+        cutoff = max((message.id for message in history), default=0)
+        context_ids = sorted(message.id for message in history)
+        if self.bootstrap:
+            await self.bootstrap({chat: cutoff}, {chat: context_ids})
+        configuration.setdefault("context_cutoffs", {})[chat] = cutoff
+        configuration.setdefault("context_ids", {})[chat] = context_ids
+        # Persist the bounded selection before the first delivery. A retry
+        # must not replace this with an unbounded min_id=0 history scan.
+        for message in reversed(history):
+            await deliver(message, historical=True)
+        return cutoff
+
+    async def _reread_source(self, chat, entity, configuration, context_ids, cutoff, reread, deliver):
+        if context_ids is None and cutoff:
+            # Bounded recovery of an older state created before ID selection.
+            history = [message async for message in self.client.iter_messages(entity, limit=self.settings.max_context_messages, max_id=cutoff + 1)]
+            context_ids = sorted(message.id for message in history)
+            if self.bootstrap:
+                await self.bootstrap({chat: cutoff}, {chat: context_ids})
+        ids = sorted({*(context_ids or []), *configuration.get("tracked_ids", {}).get(chat, [])})
+        if ids and reread:
+            messages = await self.client.get_messages(entity, ids=ids)
+            for message in sorted((message for message in messages if message is not None), key=lambda item: item.id):
+                await deliver(message, historical=message.id <= cutoff)
+
+    async def _sync_sources(self, *, force=False, chat_id=None, configuration=None, through=None):
+        configuration = await self.snapshot() if configuration is None else configuration
+        selected = configuration["sources"]
+        now = self.clock()
+        changed = selected != self.selected
+        resolve_due = changed or force or (self.missing_sources and (self.last_dialog_scan is None or now - self.last_dialog_scan >= self.dialog_interval))
+        if resolve_due:
+            await self._resolve_sources(selected, now, changed)
+        configuration["source_aliases"] = self.aliases
+        delivered = await self._sync_entities(configuration, now, force, chat_id, through)
         if chat_id is None:
             self.last_backfill = now
         self.last_delivered_versions = delivered
@@ -212,31 +249,11 @@ class TelegramReader:
         cutoff = configuration.get("context_cutoffs", {}).get(chat, 0)
         context_ids = configuration.get("context_ids", {}).get(chat)
         if cursor is None and chat not in configuration.get("context_cutoffs", {}):
-            history = [message async for message in self.client.iter_messages(entity, limit=self.settings.max_context_messages)]
-            cutoff = max((message.id for message in history), default=0)
-            context_ids = sorted(message.id for message in history)
-            if self.bootstrap:
-                await self.bootstrap({chat: cutoff}, {chat: context_ids})
-            configuration.setdefault("context_cutoffs", {})[chat] = cutoff
-            configuration.setdefault("context_ids", {})[chat] = context_ids
-            # Persist the bounded selection before the first delivery. A retry
-            # must not replace this with an unbounded min_id=0 history scan.
-            for message in reversed(history):
-                await deliver(message, historical=True)
+            cutoff = await self._bootstrap_source(chat, entity, configuration, deliver)
             cursor = cutoff
         else:
             cursor = cursor if cursor is not None else cutoff
-            if context_ids is None and cutoff:
-                # Bounded recovery of an older state created before ID selection.
-                history = [message async for message in self.client.iter_messages(entity, limit=self.settings.max_context_messages, max_id=cutoff + 1)]
-                context_ids = sorted(message.id for message in history)
-                if self.bootstrap:
-                    await self.bootstrap({chat: cutoff}, {chat: context_ids})
-            ids = sorted({*(context_ids or []), *configuration.get("tracked_ids", {}).get(chat, [])})
-            if ids and reread:
-                messages = await self.client.get_messages(entity, ids=ids)
-                for message in sorted((message for message in messages if message is not None), key=lambda item: item.id):
-                    await deliver(message, historical=message.id <= cutoff)
+            await self._reread_source(chat, entity, configuration, context_ids, cutoff, reread, deliver)
         options = {"min_id": max(cursor, cutoff), "reverse": True}
         if through is not None:
             options["max_id"] = through + 1

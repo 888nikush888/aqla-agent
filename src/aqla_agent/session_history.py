@@ -39,6 +39,19 @@ def _issue(path: Path, line: int, code: HistoryCode) -> HistoryIssue:
             "repair_hint": "Repair the indicated original JSON/metadata record offline, keep a backup, then repeat diagnosis; do not delete import receipts."}
 
 
+def _valid_routing_entry(value):
+    return (isinstance(value, dict) and isinstance(value.get("session_id"), str)
+            and (value.get("source") is None or isinstance(value["source"], dict)))
+
+
+def _routing_values(values, path):
+    if isinstance(values, dict):
+        if any(key.startswith("_") and (key != "_README" or not isinstance(value, str)) for key, value in values.items()):
+            raise HistoryImportError(_issue(path, 1, "routing_metadata"))
+        values = {key: value for key, value in values.items() if key != "_README"}
+    return values
+
+
 def _routing_entries(home: Path):
     path = home / "sessions/sessions.json"
     if not path.is_file():
@@ -51,12 +64,8 @@ def _routing_entries(home: Path):
         raise HistoryImportError(_issue(path, 1, "read_failed")) from None
     # The pinned SessionStore writes only this reserved informational sentinel.
     # Do not treat arbitrary underscore-prefixed data as valid session metadata.
-    if isinstance(values, dict):
-        if any(key.startswith("_") and (key != "_README" or not isinstance(value, str)) for key, value in values.items()):
-            raise HistoryImportError(_issue(path, 1, "routing_metadata"))
-        values = {key: value for key, value in values.items() if key != "_README"}
-    if not isinstance(values, dict) or any(not isinstance(value, dict) or not isinstance(value.get("session_id"), str) or
-                                          value.get("source") is not None and not isinstance(value["source"], dict) for value in values.values()):
+    values = _routing_values(values, path)
+    if not isinstance(values, dict) or any(not _valid_routing_entry(value) for value in values.values()):
         raise HistoryImportError(_issue(path, 1, "routing_metadata"))
     for value in values.values():
         _timestamp(value.get("created_at"), path, 1)
@@ -79,9 +88,22 @@ def _timestamp(value, path: Path, line: int):
         raise HistoryImportError(_issue(path, line, "timestamp")) from None
 
 
-def _history_payload(path: Path, entries):
-    if not path.stem or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in path.stem):
-        raise HistoryImportError(_issue(path, 1, "identity"))
+def _history_header(rows, locations, path):
+    header = {}
+    if rows and isinstance(rows[0], dict) and rows[0].get("role") == "session_meta":
+        header = rows.pop(0)
+        line = locations.pop(0)
+        if set(header) - {"role", "tools", "model", "platform", "timestamp"}:
+            raise HistoryImportError(_issue(path, line, "metadata"))
+        if any(header.get(name) is not None and not isinstance(header[name], str) for name in ("model", "platform")) or (
+            header.get("tools") is not None and (not isinstance(header["tools"], list) or any(not isinstance(tool, str) for tool in header["tools"]))
+        ):
+            raise HistoryImportError(_issue(path, line, "metadata"))
+        _timestamp(header.get("timestamp"), path, line)
+    return header
+
+
+def _history_rows(path):
     try:
         original = path.read_bytes()
         lines = original.decode("utf-8").splitlines()
@@ -97,17 +119,14 @@ def _history_payload(path: Path, entries):
             raise HistoryImportError(_issue(path, number, "json_decode")) from None
         rows.append(row)
         locations.append(number)
-    header = {}
-    if rows and isinstance(rows[0], dict) and rows[0].get("role") == "session_meta":
-        header = rows.pop(0)
-        line = locations.pop(0)
-        if set(header) - {"role", "tools", "model", "platform", "timestamp"}:
-            raise HistoryImportError(_issue(path, line, "metadata"))
-        if any(header.get(name) is not None and not isinstance(header[name], str) for name in ("model", "platform")) or (
-            header.get("tools") is not None and (not isinstance(header["tools"], list) or any(not isinstance(tool, str) for tool in header["tools"]))
-        ):
-            raise HistoryImportError(_issue(path, line, "metadata"))
-        _timestamp(header.get("timestamp"), path, line)
+    return original, rows, locations
+
+
+def _history_payload(path: Path, entries):
+    if not path.stem or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in path.stem):
+        raise HistoryImportError(_issue(path, 1, "identity"))
+    original, rows, locations = _history_rows(path)
+    header = _history_header(rows, locations, path)
     for row, line in zip(rows, locations, strict=True):
         if not isinstance(row, dict) or row.get("role") not in ("user", "assistant", "tool", "system"):
             raise HistoryImportError(_issue(path, line, "role"))

@@ -25,14 +25,7 @@ def verify_names(names):
             raise SystemExit("Forbidden artifact member: " + name)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dist", type=Path, default=Path("dist"))
-    dist = parser.parse_args().dist
-    bundle = dist / "aqla-agent-vps.zip"
-    expected = bundle.with_suffix(".zip.sha256").read_text(encoding="utf-8")
-    if expected != f"{hashlib.sha256(bundle.read_bytes()).hexdigest()}  {bundle.name}\n":
-        raise SystemExit("VPS archive checksum mismatch")
+def _verify_vps_bundle(bundle):
     with zipfile.ZipFile(bundle) as archive:
         validate_zip_members(archive)
         if archive.testzip() is not None:
@@ -63,6 +56,17 @@ def main():
             prepare(root, Path(target) / "deployment", "12345", "ci-only", "https://example.invalid/v1")
             from subprocess import run
             run([sys.executable, "-m", "ruff", "check", "src", "hermes_plugin"], cwd=root, check=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dist", type=Path, default=Path("dist"))
+    dist = parser.parse_args().dist
+    bundle = dist / "aqla-agent-vps.zip"
+    expected = bundle.with_suffix(".zip.sha256").read_text(encoding="utf-8")
+    if expected != f"{hashlib.sha256(bundle.read_bytes()).hexdigest()}  {bundle.name}\n":
+        raise SystemExit("VPS archive checksum mismatch")
+    _verify_vps_bundle(bundle)
     wheels = list(dist.glob("*.whl"))
     sources = list(dist.glob("*.tar.gz"))
     if len(wheels) != 1 or len(sources) != 1:

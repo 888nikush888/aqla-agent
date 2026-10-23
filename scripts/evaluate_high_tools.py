@@ -48,7 +48,40 @@ def transport_retryable(result):
         "rate limit", "rate_limit", "429", "temporar", "503", "502", "empty stream"))
 
 
-def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fixture=False, retry_sleep=time.sleep):
+def _install_request_guard(agent, allowed_host, allowed_tools, requests):
+    def guard(request):
+        INVARIANTS.assertTrue(request.method == 'POST' and request.url.host == allowed_host)
+        INVARIANTS.assertTrue(request.url.path.endswith('/chat/completions'))
+        body = json.loads(request.content)
+        INVARIANTS.assertTrue(body['model'] == DEFAULT_MODEL and body.get('reasoning_effort') == 'high')
+        INVARIANTS.assertTrue({t['function']['name'] for t in body.get('tools', [])} <= allowed_tools)
+        stamp = datetime.now(UTC)
+        peak = stamp.weekday() < 5 and (1 <= stamp.hour < 4 or 6 <= stamp.hour < 10)
+        requests.append({"started_utc": stamp.isoformat(), "effort": "high", "price_multiplier": 2 if peak else 1})
+
+    # Isolated native replay checks the pinned provider transport and allowed request parameters.
+    # skipcq: PYL-W0212
+    create_client = agent._create_request_openai_client
+
+    def guarded_client(**kwargs):
+        client = create_client(**kwargs)
+        client.max_retries = 0
+        # Isolated native replay checks the pinned provider transport and allowed request parameters.
+        # skipcq: PYL-W0212
+        hooks = client._client.event_hooks.setdefault("request", [])
+        if guard not in hooks:
+            hooks.append(guard)
+        return client
+
+    # Isolated native replay checks the pinned provider transport and allowed request parameters.
+    # skipcq: PYL-W0212
+    agent._create_request_openai_client = guarded_client
+    # Isolated native replay checks the pinned provider transport and allowed request parameters.
+    # skipcq: PYL-W0212
+    agent.client._client.event_hooks.setdefault("request", []).append(guard)
+
+
+def _worker_home(args, model_url, local_fixture):
     import yaml
 
     fixture_path = args.worker_fixture.resolve()
@@ -59,7 +92,6 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     os.environ.update(HERMES_HOME=str(home), HERMES_SKIP_CONFIG_MIGRATION="1", HERMES_SKIP_UPDATE_CHECK="1",
                       HERMES_STREAM_RETRIES="0")
     sys.path.insert(0, str(args.hermes_source))
-    allowed_host = "127.0.0.1" if local_fixture else "opencode.ai"
     INVARIANTS.assertTrue(local_fixture or model_url == DEFAULT_MODEL_URL)
     config = {"model": {"default": DEFAULT_MODEL, "provider": "custom", "base_url": model_url},
               "agent": {"stream": False, "api_max_retries": 1, "auto_recovery_cycles": 0},
@@ -81,6 +113,35 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
         from agent.skill_commands import build_auto_load_prompt
         skill_prompt, loaded, missing = build_auto_load_prompt(user_config=config, home_override=home)
         INVARIANTS.assertTrue(loaded == ['caveman', 'aqla-master'] and missing == [])
+    return fixture, directory, skill_prompt
+
+
+def _worker_result(directory, result, worker_error_type, turn_attempts, transport_retries, tool_events, started, measured, requests, allowed_tools):
+    checks_path = directory / "checks.private.json"
+    checks = json.loads(checks_path.read_text(encoding="utf-8")) if checks_path.exists() else []
+    return {"completed": bool(result is not None and result.get("completed") is True and not result.get("error")
+                               and not result.get("failed") and not result.get("interrupted") and not result.get("partial")),
+            "native_exit_reason": result.get("turn_exit_reason") if result else None, "worker_error_type": worker_error_type,
+            "native_failure_reason": result.get("failure_reason") if result else None,
+            "transport_turn_attempts": turn_attempts, "transport_retries": transport_retries,
+            "served_model": result.get("served_model") if result else None, "checks": checks,
+            "draft_count": sum(event["name"].endswith("source_check_interpretation") for event in tool_events),
+            "duration_seconds": time.monotonic() - started,
+            "api_responses": measured.api, "request_attempts": requests,
+            "tool_events": tool_events,
+            "tool_metrics": measured.tools, "forbidden_tools": sorted(set(measured.tools) - allowed_tools),
+            "order_requests": 0, "model": DEFAULT_MODEL, "effort": "high"}
+
+
+def _wrap_observe_tool(tool_events, record_tool):
+    def observe_tool(name, content, error, duration=None):
+        tool_events.append({"name": name, "error": bool(error), **({"error_detail": str(content)[:1500]} if error else {})})
+        record_tool(name, content, error, duration)
+    return observe_tool
+
+
+def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fixture=False, retry_sleep=time.sleep):
+    fixture, directory, skill_prompt = _worker_home(args, model_url, local_fixture)
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
     from hermes_constants import parse_reasoning_effort
     from run_agent import AIAgent
@@ -110,9 +171,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     tool_events = []
     record_tool = measured.tool
 
-    def observe_tool(name, content, error, duration=None):
-        tool_events.append({"name": name, "error": bool(error), **({"error_detail": str(content)[:1500]} if error else {})})
-        record_tool(name, content, error, duration)
+    observe_tool = _wrap_observe_tool(tool_events, record_tool)
 
     measured.tool = observe_tool
     token = RUN.set(measured)
@@ -138,36 +197,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
         # skipcq: PYL-W0212
         agent._try_recover_primary_transport = lambda *_args, **_kwargs: False
 
-        def guard(request):
-            INVARIANTS.assertTrue(request.method == 'POST' and request.url.host == allowed_host)
-            INVARIANTS.assertTrue(request.url.path.endswith('/chat/completions'))
-            body = json.loads(request.content)
-            INVARIANTS.assertTrue(body['model'] == DEFAULT_MODEL and body.get('reasoning_effort') == 'high')
-            INVARIANTS.assertTrue({t['function']['name'] for t in body.get('tools', [])} <= allowed_tools)
-            stamp = datetime.now(UTC)
-            peak = stamp.weekday() < 5 and (1 <= stamp.hour < 4 or 6 <= stamp.hour < 10)
-            requests.append({"started_utc": stamp.isoformat(), "effort": "high", "price_multiplier": 2 if peak else 1})
-
-        # Isolated native replay checks the pinned provider transport and allowed request parameters.
-        # skipcq: PYL-W0212
-        create_client = agent._create_request_openai_client
-
-        def guarded_client(**kwargs):
-            client = create_client(**kwargs)
-            client.max_retries = 0
-            # Isolated native replay checks the pinned provider transport and allowed request parameters.
-            # skipcq: PYL-W0212
-            hooks = client._client.event_hooks.setdefault("request", [])
-            if guard not in hooks:
-                hooks.append(guard)
-            return client
-
-        # Isolated native replay checks the pinned provider transport and allowed request parameters.
-        # skipcq: PYL-W0212
-        agent._create_request_openai_client = guarded_client
-        # Isolated native replay checks the pinned provider transport and allowed request parameters.
-        # skipcq: PYL-W0212
-        agent.client._client.event_hooks.setdefault("request", []).append(guard)
+        _install_request_guard(agent, "127.0.0.1" if local_fixture else "opencode.ai", allowed_tools, requests)
         instruction = (skill_prompt + "\n\n" + GUIDANCE + "\nHistorical quality replay only. "
             "The originals retain original timestamps and historical metadata. Classify communication intent AS OF the anchor publication; "
             "Python alone owns age, ownership, risk and execution permission. No trade, operator action or live write is available. "
@@ -198,21 +228,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
         RUN.reset(token)
         REPLAY.reset(cooldown_token)
         undo()
-    checks_path = directory / "checks.private.json"
-    checks = json.loads(checks_path.read_text(encoding="utf-8")) if checks_path.exists() else []
-    return {"completed": bool(result is not None and result.get("completed") is True and not result.get("error")
-                               and not result.get("failed") and not result.get("interrupted") and not result.get("partial")),
-            "native_exit_reason": result.get("turn_exit_reason") if result else None, "worker_error_type": worker_error_type,
-            "native_failure_reason": result.get("failure_reason") if result else None,
-            "transport_turn_attempts": turn_attempts, "transport_retries": transport_retries,
-            "served_model": result.get("served_model") if result else None, "checks": checks,
-            "draft_count": sum(event["name"].endswith("source_check_interpretation") for event in tool_events),
-            "duration_seconds": time.monotonic() - started,
-            "api_responses": measured.api, "request_attempts": requests,
-            "tool_events": tool_events,
-            "tool_metrics": measured.tools, "forbidden_tools": sorted(set(measured.tools) - allowed_tools),
-            "order_requests": 0, "model": DEFAULT_MODEL, "effort": "high"}
-
+    return _worker_result(directory, result, worker_error_type, turn_attempts, transport_retries, tool_events, started, measured, requests, allowed_tools)
 
 def grade(case, observed):
     from aqla_agent.source_replay import mismatches
@@ -236,27 +252,7 @@ def grade(case, observed):
             "mismatch_fields": errors, "interpretation": checks[-1]["interpretation"] if checks else None}
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hermes-source", type=Path, required=True)
-    parser.add_argument("--mcp-python", type=Path, required=True)
-    parser.add_argument("--dataset", type=Path)
-    parser.add_argument("--master", type=Path)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--runs", type=int, choices=(1, 2, 3), default=3)
-    parser.add_argument("--case-id", action="append")
-    parser.add_argument("--worker-fixture", type=Path)
-    parser.add_argument("--workers", type=int, choices=(1, 2, 4), default=2)
-    parser.add_argument("--caveman", type=Path, help="Actual deployed Caveman SKILL.md for the paired express baseline")
-    args = parser.parse_args()
-    logging.disable(logging.CRITICAL)
-    if args.worker_fixture:
-        try:
-            observed = native_worker(args)
-        except Exception as error:
-            observed = {"completed": False, "checks": [], "worker_error_type": type(error).__name__, "order_requests": 0}
-        write_private_json(args.worker_fixture.parent / "observed.private.json", observed)
-        return
+def _experiment_inputs(args):
     INVARIANTS.assertTrue(args.dataset and args.master and args.output)
     payload = json.loads(args.dataset.read_text(encoding="utf-8"))
     cases = payload["cases"]
@@ -282,19 +278,20 @@ def main():
         write_private_json(seal, identity)
     selected = [c for c in cases if not args.case_id or c["id"] in args.case_id]
     INVARIANTS.assertTrue(selected and (not args.case_id or set(args.case_id) <= {c['id'] for c in cases}))
-    schedule = [(c, run) for run in range(args.runs) for c in sorted(selected, key=lambda c: digest(c["id"]))]
-    budget_lock = threading.Lock()
-    budget_used = [0.0]
+    return cases, master, caveman, identity, selected
 
-    def cost(observed):
-        total = 0.0
-        multiplier = max((request["price_multiplier"] for request in observed.get("request_attempts", [])), default=1)
-        for row in observed.get("api_responses", []):
-            if row.get("usage_available"):
-                # Conservatively use the highest observed window for a case crossing peak time.
-                total += multiplier * (row["input_tokens"] * .15 + row["cache_read_tokens"] * .003 + row["output_tokens"] * .60) / 1_000_000
-        return total
 
+def _estimated_cost(observed):
+    total = 0.0
+    multiplier = max((request["price_multiplier"] for request in observed.get("request_attempts", [])), default=1)
+    for row in observed.get("api_responses", []):
+        if row.get("usage_available"):
+            # Conservatively use the highest observed window for a case crossing peak time.
+            total += multiplier * (row["input_tokens"] * .15 + row["cache_read_tokens"] * .003 + row["output_tokens"] * .60) / 1_000_000
+    return total
+
+
+def _wrap_evaluate(args, budget_lock, budget_used, master, caveman):
     def evaluate(item):
         case, run = item
         directory = args.output / digest([case["id"], run])[:24]
@@ -326,36 +323,87 @@ def main():
         observed_path = directory / "observed.private.json"
         observed = json.loads(observed_path.read_text(encoding="utf-8")) if observed_path.exists() else {"completed": False, "checks": []}
         row = {"case_id": case["id"], "run": run, **observed, **grade(case, observed),
-               "total_case_seconds": time.monotonic() - process_started, "quota_usd_estimate": cost(observed)}
+               "total_case_seconds": time.monotonic() - process_started, "quota_usd_estimate": _estimated_cost(observed)}
         with budget_lock:
             budget_used[0] += row["quota_usd_estimate"]
         write_private_json(path, row)
         print(json.dumps({k: row.get(k) for k in ("case_id", "run", "passed", "first_draft_passed", "draft_count", "duration_seconds", "mismatch_fields", "worker_error_type")}), flush=True)
         return row
+    return evaluate
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-        rows = list(executor.map(evaluate, schedule))
-    passed = sum(row["passed"] for row in rows)
-    responses = [response for row in rows for response in row.get("api_responses", [])]
+
+def _latency_summary(rows):
     durations = sorted(row["duration_seconds"] for row in rows if "duration_seconds" in row)
     total_durations = sorted(row["total_case_seconds"] for row in rows if "total_case_seconds" in row)
-    report = {"identity": identity, "cases": len(selected), "observations": len(rows), "passed": passed,
-              "transport_retries": sum(len(row.get("transport_retries", [])) for row in rows),
-              "observations_with_unknown_request_usage": sum(len(row.get("request_attempts", [])) > len(row.get("api_responses", []))
-                  or any(not response.get("usage_available") for response in row.get("api_responses", [])) for row in rows),
-              "first_draft_passed": sum(row["first_draft_passed"] for row in rows),
-              "all_passed": passed == len(rows), "three_runs_complete": args.runs == 3 and len(selected) == len(cases),
-              "model_request_attempts": sum(len(row.get("request_attempts", [])) for row in rows),
+    return {
               "mean_seconds": statistics.mean(durations) if durations else None,
               "median_seconds": statistics.median(durations) if durations else None,
               "mean_total_case_seconds": statistics.mean(total_durations) if total_durations else None,
               "latency_scope": "duration_seconds: native conversation including API/tools; total_case_seconds also includes worker/MCP startup",
+    }
+
+
+def _usage_summary(rows, responses):
+    return {
               "usage_totals": {key: sum(response.get(key, 0) for response in responses) for key in
                   ("input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens")},
               "quota_usd_estimate": sum(row.get("quota_usd_estimate", 0) for row in rows),
               "quota_measurement": "published-price estimate, not subscription console debit; failed-call usage may be unknown",
-              "runs": [{"run": run, "passed": sum(row["passed"] for row in rows if row["run"] == run), "cases": len(selected)} for run in range(args.runs)],
+    }
+
+
+def _unknown_request_usage(row):
+    return len(row.get("request_attempts", [])) > len(row.get("api_responses", [])) or any(
+        not response.get("usage_available") for response in row.get("api_responses", []))
+
+
+def _quality_report(identity, cases, selected, runs, rows):
+    passed = sum(row["passed"] for row in rows)
+    responses = [response for row in rows for response in row.get("api_responses", [])]
+    report = {"identity": identity, "cases": len(selected), "observations": len(rows), "passed": passed,
+              "transport_retries": sum(len(row.get("transport_retries", [])) for row in rows),
+              "observations_with_unknown_request_usage": sum(_unknown_request_usage(row) for row in rows),
+              "first_draft_passed": sum(row["first_draft_passed"] for row in rows),
+              "all_passed": passed == len(rows), "three_runs_complete": runs == 3 and len(selected) == len(cases),
+              "model_request_attempts": sum(len(row.get("request_attempts", [])) for row in rows),
+              **_latency_summary(rows),
+              **_usage_summary(rows, responses),
+              "runs": [{"run": run, "passed": sum(row["passed"] for row in rows if row["run"] == run), "cases": len(selected)} for run in range(runs)],
               "order_requests": 0, "failures": [{"case_id": row["case_id"], "run": row["run"], "fields": row["mismatch_fields"]} for row in rows if not row["passed"]]}
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--hermes-source", type=Path, required=True)
+    parser.add_argument("--mcp-python", type=Path, required=True)
+    parser.add_argument("--dataset", type=Path)
+    parser.add_argument("--master", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--runs", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument("--case-id", action="append")
+    parser.add_argument("--worker-fixture", type=Path)
+    parser.add_argument("--workers", type=int, choices=(1, 2, 4), default=2)
+    parser.add_argument("--caveman", type=Path, help="Actual deployed Caveman SKILL.md for the paired express baseline")
+    args = parser.parse_args()
+    logging.disable(logging.CRITICAL)
+    if args.worker_fixture:
+        try:
+            observed = native_worker(args)
+        except Exception as error:
+            observed = {"completed": False, "checks": [], "worker_error_type": type(error).__name__, "order_requests": 0}
+        write_private_json(args.worker_fixture.parent / "observed.private.json", observed)
+        return
+    cases, master, caveman, identity, selected = _experiment_inputs(args)
+    schedule = [(c, run) for run in range(args.runs) for c in sorted(selected, key=lambda c: digest(c["id"]))]
+    budget_lock = threading.Lock()
+    budget_used = [0.0]
+
+    evaluate = _wrap_evaluate(args, budget_lock, budget_used, master, caveman)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+        rows = list(executor.map(evaluate, schedule))
+    report = _quality_report(identity, cases, selected, args.runs, rows)
     write_private_json(args.output / "report.json", report)
     print(json.dumps({k: v for k, v in report.items() if k != "failures"}), flush=True)
     return 0 if report["all_passed"] else 1

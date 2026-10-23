@@ -50,41 +50,34 @@ def percentile(values, fraction):
     return sorted(values)[max(0, min(len(values)-1, int(len(values)*fraction + .999999)-1))]
 
 
-async def paired_fake_benchmark(cases, baseline, output):
-    """Native read/check interpretation followed by the same isolated executor."""
-    sys.path.insert(0, str(ROOT / "tests"))
+async def _paired_case(case, row, output, pair_index):
     from express_benchmark_fixture import apply_fake
+    context = case_context(case)
+    source = SourceEvent.model_validate(require_first(r["source"] for r in context["messages"] if r["event_id"] == case["anchor_event_id"]))
+    fast = evaluate(case)
+    INVARIANTS.assertTrue(fast['accepted'] and fast['passed'] and row['passed'])
+    values = {"express": Interpretation.model_validate(fast["interpretation"]),
+              "high": Interpretation.model_validate(row["interpretation"])}
+    results = {}
+    order = ("high", "express") if pair_index % 2 else ("express", "high")
+    for route in order:
+        results[route] = await apply_fake(source, values[route], output / (digest([row["case_id"], row["run"], route])[:24]), express=route == "express")
+    INVARIANTS.assertTrue(results['express']['outcome'] == results['high']['outcome'], 'Paired financial outcome differs')
+    results["high"]["seconds"] += row["duration_seconds"]
+    return {"case_id": row["case_id"], "run": row["run"], **results}
 
-    from aqla_agent.source_replay import canonical_symbol
 
-    reference = json.loads((baseline / "report.json").read_text(encoding="utf-8"))
-    INVARIANTS.assertTrue(reference['all_passed'] and reference['identity']['native_auto_load'] == ['caveman', 'aqla-master'])
-    observations = [json.loads(p.read_text(encoding="utf-8")) for p in baseline.glob("*.private.json") if p.stat().st_size]
-    by_id = {case["id"]: case for case in cases}
-    pairs = []
-    for row in observations:
-        if ":" in (canonical_symbol(row["interpretation"].get("symbol")) or ""):
-            continue
-        case = by_id[row["case_id"]]
-        context = case_context(case)
-        source = SourceEvent.model_validate(require_first(r["source"] for r in context["messages"] if r["event_id"] == case["anchor_event_id"]))
-        fast = evaluate(case)
-        INVARIANTS.assertTrue(fast['accepted'] and fast['passed'] and row['passed'])
-        values = {"express": Interpretation.model_validate(fast["interpretation"]),
-                  "high": Interpretation.model_validate(row["interpretation"])}
-        results = {}
-        order = ("high", "express") if len(pairs) % 2 else ("express", "high")
-        for route in order:
-            results[route] = await apply_fake(source, values[route], output / (digest([row["case_id"], row["run"], route])[:24]), express=route == "express")
-        INVARIANTS.assertTrue(results['express']['outcome'] == results['high']['outcome'], 'Paired financial outcome differs')
-        results["high"]["seconds"] += row["duration_seconds"]
-        pairs.append({"case_id": row["case_id"], "run": row["run"], **results})
-    INVARIANTS.assertTrue(pairs and len(pairs) == len({p['case_id'] for p in pairs}) * 3)
+def _paired_metrics(pairs):
     metrics = {}
     for route in ("express", "high"):
         seconds = [p[route]["seconds"] for p in pairs]
         metrics[route] = {"mean_seconds": statistics.mean(seconds), "median_seconds": statistics.median(seconds),
                           "p95_seconds": percentile(seconds, .95)}
+    return metrics
+
+
+def _paired_report(reference, observations, pairs, output):
+    metrics = _paired_metrics(pairs)
     passed = all(metrics["express"][key] < metrics["high"][key] for key in ("median_seconds", "p95_seconds"))
     paired_ids = {(p["case_id"], p["run"]) for p in pairs}
     comparable = [r for r in observations if (r["case_id"], r["run"]) in paired_ids]
@@ -102,6 +95,23 @@ async def paired_fake_benchmark(cases, baseline, output):
             "native_baseline_all_quota_usd_estimate": reference["quota_usd_estimate"],
             "real_order_requests": 0, "dex_cases": "covered by interpretation grading and existing DEX regression suite, excluded from this simple fake execution fixture"}
 
+
+async def paired_fake_benchmark(cases, baseline, output):
+    """Native read/check interpretation followed by the same isolated executor."""
+    sys.path.insert(0, str(ROOT / "tests"))
+    from aqla_agent.source_replay import canonical_symbol
+
+    reference = json.loads((baseline / "report.json").read_text(encoding="utf-8"))
+    INVARIANTS.assertTrue(reference['all_passed'] and reference['identity']['native_auto_load'] == ['caveman', 'aqla-master'])
+    observations = [json.loads(p.read_text(encoding="utf-8")) for p in baseline.glob("*.private.json") if p.stat().st_size]
+    by_id = {case["id"]: case for case in cases}
+    pairs = []
+    for row in observations:
+        if ":" in (canonical_symbol(row["interpretation"].get("symbol")) or ""):
+            continue
+        pairs.append(await _paired_case(by_id[row["case_id"]], row, output, len(pairs)))
+    INVARIANTS.assertTrue(pairs and len(pairs) == len({p['case_id'] for p in pairs}) * 3)
+    return _paired_report(reference, observations, pairs, output)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
