@@ -5,6 +5,7 @@ import asyncio
 import copy
 import json
 import secrets
+from decimal import Decimal
 from types import SimpleNamespace
 
 from aqla_hyperliquid_mcp.models import AqlaError
@@ -51,6 +52,16 @@ def input_value(text, schema):
     if any(item.get("type") == "integer" for item in schema.get("anyOf", [])) and text.strip().isdigit():
         return int(text.strip())
     return parse_value(text, schema)
+
+
+def setting_value(value):
+    if value is None:
+        return "aus"
+    if isinstance(value, bool):
+        return "an" if value else "aus"
+    if isinstance(value, list):
+        return "; ".join(setting_value(item) for item in value) or "keine"
+    return number(value) if isinstance(value, Decimal) else str(value)
 
 
 class TelegramMenu:
@@ -136,8 +147,8 @@ class TelegramMenu:
         net = data["net_pnl"]
         lines = [f"{'Journal' if journal else 'Dashboard'} · {self.network.capitalize()} · {self.currency} · {data['resolved_period']}",
                  "Neue Entries: " + ("pausiert" if data["paused"] else "aktiv"),
-                 "Netto belegt: " + number(net["value"]) + f" {self.currency} · {net['known']}/{net['total']} abgeschlossen",
-                 "Gebühren: " + number(data["fees"]["value"]) + " · Funding: " + number(data["funding"]["value"]),
+                 "Netto belegt: " + number(net["value"], places=6) + f" {self.currency} · {net['known']}/{net['total']} abgeschlossen",
+                 "Gebühren: " + number(data["fees"]["value"], places=6) + " · Funding: " + number(data["funding"]["value"], places=6),
                  f"Eigene offene Positionen: {data['open_trades']}"]
         for key, value in data.get("account_recovery", {}).items():
             if isinstance(value, dict):
@@ -169,7 +180,7 @@ class TelegramMenu:
         current = next((row for row in snapshot["trades"] if row["trade_id"] == trade_id), None)
         if current:
             from .messages import trade_block
-            text = trade_block({**snapshot, "trades": {trade_id: current}}, current, []).replace("**", "")
+            text = trade_block({**snapshot, "trades": {trade_id: current}}, current, [], detailed=True).replace("**", "")
             text += "\n\nEigene Menge: " + number(current.get("remaining_quantity"))
             text += "\nWaverider: " + ("pausiert" if current.get("waverider_paused") else str(current.get("waverider", {}).get("phase", "nicht aktiv")))
             from .operator_management import fingerprint
@@ -186,7 +197,7 @@ class TelegramMenu:
             row = journal["rows"][0] if journal["rows"] else {}
             accounting = row.get("accounting", {})
             text = "Historischer Trade · " + trade_id + "\n" + str(row.get("Symbol", "—")) + " · " + str(row.get("Status", "—"))
-            text += "\nNetto: " + number(accounting.get("net_pnl")) + "\nGebühren: " + number(accounting.get("fees")) + "\nFunding: " + number(accounting.get("funding"))
+            text += "\nNetto: " + number(accounting.get("net_pnl"), places=6) + "\nGebühren: " + number(accounting.get("fees"), places=6) + "\nFunding: " + number(accounting.get("funding"), places=6)
             text += "\nAbrechnung: " + ("vollständig" if accounting.get("complete") else "; ".join(accounting.get("issues", ["unvollständig"])))
             actions = []
         actions += [("Orders & Fills", "trade_evidence", trade_id), ("Aktualisieren", "trade", trade_id)]
@@ -204,7 +215,7 @@ class TelegramMenu:
         if row.get("parameters") is None:
             defaults = Parameters()
             text = row["name"] + " · noch nicht eingerichtet\nDieses Ausgangsprofil gilt für neue Planungen. Kontolimits und bestehende Freigaben bleiben verbindlich.\n\n"
-            text += "\n".join(LABELS[name] + ": " + str(getattr(defaults, name)) for name in Parameters.model_fields)
+            text += "\n".join(LABELS[name] + ": " + setting_value(getattr(defaults, name)) for name in Parameters.model_fields)
             return await self.display(bot, text, [("Dieses Ausgangsprofil übernehmen", "initialize_profile", identity, data["configuration_revision"])])
         await self.display(bot, row["name"] + " · Profil " + identity + "\nBestehende Trades behalten ihre gespeicherten Pläne.",
             [(name, "profile_group", identity, name) for name in GROUPS] + [("Profil umbenennen", "prompt", "rename_profile", identity), ("Profil löschen", "confirm_delete", "profile", identity)])
@@ -212,7 +223,7 @@ class TelegramMenu:
     async def profile_group(self, bot, identity, group):
         data = await self.config()
         parameters = Parameters.model_validate(data["profiles"][identity]["parameters"])
-        rows = [(LABELS[name] + ": " + str(getattr(parameters, name)), name) for name in GROUPS[group]]
+        rows = [(LABELS[name] + ": " + setting_value(getattr(parameters, name)), name) for name in GROUPS[group]]
         title = data["profiles"][identity]["name"] + " · " + group
         if group == "Waverider":
             permissions = data.get("waverider_permissions", {}).get(identity, {})
@@ -250,7 +261,6 @@ class TelegramMenu:
             runtime = RuntimeControls(self.extension).read()
             current, revision = runtime["values"][field], runtime["revision"]
             schema, unit = TechnicalSettings.model_json_schema()["properties"][field], "Wert"
-        self.commands.auth(protected=True)
         self.pending = {"kind": kind, "identity": identity, "field": field, "schema": schema, "revision": revision}
         selected = next((row for row in schema.get("anyOf", [schema]) if row.get("type") != "null"), schema)
         options = selected.get("enum")
@@ -259,7 +269,7 @@ class TelegramMenu:
         if kind == "technical" and field in ("express", "source_processing"):
             options = ["off", "shadow", "live"] if field == "express" else ["legacy", "shadow", "hybrid"]
         buttons = [(str(value), "input", value) for value in options] if options is not None else []
-        text = LABELS.get(field, field) + f"\nAktuell: {current}\nEinheit: {unit}\nEin gültiger neuer Wert wird sofort gespeichert."
+        text = LABELS.get(field, field) + f"\nAktuell: {setting_value(current)}\nEinheit: {unit}\nMit aktiver Setup-Freigabe wird ein gültiger neuer Wert sofort gespeichert."
         if not buttons:
             text += "\nNeuen Wert senden. Listen: Werte mit ; trennen. null = aus, falls zulässig."
         await self.display(bot, text, buttons)
@@ -292,7 +302,7 @@ class TelegramMenu:
             result = await RuntimeControls(self.extension).change(field, value, pending["revision"])
             suffix = "\nÜbernahme ausstehend; der native Dienst prüft die gespeicherte Einstellung erneut." if result["apply_status"] == "pending" else ""
         self.pending = None
-        await self.display(bot, "Gespeichert · " + LABELS.get(field, field) + ": " + str(value) + (suffix if kind == "technical" else ""),
+        await self.display(bot, "Gespeichert · " + LABELS.get(field, field) + ": " + setting_value(value) + (suffix if kind == "technical" else ""),
             [("Weitere Einstellungen", "profile_group", identity, next(group for group, fields in GROUPS.items() if field in fields))] if kind == "profile" else [("Zur Übersicht", "system" if kind == "technical" else "accounts" if kind == "limits" else "ranking")])
 
     async def run(self, bot, action, *args):
@@ -410,7 +420,7 @@ class TelegramMenu:
             values = technical["values"]
             from . import __version__
             lines = ["System & KI · Aqla " + __version__, "Freigaben und Grenzen werden bei jeder Wirkung erneut geprüft."]
-            lines += [LABELS[key] + ": " + str(value) for key, value in values.items()]
+            lines += [LABELS[key] + ": " + setting_value(value) for key, value in values.items()]
             lines.append("Technische Übernahme: " + technical["apply_status"])
             return await self.display(bot, "\n".join(lines), [("Technische Einstellungen", "technical"), ("Verlauf & Störungen", "activity", 0), ("Meldungsregeln", "notification_info"),
                 ("Erschöpfte Zustellungen erneut prüfen", "retry_delivery"), ("Aktualisieren", "system")])
@@ -466,6 +476,10 @@ class TelegramMenu:
             offset = args[2] if len(args) > 2 else 0
             data = await self.rpc("journal_read", table=table, trade_id=trade_id, offset=offset, limit=8)
             rows = [str(row.get("Art", "Vorgang")) + " · " + str(row.get("Order-ID", row.get("ID"))) + " · Menge " + str(row.get("Menge", "—")) + " · Preis " + str(row.get("Preis", row.get("Preis/Ziel", "—"))) for row in data["rows"]]
+            if table == "Orders":
+                rows = [text + " · Status: " + str(row.get("Status Börse") or "nicht bestätigt") + (" · ersetzt" if row.get("Ersetzt") else "") for text, row in zip(rows, data["rows"], strict=True)]
+            elif table == "Vorgänge":
+                rows = [text + " · Phase: " + str(row.get("Phase") or "nicht bestätigt") for text, row in zip(rows, data["rows"], strict=True)]
             buttons = [("Weitere →", "evidence_table", trade_id, table, data["next_offset"])] if data.get("next_offset") is not None else []
             if offset:
                 buttons.append(("← Vorherige", "evidence_table", trade_id, table, max(0, offset - 8)))
@@ -655,4 +669,7 @@ class TelegramMenu:
                     await self.text_input(bot, text)
         except (ValueError, AqlaError) as error:
             await self.display(bot, "Nicht gespeichert.\n" + str(error)[:600], [("Setup", "setup")])
+        except Exception:
+            self.pending = None
+            await self.display(bot, "Menü vorübergehend nicht verfügbar. Ein möglicherweise angenommener Handelsauftrag wird mit derselben Identität abgeglichen.")
         return True

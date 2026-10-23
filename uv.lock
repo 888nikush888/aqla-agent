@@ -30,7 +30,7 @@ wheels = [
 
 [[package]]
 name = "aqla-agent"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "coincurve", marker = "python_full_version < '3.14'" },

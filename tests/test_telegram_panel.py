@@ -1,5 +1,6 @@
 import copy
 import json
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -7,7 +8,7 @@ from test_native_commands import controls  # noqa: F401
 from test_native_setup import update
 
 from aqla_agent.pipelines import Parameters
-from aqla_agent.telegram_menu import GROUPS, HOME, PREFIX, TelegramMenu, input_value
+from aqla_agent.telegram_menu import GROUPS, HOME, PREFIX, TelegramMenu, input_value, setting_value
 
 
 @pytest.fixture
@@ -44,6 +45,19 @@ def test_every_profile_parameter_is_reachable_once():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("field", Parameters.model_fields)
+async def test_every_profile_setting_round_trips_through_its_input(panel, field):
+    menu, bot, data, changes, *_ = panel
+    before = Parameters.model_validate(data["profiles"]["standard"]["parameters"])
+    current = getattr(before, field)
+    text = json.dumps(current, default=str) if current is None or isinstance(current, (list, bool)) else str(current)
+    await menu.field(bot, "profile", "standard", field)
+    await menu.text_input(bot, text)
+    assert Parameters.model_validate(data["profiles"]["standard"]["parameters"]) == before
+    assert len(changes) == 1
+
+
+@pytest.mark.asyncio
 async def test_menu_navigates_one_message_and_rejects_old_buttons(panel):
     menu, bot, data, changes, *_ = panel
     assert await menu.intercept(update("/aqla"), bot)
@@ -76,6 +90,70 @@ async def test_profile_value_commits_immediately_preserving_other_fields(panel):
     assert len(changes) == 1 and changes[0]["profile"]["parameters"]["risk_percent"] == "0.75"
     after = data["profiles"]["standard"]["parameters"]
     assert {key: value for key, value in after.items() if key != "risk_percent"} == {key: value for key, value in before.items() if key != "risk_percent"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", Parameters.model_fields)
+async def test_all_profile_values_are_readable_without_setup_but_writes_stay_protected(panel, field):
+    from aqla_hyperliquid_mcp.models import AqlaError
+    menu, bot, _, changes, *_ = panel
+    menu.extension.setup.lease = None
+    await menu.field(bot, "profile", "standard", field)
+    assert "Aktuell:" in (bot.edits or bot.sent)[-1]["text"]
+    with pytest.raises(AqlaError, match="Setup"):
+        await menu.commit_field(bot, "1")
+    assert not changes
+
+
+def test_settings_are_readable_without_python_representations():
+    assert setting_value([Decimal("20"), Decimal("0.25")]) == "20; 0,25"
+    assert setting_value(None) == setting_value(False) == "aus"
+    assert setting_value(True) == "an" and setting_value([]) == "keine"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_rounds_only_monetary_display_and_keeps_missing_values_unknown(panel):
+    menu, bot, _, changes, *_ = panel
+    amount = "14.22275700000000000000000001"
+    async def dashboard(*args, **kwargs):
+        return {"net_pnl": {"value": amount, "known": 3, "total": 4}, "paused": False,
+                "resolved_period": "all", "fees": {"value": "1.024368"}, "funding": {"value": None},
+                "open_trades": 1, "source_queue": {}}
+    menu.rpc = dashboard
+    await menu.dashboard(bot)
+    text = (bot.edits or bot.sent)[-1]["text"]
+    assert "14,222757 USDC" in text and "Funding: nicht bestätigt" in text
+    assert amount == "14.22275700000000000000000001" and not changes
+
+
+@pytest.mark.asyncio
+async def test_evidence_distinguishes_replaced_orders_and_operation_phases(panel):
+    menu, bot, _, changes, *_ = panel
+    async def evidence(_server, tool, args):
+        assert tool == "journal_read" and args["trade_id"] == "own-trade"
+        return {"rows": [{"Art": "sl", "Order-ID": "original", "Status Börse": "canceled", "Ersetzt": True},
+                         {"Art": "sl", "Order-ID": "current", "Status Börse": "open", "Ersetzt": False},
+                         {"Art": "order", "Phase": "unknown"}], "next_offset": None}
+    menu.extension.mcp_call = evidence
+    await menu.run(bot, "evidence_table", "own-trade", "Orders")
+    text = (bot.edits or bot.sent)[-1]["text"]
+    assert "Status: canceled · ersetzt" in text and "Status: open" in text
+    await menu.run(bot, "evidence_table", "own-trade", "Vorgänge")
+    assert "Phase: unknown" in (bot.edits or bot.sent)[-1]["text"]
+    assert not changes
+
+
+@pytest.mark.asyncio
+async def test_unexpected_text_input_error_stays_native_and_does_not_leak_details(panel):
+    menu, bot, _, changes, *_ = panel
+    await menu.run(bot, "prompt", "filter_symbol", "")
+    async def unavailable(*args, **kwargs):
+        raise RuntimeError("synthetic-private-diagnostic")
+    menu.rpc = unavailable
+    assert await menu.intercept(update("ETH"), bot)
+    text = (bot.edits or bot.sent)[-1]["text"]
+    assert "vorübergehend" in text and "synthetic-private" not in text
+    assert menu.pending is None and not changes
 
 
 @pytest.mark.asyncio

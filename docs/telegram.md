@@ -21,6 +21,8 @@ Die bisherigen `/aqla_…`-Befehle bleiben Kurzwege. Das sichtbare Bot-Befehlsme
 
 Ein gültiger letzter Wert wird sofort gespeichert. Zahlen akzeptieren Dezimalkomma; Listen verwenden `;` zwischen Werten. Jede Änderung validiert das vollständige Profil und die aktuelle Revision. Abhängige Werte müssen in gültiger Reihenfolge gesetzt werden, etwa erst der feste Positionswert, dann die Auswahl der festen Größenberechnung.
 
+Alle Einstellungswerte sind im privaten Menü auch ohne Setup lesbar. Geschützte Änderungen verlangen die Freigabe weiterhin beim Speichern. Positionsdetails zeigen Entry, SL und TPs auch ohne neues Handelsereignis. In den Belegen bleiben ersetzte Orders sichtbar und sind mit Börsenstatus und Ersetzungsmarker gekennzeichnet. Geldbeträge werden im Menü auf sechs Nachkommastellen angezeigt; die gespeicherten Abrechnungen bleiben unverändert.
+
 Eine neue Installation zeigt das noch leere Standardprofil zuerst mit allen Ausgangswerten. Erst die ausdrückliche Übernahme richtet es ein. Erste Kontolimits verlangen beide Werte: maximale offene Trades und Gesamtrisiko; danach wird jeder gültige einzelne Wert sofort gespeichert. Es werden dabei keine Kontolimits automatisch ergänzt.
 
 Die private Setup-Freigabe dauert 300 Sekunden. Das Passwort wird ausschließlich im ursprünglichen nativen Passwortdialog verarbeitet und nach bestätigter Löschung geprüft. Lesen, Pause und Risikoreduktion bleiben nach ihren bestehenden Regeln erreichbar. Alte Buttons, fremde Nutzer, Gruppen und weitergeleitete Eingaben verleihen keine Autorität.

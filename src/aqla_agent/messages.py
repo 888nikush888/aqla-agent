@@ -213,7 +213,7 @@ def pnl(trade):
     return gross - sum((decimal(row["fee"]) for row in fills), Decimal(0))
 
 
-def trade_block(data, trade, notices):
+def trade_block(data, trade, notices, *, detailed=False):
     plan, stage = trade["plan"], trade["status"]
     plan = {**plan, "source_tp": trade.get("source_tp_override", plan.get("source_tp"))}
     market = literal(plan["market"]["symbol"])
@@ -268,7 +268,7 @@ def trade_block(data, trade, notices):
     if stage == "waiting_entry":
         lines.append("**Status:** lokaler Wartezustand · noch keine Börsenorder")
     quote = literal(plan["market"].get("quote_token", "USDC"))
-    full = opening or filled == 0 or stage in ("unknown", "protecting")
+    full = detailed or opening or filled == 0 or stage in ("unknown", "protecting")
     if full:
         receipt_filled = facts["entry_fill_confirmed"] is True
         entry = trade.get("entry_vwap") if filled else plan.get("entry_price")

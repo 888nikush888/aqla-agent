@@ -10,6 +10,17 @@ from aqla_agent.messages import MAX_NOTIFICATIONS, literal, number, split_blocks
 READY = {'hyperliquid': {'configured': True, 'enabled': True, 'network': 'testnet'}}
 
 
+def test_open_position_details_include_entry_stop_and_targets_without_an_opening_notice(opened):
+    from aqla_agent.messages import trade_block
+    trade = next(iter(opened['trades'].values()))
+    trade['status'] = 'open'
+    brief = trade_block(opened, trade, [])
+    detailed = trade_block(opened, trade, [], detailed=True)
+    assert '**Entry realisiert:**' not in brief
+    assert '**SL:**' in detailed and '**Ziele · Positionsanteil**' in detailed
+    assert detailed.startswith(brief.split('\n', 1)[0])
+
+
 def test_delayed_target_notification_uses_current_terminal_outcome(opened):
     trade=next(iter(opened['trades'].values()))
     trade.update(status='rejected',filled_quantity='0',remaining_quantity='0',fill_events={})
