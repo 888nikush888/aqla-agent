@@ -70,7 +70,7 @@ class TelegramMenu:
         self.message_id = None
         self.fresh = False
         self.tokens, self.pending = {}, None
-        self.deadline, self.binding = 0, None
+        self.recovered = False
         self.serial = asyncio.Lock()
         self.network, self.period, self.currency = "mainnet", "today", "USDC"
         self.receipt_file = self.extension.config_path.parent / "data" / "telegram-menu.json"
@@ -78,6 +78,7 @@ class TelegramMenu:
             value = json.loads(self.receipt_file.read_text(encoding="utf-8"))
             if value["owner"] == self.extension.owner:
                 self.message_id = value["message_id"]
+                self.recovered = True
         except (OSError, ValueError, KeyError):
             pass
 
@@ -87,7 +88,7 @@ class TelegramMenu:
         return {"text": str(label)[:64], "callback_data": token}
 
     def live(self):
-        return self.extension.setup.now() < self.deadline and self.binding == self.extension.setup_binding()
+        return self.message_id is not None
 
     async def rpc(self, tool, **args):
         return await self.extension.mcp_call(self.extension.server, tool, args)
@@ -97,8 +98,7 @@ class TelegramMenu:
 
     async def display(self, bot, text, buttons=(), *, raw=False, page=0):
         self.tokens.clear()
-        self.deadline = self.extension.setup.now() + 300
-        self.binding = self.extension.setup_binding()
+        self.recovered = False
         rows = []
         if raw:
             rows = [[{"text": label[:64], "callback_data": token}] for label, token in buttons]
@@ -637,7 +637,12 @@ class TelegramMenu:
                 return True
             selection = self.tokens.pop(query.data, None) if self.live() and message.message_id == self.message_id else None
             if selection is None:
-                await query.answer(text="Menü abgelaufen oder geändert. Mit /aqla neu öffnen.")
+                if self.recovered and message.message_id == self.message_id:
+                    await query.answer()
+                    async with self.serial:
+                        await self.home(bot)
+                    return True
+                await query.answer(text="Diese Schaltfläche wurde ersetzt. Bitte das aktuelle Menü verwenden.")
                 return True
             await query.answer()
             action, args = selection

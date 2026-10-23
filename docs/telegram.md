@@ -19,7 +19,7 @@ Die bisherigen `/aqla_…`-Befehle bleiben Kurzwege. Das sichtbare Bot-Befehlsme
 
 Aktuelle Quellen und Rangauswahl enthalten ausschließlich konfigurierte Kanäle, auch bei aufgelösten Telegram-Aliasnamen. Nach dem Entfernen bleiben frühere Ränge, Nachweise und Trades als Historie erhalten. `ranking_status(source=…)` kann diese gezielt unter `inactive_sources` lesen; sie sind keine aktive Anmeldung und benötigen keine Bereinigung. Erneutes Aufnehmen und Entfernen dient nicht zum Löschen dieser Historie. Rangänderungen für inaktive Quellen sind gesperrt.
 
-Nach fünf Minuten ohne Menüaktion laufen die Buttons ab. Ein Klick erklärt dann, dass `/aqla` eine neue Menükarte öffnet. Die vorhandene Positionsverwaltung läuft weiter.
+Das Menü hat keinen Inaktivitätsablauf. Es bleibt bis zur erneuten Anforderung bedienbar; dabei ersetzt die neue Karte die bisherige. Nach einem Dienstneustart stellt ein Klick auf die letzte Karte deren Hauptmenü wieder her. Ersetzte Schaltflächen werden nicht erneut ausgeführt. Die vorhandene Positionsverwaltung läuft unabhängig weiter.
 
 ## Änderungen
 

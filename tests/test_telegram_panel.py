@@ -127,14 +127,47 @@ async def test_menu_authenticates_actual_callback_actor(panel, owner, chat_type)
 
 
 @pytest.mark.asyncio
-async def test_expired_menu_explains_reopen_without_extending_authority_or_writing(panel):
+async def test_menu_stays_active_after_days_without_extending_setup(panel):
     menu, bot, _, changes, now, *_ = panel
     await menu.home(bot)
     current = callback(menu, choose(bot, "⚙️ Profile & Handelsregeln"))
-    now[0] = menu.deadline + 1
+    now[0] += 86400 * 7
     await menu.intercept(current, bot)
-    assert current.answers == [{"text": "Menü abgelaufen oder geändert. Mit /aqla neu öffnen."}]
-    assert not bot.edits and not changes and not menu.live()
+    assert current.answers == [{}]
+    assert bot.edits and not changes and menu.live()
+    await menu.field(bot, "profile", "standard", "risk_percent")
+    with pytest.raises(Exception, match="abgelaufen|Setup"):
+        await menu.commit_field(bot, "1")
+    assert not changes
+
+
+@pytest.mark.asyncio
+async def test_restart_refreshes_existing_menu_without_request_or_authority(panel):
+    menu, bot, _, changes, now, _ = panel
+    await menu.home(bot)
+    previous = menu.message_id
+    token = choose(bot, "⚙️ Profile & Handelsregeln")
+    now[0] += 86400
+    restarted = TelegramMenu(menu.commands)
+    menu.commands.menu = restarted
+    assert restarted.message_id == previous and restarted.recovered
+    await restarted.intercept(callback(restarted, token), bot)
+    assert len(bot.sent) == 1 and len(bot.edits) == 1
+    assert restarted.message_id == previous and not restarted.recovered
+    assert "Aqla · Steuerzentrale" in bot.edits[-1]["text"]
+    await restarted.intercept(callback(restarted, choose(bot, "⚙️ Profile & Handelsregeln")), bot)
+    assert "Profile" in bot.edits[-1]["text"] and not changes
+
+
+@pytest.mark.asyncio
+async def test_recovered_receipt_never_refreshes_for_other_user_or_message(panel):
+    menu, bot, _, changes, *_ = panel
+    await menu.home(bot)
+    token = choose(bot, "⚙️ Profile & Handelsregeln")
+    restarted = TelegramMenu(menu.commands)
+    for values in ({"owner":"stranger"},{"chat_type":"group"},{"message_id":restarted.message_id+1}):
+        await restarted.intercept(callback(restarted, token, **values), bot)
+    assert restarted.recovered and not bot.edits and not changes
 
 
 @pytest.mark.asyncio
