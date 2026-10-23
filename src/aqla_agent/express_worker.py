@@ -118,8 +118,7 @@ class ExpressWorker:
             job.status = "prepared"
         self.processor.save(job)
 
-    async def process(self, job):
-        snapshot = self.state.snapshot()
+    def current_event(self, job, snapshot):
         if job.status in ("applying", "recovering"):
             self.recover(job, snapshot)
             if job.status not in ("interpreted", "waiting_preview", "prepared"):
@@ -137,71 +136,96 @@ class ExpressWorker:
         if current["event_id"] != job.event_id:
             self.release(job, "source_revision_changed")
             return
-        shadow = job.processing_mode == "express_shadow"
+        return row
+
+    def processing_allowed(self, job, snapshot, shadow):
         if (not self.qualified() or job.policy_version != self.policy_version or self.processor.mode != "legacy"
                 or self.settings.mode == "off" or not shadow and self.settings.mode != "live"):
             self.release(job, "express_disabled_or_policy_changed")
-            return
+            return False
         if job.status == "waiting_preview":
             pending = self.processor.pending_previews(snapshot, job)
             if pending and not self.processor.unsubmitted_plans(snapshot, job) and not any(
                     retry_due(target["observation_retry"]) or now_ms() >= target["observation_retry"]["deadline_at"]
                     for target in pending):
+                return False
+        return True
+
+    def checked_draft(self, job, row, snapshot):
+        source = SourceEvent.model_validate(row["source"])
+        draft = compile_template(source)
+        if source.historical or draft is None:
+            self.release(job, "template_changed")
+            return
+        context, packet, fingerprint = self.processor.context(job.event_id)
+        if job.status == "waiting_preview":
+            try:
+                self.processor.check_intent(job, snapshot)
+            except AqlaError:
+                self.release(job, "source_intent_changed")
                 return
+            interpretation = precise_numeric_evidence(packet, draft)
+        else:
+            checked = check_interpretation(context, draft)
+            if not checked["valid"]:
+                self.release(job, "shared_validation_deferred")
+                return
+            from aqla_hyperliquid_mcp.models import Interpretation
+            interpretation = Interpretation.model_validate(checked["interpretation"])
+        return source, interpretation, fingerprint
+
+    async def apply_interpretation(self, job, row, source, interpretation, fingerprint, shadow):
+        # A fresh full parse plus the common checker is the internal proof;
+        # never impersonate a Decision Model's second-verification flag.
+        if job.result and job.result.interpretation != interpretation:
+            self.release(job, "interpretation_changed")
+            return
+        job.express_timings["checked_at"] = now_ms()
+        if shadow:
+            job.status, job.outcome = "shadow", "template_valid"
+            job.result = DecisionResult(model=VERSION, interpretation=interpretation)
+            self.processor.save(job)
+            return
+        if row.get("express_job_id") != job.job_id:
+            self.release(job, "claim_changed")
+            return
+        if job.status == "prepared":
+            job.fingerprint = fingerprint
+            job.result = DecisionResult(model=VERSION, interpretation=interpretation)
+            job.intent_revisions = {source.source_id: source.event_id}
+            job.status = "interpreted"
+            self.processor.save(job)
+        await self.processor.apply_saved(self.owner, job.job_id)
+        updated = SourceJob.model_validate(self.state.read("source_jobs", entries={"source_jobs": [job.job_id]})["source_jobs"][job.job_id])
+        updated.express_timings["application_reply_at"] = now_ms()
+        self.processor.save(updated)
+
+    def recover_processing_failure(self, job, error):
+        current = SourceJob.model_validate(self.state.read("source_jobs", entries={"source_jobs": [job.job_id]})["source_jobs"][job.job_id])
+        observed = self.state.snapshot()
+        if self.processor.event_operations(observed, current) or self.processor.pending_previews(observed, current):
+            self.recover(current, observed)
+        else:
+            self.release(current, "express_processing_deferred")
+        LOG.warning("Express source remains durable (%s)", type(error).__name__)
+
+    async def process(self, job):
+        snapshot = self.state.snapshot()
+        row = self.current_event(job, snapshot)
+        if row is None:
+            return
+        shadow = job.processing_mode == "express_shadow"
+        if not self.processing_allowed(job, snapshot, shadow):
+            return
         token = CLAIM.set((self.owner, job.job_id))
         try:
-            source = SourceEvent.model_validate(row["source"])
-            draft = compile_template(source)
-            if source.historical or draft is None:
-                self.release(job, "template_changed")
+            checked = self.checked_draft(job, row, snapshot)
+            if checked is None:
                 return
-            context, packet, fingerprint = self.processor.context(job.event_id)
-            if job.status == "waiting_preview":
-                try:
-                    self.processor.check_intent(job, snapshot)
-                except AqlaError:
-                    self.release(job, "source_intent_changed")
-                    return
-                interpretation = precise_numeric_evidence(packet, draft)
-            else:
-                checked = check_interpretation(context, draft)
-                if not checked["valid"]:
-                    self.release(job, "shared_validation_deferred")
-                    return
-                from aqla_hyperliquid_mcp.models import Interpretation
-                interpretation = Interpretation.model_validate(checked["interpretation"])
-            # A fresh full parse plus the common checker is the internal proof;
-            # never impersonate a Decision Model's second-verification flag.
-            if job.result and job.result.interpretation != interpretation:
-                self.release(job, "interpretation_changed")
-                return
-            job.express_timings["checked_at"] = now_ms()
-            if shadow:
-                job.status, job.outcome = "shadow", "template_valid"
-                job.result = DecisionResult(model=VERSION, interpretation=interpretation)
-                self.processor.save(job)
-                return
-            if row.get("express_job_id") != job.job_id:
-                self.release(job, "claim_changed")
-                return
-            if job.status == "prepared":
-                job.fingerprint = fingerprint
-                job.result = DecisionResult(model=VERSION, interpretation=interpretation)
-                job.intent_revisions = {source.source_id: source.event_id}
-                job.status = "interpreted"
-                self.processor.save(job)
-            await self.processor.apply_saved(self.owner, job.job_id)
-            updated = SourceJob.model_validate(self.state.read("source_jobs", entries={"source_jobs": [job.job_id]})["source_jobs"][job.job_id])
-            updated.express_timings["application_reply_at"] = now_ms()
-            self.processor.save(updated)
+            source, interpretation, fingerprint = checked
+            await self.apply_interpretation(job, row, source, interpretation, fingerprint, shadow)
         except Exception as error:
-            current = SourceJob.model_validate(self.state.read("source_jobs", entries={"source_jobs": [job.job_id]})["source_jobs"][job.job_id])
-            observed = self.state.snapshot()
-            if self.processor.event_operations(observed, current) or self.processor.pending_previews(observed, current):
-                self.recover(current, observed)
-            else:
-                self.release(current, "express_processing_deferred")
-            LOG.warning("Express source remains durable (%s)", type(error).__name__)
+            self.recover_processing_failure(job, error)
         finally:
             CLAIM.reset(token)
 

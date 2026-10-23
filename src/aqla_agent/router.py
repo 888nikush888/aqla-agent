@@ -5,6 +5,7 @@ import asyncio
 import math
 import time
 from decimal import Decimal
+from functools import partial
 from typing import Literal, NotRequired, TypedDict
 
 from aqla_hyperliquid_mcp.models import (
@@ -222,110 +223,102 @@ class Router:
         return bool(trade_id and (trade_id in data["trades"] or "entry:" + trade_id in data["operations"]
                                   or "leverage:" + trade_id in data["operations"]))
 
-    async def preview(self, event_id, interpretation):
+    def reset_legacy_preview_target(self, data, row, current):
+        if set(row["targets"]) == {"legacy:hyperliquid"}:
+            legacy = row["targets"]["legacy:hyperliquid"]
+            if legacy["status"] == "rejected" and not legacy.get("preview_invalidated") and not self.target_started(data, legacy):
+                if "legacy:hyperliquid" in current:
+                    row["targets"]["legacy:hyperliquid"] = current["legacy:hyperliquid"]
+
+    def select_preview_targets(self, event_id, data):
         from .ranking import snapshot_rank
-        self.record_interpretation(event_id, interpretation)
-        if interpretation.kind != "new_signal":
-            return self.state.snapshot()["events"][event_id]
-        def select(data):
-            row = data["events"][event_id]
-            if "targets" not in row:
-                row["targets"] = self.selected_targets(row, data)
-            current = self.selected_targets(row, data)
-            for identity, target in list(row["targets"].items()):
-                if target["status"] == "rejected" and target.get("preview_invalidated") and not self.target_started(data, target):
-                    if identity in current:
-                        row["targets"][identity] = current[identity]
-            if set(row["targets"]) == {"legacy:hyperliquid"}:
-                legacy = row["targets"]["legacy:hyperliquid"]
-                if legacy["status"] == "rejected" and not legacy.get("preview_invalidated") and not self.target_started(data, legacy):
-                    if "legacy:hyperliquid" in current:
-                        row["targets"]["legacy:hyperliquid"] = current["legacy:hyperliquid"]
-            rank = snapshot_rank(data, row["source"]["chat_id"]) if data["ranking_policy"]["enabled"] else None
-            return row["targets"], data, rank
-        targets, preview_basis, rank = self.state.update(select)
+        row = data["events"][event_id]
+        if "targets" not in row:
+            row["targets"] = self.selected_targets(row, data)
+        current = self.selected_targets(row, data)
+        for identity, target in list(row["targets"].items()):
+            if target["status"] == "rejected" and target.get("preview_invalidated") and not self.target_started(data, target):
+                if identity in current:
+                    row["targets"][identity] = current[identity]
+        self.reset_legacy_preview_target(data, row, current)
+        rank = snapshot_rank(data, row["source"]["chat_id"]) if data["ranking_policy"]["enabled"] else None
+        return row["targets"], data, rank
+
+    def pending_preview_output(self, event_id, identity, target, preview_basis, marker):
+        if marker:
+            invalid = (marker["exhausted"] or now_ms() >= marker["deadline_at"]
+                       or marker["configuration_revision"] != preview_basis["configuration_revision"]
+                       or marker["ranking_revision"] != preview_basis["ranking_revision"])
+            if invalid:
+                row = {**target, "status": "rejected", "error": "Original preview retry expired or its configuration changed",
+                       "observation_retry": {**marker, "exhausted": True}}
+                self.state.update(lambda data, key=identity, value=row: data["events"][event_id]["targets"].__setitem__(key, value))
+                return row
+            if not retry_due(marker):
+                return target
+        return None
+
+    @staticmethod
+    def claim_target_preview(event_id, identity, data):
+        current = data["events"][event_id]["targets"][identity]
+        if current["status"] != "pending" or current.get("preview_inflight_until", 0) > now_ms():
+            return False
+        if current.get("observation_retry") and not retry_due(current["observation_retry"]):
+            return False
+        current["preview_inflight_until"] = now_ms() + 300000
+        return True
+
+    @staticmethod
+    def preview_target_error(target, error, marker, engine, deadline, preview_basis):
+        row = {**target, "status": "rejected", "error": str(error) if isinstance(error, AqlaError) else "Exchange preview unavailable"}
+        row["entry_diagnostic"] = diagnostic(error, "preview")
+        if marker:
+            row["observation_retry"] = {**marker, "exhausted": True, "completed": True, "attempt_inflight": False}
+        if isinstance(error, TemporaryObservation) and engine is not None and deadline is not None:
+            retry = retry_marker(marker, error, deadline, "preview")
+            retry.update(configuration_revision=preview_basis["configuration_revision"], ranking_revision=preview_basis["ranking_revision"])
+            row.update(status="rejected" if retry["exhausted"] else "pending", observation_retry=retry)
+        if isinstance(error, ConfigurationChanged):
+            row["preview_invalidated"] = True
+        return row
+
+    async def preview_one_target(self, event_id, interpretation, target, preview_basis, rank, identity, marker):
         ranked = preview_basis["ranking_policy"]["enabled"]
-        if not targets:
-            self.state.update(lambda data: data["events"][event_id].update(status="unrouted", last_error="No enabled pipeline matches this source"))
-            return {"event_id": event_id, "targets": [], "error": "No enabled pipeline matches this source"}
-        outputs = []
-        order = sorted(targets, key=lambda identity: (targets[identity].get("requested_exchange", targets[identity]["exchange"]) == "hyperliquid", identity)) if ranked else list(targets)
-        reserved = {(saved["plan"]["exchange"] + ":" + saved["plan"]["network"], interpretation.symbol.upper())
-                    for target in targets.values() if target["status"] != "pending"
-                    and (saved := preview_basis["plans"].get(target.get("plan_id")))}
-        for identity in order:
-            target = targets[identity]
-            if target["status"] != "pending":
-                outputs.append({**target, **({"plan": self.state.snapshot()["plans"][target["plan_id"]]["plan"]} if target.get("plan_id") else {})})
-                continue
-            marker = target.get("observation_retry")
+        network = rank["network"] if rank else self.engines[target["exchange"]].exchange.settings.network if target["exchange"] in self.engines else "mainnet"
+        requested = target.get("requested_exchange", target["exchange"])
+        target = {**target, "exchange": requested}
+        target.pop("fallback_reason", None)
+        target.pop("skipped_replacements", None)
+        engine = self.engine_for(requested, network)
+        deadline = None
+        try:
+            if engine is None:
+                raise AqlaError(self.errors.get(requested + ":" + network, self.errors.get(requested, "Required account/network is unavailable")))
+            with engine.state.scope(target, preview_snapshot=preview_basis):
+                basis = engine.state.preview_snapshot()
+                deadline = min(item["source"]["sent_at"] for item in latest_sources(basis["events"], interpretation.source_refs).values()) + basis["policy"]["max_signal_age_seconds"] * 1000
+            async def preview_on(candidate, route):
+                nonlocal deadline
+                async with candidate.lock:
+                    with candidate.state.scope(route, preview_snapshot=preview_basis):
+                        basis = candidate.state.preview_snapshot()
+                        deadline = min(item["source"]["sent_at"] for item in latest_sources(basis["events"], interpretation.source_refs).values()) + basis["policy"]["max_signal_age_seconds"] * 1000
+                        return await candidate.preview(event_id, interpretation)
+            if ranked:
+                target = {**target, "requested_exchange": requested, "network": network, "rank_snapshot": rank,
+                          "setup_id": digest([rank["source_id"], sorted(interpretation.source_refs)])[:32], "leg_id": identity}
+            plan = await preview_on(engine, target)
+            row = {**target, "status": "planned", "plan_id": plan["plan_id"]}
             if marker:
-                invalid = (marker["exhausted"] or now_ms() >= marker["deadline_at"]
-                           or marker["configuration_revision"] != preview_basis["configuration_revision"]
-                           or marker["ranking_revision"] != preview_basis["ranking_revision"])
-                if invalid:
-                    row = {**target, "status": "rejected", "error": "Original preview retry expired or its configuration changed",
-                           "observation_retry": {**marker, "exhausted": True}}
-                    self.state.update(lambda data, key=identity, value=row: data["events"][event_id]["targets"].__setitem__(key, value))
-                    outputs.append(row)
-                    continue
-                if not retry_due(marker):
-                    outputs.append(target)
-                    continue
-            def claim_preview(data, key=identity):
-                current = data["events"][event_id]["targets"][key]
-                if current["status"] != "pending" or current.get("preview_inflight_until", 0) > now_ms():
-                    return False
-                if current.get("observation_retry") and not retry_due(current["observation_retry"]):
-                    return False
-                current["preview_inflight_until"] = now_ms() + 300000
-                return True
-            if not self.state.update(claim_preview):
-                outputs.append(self.state.snapshot()["events"][event_id]["targets"][identity])
-                continue
-            network = rank["network"] if rank else self.engines[target["exchange"]].exchange.settings.network if target["exchange"] in self.engines else "mainnet"
-            requested = target.get("requested_exchange", target["exchange"])
-            target = {**target, "exchange": requested}
-            target.pop("fallback_reason", None)
-            target.pop("skipped_replacements", None)
-            engine = self.engine_for(requested, network)
-            deadline = None
-            try:
-                if engine is None:
-                    raise AqlaError(self.errors.get(requested + ":" + network, self.errors.get(requested, "Required account/network is unavailable")))
-                with engine.state.scope(target, preview_snapshot=preview_basis):
-                    basis = engine.state.preview_snapshot()
-                    deadline = min(item["source"]["sent_at"] for item in latest_sources(basis["events"], interpretation.source_refs).values()) + basis["policy"]["max_signal_age_seconds"] * 1000
-                async def preview_on(candidate, route):
-                    nonlocal deadline
-                    async with candidate.lock:
-                        with candidate.state.scope(route, preview_snapshot=preview_basis):
-                            basis = candidate.state.preview_snapshot()
-                            deadline = min(item["source"]["sent_at"] for item in latest_sources(basis["events"], interpretation.source_refs).values()) + basis["policy"]["max_signal_age_seconds"] * 1000
-                            return await candidate.preview(event_id, interpretation)
-                if ranked:
-                    target = {**target, "requested_exchange": requested, "network": network, "rank_snapshot": rank,
-                              "setup_id": digest([rank["source_id"], sorted(interpretation.source_refs)])[:32], "leg_id": identity}
-                plan = await preview_on(engine, target)
-                row = {**target, "status": "planned", "plan_id": plan["plan_id"]}
-                if marker:
-                    row["observation_retry"] = {**marker, "completed": True, "exhausted": True}
-                outputs.append({**row, "plan": plan})
-                reserved.add((engine.state.account_key, interpretation.symbol.upper()))
-            except Exception as error:
-                row = {**target, "status": "rejected", "error": str(error) if isinstance(error, AqlaError) else "Exchange preview unavailable"}
-                row["entry_diagnostic"] = diagnostic(error, "preview")
-                if marker:
-                    row["observation_retry"] = {**marker, "exhausted": True, "completed": True, "attempt_inflight": False}
-                if isinstance(error, TemporaryObservation) and engine is not None and deadline is not None:
-                    retry = retry_marker(marker, error, deadline, "preview")
-                    retry.update(configuration_revision=preview_basis["configuration_revision"], ranking_revision=preview_basis["ranking_revision"])
-                    row.update(status="rejected" if retry["exhausted"] else "pending", observation_retry=retry)
-                if isinstance(error, ConfigurationChanged):
-                    row["preview_invalidated"] = True
-                outputs.append(row)
-            self.state.update(lambda data, key=identity, value=row: data["events"][event_id]["targets"].__setitem__(key, value))
-        self.finish_event(event_id)
+                row["observation_retry"] = {**marker, "completed": True, "exhausted": True}
+            output = {**row, "plan": plan}
+        except Exception as error:
+            row = self.preview_target_error(target, error, marker, engine, deadline, preview_basis)
+            output = row
+        return row, output
+
+    @staticmethod
+    def preview_response(event_id, targets, outputs):
         # Keep the old one-target interface usable for native Hermes and existing clients.
         if len(outputs) == 1 and outputs[0].get("plan"):
             return {**outputs[0]["plan"], "targets": outputs}
@@ -333,6 +326,37 @@ class Router:
             raise AqlaError(outputs[0]["error"])
         outputs.sort(key=lambda row: list(targets).index(row.get("leg_id", row["pipeline_id"] + ":" + row.get("requested_exchange", row["exchange"]))))
         return {"event_id": event_id, "targets": outputs}
+
+
+    async def preview(self, event_id, interpretation):
+        self.record_interpretation(event_id, interpretation)
+        if interpretation.kind != "new_signal":
+            return self.state.snapshot()["events"][event_id]
+        targets, preview_basis, rank = self.state.update(partial(self.select_preview_targets, event_id))
+        ranked = preview_basis["ranking_policy"]["enabled"]
+        if not targets:
+            self.state.update(lambda data: data["events"][event_id].update(status="unrouted", last_error="No enabled pipeline matches this source"))
+            return {"event_id": event_id, "targets": [], "error": "No enabled pipeline matches this source"}
+        outputs = []
+        order = sorted(targets, key=lambda identity: (targets[identity].get("requested_exchange", targets[identity]["exchange"]) == "hyperliquid", identity)) if ranked else list(targets)
+        for identity in order:
+            target = targets[identity]
+            if target["status"] != "pending":
+                outputs.append({**target, **({"plan": self.state.snapshot()["plans"][target["plan_id"]]["plan"]} if target.get("plan_id") else {})})
+                continue
+            marker = target.get("observation_retry")
+            waiting = self.pending_preview_output(event_id, identity, target, preview_basis, marker)
+            if waiting is not None:
+                outputs.append(waiting)
+                continue
+            if not self.state.update(partial(self.claim_target_preview, event_id, identity)):
+                outputs.append(self.state.snapshot()["events"][event_id]["targets"][identity])
+                continue
+            row, output = await self.preview_one_target(event_id, interpretation, target, preview_basis, rank, identity, marker)
+            outputs.append(output)
+            self.state.update(lambda data, key=identity, value=row: data["events"][event_id]["targets"].__setitem__(key, value))
+        self.finish_event(event_id)
+        return self.preview_response(event_id, targets, outputs)
 
     def finish_event(self, event_id):
         def finish(data):

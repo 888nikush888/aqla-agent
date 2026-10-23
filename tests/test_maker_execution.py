@@ -210,10 +210,10 @@ async def test_maker_target_reject_keeps_stop_and_unfilled_budget(setup, signal,
     assert state.snapshot()["operations"][targets["operation_id"]] == rejection
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("unconfirmed", ["unknown", "foreign_cloid", "foreign_market", "wrong_side", "wrong_size", "missing_size", "not_reduce_only"])
 # Sequential safety assertions; control flow (including test doubles): 15.
 # skipcq: PY-R1000
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unconfirmed", ["unknown", "foreign_cloid", "foreign_market", "wrong_side", "wrong_size", "missing_size", "not_reduce_only"])
 async def test_source_maker_replacement_resolves_only_after_own_confirmation_and_stays_resolved(setup, signal, monkeypatch, unconfirmed):
     state, fake, exchange, trading, _, trade = await open_maker(setup, signal, monkeypatch)
     identity = trade["trade_id"]

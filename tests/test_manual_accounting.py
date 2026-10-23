@@ -50,10 +50,10 @@ async def manual_trade(setup, signal, monkeypatch, *, mixed=False):
     return state, fake, identity, Reporting(state, router), payments
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('mixed', [False, True])
 # Sequential safety assertions; control flow (including test doubles): 10.
 # skipcq: PY-R1000
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mixed', [False, True])
 async def test_manual_pnl_is_evidence_bound_and_reaches_trade_fill_and_visible_journal(setup, signal, monkeypatch, mixed):
     state, fake, identity, reporting, payments = await manual_trade(setup, signal, monkeypatch, mixed=mixed)
     before = copy.deepcopy(state.snapshot()['trades'][identity])

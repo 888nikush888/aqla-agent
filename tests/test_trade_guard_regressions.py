@@ -33,6 +33,58 @@ def entry_actions(fake):
     return [action for action in fake.actions if action["type"] == "order" and any(not order["r"] for order in action["orders"])]
 
 
+class CancelFillRace:
+    """Native fake receipts advance together at the selected cancellation barrier."""
+
+    def __init__(self, fake, state, late_evidence, reveal_at):
+        self.fake, self.state = fake, state
+        self.original = fake.handle
+        self.late_evidence, self.reveal_at = late_evidence, reveal_at
+        self.delayed = self.injected = self.update_started = False
+        self.partial_fills = []
+
+    def inject_cancel(self, request, payload):
+        if request.url.path == '/exchange' and payload['action']['type'] == 'cancelByCloid' and (not self.injected):
+            cloid = payload['action']['cancels'][0]['cloid']
+            order = self.fake.orders.get(cloid)
+            if order and (not order['order']['reduceOnly']) and (order['status'] == 'open'):
+                self.partial_fills = copy.deepcopy(self.fake.fills)
+                self.fake.fill(cloid, order['order']['sz'], '100')
+                self.injected = True
+                self.delayed = self.late_evidence
+
+    def reveal_fills(self, request, payload):
+        if request.url.path == '/info' and payload.get('type') == 'orderStatus' and self.update_started and self.delayed:
+            operation = self.state.snapshot()['operations'].get('widen-late-evidence')
+            if self.reveal_at == 'before_update' or (operation and operation['phase'] == 'prepared'):
+                self.delayed = False
+
+    def visible_evidence(self, request, payload, response):
+        if request.url.path == '/info' and self.delayed:
+            if self.reveal_at == 'after_prepared' and payload.get('type') == 'orderStatus':
+                data = response.json()
+                detail = data.get('order', {})
+                if detail.get('order', {}).get('reduceOnly') is False:
+                    detail['status'] = 'canceled'
+                    detail['order']['sz'] = '2.40'
+                    return httpx.Response(200, json=data)
+            if payload.get('type') == 'userFillsByTime':
+                return httpx.Response(200, json=self.partial_fills)
+            if payload.get('type') == 'clearinghouseState':
+                data = response.json()
+                for row in data['assetPositions']:
+                    row['position']['szi'] = '2.40'
+                return httpx.Response(200, json=data)
+        return response
+
+    def __call__(self, request):
+        payload = json.loads(request.content)
+        self.inject_cancel(request, payload)
+        self.reveal_fills(request, payload)
+        response = self.original(request)
+        return self.visible_evidence(request, payload, response)
+
+
 @pytest.mark.asyncio
 async def test_exchange_send_observes_committed_sending_record(setup):
     _, state, fake, exchange, _ = setup
@@ -85,52 +137,16 @@ async def test_cancel_fill_race_rechecks_stop_widening_budget(setup, signal, lat
     interpretation = interpretation.model_copy(update={"entry": "limit", "entry_prices": [Decimal("100")]})
     plan = await trading.preview(source.event_id, interpretation)
     fake.partial_limit_fraction = .5
-    original = fake.handle
-    delayed = injected = update_started = False
-    partial_fills = []
-
-    def delayed_exchange(request):
-        nonlocal delayed, injected, partial_fills
-        payload = json.loads(request.content)
-        if request.url.path == "/exchange" and payload["action"]["type"] == "cancelByCloid" and not injected:
-            cloid = payload["action"]["cancels"][0]["cloid"]
-            order = fake.orders.get(cloid)
-            if order and not order["order"]["reduceOnly"] and order["status"] == "open":
-                partial_fills = copy.deepcopy(fake.fills)
-                fake.fill(cloid, order["order"]["sz"], "100")
-                injected = True
-                delayed = late_evidence
-        if request.url.path == "/info" and payload.get("type") == "orderStatus" and update_started and delayed:
-            operation = state.snapshot()["operations"].get("widen-late-evidence")
-            if reveal_at == "before_update" or operation and operation["phase"] == "prepared":
-                delayed = False
-        response = original(request)
-        if request.url.path == "/info" and delayed:
-            if reveal_at == "after_prepared" and payload.get("type") == "orderStatus":
-                data = response.json()
-                detail = data.get("order", {})
-                if detail.get("order", {}).get("reduceOnly") is False:
-                    # Keep all three cached observations coherent until preparation;
-                    # the terminal quantity, fills and position then advance together.
-                    detail["status"] = "canceled"
-                    detail["order"]["sz"] = "2.40"
-                    return httpx.Response(200, json=data)
-            if payload.get("type") == "userFillsByTime":
-                return httpx.Response(200, json=partial_fills)
-            if payload.get("type") == "clearinghouseState":
-                data = response.json()
-                for row in data["assetPositions"]:
-                    row["position"]["szi"] = "2.40"
-                return httpx.Response(200, json=data)
-        return response
-
-    exchange.client._transport = httpx.MockTransport(delayed_exchange)
+    race = CancelFillRace(fake, state, late_evidence, reveal_at)
+    # Isolated fake exchange transport; no native network is used.
+    # skipcq: PYL-W0212
+    exchange.client._transport = httpx.MockTransport(race)
     trade = await trading.execute(plan["plan_id"])
-    assert injected and trade["status"] == "open"
+    assert race.injected and trade["status"] == "open"
     assert Decimal(trade["remaining_quantity"]) == Decimal("2.40" if late_evidence else "4.80")
     initial_stop = require_first(row for row in trade["orders"] if row["kind"] == "sl")
     before = len(fake.actions)
-    update_started = True
+    race.update_started = True
     if late_evidence and reveal_at == "after_prepared":
         result = await trading.replace_stop(trade["trade_id"], Decimal("80"), "widen-late-evidence")
         assert result["phase"] == "rejected" and result["outcome"] == "not_sent"

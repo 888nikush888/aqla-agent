@@ -211,10 +211,10 @@ async def test_last_local_admission_can_refresh_once_without_skipping_rechecks(s
     assert state.snapshot()["plans"][plan.plan_id]["plan"] == plan.model_dump(mode="json")
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("delay_at", ["signing", "audit_write", "sending_write"])
 # Sequential safety assertions; control flow (including test doubles): 14.
 # skipcq: PY-R1000
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delay_at", ["signing", "audit_write", "sending_write"])
 async def test_slow_local_preparation_reobserves_before_entry_transport(setup, signal, clocked, monkeypatch, delay_at):
     _, state, fake, exchange, engine = setup
     source, interpretation = signal

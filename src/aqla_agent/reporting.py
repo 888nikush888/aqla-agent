@@ -110,12 +110,12 @@ class Reporting:
             current.update(accounting_facts(current))
         self.state.update(save)
 
-    async def refresh(self, trade_id) -> RefreshResult:
+    async def load_reporting_trade(self, trade_id):
         snapshot = self.state.snapshot()
         trade = snapshot["trades"][trade_id]
         if snapshot.get("retired_execution_configuration") and trade["plan"].get("exchange", "hyperliquid") != "hyperliquid":
             complete = report_row(snapshot, trade)["complete"]
-            return {"complete": complete, "reason": "complete" if complete else "unavailable"}
+            return None, None, {"complete": complete, "reason": "complete" if complete else "unavailable"}
         engine = self.router.engine_for_plan(trade["plan"]) if hasattr(self.router, "engine_for_plan") else self.router.engines.get(trade["plan"].get("exchange", "hyperliquid"))
         if engine and (not trade.get("entry_accounting") or not trade.get("closed_at") or trade.get("entry_fill_quantity_confirmed") is None):
             try:
@@ -126,7 +126,134 @@ class Reporting:
             except Exception:
                 self.state.update(lambda data: data["trades"][trade_id].update(reporting_checked_at=now_ms(),
                     funding_coverage={"complete": False, "reason": "Historische Entry-/Exit-Belege nicht vollständig verfügbar"}))
-                return {"complete": False, "reason": "history_unavailable"}
+                return None, None, {"complete": False, "reason": "history_unavailable"}
+        return trade, engine, None
+
+    @staticmethod
+    def select_observed_fills(trade, market, observed, manual, end):
+        selected: dict[str, dict] = {}
+        for row in observed:
+            if row.get("coin") != market.symbol or not trade["plan"]["created_at"] <= row["time"] <= end:
+                continue
+            identity = fill_identity(row)
+            if manual and identity in selected and selected[identity] != row:
+                raise EvidenceConflict("A historical manual fill identity has conflicting receipts")
+            selected[identity] = row
+        return selected
+
+    @staticmethod
+    def validate_funding_position(fills, side, market, fact, start, end):
+        timestamp = fact["time"]
+        if fact["market"] != market.symbol or fact["currency"] != market.quote_token or not start <= timestamp <= end:
+            raise EvidenceConflict("Funding-Markt, Zeitraum oder Währung stimmt nicht überein")
+        if any(row["time"] == timestamp for row in fills.values()):
+            raise EvidenceConflict("Reihenfolge von Funding und Fills zum selben Zeitpunkt nicht eindeutig")
+        size = sum((Decimal(row["sz"]) * (1 if row["kind"] == "entry" else -1)
+                    for row in fills.values() if row["time"] < timestamp), Decimal(0))
+        if size <= 0:
+            raise EvidenceConflict("Funding-Zahlung ohne belegte eigene Position")
+        signed = size * (1 if side == "long" else -1)
+        if fact["signed_size"] is not None and Decimal(fact["signed_size"]) != signed:
+            raise EvidenceConflict("Funding-Positionsmenge stimmt nicht mit eigenen Fills überein")
+
+    @staticmethod
+    def own_funding_events(trade, market, payments, start, end):
+        fills = trade["fill_events"]
+        assigned = {}
+        for fact in payments:
+            Reporting.validate_funding_position(fills, trade["plan"]["side"], market, fact, start, end)
+            identity = fact["identity"]
+            if identity in assigned and assigned[identity] != fact:
+                raise EvidenceConflict("Funding-Identität ist widersprüchlich")
+            old = trade.get("funding_events", {}).get(identity)
+            if old and old != fact:
+                raise EvidenceConflict("Ein unveränderlicher Funding-Beleg wurde geändert")
+            assigned[identity] = fact
+        if set(trade.get("funding_events", {})) - set(assigned):
+            raise AqlaError("Bereits gespeicherte Funding-Belege fehlen im erneuten vollständigen Abgleich")
+        return assigned
+
+    @staticmethod
+    def confirmed_fee_evidence(trade, fills, observed):
+        fee_evidence = {identity: {"fee": row.get("fee"), "feeToken": row.get("feeToken")}
+                        for identity, row in observed.items()}
+        for identity, fact in fee_evidence.items():
+            old = trade.get("report_fee_evidence", {}).get(identity, fills[identity])
+            for key in ("fee", "feeToken"):
+                if old.get(key) is not None:
+                    previous_value, observed_value = old[key], fact[key]
+                    same = (Decimal(previous_value) == Decimal(observed_value)
+                            if key == "fee" and observed_value is not None and previous_value is not None
+                            else previous_value == observed_value)
+                    if fact[key] is not None and not same:
+                        raise EvidenceConflict("Ein bereits belegter eigener Gebührenwert wurde geändert")
+                    fact[key] = old[key]
+        return fee_evidence
+
+    async def refresh_manual_coverage(self, trade_id, trade, adapter, market, start, end, coverage, observed):
+        fills = trade["fill_events"]
+        from .manual_accounting import attribute_manual_closure
+        payments = await adapter.funding_payments(market, start, end)
+        try:
+            attribution, assigned, fees = attribute_manual_closure(trade, observed, payments)
+        except (InvalidOperation, KeyError, ValueError, TypeError) as error:
+            raise EvidenceConflict(str(error) if isinstance(error, AqlaError) else "Manual PnL attribution is unconfirmed") from None
+        coverage.update({"complete": True, "fill_fingerprint": digest(fills), "payments_fingerprint": digest(assigned)})
+        def save_manual(data):
+            current = data["trades"][trade_id]
+            from .manual_accounting import closure_fingerprint
+            if (digest(current["fill_events"]) != attribution["fill_fingerprint"]
+                    or closure_fingerprint(current) != attribution["closure_fingerprint"]
+                    or digest(current["plan"]) != attribution["plan_fingerprint"]
+                    or digest(current.get("entry_accounting", {})) != attribution["entry_fingerprint"]):
+                raise EvidenceConflict("Trade evidence changed during manual accounting")
+            current.update(manual_accounting=attribution, funding_events=assigned, funding_coverage=coverage,
+                report_fee_evidence=fees, reporting_checked_at=now_ms())
+            current["manual_closure"]["pnl_complete"] = True
+        self.state.update(save_manual)
+        return {"complete": True, "reason": "complete"}
+
+    async def refresh_coverage(self, trade_id, trade, start, end, coverage, engine):
+        if engine is None:
+            raise AqlaError("Börsenkonto für Funding-Abgleich nicht verfügbar")
+        engine.assert_plan_binding(engine.state.snapshot(), TradePlan.model_validate(trade["plan"]))
+        manual = isinstance(trade.get("manual_closure"), dict) and trade["manual_closure"].get("basis") in (
+            "proved_original_account_closure", "proved_account_flat_after_last_owned_fill")
+        if (trade.get("external_conflict") or trade.get("manual_closure")) and not manual:
+            raise EvidenceConflict("Funding bei manuellem/gemischtem Positionsverlauf nicht eindeutig zuordenbar")
+        adapter = engine.exchange
+        market = Market.model_validate(trade["plan"]["market"])
+        # Restore immutable native market identities for historical reads.
+        if hasattr(adapter, "market_cache"):
+            adapter.market_cache.setdefault(market.symbol, market)
+        fills = trade["fill_events"]
+        async def fetch(low, high):
+            return await market_fills(adapter, market, low, high)
+        observed = await bounded_history(fetch, trade["plan"]["created_at"], end, limit=2000)
+        observed = self.select_observed_fills(trade, market, observed, manual, end)
+        if manual:
+            return await self.refresh_manual_coverage(trade_id, trade, adapter, market, start, end, coverage, observed)
+        if set(observed) - set(fills):
+            raise EvidenceConflict("Zusätzliche manuelle Fills im eigenen Positionsverlauf vorhanden")
+        if set(fills) - set(observed):
+            raise AqlaError("Historische eigene Fills nicht vollständig aus der Börse abrufbar")
+        payments = await adapter.funding_payments(market, start, end)
+        assigned = self.own_funding_events(trade, market, payments, start, end)
+        coverage.update({"complete": True, "fill_fingerprint": digest(fills), "payments_fingerprint": digest(assigned)})
+        fee_evidence = self.confirmed_fee_evidence(trade, fills, observed)
+        def save(data):
+            current = data["trades"][trade_id]
+            if digest(current["fill_events"]) != digest(fills):
+                raise AqlaError("Trade-Belege wurden während des Funding-Abgleichs geändert")
+            current.update(funding_events=assigned, funding_coverage=coverage, report_fee_evidence=fee_evidence,
+                           reporting_checked_at=now_ms())
+        self.state.update(save)
+        return {"complete": True, "reason": "complete"}
+
+    async def refresh(self, trade_id) -> RefreshResult:
+        trade, engine, early = await self.load_reporting_trade(trade_id)
+        if early is not None:
+            return early
         metrics = accounting_facts(trade)
         if any(trade.get(key) != value for key, value in metrics.items()):
             self.state.update(lambda data: data["trades"][trade_id].update(metrics))
@@ -138,102 +265,7 @@ class Reporting:
             return {"complete": False, "reason": "missing_lifecycle"}
         coverage: FundingCoverage = {"start": start, "end": end, "complete": False}
         try:
-            if engine is None:
-                raise AqlaError("Börsenkonto für Funding-Abgleich nicht verfügbar")
-            engine.assert_plan_binding(engine.state.snapshot(), TradePlan.model_validate(trade["plan"]))
-            manual = isinstance(trade.get("manual_closure"), dict) and trade["manual_closure"].get("basis") in (
-                "proved_original_account_closure", "proved_account_flat_after_last_owned_fill")
-            if (trade.get("external_conflict") or trade.get("manual_closure")) and not manual:
-                raise EvidenceConflict("Funding bei manuellem/gemischtem Positionsverlauf nicht eindeutig zuordenbar")
-            adapter = engine.exchange
-            market = Market.model_validate(trade["plan"]["market"])
-            # Restore immutable native market identities for historical reads.
-            if hasattr(adapter, "market_cache"):
-                adapter.market_cache.setdefault(market.symbol, market)
-            fills = trade["fill_events"]
-            async def fetch(low, high):
-                return await market_fills(adapter, market, low, high)
-            observed = await bounded_history(fetch, trade["plan"]["created_at"], end, limit=2000)
-            selected: dict[str, dict] = {}
-            for row in observed:
-                if row.get("coin") != market.symbol or not trade["plan"]["created_at"] <= row["time"] <= end:
-                    continue
-                identity = fill_identity(row)
-                if manual and identity in selected and selected[identity] != row:
-                    raise EvidenceConflict("A historical manual fill identity has conflicting receipts")
-                selected[identity] = row
-            observed = selected
-            if manual:
-                from .manual_accounting import attribute_manual_closure
-                payments = await adapter.funding_payments(market, start, end)
-                try:
-                    attribution, assigned, fees = attribute_manual_closure(trade, observed, payments)
-                except (InvalidOperation, KeyError, ValueError, TypeError) as error:
-                    raise EvidenceConflict(str(error) if isinstance(error, AqlaError) else "Manual PnL attribution is unconfirmed") from None
-                coverage.update({"complete": True, "fill_fingerprint": digest(fills), "payments_fingerprint": digest(assigned)})
-                def save_manual(data):
-                    current = data["trades"][trade_id]
-                    from .manual_accounting import closure_fingerprint
-                    if (digest(current["fill_events"]) != attribution["fill_fingerprint"]
-                            or closure_fingerprint(current) != attribution["closure_fingerprint"]
-                            or digest(current["plan"]) != attribution["plan_fingerprint"]
-                            or digest(current.get("entry_accounting", {})) != attribution["entry_fingerprint"]):
-                        raise EvidenceConflict("Trade evidence changed during manual accounting")
-                    current.update(manual_accounting=attribution, funding_events=assigned, funding_coverage=coverage,
-                        report_fee_evidence=fees, reporting_checked_at=now_ms())
-                    current["manual_closure"]["pnl_complete"] = True
-                self.state.update(save_manual)
-                return {"complete": True, "reason": "complete"}
-            if set(observed) - set(fills):
-                raise EvidenceConflict("Zusätzliche manuelle Fills im eigenen Positionsverlauf vorhanden")
-            if set(fills) - set(observed):
-                raise AqlaError("Historische eigene Fills nicht vollständig aus der Börse abrufbar")
-            payments = await adapter.funding_payments(market, start, end)
-            assigned = {}
-            for fact in payments:
-                timestamp = fact["time"]
-                if fact["market"] != market.symbol or fact["currency"] != market.quote_token or not start <= timestamp <= end:
-                    raise EvidenceConflict("Funding-Markt, Zeitraum oder Währung stimmt nicht überein")
-                if any(row["time"] == timestamp for row in fills.values()):
-                    raise EvidenceConflict("Reihenfolge von Funding und Fills zum selben Zeitpunkt nicht eindeutig")
-                size = sum((Decimal(row["sz"]) * (1 if row["kind"] == "entry" else -1)
-                            for row in fills.values() if row["time"] < timestamp), Decimal(0))
-                if size <= 0:
-                    raise EvidenceConflict("Funding-Zahlung ohne belegte eigene Position")
-                signed = size * (1 if trade["plan"]["side"] == "long" else -1)
-                if fact["signed_size"] is not None and Decimal(fact["signed_size"]) != signed:
-                    raise EvidenceConflict("Funding-Positionsmenge stimmt nicht mit eigenen Fills überein")
-                identity = fact["identity"]
-                if identity in assigned and assigned[identity] != fact:
-                    raise EvidenceConflict("Funding-Identität ist widersprüchlich")
-                old = trade.get("funding_events", {}).get(identity)
-                if old and old != fact:
-                    raise EvidenceConflict("Ein unveränderlicher Funding-Beleg wurde geändert")
-                assigned[identity] = fact
-            if set(trade.get("funding_events", {})) - set(assigned):
-                raise AqlaError("Bereits gespeicherte Funding-Belege fehlen im erneuten vollständigen Abgleich")
-            coverage.update({"complete": True, "fill_fingerprint": digest(fills), "payments_fingerprint": digest(assigned)})
-            fee_evidence = {identity: {"fee": row.get("fee"), "feeToken": row.get("feeToken")}
-                            for identity, row in observed.items()}
-            for identity, fact in fee_evidence.items():
-                old = trade.get("report_fee_evidence", {}).get(identity, fills[identity])
-                for key in ("fee", "feeToken"):
-                    if old.get(key) is not None:
-                        previous_value, observed_value = old[key], fact[key]
-                        same = (Decimal(previous_value) == Decimal(observed_value)
-                                if key == "fee" and observed_value is not None and previous_value is not None
-                                else previous_value == observed_value)
-                        if fact[key] is not None and not same:
-                            raise EvidenceConflict("Ein bereits belegter eigener Gebührenwert wurde geändert")
-                        fact[key] = old[key]
-            def save(data):
-                current = data["trades"][trade_id]
-                if digest(current["fill_events"]) != digest(fills):
-                    raise AqlaError("Trade-Belege wurden während des Funding-Abgleichs geändert")
-                current.update(funding_events=assigned, funding_coverage=coverage, report_fee_evidence=fee_evidence,
-                               reporting_checked_at=now_ms())
-            self.state.update(save)
-            return {"complete": True, "reason": "complete"}
+            return await self.refresh_coverage(trade_id, trade, start, end, coverage, engine)
         except ReadBudgetExceeded:
             raise
         except Exception as error:

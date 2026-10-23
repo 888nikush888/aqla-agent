@@ -17,12 +17,12 @@ from aqla_hyperliquid_mcp.server import close_server, create_server
 from aqla_hyperliquid_mcp.state import State
 
 
+# Sequential safety assertions; control flow (including test doubles): 13.
+# skipcq: PY-R1000
 @pytest.mark.asyncio
 @pytest.mark.parametrize("root_network", ["mainnet", "testnet"])
 @pytest.mark.parametrize("secondary", [False, True])
 @pytest.mark.parametrize("changed_account", [False, True])
-# Sequential safety assertions; control flow (including test doubles): 13.
-# skipcq: PY-R1000
 async def test_actual_menu_close_uses_original_network_and_one_identity(setup, signal, tmp_path, root_network, secondary, changed_account):
     settings, _, original, _, _ = setup
     selected=settings.model_copy(update={"network":root_network,"state_path":tmp_path/"menu-state.sqlite3"})

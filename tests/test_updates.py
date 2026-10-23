@@ -257,10 +257,10 @@ async def test_pending_stop_waits_for_terminal_quantity_and_complete_own_fills(s
     assert current["plan"] == trade["plan"]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("old_stop", ["canceled", "malformed"])
 # Sequential safety assertions; control flow (including test doubles): 10.
 # skipcq: PY-R1000
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_stop", ["canceled", "malformed"])
 async def test_terminal_quantity_lag_does_not_silence_missing_initial_protection(setup, signal, old_stop):
     _, state, fake, exchange, trading = setup
     exchange.fail_closed_protection = True
@@ -487,10 +487,10 @@ async def test_unknown_pending_stop_defers_automatic_stop_revision_without_emerg
     assert Decimal(state.snapshot()["trades"][trade["trade_id"]]["stop_price"]) == 100
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("old_stop", ["missing", "malformed"])
 # Sequential safety assertions; control flow (including test doubles): 15.
 # skipcq: PY-R1000
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_stop", ["missing", "malformed"])
 async def test_unknown_pending_stop_does_not_bypass_missing_or_malformed_initial_protection(setup, signal, old_stop):
     _, state, fake, exchange, trading = setup
     state.update(lambda data: data["policy"].update(break_even_after_tp=1))
@@ -704,9 +704,9 @@ async def test_router_supersedes_original_stop_event_on_new_acceptance(setup, si
     await router.close()
 
 
-@pytest.mark.asyncio
 # Sequential safety assertions; control flow (including test doubles): 10.
 # skipcq: PY-R1000
+@pytest.mark.asyncio
 async def test_crossed_pending_stop_waits_for_flat_position(setup, signal):
     _, state, fake, exchange, trading = setup
     trade = await waiting_gtc(setup, signal)

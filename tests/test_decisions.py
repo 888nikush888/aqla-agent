@@ -31,6 +31,22 @@ def packet_for(text="BTC long. Entry 100. SL 90. TP 110 / 120.", *, messages=Non
                          "source_read_receipt": "private-receipt", "policy": {"private": "not-for-model"}})
 
 
+def selected_answer(key, question, prepared, kind):
+    selected = {"kind": kind, "side": "long", "entry": "limit", "entry_timing": "standard",
+                "update_action": "not_present", "source_exchange": "not_present", "reason_code": "result_report"}.get(key)
+    if key == "symbol":
+        selected = next((k for k, v in prepared.items() if isinstance(v, dict) and v.get("value") == "BTC"), "not_present")
+    elif key.startswith("proof."):
+        selected = require_first(k for k, v in prepared.items() if isinstance(v, dict))
+    elif key.startswith("role."):
+        instructions = json.loads(question["instructions"]) if isinstance(question["instructions"], str) else question["instructions"]
+        raw = instructions["occurrence"]["quote"]
+        selected = {"100": "entry0", "90": "stop_loss", "110": "target_1", "120": "target_2", "50%": "target_1", "100%": "target_2"}.get(raw, "ignore")
+    elif key.startswith("normalization."):
+        selected = "not_present"
+    return selected
+
+
 def response_for(questions, *, kind="new_signal", overrides=None):
     answers = {}
     for key, question in questions.items():
@@ -41,18 +57,7 @@ def response_for(questions, *, kind="new_signal", overrides=None):
         options = question["criteria"]
         prepared = {key: json.loads(value) if isinstance(value, str) and value.startswith("{") else value
                     for key, value in options.items()}
-        selected = {"kind": kind, "side": "long", "entry": "limit", "entry_timing": "standard",
-                    "update_action": "not_present", "source_exchange": "not_present", "reason_code": "result_report"}.get(key)
-        if key == "symbol":
-            selected = next((k for k, v in prepared.items() if isinstance(v, dict) and v.get("value") == "BTC"), "not_present")
-        elif key.startswith("proof."):
-            selected = require_first(k for k, v in prepared.items() if isinstance(v, dict))
-        elif key.startswith("role."):
-            instructions = json.loads(question["instructions"]) if isinstance(question["instructions"], str) else question["instructions"]
-            raw = instructions["occurrence"]["quote"]
-            selected = {"100": "entry0", "90": "stop_loss", "110": "target_1", "120": "target_2", "50%": "target_1", "100%": "target_2"}.get(raw, "ignore")
-        elif key.startswith("normalization."):
-            selected = "not_present"
+        selected = selected_answer(key, question, prepared, kind)
         selected = (overrides or {}).get(key, selected)
         assert selected in options, (key, selected)
         answers[key] = {"type": "choice", "choice": selected,

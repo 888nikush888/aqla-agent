@@ -961,7 +961,7 @@ def select_source_entries(signal, market, policy, backup, maker_price):
     return selections, backup_entry, legs
 
 
-def allocate_source_entries(signal, base, selections, legs):
+def allocate_source_entries(base, selections, legs):
     weights = [leg.weight_percent or Decimal(50) for leg in legs]
     quantities = [quantity_grid(base.quantity * weights[0] / 100, base.market)]
     quantities.append(base.quantity - quantities[0])
@@ -1031,7 +1031,7 @@ def make_entry_plan(
         maker_price,
         _managed=True,
     )
-    planned = allocate_source_entries(signal, base, selections, legs)
+    planned = allocate_source_entries(base, selections, legs)
     values = base.model_dump()
     if backup_entry and "entry" not in base.backup_fields:
         values.update(

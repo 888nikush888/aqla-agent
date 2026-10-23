@@ -234,6 +234,87 @@ class Hyperliquid:
             size = Decimal(matching[0]["szi"]) if matching else Decimal(0)
         return AccountSnapshot(equity=raw["marginSummary"]["accountValue"], available_margin=raw["withdrawable"], position_size=size, observed_at=started)
 
+    @staticmethod
+    def inventory_dex_names(dexes):
+        if not isinstance(dexes, list) or not dexes or dexes[0] is not None or len(dexes) > 512:
+            raise AqlaError("Complete DEX inventory is unavailable")
+        names = [""] + [row["name"] for row in dexes[1:] if isinstance(row, dict) and isinstance(row.get("name"), str)]
+        if len(names) != len(dexes) or len(set(names)) != len(names):
+            raise AqlaError("DEX inventory is incomplete or ambiguous")
+        return names
+
+    @staticmethod
+    def inventory_symbols(metas, dexes):
+        if not isinstance(metas, list) or len(metas) != len(dexes) or any(not isinstance(meta, dict) or not isinstance(meta.get('universe'), list) for meta in metas):
+            raise AqlaError("Complete perpetual market inventory is unavailable")
+        perp_markets = {row['name'] for meta in metas for row in meta['universe'] if isinstance(row, dict) and isinstance(row.get('name'), str)}
+        return perp_markets
+
+    async def observe_inventory_scope(self, dex, limiter):
+        async with limiter:
+            fields = {"dex": dex} if dex else {}
+            raw, orders = await asyncio.gather(self.info("clearinghouseState", user=self.account, **fields),
+                                             self.info("frontendOpenOrders", user=self.account, **fields))
+            if not isinstance(raw, dict) or not isinstance(raw.get("assetPositions"), list) or not isinstance(orders, list):
+                raise AqlaError("Account positions or orders are incomplete")
+            return dex, raw, orders
+
+    @staticmethod
+    def inventory_position(row, dex, perp_markets, seen_positions):
+        position = row.get("position", {}) if isinstance(row, dict) else {}
+        coin = position.get("coin")
+        if not isinstance(coin, str) or "szi" not in position or (dex and not coin.startswith(dex + ":")):
+            raise AqlaError("Account position observation is malformed")
+        size = Decimal(str(position["szi"]))
+        if not size.is_finite() or coin in seen_positions or coin not in perp_markets:
+            raise AqlaError("Account position observation is ambiguous")
+        seen_positions.add(coin)
+        return coin, size
+
+    @staticmethod
+    def inventory_entry_orders(orders, perp_markets):
+        entries = []
+        for order in orders:
+            if not isinstance(order, dict) or not isinstance(order.get("coin"), str):
+                raise AqlaError("Account order observation is malformed")
+            # Spot orders still consume the exchange-reported USDC hold,
+            # but do not reserve a perpetual trading slot.
+            if order["coin"] not in perp_markets:
+                continue
+            if type(order.get("reduceOnly")) is not bool:
+                raise AqlaError("Order reduction scope is unknown")
+            if not order["reduceOnly"]:
+                entries.append({"market": order["coin"], "oid": order.get("oid"), "cloid": order.get("cloid")})
+        return entries
+
+    @staticmethod
+    def collect_inventory(observations, perp_markets):
+        positions, entries, seen_positions = {}, [], set()
+        states = {}
+        for dex, raw, orders in observations:
+            states[dex] = raw
+            for row in raw["assetPositions"]:
+                coin, size = Hyperliquid.inventory_position(row, dex, perp_markets, seen_positions)
+                if size:
+                    positions[coin] = size
+            entries.extend(Hyperliquid.inventory_entry_orders(orders, perp_markets))
+        return positions, entries, states
+
+    async def unified_inventory_budget(self):
+        spot = await self.info("spotClearinghouseState", user=self.account)
+        balances = [row for row in spot.get("balances", []) if row.get("token") == 0 and row.get("coin") == "USDC"]
+        if len(balances) != 1:
+            raise AqlaError("Unified USDC balance is unavailable or ambiguous")
+        equity, hold = Decimal(balances[0]["total"]), Decimal(balances[0]["hold"])
+        available = equity - hold
+        # This exchange ceiling includes cross/isolated maintenance. It is
+        # an additional ceiling, never a replacement for initial holds.
+        ceilings = [Decimal(value) for token, value in spot.get("tokenToAvailableAfterMaintenance", []) if token == 0]
+        if len(ceilings) != 1 or hold < 0 or available < 0:
+            raise AqlaError("Unified USDC availability is not completely proved")
+        available = min(available, max(Decimal(0), ceilings[0]))
+        return equity, available
+
     async def account_inventory(self, market: Market | None = None):
         """Complete bounded REST observation; entry calls never use a cached budget."""
         stamp = now_ms()
@@ -241,67 +322,17 @@ class Hyperliquid:
                                                 self.info("perpDexs"), self.info("allPerpMetas"))
         if mode not in ("disabled", None, "unifiedAccount"):
             raise AqlaError("Shared account entries require Standard or Unified Account mode; portfolio margin is unsupported")
-        if not isinstance(dexes, list) or not dexes or dexes[0] is not None or len(dexes) > 512:
-            raise AqlaError("Complete DEX inventory is unavailable")
-        names = [""] + [row["name"] for row in dexes[1:] if isinstance(row, dict) and isinstance(row.get("name"), str)]
-        if len(names) != len(dexes) or len(set(names)) != len(names):
-            raise AqlaError("DEX inventory is incomplete or ambiguous")
-        if not isinstance(metas, list) or len(metas) != len(dexes) or any(not isinstance(meta, dict) or not isinstance(meta.get('universe'), list) for meta in metas):
-            raise AqlaError("Complete perpetual market inventory is unavailable")
-        perp_markets = {row['name'] for meta in metas for row in meta['universe'] if isinstance(row, dict) and isinstance(row.get('name'), str)}
+        names = self.inventory_dex_names(dexes)
+        perp_markets = self.inventory_symbols(metas, dexes)
         limiter = asyncio.Semaphore(3)
-        async def observe(dex):
-            async with limiter:
-                fields = {"dex": dex} if dex else {}
-                raw, orders = await asyncio.gather(self.info("clearinghouseState", user=self.account, **fields),
-                                                 self.info("frontendOpenOrders", user=self.account, **fields))
-                if not isinstance(raw, dict) or not isinstance(raw.get("assetPositions"), list) or not isinstance(orders, list):
-                    raise AqlaError("Account positions or orders are incomplete")
-                return dex, raw, orders
         if len(names) > 1:
             from aqla_agent.inventory_stream import observe as observe_large_inventory
             observations = await observe_large_inventory(self, names)
         else:
-            observations = await asyncio.gather(*(observe(dex) for dex in names))
-        positions, entries, seen_positions = {}, [], set()
-        states = {}
-        for dex, raw, orders in observations:
-            states[dex] = raw
-            for row in raw["assetPositions"]:
-                position = row.get("position", {}) if isinstance(row, dict) else {}
-                coin = position.get("coin")
-                if not isinstance(coin, str) or "szi" not in position or (dex and not coin.startswith(dex + ":")):
-                    raise AqlaError("Account position observation is malformed")
-                size = Decimal(str(position["szi"]))
-                if not size.is_finite() or coin in seen_positions or coin not in perp_markets:
-                    raise AqlaError("Account position observation is ambiguous")
-                seen_positions.add(coin)
-                if size:
-                    positions[coin] = size
-            for order in orders:
-                if not isinstance(order, dict) or not isinstance(order.get("coin"), str):
-                    raise AqlaError("Account order observation is malformed")
-                # Spot orders still consume the exchange-reported USDC hold,
-                # but do not reserve a perpetual trading slot.
-                if order["coin"] not in perp_markets:
-                    continue
-                if type(order.get("reduceOnly")) is not bool:
-                    raise AqlaError("Order reduction scope is unknown")
-                if not order["reduceOnly"]:
-                    entries.append({"market": order["coin"], "oid": order.get("oid"), "cloid": order.get("cloid")})
+            observations = await asyncio.gather(*(self.observe_inventory_scope(dex, limiter) for dex in names))
+        positions, entries, states = self.collect_inventory(observations, perp_markets)
         if mode == "unifiedAccount":
-            spot = await self.info("spotClearinghouseState", user=self.account)
-            balances = [row for row in spot.get("balances", []) if row.get("token") == 0 and row.get("coin") == "USDC"]
-            if len(balances) != 1:
-                raise AqlaError("Unified USDC balance is unavailable or ambiguous")
-            equity, hold = Decimal(balances[0]["total"]), Decimal(balances[0]["hold"])
-            available = equity - hold
-            # This exchange ceiling includes cross/isolated maintenance. It is
-            # an additional ceiling, never a replacement for initial holds.
-            ceilings = [Decimal(value) for token, value in spot.get("tokenToAvailableAfterMaintenance", []) if token == 0]
-            if len(ceilings) != 1 or hold < 0 or available < 0:
-                raise AqlaError("Unified USDC availability is not completely proved")
-            available = min(available, max(Decimal(0), ceilings[0]))
+            equity, available = await self.unified_inventory_budget()
         else:
             raw = states.get(market.dex if market else "")
             if raw is None:

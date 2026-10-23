@@ -404,7 +404,8 @@ class ToolServices:
         return {**report, **{key: report[key][offset:offset + limit] for key in totals},
                 "page": {"offset": offset, "limit": limit, "totals": totals}, "publication_job": diagnostic}
 
-    def diagnostic_selection(self, snapshot, entry_operations, trade_id, symbol, offset, limit):
+    @staticmethod
+    def diagnostic_selection(snapshot, entry_operations, trade_id, symbol, offset, limit):
         if trade_id is None:
             if not symbol:
                 raise AqlaError("Supply an Aqla trade ID or a market symbol")
@@ -666,7 +667,8 @@ class ToolServices:
             engine.state.assert_binding(engine.exchange.settings)
         return self.state.update(partial(self.apply_account_control, action, account_key, expected_revision, enabled, limits, commit_check))
 
-    def apply_legacy_control(self, action, policy, sources, expected_revision, notification_id, commit_check, data):
+    @staticmethod
+    def apply_legacy_control(action, policy, sources, expected_revision, notification_id, commit_check, data):
         commit_check()
         previous_paused = data["paused"]
         if action == "set_policy":
