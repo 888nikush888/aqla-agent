@@ -98,3 +98,27 @@ def test_native_inputs_preserve_decimal_comma_and_typed_tp_arrays():
     assert input_value("0,5", schema["risk_percent"]) == "0.5"
     assert input_value("1", schema["waverider_until_tp"]) == 1
     assert input_value("last", schema["waverider_until_tp"]) == "last"
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_profile_requires_explicit_template_acceptance(panel):
+    menu, bot, data, changes, *_ = panel
+    data["profiles"]["standard"]["parameters"] = None
+    await menu.profile(bot, "standard")
+    assert "noch nicht eingerichtet" in (bot.edits or bot.sent)[-1]["text"] and not changes
+    token = choose(bot, "Dieses Ausgangsprofil übernehmen")
+    await menu.intercept(callback(menu, token), bot)
+    assert len(changes) == 1 and data["profiles"]["standard"]["parameters"]["risk_percent"] == "0.5"
+
+
+@pytest.mark.asyncio
+async def test_first_account_limits_require_both_explicit_values(panel):
+    menu, bot, data, changes, *_ = panel
+    data["execution_accounts"]["hyperliquid:testnet"]["limits"] = None
+    await menu.run(bot, "limit_fields", "hyperliquid:testnet")
+    with pytest.raises(ValueError, match="Beide Werte"):
+        await menu.text_input(bot, "3")
+    assert not changes
+    await menu.text_input(bot, "3; 2")
+    assert len(changes) == 1
+    assert data["execution_accounts"]["hyperliquid:testnet"]["limits"] == {"max_open_trades": 3, "max_total_risk_percent": "2"}

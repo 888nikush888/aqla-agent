@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from aqla_hyperliquid_mcp.models import AqlaError
 
 from .messages import number
-from .pipelines import Parameters, Pipeline, TradingProfile
+from .pipelines import AccountLimits, Parameters, Pipeline, TradingProfile
 from .ranking import RankingPolicy
 
 PREFIX = "aqla-menu:"
@@ -201,6 +201,11 @@ class TelegramMenu:
             return await self.run(bot, "prompt", "create_profile", "")
         data = await self.config()
         row = data["profiles"][identity]
+        if row.get("parameters") is None:
+            defaults = Parameters()
+            text = row["name"] + " · noch nicht eingerichtet\nDieses Ausgangsprofil gilt für neue Planungen. Kontolimits und bestehende Freigaben bleiben verbindlich.\n\n"
+            text += "\n".join(LABELS[name] + ": " + str(getattr(defaults, name)) for name in Parameters.model_fields)
+            return await self.display(bot, text, [("Dieses Ausgangsprofil übernehmen", "initialize_profile", identity, data["configuration_revision"])])
         await self.display(bot, row["name"] + " · Profil " + identity + "\nBestehende Trades behalten ihre gespeicherten Pläne.",
             [(name, "profile_group", identity, name) for name in GROUPS] + [("Profil umbenennen", "prompt", "rename_profile", identity), ("Profil löschen", "confirm_delete", "profile", identity)])
 
@@ -234,6 +239,12 @@ class TelegramMenu:
                 schema = schema["additionalProperties"]
             field += "." + subfield if subfield else ""
             unit = "Wert"
+        elif kind == "limits":
+            values, revision = data["execution_accounts"][identity]["limits"], data["configuration_revision"]
+            if values is None:
+                return await self.run(bot, "prompt", "initial_limits", identity)
+            current = values[field]
+            schema, unit = AccountLimits.model_json_schema()["properties"][field], "Trades" if field == "max_open_trades" else "%"
         else:
             from .runtime_controls import RuntimeControls, TechnicalSettings
             runtime = RuntimeControls(self.extension).read()
@@ -273,13 +284,16 @@ class TelegramMenu:
                 values[name] = value
             policy = RankingPolicy.model_validate(values)
             await self.commands.control(action="set_ranking_policy", ranking_policy=policy.model_dump(mode="json"), expected_revision=pending["revision"])
+        elif kind == "limits":
+            limits = AccountLimits.model_validate({**data["execution_accounts"][identity]["limits"], field: value})
+            await self.commands.control(action="set_account_limits", account_key=identity, limits=limits.model_dump(mode="json"), expected_revision=pending["revision"])
         else:
             from .runtime_controls import RuntimeControls
             result = await RuntimeControls(self.extension).change(field, value, pending["revision"])
             suffix = "\nÜbernahme ausstehend; der native Dienst prüft die gespeicherte Einstellung erneut." if result["apply_status"] == "pending" else ""
         self.pending = None
         await self.display(bot, "Gespeichert · " + LABELS.get(field, field) + ": " + str(value) + (suffix if kind == "technical" else ""),
-            [("Weitere Einstellungen", "profile_group", identity, next(group for group, fields in GROUPS.items() if field in fields))] if kind == "profile" else [("Zur Übersicht", "system" if kind == "technical" else "ranking")])
+            [("Weitere Einstellungen", "profile_group", identity, next(group for group, fields in GROUPS.items() if field in fields))] if kind == "profile" else [("Zur Übersicht", "system" if kind == "technical" else "accounts" if kind == "limits" else "ranking")])
 
     async def run(self, bot, action, *args):
         if action in ("home", "cancel"):
@@ -298,6 +312,14 @@ class TelegramMenu:
             return await self.display(bot, args[0], args[1], raw=args[2], page=args[3])
         if action == "profile_field":
             return await self.field(bot, "profile", *args)
+        if action == "initialize_profile":
+            data = await self.config()
+            row = data["profiles"][args[0]]
+            if row.get("parameters") is not None:
+                raise AqlaError("Profil ist inzwischen eingerichtet; aktuelle Werte verwenden")
+            profile = TradingProfile(id=args[0], name=row["name"], parameters=Parameters())
+            await self.commands.control(action="set_profile", profile=profile.model_dump(mode="json"), expected_revision=args[1])
+            return await self.profile(bot, args[0])
         if action == "field":
             return await self.field(bot, *args)
         if action == "input":
@@ -344,7 +366,7 @@ class TelegramMenu:
             data = await self.config()
             lines = [key + " · " + ("aktiv" if row.get("enabled") else "gesperrt") + " · max. " + str((row.get("limits") or {}).get("max_open_trades", "—")) + " Trades · Gesamtrisiko " + number((row.get("limits") or {}).get("max_total_risk_percent")) + " %" for key, row in data["execution_accounts"].items()]
             return await self.display(bot, "Konten & Freigaben\n" + "\n".join(lines), [("Entries sofort pausieren", "pause"), ("Entries fortsetzen", "resume"),
-                ("Kontolimits", "command", "aqla_limits"), ("Konto aktivieren/sperren", "account_selection"), ("Eigentumskonflikte", "conflicts"),
+                ("Kontolimits", "limits_selection"), ("Konto aktivieren/sperren", "account_selection"), ("Eigentumskonflikte", "conflicts"),
                 ("Setup-Freigabe", "setup"), ("Profile anlegen", "prompt", "create_profile", "")])
         if action in ("pause", "resume"):
             await self.commands.control(action=action)
@@ -352,6 +374,14 @@ class TelegramMenu:
         if action == "account_selection":
             data = await self.config()
             return await self.paged(bot, "Konto wählen", [(key, key) for key in data["execution_accounts"]], "account")
+        if action == "limits_selection":
+            data = await self.config()
+            return await self.paged(bot, "Limits je Ausführungskonto", [(key, key) for key, row in data["execution_accounts"].items() if row.get("configured")], "limit_fields")
+        if action == "limit_fields":
+            data = await self.config()
+            if not data["execution_accounts"][args[0]].get("limits"):
+                return await self.run(bot, "prompt", "initial_limits", args[0])
+            return await self.display(bot, args[0], [(LABELS[field], "field", "limits", args[0], field) for field in AccountLimits.model_fields])
         if action == "account":
             data = await self.config()
             row = data["execution_accounts"][args[0]]
@@ -407,6 +437,8 @@ class TelegramMenu:
         if action == "command":
             command = args[0]
             if command in ("aqla_rang", "aqla_limits", "aqla_parameter", "aqla_maker"):
+                if command == "aqla_limits":
+                    return await self.run(bot, "limits_selection")
                 return await self.commands.start(bot, command, "")
             return await self.commands.ownership(bot, command, "")
         if action == "help":
@@ -502,10 +534,14 @@ class TelegramMenu:
             return await self.display(bot, "Verwaltungsauftrag: " + label + "\nEin ungeklärter Auftrag wird mit derselben Identität abgeglichen.", [("Position anzeigen", "trade", payload["trade_id"])])
         if action == "prompt":
             data = await self.config()
+            if args[0] == "create_profile" and data["profiles"]["standard"].get("parameters") is None:
+                self.pending = None
+                return await self.profile(bot, "standard")
             if not args[0].startswith("filter_"):
                 self.commands.auth(protected=True)
             self.pending = {"kind": "prompt", "action": args[0], "identity": args[1], "revision": data["configuration_revision"]}
             prompts = {"create_profile": "Name des neuen Profils senden. Es übernimmt die aktuellen Standardwerte und wird keinem Routing automatisch zugewiesen.", "rename_profile": "Neuen Profilnamen senden.",
+                "initial_limits": "Noch keine Kontolimits hinterlegt. Beide ausdrücklich setzen: maximale offene Trades; Gesamtrisiko in Prozent. Beispiel: 3; 2. Es werden keine Limits stillschweigend ausgewählt.",
                 "add_source": "Telegram-ID oder @username ergänzen. Bestehende Quellen bleiben erhalten.", "remove_source": "Genau eine vorhandene Telegram-ID oder @username entfernen.",
                 "rename_source": 'Telegram-ID und "neuen Namen" senden.', "create_pipeline": "Namen des neuen Routings senden. Es wird zunächst deaktiviert mit dem Standardprofil angelegt.",
                 "pipeline_sources": "Quellen mit ; getrennt senden. * bedeutet alle ausgewählten Quellen.", "pipeline_name": "Neuen Routingnamen senden.",
@@ -517,7 +553,7 @@ class TelegramMenu:
         pending = self.pending
         if not pending or not self.live():
             raise AqlaError("Eingabe ist abgelaufen")
-        if pending["kind"] in ("profile", "ranking", "technical"):
+        if pending["kind"] in ("profile", "ranking", "technical", "limits"):
             return await self.commit_field(bot, input_value(text, pending["schema"]))
         if pending["kind"] == "manage":
             value = [part.strip().replace(",", ".") for part in text.split(";")] if pending["action"] == "replace_targets" else text.strip().replace(",", ".")
@@ -525,6 +561,14 @@ class TelegramMenu:
         action, identity = pending["action"], pending["identity"]
         data = await self.config()
         revision = pending["revision"]
+        if action == "initial_limits":
+            parts = [part.strip().replace(",", ".") for part in text.split(";")]
+            if len(parts) != 2:
+                raise ValueError("Beide Werte senden: maximale offene Trades; Gesamtrisiko (%)")
+            limits = AccountLimits(max_open_trades=int(parts[0]), max_total_risk_percent=parts[1])
+            await self.commands.control(action="set_account_limits", account_key=identity, limits=limits.model_dump(mode="json"), expected_revision=revision)
+            self.pending = None
+            return await self.display(bot, "Kontolimits gespeichert. Der bestehende Aktivierungsstatus bleibt unverändert.", [("Konten", "accounts")])
         if action.startswith("filter_"):
             column = {"filter_symbol": "Symbol", "filter_source": "Quelle", "filter_status": "Status"}[action]
             self.pending = None
@@ -533,6 +577,9 @@ class TelegramMenu:
             await self.commands.source_change(bot, {"add_source": "aqla_hinzufuegen", "remove_source": "aqla_entfernen", "rename_source": "aqla_kanalname"}[action], text.strip())
         elif action in ("create_profile", "rename_profile"):
             if action == "create_profile":
+                if data["profiles"]["standard"].get("parameters") is None:
+                    self.pending = None
+                    return await self.profile(bot, "standard")
                 profile = TradingProfile(id="p_" + secrets.token_hex(6), name=text.strip(), parameters=Parameters.model_validate(data["profiles"]["standard"]["parameters"]))
             else:
                 row = data["profiles"][identity]
@@ -582,7 +629,11 @@ class TelegramMenu:
         text = getattr(message, "text", "") or ""
         head = text.split(maxsplit=1)[0] if text else ""
         command = head.split("@", 1)[0].lower()
-        aliases = {"/aqla": "home", "/aqla_status": "dashboard", "/aqla_journal": "journal", "/aqla_profile": "profiles", "/aqla_kanaele": "sources", "/aqla_funktionen": "help"}
+        aliases = {"/aqla": ("home",), "/aqla_status": ("dashboard",), "/aqla_journal": ("journal",), "/aqla_profile": ("profiles",), "/aqla_kanaele": ("sources",), "/aqla_funktionen": ("help",)}
+        if len(text.split(maxsplit=1)) == 1:
+            aliases.update({"/aqla_limits": ("limits_selection",), "/aqla_parameter": ("profiles",),
+                "/aqla_hinzufuegen": ("prompt", "add_source", ""), "/aqla_entfernen": ("prompt", "remove_source", ""),
+                "/aqla_kanalname": ("prompt", "rename_source", ""), "/aqla_konflikt": ("conflicts",), "/aqla_konflikt_loesen": ("conflicts",)})
         from .native_setup import addressed_to_bot
         if not addressed_to_bot(head, bot):
             return command in aliases
@@ -597,7 +648,7 @@ class TelegramMenu:
             async with self.serial:
                 if command in aliases:
                     self.pending = None
-                    await self.run(bot, aliases[command])
+                    await self.run(bot, *aliases[command])
                 else:
                     await self.text_input(bot, text)
         except (ValueError, AqlaError) as error:

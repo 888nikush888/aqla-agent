@@ -211,9 +211,10 @@ def route_control(data, action, *, expected_revision, profile=None, pipeline=Non
             raise AqlaError("The global Backup profile requires a fixed leverage")
         previous = data["profiles"].get(profile.id, {})
         data["profiles"][profile.id] = {**profile.model_dump(mode="json"), "revision": previous.get("revision", 0) + 1}
-        if profile.id == "standard" and data["venue_limits"]["hyperliquid"]:
-            data["policy"] = profile.parameters.policy(AccountLimits(**data["venue_limits"]["hyperliquid"])).model_dump(mode="json")
-            data["policy_revision"] += 1
+        if profile.id == "standard":
+            if data["venue_limits"]["hyperliquid"]:
+                data["policy"] = profile.parameters.policy(AccountLimits(**data["venue_limits"]["hyperliquid"])).model_dump(mode="json")
+            data["policy_revision"] = max(data["policy_revision"], previous.get("revision", 0)) + 1
             data["profiles"]["standard"]["revision"] = data["policy_revision"]
     elif action == "set_pipeline":
         if pipeline is None or any(target.profile_id not in data["profiles"] for target in pipeline.targets):

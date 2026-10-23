@@ -652,6 +652,10 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                     venue = account_key.split(":")[0]
                     values["venue_limits"][venue] = values["account_limits"][account_key]
                     values["venue_enabled"][venue] = values["account_enabled"][account_key]
+                    if values.get("policy") is None and values["profiles"]["standard"].get("parameters") and values["account_limits"].get(account_key):
+                        from aqla_agent.pipelines import Parameters
+                        values["policy"] = Parameters.model_validate(values["profiles"]["standard"]["parameters"]).policy(
+                            AccountLimits.model_validate(values["account_limits"][account_key])).model_dump(mode="json")
                 values["configuration_revision"] += 1
                 return {"configuration_revision": values["configuration_revision"], "account": account_key,
                         "limits": values["account_limits"][account_key], "enabled": values["account_enabled"][account_key]}

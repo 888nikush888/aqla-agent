@@ -21,6 +21,8 @@ Die bisherigen `/aqla_…`-Befehle bleiben Kurzwege. Das sichtbare Bot-Befehlsme
 
 Ein gültiger letzter Wert wird sofort gespeichert. Zahlen akzeptieren Dezimalkomma; Listen verwenden `;` zwischen Werten. Jede Änderung validiert das vollständige Profil und die aktuelle Revision. Abhängige Werte müssen in gültiger Reihenfolge gesetzt werden, etwa erst der feste Positionswert, dann die Auswahl der festen Größenberechnung.
 
+Eine neue Installation zeigt das noch leere Standardprofil zuerst mit allen Ausgangswerten. Erst die ausdrückliche Übernahme richtet es ein. Erste Kontolimits verlangen beide Werte: maximale offene Trades und Gesamtrisiko; danach wird jeder gültige einzelne Wert sofort gespeichert. Es werden dabei keine Kontolimits automatisch ergänzt.
+
 Die private Setup-Freigabe dauert 300 Sekunden. Das Passwort wird ausschließlich im ursprünglichen nativen Passwortdialog verarbeitet und nach bestätigter Löschung geprüft. Lesen, Pause und Risikoreduktion bleiben nach ihren bestehenden Regeln erreichbar. Alte Buttons, fremde Nutzer, Gruppen und weitergeleitete Eingaben verleihen keine Autorität.
 
 Positionsaufträge binden exakt einen Trade, die angezeigten Belege und eine dauerhafte Auftragsidentität. Doppelklick und Wiederanlauf erzeugen keine neue Handelsabsicht. Es gibt keinen Menüdialog zum Eröffnen neuer manueller Positionen. Bereits beendete Waverider werden nicht wieder aufgenommen.
