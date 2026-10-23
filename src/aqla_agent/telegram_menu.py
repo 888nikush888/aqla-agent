@@ -297,6 +297,8 @@ class TelegramMenu:
 
     async def run(self, bot, action, *args):
         if action in ("home", "cancel"):
+            if action == "cancel" and self.extension.setup.challenge is not None:
+                await self.extension.setup.revoke()
             return await self.home(bot)
         if action == "dashboard":
             return await self.dashboard(bot)
@@ -537,7 +539,7 @@ class TelegramMenu:
             if args[0] == "create_profile" and data["profiles"]["standard"].get("parameters") is None:
                 self.pending = None
                 return await self.profile(bot, "standard")
-            if not args[0].startswith("filter_"):
+            if not args[0].startswith("filter_") and args[0] != "rename_source":
                 self.commands.auth(protected=True)
             self.pending = {"kind": "prompt", "action": args[0], "identity": args[1], "revision": data["configuration_revision"]}
             prompts = {"create_profile": "Name des neuen Profils senden. Es übernimmt die aktuellen Standardwerte und wird keinem Routing automatisch zugewiesen.", "rename_profile": "Neuen Profilnamen senden.",

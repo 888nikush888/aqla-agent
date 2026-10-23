@@ -122,3 +122,22 @@ async def test_first_account_limits_require_both_explicit_values(panel):
     await menu.text_input(bot, "3; 2")
     assert len(changes) == 1
     assert data["execution_accounts"]["hyperliquid:testnet"]["limits"] == {"max_open_trades": 3, "max_total_risk_percent": "2"}
+
+
+@pytest.mark.asyncio
+async def test_menu_cosmetic_name_keeps_existing_no_setup_permission(panel):
+    menu, bot, data, changes, *_ = panel
+    menu.extension.setup.lease = None
+    await menu.run(bot, "prompt", "rename_source", "")
+    await menu.text_input(bot, '-101 "Neuer Name"')
+    assert data["source_names"]["-101"] == "Neuer Name" and len(changes) == 1
+
+
+@pytest.mark.asyncio
+async def test_menu_cancel_revokes_an_unanswered_password_challenge(panel):
+    from aqla_agent.native_setup import Challenge
+    menu, bot, _, changes, *_ = panel
+    menu.extension.setup.challenge = Challenge(menu.extension.setup_binding(), 1300.0, 999)
+    await menu.run(bot, "cancel")
+    assert menu.extension.setup.challenge is None and menu.extension.setup.lease is None
+    assert 999 in menu.extension.setup.old_prompts and not changes

@@ -250,7 +250,8 @@ class NativeCommands:
 
     async def control(self, **arguments):
         # Read authority immediately before RPC. MCP rechecks again at its write.
-        protected = arguments.get("action") not in ("pause", "set_source_name")
+        protected = arguments.get("action") not in ("pause", "set_source_name", "close_trade", "clear_notification") and not (
+            arguments.get("action") in ("set_account_enabled", "set_exchange_enabled") and arguments.get("enabled") is False)
         return await self.extension.mcp_call(self.extension.server, "control", {**arguments, "context_auth": self.auth(protected=protected)})
 
     async def reply(self, bot, text, buttons=None, *, markdown=False):
