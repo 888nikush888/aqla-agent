@@ -87,6 +87,8 @@ async def start(engine, event_id, signal):
 async def resume(engine, trade_id):
     if getattr(engine, "_sequence_running", False):
         return
+    # Reentrancy marker for the owning engine's persisted management sequence.
+    # skipcq: PYL-W0212
     engine._sequence_running = True
     try:
         trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
@@ -146,4 +148,6 @@ async def resume(engine, trade_id):
                 if pending["phase"] == "confirmed":
                     finish(engine, trade_id, event_id, "confirmed")
     finally:
+        # Reentrancy marker for the owning engine's persisted management sequence.
+        # skipcq: PYL-W0212
         engine._sequence_running = False

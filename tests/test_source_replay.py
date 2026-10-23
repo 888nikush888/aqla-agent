@@ -1,4 +1,7 @@
 import importlib.util
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -6,6 +9,15 @@ import pytest
 from aqla_agent.decision_evaluation import case_context, case_packet, complete_fields
 from aqla_agent.source_replay import canonical_symbol, mismatches
 from aqla_hyperliquid_mcp.models import Interpretation
+
+
+def test_owned_trade_replay_is_rejected_before_state_creation_with_optimized_python(tmp_path):
+    fixture = tmp_path / "case.json"
+    fixture.write_text(json.dumps({"packet": {"trades": [{"trade_id": "unreconstructed"}], "messages": []}}))
+    result = subprocess.run([sys.executable, "-O", "-m", "aqla_agent.source_replay", str(fixture)],
+                            input="", capture_output=True, text=True, timeout=10, check=False)
+    assert result.returncode != 0 and "Owned trade fixtures require explicit isolated reconstruction" in result.stderr
+    assert not list(tmp_path.glob("state*"))
 
 
 def test_replay_grader_does_not_hide_wrong_prices_or_false_entries():

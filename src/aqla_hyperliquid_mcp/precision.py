@@ -10,12 +10,18 @@ def quantity_grid(value: Decimal, market: Market):
     return value.quantize(Decimal(1).scaleb(-market.size_decimals), rounding=ROUND_DOWN)
 
 
+def price_step(value: Decimal, market: Market):
+    if market.price_tick is not None:
+        return market.price_tick
+    decimals = (6 if market.product == "perp" else 8) - market.size_decimals
+    exponent = max(-decimals, value.adjusted() - 4) if value < 100000 else 0
+    return Decimal(1).scaleb(exponent)
+
+
 def price_grid(value: Decimal, market: Market, up=False):
     if market.price_tick is not None:
         return (value / market.price_tick).to_integral_value(rounding=ROUND_UP if up else ROUND_DOWN) * market.price_tick
-    decimals = (6 if market.product == "perp" else 8) - market.size_decimals
-    exponent = max(-decimals, value.adjusted() - 4) if value < 100000 else 0
-    return value.quantize(Decimal(1).scaleb(exponent), rounding=ROUND_UP if up else ROUND_DOWN)
+    return value.quantize(price_step(value, market), rounding=ROUND_UP if up else ROUND_DOWN)
 
 
 def slippage_price(reference: Decimal, percent: Decimal, market: Market, buy: bool):

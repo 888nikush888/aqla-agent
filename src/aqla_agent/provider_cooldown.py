@@ -4,7 +4,7 @@ import math
 import os
 import sqlite3
 import time
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -15,6 +15,8 @@ REPLAY = ContextVar("aqla_provider_cooldown_replay", default=False)
 
 
 def identity(agent):
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     runtime = agent._primary_runtime or {}
     return digest({key: runtime.get(key, "") for key in ("provider", "base_url", "model", "api_key")})
 
@@ -36,9 +38,13 @@ def storage():
     except FileExistsError:
         pass
     os.chmod(target, 0o600)
-    with closing(sqlite3.connect(target, timeout=1)) as connection, connection:
-        connection.execute("CREATE TABLE IF NOT EXISTS cooldowns (route TEXT PRIMARY KEY, until REAL NOT NULL)")
-        yield connection
+    connection = sqlite3.connect(target, timeout=1)
+    try:
+        with connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS cooldowns (route TEXT PRIMARY KEY, until REAL NOT NULL)")
+            yield connection
+    finally:
+        connection.close()
 
 
 def remember(agent, seconds):
@@ -67,8 +73,12 @@ def install(replace):
     from agent import agent_runtime_helpers, chat_completion_helpers, fallback_cooldown
     from agent.error_classifier import FailoverReason
 
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     arm = fallback_cooldown._arm_rate_limit_cooldown
     restore = agent_runtime_helpers.restore_primary_runtime
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     buffer = chat_completion_helpers._buffer_fallback_notice
 
     def buffer_notice(agent, notice):
@@ -85,10 +95,16 @@ def install(replace):
     def restore_shared(agent):
         until = reset_at(agent)
         if until:
+            # Pinned native integration interface; covered by native contract and integration checks.
+            # skipcq: PYL-W0212
             agent._rate_limited_until = max(getattr(agent, "_rate_limited_until", 0), time.monotonic() + until - time.time())
+            # Pinned native integration interface; covered by native contract and integration checks.
+            # skipcq: PYL-W0212
             if not agent._fallback_activated:
                 token = REPLAY.set(True)
                 try:
+                    # Pinned native integration interface; covered by native contract and integration checks.
+                    # skipcq: PYL-W0212
                     activated = agent._try_activate_fallback(reason=FailoverReason.rate_limit, reset_at=until)
                 finally:
                     REPLAY.reset(token)

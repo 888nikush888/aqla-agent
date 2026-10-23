@@ -93,7 +93,7 @@ async def observe_conflict(engine, trade_id):
     signed = engine.position_size(await engine.positions(plan.market), plan.market)
     if signed:
         reasons.append("position_not_flat")
-    rows = [row for row in await engine._fills(plan) if row.get("coin") == plan.market.symbol]
+    rows = [row for row in await engine.fill_history_for_plan(plan) if row.get("coin") == plan.market.symbol]
     owned = dict(trade.get("fill_events", {}))
     # First try exact own closure; mixed account proof retains foreign fills separately.
     def sequence(row):

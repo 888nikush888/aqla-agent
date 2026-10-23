@@ -9,6 +9,7 @@ from aqla_agent import waverider
 from aqla_agent.managed_entries import position_basis
 from aqla_hyperliquid_mcp import models
 from aqla_hyperliquid_mcp.models import Evidence, Interpretation, Market, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.precision import quantity_grid
 
 
 async def reduced_trade(setup, signal, monkeypatch, side):
@@ -119,3 +120,28 @@ async def test_lost_reentry_response_reconciles_its_own_fill_without_resending(s
     assert current["waverider"]["cycle"] == 1 and current["waverider"]["phase"] == "waiting_rise"
     assert quantity / 2 < position_basis(current)[0] <= quantity
     assert current["plan"] == plan
+
+
+async def test_one_native_tick_of_noise_cannot_reduce_but_two_confirmed_ticks_can(setup, signal, monkeypatch):
+    state, boundary, exchange, trading, raw, trade = await wave_trade(setup, signal, monkeypatch, "until_target")
+    identity = trade["trade_id"]
+    initial = Decimal(trade["remaining_quantity"])
+    market = Market.model_validate(raw["market"])
+    clock = [now_ms() + 1000]
+    monkeypatch.setattr(models.time, "time_ns", lambda: clock[0] * 1_000_000)
+    state.update(lambda data: data["trades"][identity].update(waverider={"phase": "waiting_rise", "cycle": 0,
+        "finished": False, "checkpoint": clock[0],
+        "market_facts": {"fee_rate": ".0004", "atr": ".001", "observed_at": clock[0]}}))
+    before = list(boundary.fills)
+    for price in ("104", "103.99", "103.99", "103.99"):
+        clock[0] += 1000
+        boundary.mid = price
+        await waverider.tick(trading, identity, await exchange.price_snapshot(market))
+    assert boundary.fills == before and boundary.position == initial
+    for _ in range(3):
+        clock[0] += 1000
+        boundary.mid = "103.98"
+        await waverider.tick(trading, identity, await exchange.price_snapshot(market))
+    assert boundary.position == initial - quantity_grid(initial / 2, market)
+    current = state.snapshot()["trades"][identity]
+    assert current["waverider"]["phase"] == "waiting_rebound" and current["waverider"]["cycle"] == 0

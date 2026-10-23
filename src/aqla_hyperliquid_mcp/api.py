@@ -356,7 +356,7 @@ class Hyperliquid:
             return advance({"nonces": nonces})
 
         roots = ("nonces",) if root is self.state else ("nonces", "account_nonces")
-        with root._thread_lock:
+        with root.locked():
             if root is not self.state:
                 self.state.assert_binding(self.settings)
                 legacy = self.state.legacy_context(root.read("network", "venue_accounts"))
@@ -641,6 +641,8 @@ class Hyperliquid:
 
             # An isolated facade override: HIP-3 IDs are above the spot range,
             # but their price precision still follows the perpetual contract.
+            # Pinned SDK helper used only after explicit native action/scope validation.
+            # skipcq: PYL-W0212
             sdk._slippage_price = slippage_price
 
             def capture(action, signature, timestamp):
@@ -656,6 +658,8 @@ class Hyperliquid:
                     raise AqlaError("SDK action differs from its documented signing scope")
                 return payload
 
+            # Pinned SDK helper used only after explicit native action/scope validation.
+            # skipcq: PYL-W0212
             sdk._post_action = capture
             arguments = cloid_arguments(params)
             if operation == "noop":

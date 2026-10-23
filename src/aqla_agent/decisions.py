@@ -203,7 +203,9 @@ class SourceProcessingConfig(Model):
 
 
 
-def checked_answers(response, questions, profile, *, collect=False):
+def checked_answers(response, questions, _profile, *, collect=False):
+    # Retain the historical collector keyword; grading is shared for all callers.
+    del collect
     answers = response.get("answers")
     if not isinstance(answers, dict) or set(answers) != set(questions):
         raise DecisionFailure("answer_shape")

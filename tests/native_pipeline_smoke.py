@@ -185,25 +185,23 @@ create_server(settings, state=state, exchange=exchange).run(transport="stdio")
                     parameters = json.loads(json.dumps(parameters))
                     parameters["interpretation"]["evidence"] = [{"field": "classification", "source_id": original.source_id, "quote": "BTC Ergebnis: Ziel erreicht."}]
                     receipts = []
+                    from native_tool_smoke import payload
+                    def find_receipt(item):
+                        if isinstance(item, dict):
+                            if item.get("source_read_receipt"):
+                                receipts.append(item["source_read_receipt"])
+                            for child in item.values():
+                                find_receipt(child)
+                        elif isinstance(item, str):
+                            parsed = payload(item)
+                            if parsed:
+                                find_receipt(parsed)
+                        elif isinstance(item, list):
+                            for child in item:
+                                find_receipt(child)
                     for previous in request.get("messages", []):
                         if previous.get("role") == "tool":
-                            body = previous.get("content") or ""
-                            from native_tool_smoke import payload
-                            value = payload(body)
-                            def find_receipt(item):
-                                if isinstance(item, dict):
-                                    if item.get("source_read_receipt"):
-                                        receipts.append(item["source_read_receipt"])
-                                    for child in item.values():
-                                        find_receipt(child)
-                                elif isinstance(item, str):
-                                    parsed = payload(item)
-                                    if parsed:
-                                        find_receipt(parsed)
-                                elif isinstance(item, list):
-                                    for child in item:
-                                        find_receipt(child)
-                            find_receipt(value)
+                            find_receipt(payload(previous.get("content") or ""))
                     assert receipts, "Classification must receive a receipt from actual source_context output"
                     parameters["source_read_receipt"] = receipts[-1]
                 available = [tool["function"]["name"] for tool in tools]

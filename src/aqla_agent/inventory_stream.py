@@ -86,6 +86,8 @@ async def observe(adapter, names, *, connector=connect):
     new = feed is None
     if new:
         feed = InventoryStream(adapter, names, connector)
+        # Account-scoped feed lifecycle; freshness and generation are rechecked before admission.
+        # skipcq: PYL-W0212
         adapter._inventory_feed = feed
     try:
         async with asyncio.timeout(9), feed.read_lock:
@@ -129,6 +131,8 @@ async def observe(adapter, names, *, connector=connect):
     except BaseException as error:
         await feed.close()
         if getattr(adapter, "_inventory_feed", None) is feed:
+            # Account-scoped feed lifecycle; freshness and generation are rechecked before admission.
+            # skipcq: PYL-W0212
             adapter._inventory_feed = None
         if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
             raise

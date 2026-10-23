@@ -1,4 +1,5 @@
 """Offline counters and timings: mock exchange, isolated state, no real transports."""
+
 import argparse
 import asyncio
 import json
@@ -9,6 +10,9 @@ import time
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import TestCase
+
+INVARIANTS = TestCase()
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT / "tests")]
@@ -40,8 +44,7 @@ async def run(cycles, history):
         state = State(settings)
         fake, reads = FakeExchange(signer.address), Counter()
         def transport(request):
-            if not (request.url.host == "fixture.invalid"):
-                raise AssertionError("Only the local mock transport is permitted")
+            INVARIANTS.assertTrue(request.url.host == 'fixture.invalid', 'Only the local mock transport is permitted')
             if request.url.path == "/info":
                 reads[json.loads(request.content)["type"]] += 1
             return fake.handle(request)
@@ -68,25 +71,26 @@ async def run(cycles, history):
             started = time.perf_counter()
             await engine.refresh_trade(trade["trade_id"])
             durations.append((time.perf_counter() - started) * 1000)
-        if not (len(fake.actions) == before):
-            raise AssertionError("A normal no-op refresh must not issue another fake order")
+        INVARIANTS.assertTrue(len(fake.actions) == before, 'A normal no-op refresh must not issue another fake order')
         whole_bytes = len(json.dumps(state.snapshot()).encode())
         patched = []
+        # Isolated benchmark instruments SQLite writes without changing the production writer.
+        # skipcq: PYL-W0212
         original = state._store.save_roots
         def patch(changed):
             patched.append(len(json.dumps(changed).encode()))
             return original(changed)
+        # Isolated benchmark instruments SQLite writes without changing the production writer.
+        # skipcq: PYL-W0212
         state._store.save_roots = patch
         state.update_metadata(("cursors",), lambda part: part["cursors"].update(benchmark=1))
-        if not (patched and patched[-1] < whole_bytes / 10):
-            raise AssertionError
+        INVARIANTS.assertTrue(patched and patched[-1] < whole_bytes / 10)
         sparse_bytes = patched[-1]
         server = create_server(settings, state=state, exchange=exchange)
         sent, model_calls = [], []
         async def mcp_call(_, tool, arguments):
             response = await server.call_tool(tool, arguments)
-            if not (not response.is_error):
-                raise AssertionError
+            INVARIANTS.assertTrue(not response.is_error)
             return response.structured_content or json.loads(response.content[0].text)
         async def send(owner, text):
             sent.append((owner, text))
@@ -106,8 +110,7 @@ async def run(cycles, history):
             worker = SourceWorker(extension, {"mode": "legacy"}, adapter=SimpleNamespace(decide=forbidden), fallback=forbidden)
             await worker.deliver()
             await worker.deliver()
-            if not (len(sent) == 1 and not model_calls):
-                raise AssertionError
+            INVARIANTS.assertTrue(len(sent) == 1 and (not model_calls))
             report = {"fake_exchange_only": True, "real_transports": 0, "cycles": cycles, "synthetic_history_events": history,
                 "refresh_p50_ms": statistics.median(durations), "refresh_max_ms": max(durations),
                 "info_calls_per_cycle": {key: value / cycles for key, value in sorted(reads.items())},

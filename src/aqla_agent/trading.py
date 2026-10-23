@@ -43,7 +43,8 @@ from aqla_hyperliquid_mcp.rules import (
     verify_update_shape,
 )
 
-from . import managed_entries, waverider
+from . import managed_entries
+from . import waverider as wave_manager
 from .account_work import AccountLock
 from .accounting import foreign_entry_orders, occupied_markets
 from .entry import execution_limit, gate_state, passive_entry_price, validate_entry_prices
@@ -102,11 +103,20 @@ class Trading:
         self.lock = AccountLock()
         self.recovery_lock = asyncio.Lock()
         self.recovery_checked = False
-        self.waves = waverider
+        self.waves = wave_manager
         self.express_ingress: Callable | None = None
         self.express_admission: Callable | None = None
         self.entry_wake: Callable | None = None
         self.disposition_key: bytes | None = None
+        self.recovery_cursor = 0
+
+    def invoke_hook(self, name, *args):
+        callback = getattr(self, name, None)
+        if callback is None:
+            return
+        if not callable(callback):
+            raise AqlaError("Configured trading callback is unavailable")
+        return callback(*args)
 
     def ingest(self, source: SourceEvent, *, native_forward=False):
         legacy_event_id = digest([source.source_id, source.edited_at, source.text, source.media])[:32]
@@ -137,8 +147,7 @@ class Trading:
             state["cursors"][source.chat_id] = max(source.message_id, state["cursors"].get(source.chat_id, 0))
             from .source_queue import repair_queue
             repair_queue(state)
-            if ingress := getattr(self, "express_ingress", None):
-                ingress(state, row)
+            self.invoke_hook("express_ingress", state, row)
             self.prune_events(state, inserted_event=source.event_id)
             return row
 
@@ -477,8 +486,7 @@ class Trading:
                     or Decimal(parent.get("filled_quantity", "0")) or not parent.get("entries_disabled")
                     or parent.get("rerouted_to_plan_id") != plan.plan_id):
                 raise AqlaError("Previous venue has not released this setup with proved zero fills")
-        if express_admission := getattr(self, "express_admission", None):
-            express_admission(snapshot, plan)
+        self.invoke_hook("express_admission", snapshot, plan)
         if not owned:
             from .express import require_source_access
             for event_id in plan.source_revisions.values():
@@ -668,8 +676,7 @@ class Trading:
             fresh = await self.preview(saved["event_id"], signal, _refresh_from=plan_id)
             fresh = TradePlan.model_validate(fresh)
             return await self.execute_locked(fresh.plan_id, refresh_budget=False)
-        if wake := getattr(self, "entry_wake", None):
-            wake()
+        self.invoke_hook("entry_wake")
         if plan.entry_timing == "deferred":
             self.state.update(lambda data: data["notifications"].setdefault("entry-waiting:" + plan.trade_id,
                               {"trade_id": plan.trade_id, "change": {"status": "waiting_entry"}, "observed_at": now_ms()}))
@@ -1104,7 +1111,7 @@ class Trading:
 
     _patch = patch_trade
 
-    async def _fills(self, plan):
+    async def fill_history_for_plan(self, plan):
         result = {}
         pages = 0
 
@@ -1126,6 +1133,8 @@ class Trading:
 
         await window(plan.created_at, now_ms())
         return list(result.values())
+
+    _fills = fill_history_for_plan
 
     async def capture_fills(self, trade_id, entry_status=None):
         with order_observations(self.exchange):
@@ -1174,7 +1183,7 @@ class Trading:
         owned = dict(trade.get("fill_events", {}))
         roles = dict(trade.get("fill_execution_roles", {}))
         conflicts = dict(trade.get("fill_execution_role_conflicts", {}))
-        for row in await self._fills(plan):
+        for row in await self.fill_history_for_plan(plan):
             if row.get("oid") not in mapping or row.get("coin") != plan.market.symbol:
                 continue
             identity = digest([row["oid"], row.get("tid"), row.get("time"), row.get("sz"), row.get("px")])

@@ -29,8 +29,8 @@ async def test_100_live_events_do_not_repeat_dialog_or_history_work(missing):
             counts["rereads"] += 1
             return [message(identity) for identity in ids]
         async def iter_messages(self, entity, **kwargs):
-            if False:
-                yield None
+            for item in ():
+                yield item
     async def snapshot():
         return configuration
     async def deliver(source):
@@ -292,8 +292,8 @@ async def test_live_recovery_only_queries_affected_subscribed_source():
     class Client(ReaderClient):
         async def iter_messages(self, entity, **kwargs):
             queries.append(entity)
-            if False:
-                yield
+            for item in ():
+                yield item
     reader = TelegramReader(Settings(network="testnet", account="0x" + "0" * 40), deliver, snapshot, clock=lambda: clock[0])
     reader.client = Client()
     reader.selected = list(configuration["sources"])
@@ -560,9 +560,9 @@ async def test_global_reader_rpc_failures_still_escape_with_actionable_status(fa
         return {"sources": ["@signala"], "cursors": {}, "tracked_ids": {}}
     class Client(ReaderClient):
         async def iter_messages(self, entity, **kwargs):
+            for item in ():
+                yield item
             raise getattr(errors, failure)(request="sensitive-rpc-details")
-            if False:
-                yield
     reader = TelegramReader(Settings(network="testnet", account="0x" + "0" * 40), None, snapshot)
     reader.client = Client()
     with pytest.raises(getattr(errors, failure)) as captured:

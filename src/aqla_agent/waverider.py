@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import sqlite3
+from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
@@ -20,6 +21,7 @@ from aqla_hyperliquid_mcp.models import (
     now_ms,
     require_first,
 )
+from aqla_hyperliquid_mcp.precision import price_step
 from aqla_hyperliquid_mcp.rules import quantity_grid, slippage_price
 
 from .accounting import position_basis
@@ -49,6 +51,25 @@ def profile_hash(policy, base_parameters=None):
     return digest(values)
 
 
+def exit_pool_sizes(row, core, flex, rights):
+    size = Decimal(row["sz"])
+    if size > core + flex or row["kind"] in ("waverider", "waverider_retirement") and size > flex:
+        raise AqlaError("Waverider reduction exceeds its proved flexible inventory")
+    if row["kind"] in ("waverider", "waverider_retirement"):
+        core_exit, flex_exit = Decimal(0), size
+    elif row.get("exit_pool") == "core":
+        if size > core or core <= 0:
+            raise AqlaError("Source core target exceeds its reserved core inventory")
+        rights *= 1 - size / core
+        core_exit, flex_exit = size, Decimal(0)
+    else:
+        ratio = size / (core + flex)
+        core_exit = core * ratio
+        flex_exit = size - core_exit
+        rights *= 1 - ratio
+    return core_exit, flex_exit, rights
+
+
 def pools(trade, percent):
     """Core and flex cost bases stay distinct, including partially filled cycles."""
     core, flex, core_cost, flex_cost, rights, losses, fees = (Decimal(0) for _ in range(7))
@@ -64,20 +85,7 @@ def pools(trade, percent):
             flex_cost += added * price
             core, flex = core + size - added, flex + added
         else:
-            if size > core + flex or row["kind"] in ("waverider", "waverider_retirement") and size > flex:
-                raise AqlaError("Waverider reduction exceeds its proved flexible inventory")
-            if row["kind"] in ("waverider", "waverider_retirement"):
-                core_exit, flex_exit = Decimal(0), size
-            elif row.get("exit_pool") == "core":
-                if size > core or core <= 0:
-                    raise AqlaError("Source core target exceeds its reserved core inventory")
-                rights *= 1 - size / core
-                core_exit, flex_exit = size, Decimal(0)
-            else:
-                ratio = size / (core + flex)
-                core_exit = core * ratio
-                flex_exit = size - core_exit
-                rights *= 1 - ratio
+            core_exit, flex_exit, rights = exit_pool_sizes(row, core, flex, rights)
             core_average, flex_average = core_cost / core if core else Decimal(0), flex_cost / flex if flex else Decimal(0)
             losses += max(Decimal(0), -(price - core_average) * core_exit * direction)
             losses += max(Decimal(0), -(price - flex_average) * flex_exit * direction)
@@ -156,6 +164,43 @@ def advance(state, *, side, price, basis, volatility, cycle_cost, tick, stamp):
     return result, None
 
 
+def comparable_performance(group):
+    return (all(Decimal(group[key]).is_finite() for key in ("net_pnl", "baseline_net_pnl", "max_drawdown", "baseline_max_drawdown"))
+        and Decimal(group["net_pnl"]) >= Decimal(group["baseline_net_pnl"])
+        and Decimal(group["max_drawdown"]) <= Decimal(group["baseline_max_drawdown"]))
+
+
+def qualification_scope(report, expected_profile, expected_venue, expected_cohort):
+    return (report["software_hash"] == software_hash()
+        and (expected_profile is None or report["profile_hash"] == expected_profile)
+        and (expected_venue is None or expected_venue in report["allowed_venues"])
+        and (expected_cohort is None or expected_cohort in report.get("cohorts", {})))
+
+
+def qualification_evidence(report):
+    return (report["version"] == VERSION and report["critical_errors"] == 0
+        and report.get("cost_model") == COST_MODEL and report.get("data_errors") == 0
+        and report.get("cases_requested") == report["cases"]
+        and report["cases"] >= MIN_CASES and report["waves"] >= MIN_WAVES
+        and report["data_kind"] == "executable_depth" and bool(report["holdout_hash"]))
+
+
+def operator_consent(report):
+    return (report["kind"] == "waverider_operator_live_v1" and report["version"] == VERSION
+        and report["historical_quality_waived"] is True and isinstance(report["operator"], str) and bool(report["operator"].strip())
+        and len(report["consent_sha256"]) == 64 and all(c in "0123456789abcdef" for c in report["consent_sha256"]))
+
+
+def operator_scope(report, plan, issued):
+    account = f"{plan.exchange}:{plan.network}:{plan.account.lower()}"
+    cohort = f"{plan.exchange}:{plan.network}:{plan.market.quote_token}"
+    return (type(issued) is int and 0 <= issued <= now_ms() and plan.created_at >= issued
+        and report["software_hash"] == software_hash()
+        and report["profile_hash"] == profile_hash(plan.policy, plan.base_parameters)
+        and isinstance(report["allowed_accounts"], list) and isinstance(report["allowed_cohorts"], list)
+        and account in report["allowed_accounts"] and cohort in report["allowed_cohorts"])
+
+
 def qualification_valid(path, key, expected_profile=None, expected_venue=None, expected_cohort=None):
     try:
         report = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -163,18 +208,10 @@ def qualification_valid(path, key, expected_profile=None, expected_venue=None, e
         body = json.dumps(report, sort_keys=True, separators=(",", ":")).encode()
         valid = hmac.compare_digest(signature, hmac.new(key, body, hashlib.sha256).hexdigest())
         groups = list(report.get("cohorts", {}).values()) or [report]
-        comparisons = all(all(Decimal(group[key]).is_finite() for key in ("net_pnl", "baseline_net_pnl", "max_drawdown", "baseline_max_drawdown"))
-            and Decimal(group["net_pnl"]) >= Decimal(group["baseline_net_pnl"])
-            and Decimal(group["max_drawdown"]) <= Decimal(group["baseline_max_drawdown"]) for group in groups)
-        return (valid and comparisons and report["software_hash"] == software_hash()
-            and (expected_profile is None or report["profile_hash"] == expected_profile)
-            and (expected_venue is None or expected_venue in report["allowed_venues"])
-            and (expected_cohort is None or expected_cohort in report.get("cohorts", {}))
-            and report["version"] == VERSION and report["critical_errors"] == 0
-            and report.get("cost_model") == COST_MODEL and report.get("data_errors") == 0
-            and report.get("cases_requested") == report["cases"]
-            and report["cases"] >= MIN_CASES and report["waves"] >= MIN_WAVES
-            and report["data_kind"] == "executable_depth" and bool(report["holdout_hash"]))
+        comparisons = all(comparable_performance(group) for group in groups)
+        return (valid and comparisons
+            and qualification_scope(report, expected_profile, expected_venue, expected_cohort)
+            and qualification_evidence(report))
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
         return False
 
@@ -186,17 +223,8 @@ def operator_authorized(path, key, plan):
         signature = report.pop("signature")
         body = json.dumps(report, sort_keys=True, separators=(",", ":")).encode()
         issued = report["issued_at"]
-        account = f"{plan.exchange}:{plan.network}:{plan.account.lower()}"
-        cohort = f"{plan.exchange}:{plan.network}:{plan.market.quote_token}"
         return (hmac.compare_digest(signature, hmac.new(key, body, hashlib.sha256).hexdigest())
-            and report["kind"] == "waverider_operator_live_v1" and report["version"] == VERSION
-            and report["historical_quality_waived"] is True and isinstance(report["operator"], str) and bool(report["operator"].strip())
-            and len(report["consent_sha256"]) == 64 and all(c in "0123456789abcdef" for c in report["consent_sha256"])
-            and type(issued) is int and 0 <= issued <= now_ms() and plan.created_at >= issued
-            and report["software_hash"] == software_hash()
-            and report["profile_hash"] == profile_hash(plan.policy, plan.base_parameters)
-            and isinstance(report["allowed_accounts"], list) and isinstance(report["allowed_cohorts"], list)
-            and account in report["allowed_accounts"] and cohort in report["allowed_cohorts"])
+            and operator_consent(report) and operator_scope(report, plan, issued))
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
         return False
 
@@ -250,6 +278,23 @@ async def market_facts(exchange, market):
             "version": VERSION, "market": market.symbol}
 
 
+def expire_recordings(db, stamp, retention_days):
+    cutoff = stamp - retention_days * 86400000
+    expired = db.execute("SELECT setups.setup, setups.payload, MAX(observations.stamp) FROM setups JOIN observations ON setups.setup=observations.setup GROUP BY setups.setup HAVING MAX(observations.stamp)<? LIMIT 100", (cutoff,)).fetchall()
+    removed = False
+    for identity, raw, _ in expired:
+        plan = json.loads(raw)["plan"]
+        last = json.loads(db.execute("SELECT payload FROM observations WHERE setup=? ORDER BY stamp DESC LIMIT 1", (identity,)).fetchone()[0])
+        if last.get("state", {}).get("finished") or plan["policy"].get("waverider_lifetime", "signal_deadline") == "signal_deadline" and plan["deadline_at"] < cutoff:
+            db.execute("DELETE FROM observations WHERE setup=?", (identity,))
+            db.execute("DELETE FROM original_fills WHERE setup=?", (identity,))
+            db.execute("DELETE FROM setups WHERE setup=?", (identity,))
+            removed = True
+    if removed:
+        db.commit()
+        db.execute("VACUUM")
+
+
 def capture(path, setup_id, stamp, record, *, max_bytes=512 * 1024 * 1024, retention_days=None):
     # Separate append-only diagnostics avoid copying market ticks into the financial state.
     path = Path(path)
@@ -259,20 +304,7 @@ def capture(path, setup_id, stamp, record, *, max_bytes=512 * 1024 * 1024, reten
         db.execute("CREATE TABLE IF NOT EXISTS original_fills (setup TEXT NOT NULL, identity TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(setup,identity))")
         db.execute("CREATE TABLE IF NOT EXISTS observations (setup TEXT NOT NULL, stamp INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(setup,stamp))")
         if retention_days is not None:
-            cutoff = stamp - retention_days * 86400000
-            expired = db.execute("SELECT setups.setup, setups.payload, MAX(observations.stamp) FROM setups JOIN observations ON setups.setup=observations.setup GROUP BY setups.setup HAVING MAX(observations.stamp)<? LIMIT 100", (cutoff,)).fetchall()
-            removed = False
-            for identity, raw, _ in expired:
-                plan = json.loads(raw)["plan"]
-                last = json.loads(db.execute("SELECT payload FROM observations WHERE setup=? ORDER BY stamp DESC LIMIT 1", (identity,)).fetchone()[0])
-                if last.get("state", {}).get("finished") or plan["policy"].get("waverider_lifetime", "signal_deadline") == "signal_deadline" and plan["deadline_at"] < cutoff:
-                    db.execute("DELETE FROM observations WHERE setup=?", (identity,))
-                    db.execute("DELETE FROM original_fills WHERE setup=?", (identity,))
-                    db.execute("DELETE FROM setups WHERE setup=?", (identity,))
-                    removed = True
-            if removed:
-                db.commit()
-                db.execute("VACUUM")
+            expire_recordings(db, stamp, retention_days)
         if path.stat().st_size >= max_bytes:
             return False
         metadata = {key: record[key] for key in ("plan", "family", "software_hash") if key in record}
@@ -309,6 +341,8 @@ def queue_evidence(engine, trade_id, quote):
     tasks = getattr(engine, "_waverider_capture_tasks", {})
     task = tasks.get(trade_id)
     if task and not task.done():
+        # Per-account wave observation/recorder cache shared with the owning engine.
+        # skipcq: PYL-W0212
         engine._replay_health = {"status": "lagging", "reason": "previous_observation_still_pending"}
         return
     tasks[trade_id] = asyncio.create_task(collect_evidence(engine, trade_id, quote), name="aqla-wave-evidence")
@@ -316,6 +350,8 @@ def queue_evidence(engine, trade_id, quote):
         if tasks.get(trade_id) is task:
             tasks.pop(trade_id, None)
     tasks[trade_id].add_done_callback(discard)
+    # Per-account wave observation/recorder cache shared with the owning engine.
+    # skipcq: PYL-W0212
     engine._waverider_capture_tasks = tasks
 
 
@@ -334,6 +370,8 @@ async def collect_evidence(engine, trade_id, quote):
             except Exception:
                 previous = {"observed_at": now_ms(), "unavailable": True}
             cache[plan.market.symbol] = previous
+            # Per-account wave observation/recorder cache shared with the owning engine.
+            # skipcq: PYL-W0212
             engine._waverider_facts_cache = cache
         quote.fresh(as_of=quote.observed_at)
         from .managed_entries import original_fills
@@ -343,8 +381,12 @@ async def collect_evidence(engine, trade_id, quote):
                  "original_fills": original_fills(trade), "status": trade["status"], "state": trade.get("waverider", {}),
                  "evidence_error": "market_facts_unavailable" if previous.get("unavailable") else None},
             max_bytes=config.max_bytes, retention_days=config.retention_days)
+        # Per-account wave observation/recorder cache shared with the owning engine.
+        # skipcq: PYL-W0212
         engine._replay_health = {"status": "recording" if captured else "saturated", "last_observed_at": quote.observed_at}
     except Exception:
+        # Per-account wave observation/recorder cache shared with the owning engine.
+        # skipcq: PYL-W0212
         engine._replay_health = {"status": "unavailable", "reason": "recording_failed"}
         return
 
@@ -359,9 +401,80 @@ def ended(plan, trade, quote=None):
         or quote is not None and (quote.bid >= target if plan.side == "long" else quote.ask <= target))
 
 
+def cycle_observation(plan, quote, quantity, *, reentering, fee_rate, as_of=None):
+    if quantity < plan.market.min_quantity or quantity <= 0 or quantity * quote.mid < plan.market.min_notional:
+        raise AqlaError("Flexible quantity is below the exchange minimum; ordinary protection remains active")
+    buy = (plan.side == "long") if reentering else (plan.side == "short")
+    limit = slippage_price(quote.mid, plan.policy.max_slippage_percent, plan.market, buy=buy)
+    capacity, price = quote.executable(buy=buy, limit=limit, quantity=quantity, as_of=as_of)
+    if capacity < quantity:
+        raise AqlaError("Waverider depth cannot cover its flexible quantity within the price bound")
+    cost = price * (Decimal(fee_rate) * 2 + plan.policy.max_slippage_percent / 50)
+    return price, cost, price_step(price, plan.market)
+
+
 def observation_marker(state):
     return tuple(state.get(key) for key in ("checkpoint", "endpoint_reached_at", "finished", "operation_id",
         "phase", "cycle", "sale_price", "sold_quantity", "resume_phase"))
+
+
+async def fresh_cycle_quote(engine, plan, state, quote):
+    facts = state.get("market_facts")
+    if not facts or not 0 <= now_ms() - facts["observed_at"] < 60000:
+        facts = await read_observation(lambda: market_facts(engine.exchange, plan.market), "waverider_market")
+        state["market_facts"] = facts
+    stale = False
+    try:
+        quote.fresh()
+    except TemporaryObservation:
+        stale = True
+    if stale or not quote.bids or not quote.asks:
+        reader = getattr(engine.exchange, "depth_snapshot", engine.exchange.price_snapshot)
+        quote = await read_observation(lambda: reader(plan.market), "price")
+    return quote, facts
+
+
+def cycle_inventory(trade, plan, state, permitted, rebuying):
+    own_quantity, basis, realized, fees = position_basis(trade)
+    inventory = pools(trade, plan.policy.waverider_flex_percent)
+    quantity = quantity_grid(max(Decimal(0), inventory["rights"] - inventory["flex"]) if rebuying and permitted
+                            else min(own_quantity, inventory["rights"]) if not permitted else inventory["flex"], plan.market)
+    if inventory["flex"]:
+        basis = inventory["flex_basis"]
+    if not permitted:
+        basis = Decimal(state.get("paper_basis", str(basis)))
+    state.update(core_quantity=str(inventory["core"]), flexible_quantity=str(inventory["flex"]),
+                 remaining_risk_budget=str(max(Decimal(0), plan.risk_usdc - inventory["spent"])))
+    return basis, quantity, realized, fees
+
+
+def paper_cycle(state, plan, action, price, quantity, stamp):
+    state.setdefault("paper_actions", []).append({"action": action, "at": stamp, "price": str(price), "quantity": str(quantity)})
+    state["paper_actions"] = state["paper_actions"][-20:]
+    if action == "reduce":
+        state.update(phase="waiting_rebound", sale_price=str(price), extreme=str(price * (1 if plan.side == "long" else -1)))
+    else:
+        state.update(phase="waiting_rise", cycle=state.get("cycle", 0) + 1, paper_basis=str(price), extreme=str(price * (1 if plan.side == "long" else -1)))
+    for field in ("confirmation_since", "confirmation_count", "wave_atr"):
+        state.pop(field, None)
+
+
+def save_cycle_observation(engine, trade_id, state, persisted, memory):
+    if state.get("phase") != persisted.get("phase") or state.get("operation_id") != persisted.get("operation_id") or now_ms() - persisted.get("checkpoint", 0) >= 10000:
+        state["checkpoint"] = now_ms()
+        engine.patch_trade(trade_id, waverider=state)
+        persisted = state
+    marker = observation_marker(persisted)
+    memory[trade_id] = (marker, state)
+    # Per-account wave observation/recorder cache shared with the owning engine.
+    # skipcq: PYL-W0212
+    engine._waverider_observations = memory
+
+
+def pause_cycle(state, error):
+    if state.get("phase") != "paused":
+        state["resume_phase"] = state.get("phase", "waiting_rise")
+    state.update(phase="paused", reason=str(error) if isinstance(error, AqlaError) else "Waverider market evidence is unavailable")
 
 
 async def tick(engine, trade_id, quote):
@@ -391,39 +504,12 @@ async def tick(engine, trade_id, quote):
             if state.get("phase") in ("pending_reduce", "pending_reenter"):
                 engine.patch_trade(trade_id, waverider=state)
                 return
-        facts = state.get("market_facts")
-        if not facts or not 0 <= now_ms() - facts["observed_at"] < 60000:
-            facts = await read_observation(lambda: market_facts(engine.exchange, plan.market), "waverider_market")
-            state["market_facts"] = facts
-        stale = False
-        try:
-            quote.fresh()
-        except TemporaryObservation:
-            stale = True
-        if stale or not quote.bids or not quote.asks:
-            reader = getattr(engine.exchange, "depth_snapshot", engine.exchange.price_snapshot)
-            quote = await read_observation(lambda: reader(plan.market), "price")
-        own_quantity, basis, realized, fees = position_basis(trade)
-        inventory = pools(trade, plan.policy.waverider_flex_percent)
+        quote, facts = await fresh_cycle_quote(engine, plan, state, quote)
         rebuying = state.get("phase") in ("waiting_rebound", "pending_reenter")
-        quantity = quantity_grid(max(Decimal(0), inventory["rights"] - inventory["flex"]) if rebuying and permitted
-                                else min(own_quantity, inventory["rights"]) if not permitted else inventory["flex"], plan.market)
-        if inventory["flex"]:
-            basis = inventory["flex_basis"]
-        if not permitted:
-            basis = Decimal(state.get("paper_basis", str(basis)))
-        state.update(core_quantity=str(inventory["core"]), flexible_quantity=str(inventory["flex"]),
-                     remaining_risk_budget=str(max(Decimal(0), plan.risk_usdc - inventory["spent"])))
-        if quantity < plan.market.min_quantity or quantity <= 0 or quantity * quote.mid < plan.market.min_notional:
-            raise AqlaError("Flexible quantity is below the exchange minimum; ordinary protection remains active")
-        buy = (plan.side == "long") if rebuying else (plan.side == "short")
-        limit = slippage_price(quote.mid, plan.policy.max_slippage_percent, plan.market, buy=buy)
-        capacity, price = quote.executable(buy=buy, limit=limit, quantity=quantity)
-        if capacity < quantity:
-            raise AqlaError("Waverider depth cannot cover its flexible quantity within the price bound")
-        cost = price * (Decimal(facts["fee_rate"]) * 2 + plan.policy.max_slippage_percent / 50)
+        basis, quantity, realized, fees = cycle_inventory(trade, plan, state, permitted, rebuying)
+        price, cost, tick_size = cycle_observation(plan, quote, quantity, reentering=rebuying, fee_rate=facts["fee_rate"])
         state, action = advance(state, side=plan.side, price=price, basis=basis,
-            volatility=Decimal(facts["atr"]), cycle_cost=cost, tick=plan.market.price_tick or Decimal(1).scaleb(-6 + plan.market.size_decimals), stamp=quote.observed_at)
+            volatility=Decimal(facts["atr"]), cycle_cost=cost, tick=tick_size, stamp=quote.observed_at)
         if now_ms() - state.get("last_captured_at", 0) >= 1000:
             queue_evidence(engine, trade_id, quote)
             state["last_captured_at"] = now_ms()
@@ -431,26 +517,11 @@ async def tick(engine, trade_id, quote):
             if permitted:
                 await execute(engine, trade_id, state, action, quantity, quote, cost)
                 return
-            state.setdefault("paper_actions", []).append({"action": action, "at": quote.observed_at, "price": str(price), "quantity": str(quantity)})
-            state["paper_actions"] = state["paper_actions"][-20:]
-            if action == "reduce":
-                state.update(phase="waiting_rebound", sale_price=str(price), extreme=str(price * (1 if plan.side == "long" else -1)))
-            else:
-                state.update(phase="waiting_rise", cycle=state.get("cycle", 0) + 1, paper_basis=str(price), extreme=str(price * (1 if plan.side == "long" else -1)))
-            for field in ("confirmation_since", "confirmation_count", "wave_atr"):
-                state.pop(field, None)
+            paper_cycle(state, plan, action, price, quantity, quote.observed_at)
         state.update(reason=None, net_realized=str(realized - fees))
     except (KeyError, ValueError, TypeError, OSError, sqlite3.Error) as error:
-        if state.get("phase") != "paused":
-            state["resume_phase"] = state.get("phase", "waiting_rise")
-        state.update(phase="paused", reason=str(error) if isinstance(error, AqlaError) else "Waverider market evidence is unavailable")
-    if state.get("phase") != persisted.get("phase") or state.get("operation_id") != persisted.get("operation_id") or now_ms() - persisted.get("checkpoint", 0) >= 10000:
-        state["checkpoint"] = now_ms()
-        engine.patch_trade(trade_id, waverider=state)
-        persisted = state
-    marker = observation_marker(persisted)
-    memory[trade_id] = (marker, state)
-    engine._waverider_observations = memory
+        pause_cycle(state, error)
+    save_cycle_observation(engine, trade_id, state, persisted, memory)
 
 
 def reset_phase(state, phase):
@@ -458,9 +529,8 @@ def reset_phase(state, phase):
     return {**result, "phase": phase}
 
 
-async def resume_cycle(engine, trade_id, state):
-    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-    operations = engine.state.read("operations")["operations"]
+def pending_cycle_order(engine, trade_id, trade, state, operations):
+    """Resolve this action's own order, without borrowing a previous exit."""
     reentering = state["phase"] == "pending_reenter"
     action = "reenter" if reentering else state.get("action", "reduce")
     expected = f"waverider:{trade_id}:{state.get('cycle', 0)}:{action}"
@@ -469,33 +539,21 @@ async def resume_cycle(engine, trade_id, state):
     if reentering and not rows:
         if expected in operations:
             raise AqlaError("Waverider reentry operation has no matching owned entry; reconciliation is required")
-        # A pre-send guard can fail after advance(), before a new entry is staged.
-        result = reset_phase(state, "waiting_rebound")
-        engine.patch_trade(trade_id, waverider=result)
-        return result
+        return None
     identity = rows[-1]["operation_id"] if reentering else expected
-    operation = operations.get(identity)
-    if not reentering and operation is None and not trade.get("suspended_wave_targets"):
-        result = reset_phase(state, "waiting_retrace")
-        engine.patch_trade(trade_id, waverider=result)
-        return result
-    state = {**state, "operation_id": identity}
-    if operation and operation.get("outcome") == "not_sent":
-        result = {**reset_phase(state, "waiting_retrace" if state["phase"] == "pending_reduce" else "waiting_rebound"), "cycle": state.get("cycle", 0) + 1}
-        engine.patch_trade(trade_id, waverider=result)
-        return result
+    if not reentering and identity not in operations and not trade.get("suspended_wave_targets"):
+        return None
     cloid = rows[-1]["cloid"] if reentering else engine.exchange.cloid(identity)
-    raw = await engine.order_status(cloid)
-    if raw.get("order", {}).get("status") not in TERMINAL_ORDER:
-        return state
-    await engine.capture_fills(trade_id)
-    current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-    oid = raw["order"]["order"]["oid"]
-    fills = [row for row in current["fill_events"].values() if row["oid"] == oid
-             and (row["kind"] == "entry" and row.get("entry_role") == "waverider" if reentering
-                  else row["kind"] in ("waverider", "waverider_retirement"))]
-    if raw["order"]["status"] == "filled" and not fills:
-        return state
+    return identity, cloid
+
+
+def own_cycle_fills(trade, oid, reentering):
+    return [row for row in trade["fill_events"].values() if row["oid"] == oid
+            and (row["kind"] == "entry" and row.get("entry_role") == "waverider" if reentering
+                 else row["kind"] in ("waverider", "waverider_retirement"))]
+
+
+def completed_cycle(state, fills):
     quantity = sum((Decimal(row["sz"]) for row in fills), Decimal(0))
     if state["phase"] == "pending_reduce":
         if quantity:
@@ -505,6 +563,34 @@ async def resume_cycle(engine, trade_id, state):
             result = {**reset_phase(state, "waiting_rise"), "cycle": state.get("cycle", 0) + 1}
     else:
         result = {**reset_phase(state, "waiting_rise" if quantity else "waiting_rebound"), "cycle": state.get("cycle", 0) + 1}
+    return result
+
+
+async def resume_cycle(engine, trade_id, state):
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+    operations = engine.state.read("operations")["operations"]
+    order = pending_cycle_order(engine, trade_id, trade, state, operations)
+    if order is None:
+        # A pre-send guard can fail before the new action is staged.
+        result = reset_phase(state, "waiting_rebound" if state["phase"] == "pending_reenter" else "waiting_retrace")
+        engine.patch_trade(trade_id, waverider=result)
+        return result
+    identity, cloid = order
+    state = {**state, "operation_id": identity}
+    operation = operations.get(identity)
+    if operation and operation.get("outcome") == "not_sent":
+        result = {**reset_phase(state, "waiting_retrace" if state["phase"] == "pending_reduce" else "waiting_rebound"), "cycle": state.get("cycle", 0) + 1}
+        engine.patch_trade(trade_id, waverider=result)
+        return result
+    raw = await engine.order_status(cloid)
+    if raw.get("order", {}).get("status") not in TERMINAL_ORDER:
+        return state
+    await engine.capture_fills(trade_id)
+    current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+    fills = own_cycle_fills(current, raw["order"]["order"]["oid"], state["phase"] == "pending_reenter")
+    if raw["order"]["status"] == "filled" and not fills:
+        return state
+    result = completed_cycle(state, fills)
     engine.patch_trade(trade_id, waverider=result)
     return result
 
@@ -556,18 +642,7 @@ async def resume_exit(engine, trade_id):
     return True
 
 
-async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
-    """Scoped internal management; source close/reduce keeps its original semantics."""
-    from .managed_entries import dispatch_next, patch_row
-    await engine.capture_fills(trade_id)
-    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-    plan = TradePlan.model_validate(trade["plan"])
-    if action != "retire" and trade.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE:
-        raise AqlaError("A pending stop update blocks optional Waverider management")
-    if action != "retire":
-        if not live_permission(engine, plan):
-            raise AqlaError("Waverider live management is not authorized")
-        engine.validate_configuration(engine.state.snapshot(), plan)
+async def confirmed_cycle_quote(engine, trade_id, plan, trade):
     signed = engine.position_size(await engine.positions(plan.market), plan.market)
     engine.owned_remaining(trade_id, signed)
     quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
@@ -577,103 +652,86 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
     stops = [(row, await engine.order_status(row["cloid"])) for row in trade["orders"] if row["kind"] == "sl" and not row.get("retired")]
     if not protected(engine, trade, stops):
         raise AqlaError("Optional Waverider management requires a freshly confirmed covering stop")
-    if action != "retire" and ended(plan, trade, quote):
-        engine.patch_trade(trade_id, waverider={**state, "finished": True, "phase": "finished"})
+    return quote
+
+
+async def suspend_cycle_targets(engine, context, action, quantity, order):
+    trade_id, trade, plan, state = context.trade_id, context.trade, context.plan, context.state
+    cycle, identity = context.cycle, context.identity
+    corrective = action == "retire"
+    def stage(data):
+        current = data["trades"][trade_id]
+        current.setdefault("exit_orders", []).append({"kind": "waverider_retirement" if corrective else "waverider", "reason": "retired_source_target" if corrective else "waverider", "cloid": order["c"],
+            "quantity": order["s"], "price": order["p"], "cycle": cycle, "operation_id": identity})
+        current.update(suspended_wave_targets=identity, waverider={**state, "phase": "preparing_reduce", "operation_id": identity, "action": action})
+    engine.state.update(stage)
+    await engine.cancel_owned_orders(trade_id, operation_id="wave-cancel-targets:" + identity)
+    for target in [row for row in trade["orders"] if row["kind"] == "tp" and not row.get("retired")]:
+        raw = await engine.order_status(target["cloid"])
+        if raw.get("order", {}).get("status") not in TERMINAL_ORDER:
+            raise AqlaError("Source target cancellation is unconfirmed; optional exit remains unsent")
+    await engine.capture_fills(trade_id)
+    latest = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+    available = pools(latest, plan.policy.waverider_flex_percent)
+    if corrective:
+        quantity = min(quantity, max(Decimal(0), available["flex"] - available["rights"]))
+        if quantity <= 0:
+            await resume_exit(engine, trade_id)
+            return
+        from aqla_hyperliquid_mcp.models import wire_number
+        order["s"] = wire_number(quantity)
+        engine.state.update(lambda data: require_first(row for row in data["trades"][trade_id]["exit_orders"] if row["cloid"] == order["c"]).update(quantity=order["s"]))
+    if quantity > available["flex"] or not corrective and latest.get("entries_disabled"):
+        await resume_exit(engine, trade_id)
         return
-    cycle = state.get("cycle", 0)
-    identity = f"waverider:{trade_id}:{cycle}:{action}"
-    if identity in engine.state.read("operations")["operations"]:
+    def retire(data):
+        for target in data["trades"][trade_id]["orders"]:
+            if target["kind"] == "tp":
+                target["retired"] = True
+    engine.state.update(retire)
+    return latest, available
+
+
+async def submit_cycle_reduction(engine, context, action, order, limit, latest, available, cycle_cost):
+    trade_id, plan, state = context.trade_id, context.plan, context.state
+    identity = context.identity
+    corrective = action == "retire"
+    try:
+        quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
+    except BaseException:
+        if await resume_exit(engine, trade_id):
+            from .managed_entries import restore_targets
+            await restore_targets(engine, trade_id)
+        raise
+    def guard(data):
+        current = data["trades"][trade_id]
+        if not corrective:
+            if current.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE:
+                raise AqlaError("A pending stop update blocks optional Waverider management")
+            if not live_permission(engine, plan):
+                raise AqlaError("Waverider authorization changed before transport")
+            engine.validate_configuration(data, plan)
+        if current["status"] != "open" or not corrective and (current.get("entries_disabled") or current["waverider"].get("finished")):
+            raise AqlaError("Waverider reduction no longer owns its setup")
+        if not corrective and ended(plan, current, quote):
+            raise AqlaError("Waverider endpoint was reached before transport")
+        quote.fresh()
+    if not corrective and (ended(plan, latest, quote) or (limit - available["flex_basis"]) * (1 if plan.side == "long" else -1) <= cycle_cost):
+        await resume_exit(engine, trade_id)
         return
-    own, average, _, _ = position_basis(trade)
-    inventory = pools(trade, plan.policy.waverider_flex_percent)
+    result = await engine.exchange.mutate(identity, {"type": "order", "orders": [order], "grouping": "na"}, prepare_guard=guard)
+    engine.patch_trade(trade_id, waverider={**state, "phase": "pending_reduce", "operation_id": identity, "action": action})
+    if result["phase"] in ("acknowledged", "reconciled", "rejected"):
+        if await resume_exit(engine, trade_id):
+            from .managed_entries import refresh
+            await refresh(engine, trade_id, dispatch=False)
+    return
+
+
+def reentry_size(context, quote, limit, sold):
+    trade, plan = context.trade, context.plan
+    own, average, inventory = context.own, context.average, context.inventory
     spent = inventory["spent"]
-    if any(row.get("fee") is None or row.get("feeToken") != plan.market.quote_token for row in trade.get("fill_events", {}).values()):
-        raise AqlaError("Waverider needs complete actual fee evidence before live management")
-    if action in ("reduce", "retire"):
-        corrective = action == "retire"
-        buy = plan.side == "short"
-        maker = plan.take_profit_execution == "maker_only" and not corrective
-        limit = passive_entry_price(plan.market, "long" if buy else "short", quote) if maker else slippage_price(quote.bid if plan.side == "long" else quote.ask, plan.policy.max_slippage_percent, plan.market, buy=buy)
-        if quantity > inventory["flex"] or not corrective and (limit - inventory["flex_basis"]) * (1 if plan.side == "long" else -1) <= cycle_cost:
-            state.update(phase="waiting_retrace", reason="Worst allowed exit has no net profit")
-            engine.patch_trade(trade_id, waverider=state)
-            return
-        from .managed_entries import target_allocations
-        retained, _ = target_allocations(plan, own - quantity, trade.get("target_budgets"), trade["tp_filled"], trade.get("completed_target_indices", []))
-        if not corrective and (not retained or any(size > 0 and (size < plan.market.min_quantity or size * Decimal(trade["targets"][index]) < plan.market.min_notional) for index, size in enumerate(retained))):
-            raise AqlaError("Wave reduction would leave core targets below native minimums")
-        order = engine.order(plan, min(quantity, own), limit, reduce=True, cloid=engine.exchange.cloid(identity))
-        order["t"] = {"limit": {"tif": "Alo" if maker else "Ioc"}}
-        def guard(data):
-            current = data["trades"][trade_id]
-            if not corrective:
-                if current.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE:
-                    raise AqlaError("A pending stop update blocks optional Waverider management")
-                if not live_permission(engine, plan):
-                    raise AqlaError("Waverider authorization changed before transport")
-                engine.validate_configuration(data, plan)
-            if current["status"] != "open" or not corrective and (current.get("entries_disabled") or current["waverider"].get("finished")):
-                raise AqlaError("Waverider reduction no longer owns its setup")
-            if not corrective and ended(plan, current, quote):
-                raise AqlaError("Waverider endpoint was reached before transport")
-            quote.fresh()
-        def stage(data):
-            current = data["trades"][trade_id]
-            current.setdefault("exit_orders", []).append({"kind": "waverider_retirement" if corrective else "waverider", "reason": "retired_source_target" if corrective else "waverider", "cloid": order["c"],
-                "quantity": order["s"], "price": order["p"], "cycle": cycle, "operation_id": identity})
-            current.update(suspended_wave_targets=identity, waverider={**state, "phase": "preparing_reduce", "operation_id": identity, "action": action})
-        engine.state.update(stage)
-        await engine.cancel_owned_orders(trade_id, operation_id="wave-cancel-targets:" + identity)
-        for target in [row for row in trade["orders"] if row["kind"] == "tp" and not row.get("retired")]:
-            raw = await engine.order_status(target["cloid"])
-            if raw.get("order", {}).get("status") not in TERMINAL_ORDER:
-                raise AqlaError("Source target cancellation is unconfirmed; optional exit remains unsent")
-        await engine.capture_fills(trade_id)
-        latest = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-        available = pools(latest, plan.policy.waverider_flex_percent)
-        if corrective:
-            quantity = min(quantity, max(Decimal(0), available["flex"] - available["rights"]))
-            if quantity <= 0:
-                await resume_exit(engine, trade_id)
-                return
-            from aqla_hyperliquid_mcp.models import wire_number
-            order["s"] = wire_number(quantity)
-            engine.state.update(lambda data: require_first(row for row in data["trades"][trade_id]["exit_orders"] if row["cloid"] == order["c"]).update(quantity=order["s"]))
-        if quantity > available["flex"] or not corrective and latest.get("entries_disabled"):
-            await resume_exit(engine, trade_id)
-            return
-        def retire(data):
-            for target in data["trades"][trade_id]["orders"]:
-                if target["kind"] == "tp":
-                    target["retired"] = True
-        engine.state.update(retire)
-        try:
-            quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
-        except BaseException:
-            if await resume_exit(engine, trade_id):
-                from .managed_entries import restore_targets
-                await restore_targets(engine, trade_id)
-            raise
-        if not corrective and (ended(plan, latest, quote) or (limit - available["flex_basis"]) * (1 if plan.side == "long" else -1) <= cycle_cost):
-            await resume_exit(engine, trade_id)
-            return
-        result = await engine.exchange.mutate(identity, {"type": "order", "orders": [order], "grouping": "na"}, prepare_guard=guard)
-        engine.patch_trade(trade_id, waverider={**state, "phase": "pending_reduce", "operation_id": identity, "action": action})
-        if result["phase"] in ("acknowledged", "reconciled", "rejected"):
-            if await resume_exit(engine, trade_id):
-                from .managed_entries import refresh
-                await refresh(engine, trade_id, dispatch=False)
-        return
-    sold = min(Decimal(state.get("sold_quantity") or 0), max(Decimal(0), inventory["rights"] - inventory["flex"]))
-    if sold <= 0:
-        raise AqlaError("Waverider has no proved sold quantity to rebuild")
-    buy = plan.side == "long"
-    maker = plan.entry_execution == "maker_only"
-    limit = passive_entry_price(plan.market, plan.side, quote) if maker else slippage_price(quote.ask if buy else quote.bid, plan.policy.max_slippage_percent, plan.market, buy=buy)
-    if (Decimal(state["sale_price"]) - limit) * (1 if buy else -1) <= cycle_cost:
-        state.update(phase="waiting_rebound", reason="Worst allowed reentry has no price advantage after costs")
-        engine.patch_trade(trade_id, waverider=state)
-        return
     stop = Decimal(trade["stop_price"])
     direction = Decimal(1) if plan.side == "long" else Decimal(-1)
     open_risk = (inventory["core"] * max(Decimal(0), (inventory["core_basis"] - stop) * direction)
@@ -691,6 +749,95 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
     quantity = quantity_grid(min(sold, maximum, plan.quantity - own - reserved_quantity, notional_room), plan.market)
     if quantity <= 0 or quantity * limit < plan.market.min_notional:
         raise AqlaError("Original lifetime risk budget cannot fund a Waverider reentry")
+    return quantity
+
+
+@dataclass(frozen=True, repr=False)
+class CycleExecution:
+    trade_id: str
+    trade: dict
+    plan: TradePlan
+    state: dict
+    cycle: int
+    identity: str
+    own: Decimal
+    average: Decimal
+    inventory: dict[str, Decimal]
+
+
+async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
+    """Scoped internal management; source close/reduce keeps its original semantics."""
+    await engine.capture_fills(trade_id)
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+    plan = TradePlan.model_validate(trade["plan"])
+    if action != "retire" and trade.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE:
+        raise AqlaError("A pending stop update blocks optional Waverider management")
+    if action != "retire":
+        if not live_permission(engine, plan):
+            raise AqlaError("Waverider live management is not authorized")
+        engine.validate_configuration(engine.state.snapshot(), plan)
+    quote = await confirmed_cycle_quote(engine, trade_id, plan, trade)
+    if action != "retire" and ended(plan, trade, quote):
+        engine.patch_trade(trade_id, waverider={**state, "finished": True, "phase": "finished"})
+        return
+    cycle = state.get("cycle", 0)
+    identity = f"waverider:{trade_id}:{cycle}:{action}"
+    if identity in engine.state.read("operations")["operations"]:
+        return
+    own, average, _, _ = position_basis(trade)
+    inventory = pools(trade, plan.policy.waverider_flex_percent)
+    if any(row.get("fee") is None or row.get("feeToken") != plan.market.quote_token for row in trade.get("fill_events", {}).values()):
+        raise AqlaError("Waverider needs complete actual fee evidence before live management")
+    context = CycleExecution(trade_id, trade, plan, state, cycle, identity, own, average, inventory)
+    if action in ("reduce", "retire"):
+        return await reduce_cycle(engine, context, action, quantity, quote, cycle_cost)
+    return await reenter_cycle(engine, context, quote, cycle_cost)
+
+
+def retained_targets_fit(plan, quantity, budgets, filled, completed, targets):
+    from .managed_entries import target_allocations
+    retained, _ = target_allocations(plan, quantity, budgets, filled, completed)
+    return bool(retained) and all(size <= 0 or size >= plan.market.min_quantity
+        and size * Decimal(targets[index]) >= plan.market.min_notional for index, size in enumerate(retained))
+
+
+async def reduce_cycle(engine, context, action, quantity, quote, cycle_cost):
+    trade_id, trade, plan, state = context.trade_id, context.trade, context.plan, context.state
+    identity, own, inventory = context.identity, context.own, context.inventory
+    corrective = action == "retire"
+    buy = plan.side == "short"
+    maker = plan.take_profit_execution == "maker_only" and not corrective
+    limit = passive_entry_price(plan.market, "long" if buy else "short", quote) if maker else slippage_price(quote.bid if plan.side == "long" else quote.ask, plan.policy.max_slippage_percent, plan.market, buy=buy)
+    if quantity > inventory["flex"] or not corrective and (limit - inventory["flex_basis"]) * (1 if plan.side == "long" else -1) <= cycle_cost:
+        state.update(phase="waiting_retrace", reason="Worst allowed exit has no net profit")
+        engine.patch_trade(trade_id, waverider=state)
+        return
+    if not corrective and not retained_targets_fit(plan, own - quantity, trade.get("target_budgets"), trade["tp_filled"], trade.get("completed_target_indices", []), trade["targets"]):
+        raise AqlaError("Wave reduction would leave core targets below native minimums")
+    order = engine.order(plan, min(quantity, own), limit, reduce=True, cloid=engine.exchange.cloid(identity))
+    order["t"] = {"limit": {"tif": "Alo" if maker else "Ioc"}}
+    suspended = await suspend_cycle_targets(engine, context, action, quantity, order)
+    if suspended is None:
+        return
+    latest, available = suspended
+    return await submit_cycle_reduction(engine, context, action, order, limit, latest, available, cycle_cost)
+
+
+async def reenter_cycle(engine, context, quote, cycle_cost):
+    from .managed_entries import dispatch_next, patch_row
+    trade_id, plan, state = context.trade_id, context.plan, context.state
+    cycle, identity, inventory = context.cycle, context.identity, context.inventory
+    sold = min(Decimal(state.get("sold_quantity") or 0), max(Decimal(0), inventory["rights"] - inventory["flex"]))
+    if sold <= 0:
+        raise AqlaError("Waverider has no proved sold quantity to rebuild")
+    buy = plan.side == "long"
+    maker = plan.entry_execution == "maker_only"
+    limit = passive_entry_price(plan.market, plan.side, quote) if maker else slippage_price(quote.ask if buy else quote.bid, plan.policy.max_slippage_percent, plan.market, buy=buy)
+    if (Decimal(state["sale_price"]) - limit) * (1 if buy else -1) <= cycle_cost:
+        state.update(phase="waiting_rebound", reason="Worst allowed reentry has no price advantage after costs")
+        engine.patch_trade(trade_id, waverider=state)
+        return
+    quantity = reentry_size(context, quote, limit, sold)
     row = {"kind": "waverider", "index": 0, "quantity": str(quantity), "price": str(limit), "limit": str(limit),
            "entry_kind": "limit" if maker else "market", "timing": "standard", "operation_id": identity, "cloid": engine.exchange.cloid(identity), "phase": "pending", "cycle": cycle}
     def stage_reentry(data):

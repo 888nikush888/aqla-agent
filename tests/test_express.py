@@ -23,6 +23,21 @@ def source(text=TEXT, **kwargs):
     return SourceEvent(chat_id="channel", message_id=1, sent_at=now_ms(), text=text, **kwargs)
 
 
+@pytest.mark.parametrize("hook", ["express_ingress", "express_admission"])
+async def test_malformed_installed_hook_cannot_bypass_source_or_admission_guards(setup, signal, hook):
+    _, state, boundary, _, engine = setup
+    setattr(engine, hook, object())
+    plan = await engine.preview(signal[0].event_id, signal[1]) if hook == "express_admission" else None
+    with pytest.raises(AqlaError, match="Configured trading callback"):
+        if hook == "express_ingress":
+            engine.ingest(source().model_copy(update={"message_id": 2}))
+        else:
+            await engine.execute(plan["plan_id"])
+    snapshot = state.snapshot()
+    assert not snapshot["trades"] and not snapshot["operations"]
+    assert not boundary.actions
+
+
 @pytest.fixture
 async def express_server(setup):
     settings, state, _, exchange, _ = setup

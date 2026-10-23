@@ -171,7 +171,7 @@ def test_separate_equal_quotes_choose_values_independently_and_dates_stay_unrequ
     packet = packet_for("BTC long. Date 13.10.2026. Entry limit 1.234. SL 1.234.")
     groups = numeric_occurrences(candidates(packet))
     assert len(groups) == 2
-    first, second = groups
+    first, second = groups[0], groups[1]
     assert first[0] != second[0] and first[1][0].quote == second[1][0].quote == "1.234"
     overrides = {}
     for (identity, group), role, value in zip(groups, ("entry0", "stop_loss"), ("1234", "1.234"), strict=True):

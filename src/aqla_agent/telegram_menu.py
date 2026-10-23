@@ -148,7 +148,7 @@ class TelegramMenu:
         self.pending = None
         self.commands.cancel()
         await self.display(bot, "Aqla · Steuerzentrale\nHandel, Journal und Einstellungen an einem Ort.",
-                           [(label, action) for label, action in HOME])
+                           list(HOME))
 
     async def dashboard(self, bot, journal=False, offset=0):
         data = await self.rpc("dashboard", network=self.network, period=self.period, currency=self.currency, offset=offset)
@@ -645,7 +645,9 @@ class TelegramMenu:
 
 
     async def _menu_evidence_table(self, bot, *args):
-        trade_id, table = args[:2]
+        if len(args) < 2:
+            raise AqlaError("Trade und Belegtabelle sind erforderlich")
+        trade_id, table = args[0], args[1]
         offset = args[2] if len(args) > 2 else 0
         data = await self.rpc("journal_read", table=table, trade_id=trade_id, offset=offset, limit=8)
         rows = [str(row.get("Art", "Vorgang")) + " · " + str(row.get("Order-ID", row.get("ID"))) + " · Menge " + str(row.get("Menge", "—")) + " · Preis " + str(row.get("Preis", row.get("Preis/Ziel", "—"))) for row in data["rows"]]
@@ -665,7 +667,8 @@ class TelegramMenu:
 
     async def _menu_filtered(self, bot, *args):
         column, value, offset = args
-        result = await self.rpc("journal_read", table="Trades", filters={column: value}, account_key="hyperliquid:" + self.network, offset=offset, limit=8)
+        # Public venue/network namespace; contains no authentication material.
+        result = await self.rpc("journal_read", table="Trades", filters={column: value}, account_key="hyperliquid:" + self.network, offset=offset, limit=8)  # skipcq: SCT-A000
         buttons = [(row["Symbol"] + " · " + row["Status"], "trade", row["ID"]) for row in result["rows"]]
         if result.get("next_offset") is not None:
             buttons.append(("Weitere →", "filtered", column, value, result["next_offset"]))
@@ -726,6 +729,8 @@ class TelegramMenu:
 
     async def _menu_manage_apply(self, bot, *args):
         pending = self.pending
+        if not pending or pending.get("kind") != "manage":
+            raise AqlaError("Verwaltungsbestätigung ist nicht mehr aktuell")
         payload = {"trade_id": pending["trade_id"], "expected_fingerprint": pending["fingerprint"], "action": pending["action"]}
         if args[0] is not None:
             payload[{"reduce": "percent", "move_stop": "stop", "replace_targets": "targets"}[pending["action"]]] = args[0]

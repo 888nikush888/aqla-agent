@@ -5,7 +5,7 @@ import json
 from decimal import Decimal
 
 import pytest
-from test_pipelines import routed  # noqa: F401 -- shared independent-target fixture
+from routing_fixture import routed  # noqa: F401 -- shared independent-target fixture
 
 from aqla_agent.entry import PriceSnapshot
 from aqla_agent.lifecycle import close_reason

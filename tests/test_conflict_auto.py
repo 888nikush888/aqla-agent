@@ -145,12 +145,12 @@ async def test_changed_local_trade_during_proof_cannot_commit(setup, signal, mon
     manual_fill(fake, own, start=own)
     fake.position = 0
     terminal_orders(fake)
-    original = engine._fills
+    original = engine.fill_history_for_plan
     async def changed(plan):
         rows = await original(plan)
         state.update(lambda data: data['trades'][identity].update(management_revision=999))
         return rows
-    monkeypatch.setattr(engine, '_fills', changed)
+    monkeypatch.setattr(engine, 'fill_history_for_plan', changed)
     await engine.recover()
     assert state.snapshot()['trades'][identity]['status'] == 'conflicted'
 

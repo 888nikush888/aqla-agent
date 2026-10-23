@@ -19,6 +19,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import TestCase
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -26,6 +27,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from aqla_agent.decision_evaluation import case_context, write_private_json  # noqa: E402
 from aqla_agent.install import DEFAULT_MODEL, DEFAULT_MODEL_URL  # noqa: E402
 from aqla_hyperliquid_mcp.models import Interpretation, digest  # noqa: E402
+
+INVARIANTS = TestCase()
 
 
 def source_digest():
@@ -57,8 +60,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
                       HERMES_STREAM_RETRIES="0")
     sys.path.insert(0, str(args.hermes_source))
     allowed_host = "127.0.0.1" if local_fixture else "opencode.ai"
-    if not (local_fixture or model_url == DEFAULT_MODEL_URL):
-        raise AssertionError
+    INVARIANTS.assertTrue(local_fixture or model_url == DEFAULT_MODEL_URL)
     config = {"model": {"default": DEFAULT_MODEL, "provider": "custom", "base_url": model_url},
               "agent": {"stream": False, "api_max_retries": 1, "auto_recovery_cycles": 0},
               "compression": {"enabled": False}, "plugins": {"enabled": []}, "fallback_providers": [],
@@ -78,8 +80,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     if fixture.get("caveman"):
         from agent.skill_commands import build_auto_load_prompt
         skill_prompt, loaded, missing = build_auto_load_prompt(user_config=config, home_override=home)
-        if not (loaded == ['caveman', 'aqla-master'] and missing == []):
-            raise AssertionError
+        INVARIANTS.assertTrue(loaded == ['caveman', 'aqla-master'] and missing == [])
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
     from hermes_constants import parse_reasoning_effort
     from run_agent import AIAgent
@@ -87,8 +88,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     from tools.mcp_tool_lifecycle import shutdown_mcp_servers
     from tools.registry import registry
 
-    if not (get_reasoning_stale_timeout_floor(DEFAULT_MODEL) == 600):
-        raise AssertionError
+    INVARIANTS.assertTrue(get_reasoning_stale_timeout_floor(DEFAULT_MODEL) == 600)
 
     from aqla_agent.hermes_runtime import install_strict_profile
     from aqla_agent.provider_cooldown import REPLAY
@@ -102,8 +102,7 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     cooldown_token = REPLAY.set(True)
     register_reader(SimpleNamespace(register_tool=registry.register))
     names = discover_mcp_tools()
-    if not (any(n.endswith('source_check_interpretation') for n in names)):
-        raise AssertionError
+    INVARIANTS.assertTrue(any(n.endswith('source_check_interpretation') for n in names))
     allowed_tools = {"mcp__aqla__source_context", "mcp__aqla__source_context_batch", "mcp__aqla__source_check_interpretation",
                      "mcp__aqla__get_prompt", "mcp__aqla__list_prompts", "mcp__aqla__list_resources", "mcp__aqla__read_resource",
                      "aqla_read_tool_result", "tool_search", "tool_describe", "tool_call"}
@@ -135,33 +134,39 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
         agent.client.max_retries = 0
         # The evaluation owns its three attempts and 15/30s backoff; native's
         # extra last-primary rung would otherwise add an unplanned fourth try.
+        # Isolated replay checks recovery against the pinned native primary transport.
+        # skipcq: PYL-W0212
         agent._try_recover_primary_transport = lambda *_args, **_kwargs: False
 
         def guard(request):
-            if not (request.method == 'POST' and request.url.host == allowed_host):
-                raise AssertionError
-            if not (request.url.path.endswith('/chat/completions')):
-                raise AssertionError
+            INVARIANTS.assertTrue(request.method == 'POST' and request.url.host == allowed_host)
+            INVARIANTS.assertTrue(request.url.path.endswith('/chat/completions'))
             body = json.loads(request.content)
-            if not (body['model'] == DEFAULT_MODEL and body.get('reasoning_effort') == 'high'):
-                raise AssertionError
-            if not ({t['function']['name'] for t in body.get('tools', [])} <= allowed_tools):
-                raise AssertionError
+            INVARIANTS.assertTrue(body['model'] == DEFAULT_MODEL and body.get('reasoning_effort') == 'high')
+            INVARIANTS.assertTrue({t['function']['name'] for t in body.get('tools', [])} <= allowed_tools)
             stamp = datetime.now(UTC)
             peak = stamp.weekday() < 5 and (1 <= stamp.hour < 4 or 6 <= stamp.hour < 10)
             requests.append({"started_utc": stamp.isoformat(), "effort": "high", "price_multiplier": 2 if peak else 1})
 
+        # Isolated native replay checks the pinned provider transport and allowed request parameters.
+        # skipcq: PYL-W0212
         create_client = agent._create_request_openai_client
 
         def guarded_client(**kwargs):
             client = create_client(**kwargs)
             client.max_retries = 0
+            # Isolated native replay checks the pinned provider transport and allowed request parameters.
+            # skipcq: PYL-W0212
             hooks = client._client.event_hooks.setdefault("request", [])
             if guard not in hooks:
                 hooks.append(guard)
             return client
 
+        # Isolated native replay checks the pinned provider transport and allowed request parameters.
+        # skipcq: PYL-W0212
         agent._create_request_openai_client = guarded_client
+        # Isolated native replay checks the pinned provider transport and allowed request parameters.
+        # skipcq: PYL-W0212
         agent.client._client.event_hooks.setdefault("request", []).append(guard)
         instruction = (skill_prompt + "\n\n" + GUIDANCE + "\nHistorical quality replay only. "
             "The originals retain original timestamps and historical metadata. Classify communication intent AS OF the anchor publication; "
@@ -252,15 +257,13 @@ def main():
             observed = {"completed": False, "checks": [], "worker_error_type": type(error).__name__, "order_requests": 0}
         write_private_json(args.worker_fixture.parent / "observed.private.json", observed)
         return
-    if not (args.dataset and args.master and args.output):
-        raise AssertionError
+    INVARIANTS.assertTrue(args.dataset and args.master and args.output)
     payload = json.loads(args.dataset.read_text(encoding="utf-8"))
     cases = payload["cases"]
     master = args.master.read_text(encoding="utf-8")
     caveman = args.caveman.read_text(encoding="utf-8") if args.caveman else None
     manifest = payload.get("protocol", payload.get("manifest"))
-    if not (digest(cases) == manifest['dataset_sha256']):
-        raise AssertionError
+    INVARIANTS.assertTrue(digest(cases) == manifest['dataset_sha256'])
     identity = {"version": "high-tools-native-v3", "source_sha256": source_digest(),
                 "dataset_sha256": digest(cases), "master_sha256": hashlib.sha256(master.encode()).hexdigest(),
                 "effort": "high", "model": DEFAULT_MODEL, "draft_limit": 3, "transport_attempt_limit": 3,
@@ -274,13 +277,11 @@ def main():
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
     seal = args.output / "identity.json"
     if seal.exists():
-        if not (json.loads(seal.read_text(encoding='utf-8')) == identity):
-            raise AssertionError('Frozen experiment changed')
+        INVARIANTS.assertTrue(json.loads(seal.read_text(encoding='utf-8')) == identity, 'Frozen experiment changed')
     else:
         write_private_json(seal, identity)
     selected = [c for c in cases if not args.case_id or c["id"] in args.case_id]
-    if not (selected and (not args.case_id or set(args.case_id) <= {c['id'] for c in cases})):
-        raise AssertionError
+    INVARIANTS.assertTrue(selected and (not args.case_id or set(args.case_id) <= {c['id'] for c in cases}))
     schedule = [(c, run) for run in range(args.runs) for c in sorted(selected, key=lambda c: digest(c["id"]))]
     budget_lock = threading.Lock()
     budget_used = [0.0]

@@ -181,7 +181,7 @@ def _order_actions(data):
             for order in operation["wire_action"].get("orders", []) if order.get("c")}
 
 
-def _trade_records(data, identity, trade, aliases, actions, tables=("Trades", "Orders", "Fills")):
+def _trade_records(_data, identity, trade, aliases, actions, tables=("Trades", "Orders", "Fills")):
     plan = trade["plan"]
     if "Trades" in tables or "Fills" in tables:
         from aqla_agent.manual_accounting import verified_manual_accounting

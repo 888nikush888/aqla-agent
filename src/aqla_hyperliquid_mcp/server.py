@@ -174,6 +174,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
 
     server = AqlaServer("aqla-hyperliquid", version=__version__, lifespan=lifespan,
                        instructions="Hermes interprets received sources. Python enforces user rules. Unknown exchange results are never automatically retried. Keep operation IDs stable.")
+    # Internal server gate handle; public tools still enforce the current owner lease.
+    # skipcq: PYL-W0212
     server._aqla_setup_gate = setup_gate
     read = ToolAnnotations.model_validate({"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
     write = ToolAnnotations.model_validate({"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True})
@@ -761,7 +763,11 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             if not technical or set(technical) != {"express", "waverider_replay"}:
                 raise AqlaError("Only explicit technical controls may be reloaded")
             selected = ExpressSettings.model_validate(technical["express"])
+            # Pydantic private path stays outside serialized settings and source context.
+            # skipcq: PYL-W0212
             if settings._configuration_file is not None:
+                # Pydantic private path stays outside serialized settings and source context.
+                # skipcq: PYL-W0212
                 fresh = Settings.load(settings._configuration_file)
                 if fresh.express.model_dump(mode="json") != selected.model_dump(mode="json") or fresh.waverider_replay.model_dump(mode="json") != technical["waverider_replay"]:
                     raise AqlaError("Technical request was superseded by the current saved configuration")
@@ -882,7 +888,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             from aqla_agent.setup_actions import public_action_requires_setup
             def check(data):
                 claims = authorize(context_auth, operator=True)
-                if public_action_requires_setup(request, data, account_key="hyperliquid:" + settings.network, account=exchange.account, network=settings.network):
+                # Public venue/network namespace; contains no authentication material.
+                if public_action_requires_setup(request, data, account_key="hyperliquid:" + settings.network, account=exchange.account, network=settings.network):  # skipcq: SCT-A000
                     require_setup(claims)
             check(state.read("operations", "trades"))
             return check

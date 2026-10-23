@@ -5,8 +5,11 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from unittest import TestCase
 
 from .decision_evaluation import CRITICAL_FIELDS, complete_fields, equal, write_private_json
+
+INVARIANTS = TestCase()
 
 
 def canonical_symbol(value):
@@ -62,8 +65,7 @@ def serve_fixture(path):
     fixture = json.loads(Path(path).read_text(encoding="utf-8"))
     packet = fixture["packet"]
     directory = Path(path).parent
-    if not (not packet.get("trades")):
-        raise AssertionError("Owned trade fixtures require explicit isolated reconstruction")
+    INVARIANTS.assertTrue(not packet.get('trades'), 'Owned trade fixtures require explicit isolated reconstruction')
     settings = Settings(network="testnet", account="0x" + "1" * 40,
                         state_path=directory / "state.sqlite3", sources=sorted({m["chat_id"] for m in packet["messages"]}))
     state = State(settings)
@@ -82,8 +84,7 @@ def serve_fixture(path):
     for tool in asyncio.run(server.list_tools()):
         if tool.name not in allowed:
             server.remove_tool(tool.name)
-    if not ({t.name for t in asyncio.run(server.list_tools())} == allowed):
-        raise AssertionError
+    INVARIANTS.assertTrue({t.name for t in asyncio.run(server.list_tools())} == allowed)
     check = source_assistance.check_interpretation
     checks = []
 
@@ -105,8 +106,7 @@ def serve_fixture(path):
         server.run(transport="stdio")
     finally:
         source_assistance.check_interpretation = check
-        if not (not state.snapshot()["plans"] and not state.snapshot()["operations"] and not state.snapshot()["trades"]):
-            raise AssertionError
+        INVARIANTS.assertTrue(not state.snapshot()['plans'] and (not state.snapshot()['operations']) and (not state.snapshot()['trades']))
         state.close()
 
 

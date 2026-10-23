@@ -23,7 +23,16 @@ from aqla_hyperliquid_mcp.rules import backup_prices, make_plan, quantity_grid, 
 from .entry import PriceSnapshot, gate_state, validate_entry_prices
 from .managed_entries import cap_quantity, leg_view, target_allocations
 from .observations import TemporaryObservation
-from .waverider import COST_MODEL, VERSION, advance, profile_hash, reset_phase, software_hash
+from .waverider import (
+    COST_MODEL,
+    VERSION,
+    advance,
+    cycle_observation,
+    profile_hash,
+    reset_phase,
+    retained_targets_fit,
+    software_hash,
+)
 
 
 class ReplayEvidenceError(AqlaError):
@@ -348,19 +357,22 @@ def simulate(case, *, wave):
                 basis = flex_cost / flex
                 limit = slippage_price(quote.bid if sign == 1 else quote.ask, plan.policy.max_slippage_percent, plan.market, buy=sign == -1)
                 if (limit - basis) * sign > pending["cost"]:
-                    retained, _ = target_allocations(plan, core, target_budgets, target_spent, completed)
-                    feasible = retained and all(size <= 0 or size >= plan.market.min_quantity and size * target_prices[i] >= plan.market.min_notional for i, size in enumerate(retained))
+                    feasible = retained_targets_fit(plan, core, target_budgets, target_spent, completed, target_prices)
                     if not feasible:
                         pending = None
                         state = reset_phase(state, "waiting_rise")
-                        continue
-                    amount, price = fill(quote, buy=sign == -1, limit=limit, quantity=flex, stamp=stamp)
-                    if amount:
-                        flex, flex_cost = flex - amount, flex_cost - amount * basis
-                        cash += amount * price * sign
-                        fees += amount * price * rate
-                        risk_fees += amount * price * rate
-                        state = {**reset_phase(state, "waiting_rebound"), "sale_price": str(price), "sold_quantity": str(amount)}
+                    else:
+                        amount, price = fill(quote, buy=sign == -1, limit=limit, quantity=flex, stamp=stamp)
+                        if amount:
+                            flex, flex_cost = flex - amount, flex_cost - amount * basis
+                            cash += amount * price * sign
+                            fees += amount * price * rate
+                            risk_fees += amount * price * rate
+                            state = {**reset_phase(state, "waiting_rebound"), "sale_price": str(price), "sold_quantity": str(amount)}
+                        else:
+                            state = {**reset_phase(state, "waiting_rise"), "cycle": state.get("cycle", 0) + 1}
+                else:
+                    state["phase"] = "waiting_retrace"
             elif action == "reenter":
                 limit = slippage_price(quote.ask if sign == 1 else quote.bid, plan.policy.max_slippage_percent, plan.market, buy=sign == 1)
                 size = Decimal(state.get("sold_quantity", "0"))
@@ -383,18 +395,26 @@ def simulate(case, *, wave):
                         cycles += 1
                         grew = True
                         state = reset_phase(state, "waiting_rise")
+                    else:
+                        state = {**reset_phase(state, "waiting_rebound"), "cycle": state.get("cycle", 0) + 1}
+                else:
+                    state["phase"] = "waiting_rebound"
             pending = None
         if wave and active and core + flex and not pending:
             phase = state.get("phase", "waiting_rise")
-            size = flex if phase != "waiting_rebound" else Decimal(state.get("sold_quantity", "0"))
+            size = quantity_grid(flex if phase != "waiting_rebound" else Decimal(state.get("sold_quantity", "0")), plan.market)
             if size > 0:
-                price = (quote.ask if sign == 1 else quote.bid) if phase == "waiting_rebound" else (quote.bid if sign == 1 else quote.ask)
-                basis = flex_cost / flex if flex else Decimal(state.get("sale_price", str(price)))
-                cost = price * (rate * 2 + plan.policy.max_slippage_percent / 50)
-                state, action = advance(state, side=plan.side, price=price, basis=basis, volatility=volatility,
-                    cycle_cost=cost, tick=plan.market.price_tick or Decimal(".0001"), stamp=stamp)
-                if action:
-                    pending = {"action": action, "at": stamp, "cost": cost}
+                try:
+                    observed = cycle_observation(plan, quote, size, reentering=phase == "waiting_rebound", fee_rate=rate, as_of=stamp)
+                except AqlaError:
+                    observed = None
+                if observed is not None:
+                    price, cost, tick_size = observed
+                    basis = flex_cost / flex if flex else Decimal(state.get("sale_price", str(price)))
+                    state, action = advance(state, side=plan.side, price=price, basis=basis, volatility=volatility,
+                        cycle_cost=cost, tick=tick_size, stamp=stamp)
+                    if action:
+                        pending = {"action": action, "at": stamp, "cost": cost}
         own = core + flex
         if own > plan.quantity or core_cost + flex_cost > plan.policy.max_notional_usdc:
             raise AqlaError("Replay exceeded original quantity/notional constraints")

@@ -131,4 +131,6 @@ async def submit(exchange, operation_id, multisig_user, request, nonce, signatur
         return {"action": action, "nonce": timestamp, "signature": signature,
                 "vaultAddress": exchange.settings.vault_address, "expiresAfter": expires_after}
 
+    # Pinned SDK dispatch after native scope and multisig validation.
+    # skipcq: PYL-W0212
     return await exchange._dispatch(operation_id, request_binding, build, deadline=expires_after, nonce_override=nonce, prepare_guard=prepare_guard)

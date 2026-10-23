@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import threading
+from contextlib import contextmanager
 
 import portalocker
 
@@ -20,6 +21,12 @@ METADATA_ROOTS = {"nonces": dict, "account_nonces": dict, "venue_nonces": dict, 
 
 class State:
     """One writer and one transactional SQLite state, with legacy JSON import."""
+
+    @contextmanager
+    def locked(self):
+        """Keep compound namespace/nonce work inside the existing reentrant lock."""
+        with self._thread_lock:
+            yield
 
     def __init__(self, settings: Settings):
         self.path = database_path(settings.state_path)

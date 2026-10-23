@@ -108,6 +108,8 @@ def install_skill_review(replace):
     master = get_hermes_home() / "skills" / "aqla-master" / "SKILL.md"
     cadence = ReviewCadence(get_hermes_home())
     gate, stage, apply = approval.write_approval_enabled, approval.stage_write, manager.apply_skill_pending
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     spawn, action_lines = review.spawn_background_review_thread, review._action_lines
 
     def approval_enabled(subsystem):
@@ -117,6 +119,8 @@ def install_skill_review(replace):
     def stage_write(subsystem, payload, *, summary, origin):
         if subsystem != approval.SKILLS:
             return stage(subsystem, payload, summary=summary, origin=origin)
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
         with manager._skill_mutation_lock("aqla-master"):
             content = master_content(payload, master)
             digest = hashlib.sha256(master.read_bytes()).hexdigest()
@@ -135,6 +139,8 @@ def install_skill_review(replace):
     def apply_pending(payload):
         if not any((origin := ext.active_context) and origin[0] == "operator" for ext in tuple(EXTENSIONS)):
             return json.dumps({"success": False, "error": "An authenticated owner approval is required"})
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
         with manager._skill_mutation_lock("aqla-master"):
             try:
                 master_content(payload, master)
@@ -186,6 +192,8 @@ def install_skill_review(replace):
     def publish_proposal(agent, actions):
         # A staged proposal must not be announced as 'Memory updated'. Use native delivery.
         text = "\n\n".join(dict.fromkeys(actions))
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
         agent._safe_print(text)
         if agent.background_review_callback:
             with suppress(Exception):

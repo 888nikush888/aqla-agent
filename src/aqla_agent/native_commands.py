@@ -101,6 +101,8 @@ def install_catalog(replace):
                     text = await native(self, event)
                 finally:
                     _CATALOG_NATIVE.reset(token)
+                # Pinned native integration interface; covered by native contract and integration checks.
+                # skipcq: PYL-W0212
                 allowed = self._catalog_options(event).get("allowed_commands")
                 return "**Hermes Agent**\n" + text + "\n\n**aqla Agent-System**\n" + system_catalog(allowed)
             return catalog
@@ -109,10 +111,14 @@ def install_catalog(replace):
 
 
 def install_menu(adapter, replace):
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     native_menu = adapter._register_command_menu
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     native_rows = adapter._bot_commands
 
-    def prefixed(self, rows):
+    def prefixed(_self, rows):
         return native_rows([(name, ("aqla: " if name in COMMANDS else "Hermes: ") + str(description))
                             for name, description in rows])
 
@@ -126,6 +132,8 @@ def install_menu(adapter, replace):
         rows = [(name, COMMANDS[name][0]) for name in ("aqla", "aqla_pause", "setup")]
         for extension in tuple(EXTENSIONS):
             if extension.gateway is None or extension.gateway is getattr(self, "gateway_runner", None):
+                # Pinned native integration interface; covered by native contract and integration checks.
+                # skipcq: PYL-W0212
                 await self._bot.set_my_commands(self._bot_commands(rows), scope=BotCommandScopeChat(chat_id=int(extension.owner)))
 
     replace("_bot_commands", prefixed)

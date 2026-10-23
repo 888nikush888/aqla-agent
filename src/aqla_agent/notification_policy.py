@@ -35,7 +35,7 @@ def trade_label(trade):
             + " · " + plan["network"].capitalize())
 
 
-def compact_event(data, notice, trade, kind, fills=()):
+def compact_event(data, _notice, trade, kind, fills=()):
     plan = trade["plan"]
     unit = literal(plan["market"].get("quote_token", "USDC"))
     title = {"entry": "✅ Einstieg", "exit": "💰 Teilabschluss", "closed": "🏁 Geschlossen",

@@ -135,6 +135,8 @@ class SourceWorker:
         from agent.usage_pricing import estimate_usage_cost, normalize_usage
 
         extension = self.extension
+        # Pinned native provider resolver; the source worker retains its isolated runtime scope.
+        # skipcq: PYL-W0212
         model, runtime = await asyncio.to_thread(extension.gateway._resolve_session_agent_runtime,
                                                  session_key=extension.session_key)
         spans = candidates(packet) if spans is None else spans
@@ -309,6 +311,8 @@ class SourceWorker:
                         raise DecisionFailure(code) from error
                     phase = "interpretation_fallback"
                     self.check_input(self.fallback_messages(packet, code, spans or []))
+                    # Bound method identity selects its supported call signature.
+                    # skipcq: PYL-W0143
                     result = await self.fallback(packet, code, usage, spans=spans) if self.fallback == self.generative_fallback else await self.fallback(packet, code, usage)
                     measured.workflow["fallback_reason"] = code
                 if self.extension.skill_hash() != master_hash:

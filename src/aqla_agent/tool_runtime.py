@@ -92,9 +92,15 @@ def install(replace):
 
     replace(validation, "_schema_for_local_validation", nullable_schema)
     replace(validation, "_schema_has_external_ref", external_refs)
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     untrusted = dispatch._is_untrusted_tool
     replace(dispatch, "_is_untrusted_tool", lambda name: name == "aqla_read_tool_result" or untrusted(name))
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     unwrap = executor._unwrap_tool_search_call
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     bridge = model_tools._dispatch_bridge_tool
 
     def unwrap_call(agent, function_name, function_args, *, flatten_probe=False):
@@ -118,6 +124,8 @@ def install(replace):
 
     replace(executor, "_unwrap_tool_search_call", unwrap_call)
     replace(model_tools, "_dispatch_bridge_tool", bridge_call)
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     summarize = context_compressor._summarize_tool_result
 
     def summarize_result(tool_name, tool_args, tool_content):
@@ -134,6 +142,8 @@ def install(replace):
         return summarize(tool_name, tool_args, tool_content)
 
     replace(context_compressor, "_summarize_tool_result", summarize_result)
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     commit, finalize = executor._commit_tool_result, executor._finalize_tool_batch
 
     def commit_result(agent, messages, ref, function_result, **kwargs):
@@ -145,6 +155,8 @@ def install(replace):
         with scope:
             generated = GENERATED.get()
             capture = CAPTURE.get()
+            # Pinned native integration interface; covered by native contract and integration checks.
+            # skipcq: PYL-W0212
             if capture and executor._is_multimodal_tool_result(function_result):
                 try:
                     identity = OutputStore(capture[2]).save(encoded(function_result).decode(), capture[0], ref.call_id)
@@ -160,6 +172,8 @@ def install(replace):
             # Guardrail paths reset each turn; this is only a projection hint,
             # never receipt authority. Receipts survive independently on disk.
             if generated:
+                # Pinned native integration interface; covered by native contract and integration checks.
+                # skipcq: PYL-W0212
                 agent._tool_guardrails.record_persisted_result(ref.call_id, "aqla-output:" + generated[0][1])
             return result
 
@@ -176,6 +190,8 @@ def install(replace):
                             row["content"] = persist_result(row["content"], "aqla_read_tool_result", row["tool_call_id"], config=budget)
                 result = finalize(agent, messages, effective_task_id, num_tools, budget)
                 for call_id, identity in GENERATED.get() or []:
+                    # Pinned native integration interface; covered by native contract and integration checks.
+                    # skipcq: PYL-W0212
                     agent._tool_guardrails.record_persisted_result(call_id, "aqla-output:" + identity)
                 return result
             finally:
@@ -203,6 +219,8 @@ def install(replace):
                 except (OSError, ValueError, TypeError, KeyError, AttributeError):
                     content = encoded({"error": "Reader page exceeds the native budget; request fewer sections or IDs"}).decode()
                 if framed:
+                    # Pinned native integration interface; covered by native contract and integration checks.
+                    # skipcq: PYL-W0212
                     return dispatch._maybe_wrap_untrusted("aqla_read_tool_result", content)
             if len(json.dumps(content, ensure_ascii=True).encode()) <= cap:
                 return content
@@ -233,10 +251,14 @@ def install(replace):
 
     replace(storage, "maybe_persist_tool_result", persist_result)
     replace(executor, "maybe_persist_tool_result", persist_result)
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     stub = ToolCallGuardrailController._build_result_reference_stub
 
     def reference_stub(self, tool_name, args):
         value = stub(self, tool_name, args)
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
         path = self._persisted_result_paths.get(self._identical_streak_first_call_id, "")
         if path.startswith("aqla-output:"):
             value = value.split("\n[The referenced result was persisted to:", 1)[0]
@@ -247,6 +269,8 @@ def install(replace):
 
     replace(ToolCallGuardrailController, "_build_result_reference_stub", reference_stub)
     from gateway.run_plugin_rewire import GatewayPluginRewireMixin
+    # Pinned native integration interface; covered by native contract and integration checks.
+    # skipcq: PYL-W0212
     rewire = GatewayPluginRewireMixin._rewire_plugin_handlers
 
     def rewire_handlers(self, profile_name=None, profile_home=None):
@@ -256,6 +280,8 @@ def install(replace):
         result = rewire(self, profile_name, profile_home)
         scope = _profile_runtime_scope(profile_home, hydrate_secrets=False) if profile_home is not None else nullcontext()
         with scope:
+            # Pinned native integration interface; covered by native contract and integration checks.
+            # skipcq: PYL-W0212
             selected = self.adapters if profile_name is None else self._profile_adapters.get(profile_name, {})
             for platform, adapter in selected.items():
                 if getattr(platform, "value", platform) == "telegram":

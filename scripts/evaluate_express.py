@@ -10,6 +10,7 @@ import statistics
 import sys
 import time
 from pathlib import Path
+from unittest import TestCase
 
 from aqla_hyperliquid_mcp.models import require_first
 
@@ -21,6 +22,8 @@ from aqla_agent.express import VERSION, compile_template  # noqa: E402
 from aqla_agent.source_assistance import check_interpretation  # noqa: E402
 from aqla_agent.source_replay import mismatches  # noqa: E402
 from aqla_hyperliquid_mcp.models import Interpretation, SourceEvent, digest  # noqa: E402
+
+INVARIANTS = TestCase()
 
 
 def evaluate(case):
@@ -55,8 +58,7 @@ async def paired_fake_benchmark(cases, baseline, output):
     from aqla_agent.source_replay import canonical_symbol
 
     reference = json.loads((baseline / "report.json").read_text(encoding="utf-8"))
-    if not (reference['all_passed'] and reference['identity']['native_auto_load'] == ['caveman', 'aqla-master']):
-        raise AssertionError
+    INVARIANTS.assertTrue(reference['all_passed'] and reference['identity']['native_auto_load'] == ['caveman', 'aqla-master'])
     observations = [json.loads(p.read_text(encoding="utf-8")) for p in baseline.glob("*.private.json") if p.stat().st_size]
     by_id = {case["id"]: case for case in cases}
     pairs = []
@@ -67,20 +69,17 @@ async def paired_fake_benchmark(cases, baseline, output):
         context = case_context(case)
         source = SourceEvent.model_validate(require_first(r["source"] for r in context["messages"] if r["event_id"] == case["anchor_event_id"]))
         fast = evaluate(case)
-        if not (fast['accepted'] and fast['passed'] and row['passed']):
-            raise AssertionError
+        INVARIANTS.assertTrue(fast['accepted'] and fast['passed'] and row['passed'])
         values = {"express": Interpretation.model_validate(fast["interpretation"]),
                   "high": Interpretation.model_validate(row["interpretation"])}
         results = {}
         order = ("high", "express") if len(pairs) % 2 else ("express", "high")
         for route in order:
             results[route] = await apply_fake(source, values[route], output / (digest([row["case_id"], row["run"], route])[:24]), express=route == "express")
-        if not (results['express']['outcome'] == results['high']['outcome']):
-            raise AssertionError('Paired financial outcome differs')
+        INVARIANTS.assertTrue(results['express']['outcome'] == results['high']['outcome'], 'Paired financial outcome differs')
         results["high"]["seconds"] += row["duration_seconds"]
         pairs.append({"case_id": row["case_id"], "run": row["run"], **results})
-    if not (pairs and len(pairs) == len({p['case_id'] for p in pairs}) * 3):
-        raise AssertionError
+    INVARIANTS.assertTrue(pairs and len(pairs) == len({p['case_id'] for p in pairs}) * 3)
     metrics = {}
     for route in ("express", "high"):
         seconds = [p[route]["seconds"] for p in pairs]
@@ -114,16 +113,14 @@ def main():
     payload = json.loads(args.dataset.read_text(encoding="utf-8"))
     cases = payload["cases"]
     manifest = payload.get("protocol", payload.get("manifest"))
-    if not (manifest and manifest['dataset_sha256'] == digest(cases)):
-        raise AssertionError('Frozen originals/reference hash changed')
+    INVARIANTS.assertTrue(manifest and manifest['dataset_sha256'] == digest(cases), 'Frozen originals/reference hash changed')
     identity = {"template_version": VERSION, "dataset_sha256": digest(cases),
                 "source_sha256": digest([(p.relative_to(ROOT).as_posix(), hashlib.sha256(p.read_bytes()).hexdigest())
                     for p in sorted((ROOT / "src").rglob("*.py"))]), "model_calls": 0, "order_requests": 0}
     args.output.mkdir(parents=True, mode=0o700, exist_ok=True)
     seal = args.output / "identity.json"
     if seal.exists():
-        if not (json.loads(seal.read_text(encoding='utf-8')) == identity):
-            raise AssertionError('Frozen replay implementation changed')
+        INVARIANTS.assertTrue(json.loads(seal.read_text(encoding='utf-8')) == identity, 'Frozen replay implementation changed')
     else:
         write_private_json(seal, identity)
     rows = [evaluate(case) for case in cases]

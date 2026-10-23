@@ -10,7 +10,8 @@ import time
 import weakref
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 
 from aqla_hyperliquid_mcp.auth import Authority
@@ -31,9 +32,9 @@ class TurnClaim:
     origin: tuple | None
     active: bool = True
     changes_allowed: bool = True
-    lock: threading.RLock = field(default_factory=threading.RLock)
-    notification_messages: list = field(default_factory=list)
-    notification_acks: dict = field(default_factory=dict)
+    lock: threading.RLock = dataclass_field(default_factory=threading.RLock)
+    notification_messages: list = dataclass_field(default_factory=list)
+    notification_acks: dict = dataclass_field(default_factory=dict)
     automatic: bool = False
 
     def read(self):
@@ -148,6 +149,8 @@ class HermesExtension:
     def refresh_master(self, gateway):
         new_hash = self.skill_hash()
         if new_hash != self.master_hash:
+            # Pinned native integration interface; covered by native contract and integration checks.
+            # skipcq: PYL-W0212
             gateway._evict_cached_agent(self.session_key)
             self.master_hash = new_hash
 
@@ -455,16 +458,26 @@ class HermesExtension:
     def attach(self, event, gateway, *, bootstrap=False, adapter=None):
         if not self.origin(event):
             return
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
         adapter = adapter or gateway._delivery_adapter_for(event.source)
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
         if adapter is None or not adapter._message_handler:
             raise AqlaError("Native Hermes adapter handler is unavailable")
         self.gateway = gateway
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
         self.session_key = gateway.session_store._generate_session_key(event.source)
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
         if self.binding and self.binding[0] is adapter and adapter._message_handler is self.binding[2]:
             return
         if self.binding:
             self.unbind_adapter()
             self.gateway_identity = secrets.token_hex(32)
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
         original = adapter._message_handler
 
         async def native_handler(incoming):
@@ -491,6 +504,8 @@ class HermesExtension:
         self.revoke_setup()
         if self.binding:
             adapter, original, wrapper = self.binding
+            # Pinned native integration interface; covered by native contract and integration checks.
+            # skipcq: PYL-W0212
             if adapter._message_handler is wrapper:
                 adapter.set_message_handler(original)
             self.binding = None
@@ -500,13 +515,13 @@ class HermesExtension:
         if captured is not None:
             return SourceEvent.model_validate(captured)
         raw = getattr(event, "raw_message", None)
-        def field(name):
+        def forward_field(name):
             return raw.get(name) if isinstance(raw, dict) else getattr(raw, name, None)
-        origin = field("forward_origin")
-        original_date = getattr(origin, "date", None) or field("forward_date") or field("date")
+        origin = forward_field("forward_origin")
+        original_date = getattr(origin, "date", None) or forward_field("forward_date") or forward_field("date")
         sent = int(original_date.timestamp() * 1000) if hasattr(original_date, "timestamp") else now_ms()
-        edited = field("edit_date")
-        reply = field("reply_to_message")
+        edited = forward_field("edit_date")
+        reply = forward_field("reply_to_message")
         return SourceEvent(chat_id=self.owner, message_id=int(event.message_id), sent_at=sent,
                            edited_at=int(edited.timestamp() * 1000) if edited else None,
                            reply_to_id=getattr(reply, "message_id", None), text=event.text or "", forward_from="native-owner-forward")

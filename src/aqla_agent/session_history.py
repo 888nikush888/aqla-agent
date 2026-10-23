@@ -150,6 +150,8 @@ def diagnose_session_history(home: Path, *, validator=None) -> HistoryDiagnosis:
     if validator is None:
         try:
             from hermes_state import SessionDB
+            # Pinned native integration interface; covered by native contract and integration checks.
+            # skipcq: PYL-W0212
             validator = object.__new__(SessionDB)._validate_import_payload
         except ImportError:
             result["issues"].append(_issue(home, 0, "native_validation_unavailable"))
@@ -175,9 +177,15 @@ def migrate_session_history(home: Path, *, db=None):
         from hermes_state import SessionDB
         db = SessionDB(db_path=home / "state.db")
     try:
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
         db._execute_write(lambda connection: connection.execute(
             "CREATE TABLE IF NOT EXISTS aqla_jsonl_imports (session_id TEXT PRIMARY KEY, source_sha256 TEXT NOT NULL, imported_messages INTEGER NOT NULL, source_metadata TEXT NOT NULL DEFAULT '{}')"))
+        # Pinned native integration interface; covered by native contract and integration checks.
+        # skipcq: PYL-W0212
         if "source_metadata" not in {row[1] for row in db._read_all("PRAGMA table_info(aqla_jsonl_imports)")}:
+            # Pinned native integration interface; covered by native contract and integration checks.
+            # skipcq: PYL-W0212
             db._execute_write(lambda connection: connection.execute(
                 "ALTER TABLE aqla_jsonl_imports ADD COLUMN source_metadata TEXT NOT NULL DEFAULT '{}'"))
         entries = _routing_entries(home)
@@ -187,11 +195,15 @@ def migrate_session_history(home: Path, *, db=None):
             session_id = path.stem
             # The old adapter's filename contract also excludes path traversal.
             reader.path(session_id)
+            # Pinned native integration interface; covered by native contract and integration checks.
+            # skipcq: PYL-W0212
             if db._read_one("SELECT 1 FROM aqla_jsonl_imports WHERE session_id = ?", (session_id,)):
                 result["skipped"] += 1
                 continue
             payload, header, original, locations = _history_payload(path, entries)
             rows = payload["messages"]
+            # Pinned native integration interface; covered by native contract and integration checks.
+            # skipcq: PYL-W0212
             normalized = _validate_native(payload, path, locations, db._validate_import_payload)
             item = normalized[0]
             fingerprint = hashlib.sha256(original).hexdigest()
@@ -203,12 +215,16 @@ def migrate_session_history(home: Path, *, db=None):
                     return False
                 exists = connection.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone()
                 if not exists:
+                    # Pinned native integration interface; covered by native contract and integration checks.
+                    # skipcq: PYL-W0212
                     db._import_session_row(connection, item["session"], item["messages"], session_id)
                 # Same transaction as message import; also prevents resurrection after user deletion.
                 connection.execute("INSERT INTO aqla_jsonl_imports (session_id,source_sha256,imported_messages,source_metadata) VALUES (?, ?, ?, ?)",
                                    (session_id, fingerprint, count if not exists else 0, metadata))
                 return not exists
 
+            # Pinned native integration interface; covered by native contract and integration checks.
+            # skipcq: PYL-W0212
             imported = db._execute_write(import_one)
             result["imported" if imported else "skipped"] += 1
             if imported:

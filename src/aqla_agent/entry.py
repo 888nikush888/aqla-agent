@@ -101,18 +101,7 @@ def passive_entry_price(market, side, quote) -> Decimal:
     return price
 
 
-def validate_entry_prices(plan, quote, *, stop=None, targets=None, as_of=None):
-    if plan.entry_legs:
-        return {"legs": [validate_entry_prices(leg_view(plan, {"index": leg.index, "quantity": str(leg.quantity)}),
-                      quote, stop=stop, targets=targets, as_of=as_of) for leg in plan.entry_legs if leg.timing != "deferred"]}
-    quote.fresh(as_of=as_of)
-    if quote.market != plan.market.symbol:
-        raise AqlaError("Entry price observation belongs to another market")
-    stop = Decimal(str(stop)) if stop is not None else plan.stop_loss
-    targets = [Decimal(str(value)) for value in targets] if targets is not None else plan.take_profits
-    limit = execution_limit(plan)
-    price = quote.ask if plan.side == "long" else quote.bid
-    maker = plan.entry_execution == "maker_only"
+def validate_entry_execution(plan, quote, price, limit, maker, as_of):
     if maker and (limit >= quote.ask if plan.side == "long" else limit <= quote.bid):
         raise AqlaError("Saved maker entry price would cross the executable book")
     # Resting ordinary limit orders may wait for a retracement; evaluate immediate
@@ -128,20 +117,45 @@ def validate_entry_prices(plan, quote, *, stop=None, targets=None, as_of=None):
     elif plan.entry_kind == "market" and not marketable:
         if not maker:
             raise AqlaError("Executable entry price exceeds the saved market limit")
-    if not marketable and not maker:
-        return {"marketable": False, "limit": str(limit)}
-    if maker:
-        price = limit
-    safe = (stop < min(price, limit, quote.stop_reference) and all(value > max(price, limit) for value in targets)
+    return marketable
+
+
+def valid_entry_structure(plan, quote, price, limit, stop, targets):
+    return (stop < min(price, limit, quote.stop_reference) and all(value > max(price, limit) for value in targets)
             if plan.side == "long" else stop > max(price, limit, quote.stop_reference) and all(value < min(price, limit) for value in targets))
-    if not safe:
-        raise AqlaError("Live entry/SL/TP structure is invalid on the target exchange")
+
+
+def validate_entry_risk(plan, price, limit, stop):
     worst_price = max(price, limit)
     if plan.quantity * worst_price > plan.policy.max_notional_usdc:
         raise AqlaError("Live execution would exceed the maximum position value")
     risk = plan.quantity * (abs(price - stop) + worst_price * plan.policy.cost_reserve_bps / 10000)
     if risk > plan.risk_usdc:
         raise AqlaError("Live execution would exceed the reserved SL risk")
+    return risk
+
+
+def validate_entry_prices(plan, quote, *, stop=None, targets=None, as_of=None):
+    if plan.entry_legs:
+        return {"legs": [validate_entry_prices(leg_view(plan, {"index": leg.index, "quantity": str(leg.quantity)}),
+                      quote, stop=stop, targets=targets, as_of=as_of) for leg in plan.entry_legs if leg.timing != "deferred"]}
+    quote.fresh(as_of=as_of)
+    if quote.market != plan.market.symbol:
+        raise AqlaError("Entry price observation belongs to another market")
+    stop = Decimal(str(stop)) if stop is not None else plan.stop_loss
+    targets = [Decimal(str(value)) for value in targets] if targets is not None else plan.take_profits
+    limit = execution_limit(plan)
+    price = quote.ask if plan.side == "long" else quote.bid
+    maker = plan.entry_execution == "maker_only"
+    marketable = validate_entry_execution(plan, quote, price, limit, maker, as_of)
+    if not marketable and not maker:
+        return {"marketable": False, "limit": str(limit)}
+    if maker:
+        price = limit
+    safe = valid_entry_structure(plan, quote, price, limit, stop, targets)
+    if not safe:
+        raise AqlaError("Live entry/SL/TP structure is invalid on the target exchange")
+    risk = validate_entry_risk(plan, price, limit, stop)
     return {"marketable": marketable, "limit": str(limit), "expected_entry": str(price), "expected_risk": str(risk)}
 
 

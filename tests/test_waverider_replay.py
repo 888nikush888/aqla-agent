@@ -20,10 +20,10 @@ from aqla_hyperliquid_mcp.models import AccountSnapshot, AqlaError, Interpretati
 from aqla_hyperliquid_mcp.rules import make_plan
 
 
-def replay_case(prices, *, currency="USDC", venue="hyperliquid"):
+def replay_case(prices, *, currency="USDC", venue="hyperliquid", min_notional=10):
     stamp = 1000000
     signal = Interpretation(kind="new_signal", source_refs=["source:" + venue + currency], symbol="BTC", side="long", entry="market", stop_loss=90, take_profits=[110, 120])
-    plan = make_plan(signal, Market(symbol="BTC", asset_id=0, product="perp", mid=100, size_decimals=2, max_leverage=20, quote_token=currency),
+    plan = make_plan(signal, Market(symbol="BTC", asset_id=0, product="perp", mid=100, size_decimals=2, max_leverage=20, quote_token=currency, min_notional=min_notional),
         AccountSnapshot(equity=10000, available_margin=10000, observed_at=stamp), Policy(entry_range_choice="split"),
         1, stamp, ("testnet", "account"), stamp=stamp)
     plan.exchange = venue
@@ -45,6 +45,53 @@ def test_replay_keeps_existing_fills_and_does_not_close_for_a_price_gain():
 def test_replay_counts_stop_gap_in_pnl_without_inventing_a_new_admission():
     result = simulate(replay_case([100, 100, 89, 89, 89]), wave=True)
     assert Decimal(result["net_pnl"]) < 0
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_replay_resumes_after_a_cost_block_without_losing_the_wave(side):
+    prices = [100, 102, 100.8, 100.8, 100.8, 100.8, 101.4, 101.4, 101.4, 101.4,
+              98.5, 99.5, 99.5, 99.5, 99.5, 100]
+    case = replay_case(prices if side == "long" else [200 - value for value in prices])
+    if side == "short":
+        case["plan"].update(side="short", stop_loss="110", take_profits=["90", "80"])
+    result = simulate(case, wave=True)
+    assert result["waves"] == 1
+    assert Decimal(result["remaining_quantity"]) <= Decimal(case["plan"]["quantity"])
+    prefix = copy.deepcopy(case)
+    prefix["observations"] = prefix["observations"][:6]
+    assert Decimal(simulate(prefix, wave=True)["fees"]) == Decimal(case["original_entry_events"][0]["fee"])
+
+
+def test_unexecutable_flexible_depth_does_not_manufacture_a_replay_wave():
+    case = replay_case([100, 102, 101, 101, 101, 101, 98, 99, 99, 99, 99, 100])
+    for row in case["observations"]:
+        row["quote"]["bids"][0][1] = ".001"
+        row["quote"]["asks"][0][1] = ".001"
+    result = simulate(case, wave=True)
+    assert result["waves"] == 0
+    assert Decimal(result["fees"]) == Decimal(case["original_entry_events"][0]["fee"])
+    assert len(result["equity"]) == len(case["observations"])
+
+
+def test_core_minimum_refusal_keeps_every_valuation_and_matches_standard_holdings():
+    case = replay_case([100, 102, 101.2, 101.2, 101.2, 101.2, 100, 100], min_notional=200)
+    wave, standard = simulate(case, wave=True), simulate(case, wave=False)
+    assert wave["waves"] == 0 and wave["equity"] == standard["equity"]
+    assert wave["remaining_quantity"] == standard["remaining_quantity"]
+
+
+def test_future_price_changes_cannot_change_an_earlier_replay_prefix():
+    case = replay_case([100, 102, 100.8, 100.8, 100.8, 100.8, 101.4, 101.4, 101.4, 101.4,
+                        98.5, 99.5, 99.5, 99.5, 99.5, 100])
+    prefix = copy.deepcopy(case)
+    prefix["observations"] = prefix["observations"][:8]
+    poisoned = copy.deepcopy(case)
+    for row in poisoned["observations"][8:]:
+        row["quote"].update(bid="1000000", ask="1000000", mid="1000000", stop_reference="1000000",
+                            bids=[["1000000", "10000"]], asks=[["1000000", "10000"]])
+    expected = simulate(prefix, wave=True)["equity"]
+    assert simulate(case, wave=True)["equity"][:8] == expected
+    assert simulate(poisoned, wave=True)["equity"][:8] == expected
 
 
 def test_recorder_budget_is_reported_and_retention_keeps_active_until_target_setups(tmp_path):

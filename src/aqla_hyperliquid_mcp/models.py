@@ -189,6 +189,8 @@ class Settings(Model):
             if execution.get("private_key_file"):
                 execution["private_key_file"] = str((path.parent / execution["private_key_file"]).resolve())
         result = cls.model_validate(raw)
+        # Pydantic private path stays outside serialized settings and source context.
+        # skipcq: PYL-W0212
         result._configuration_file = path
         return result
 
