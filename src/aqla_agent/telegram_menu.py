@@ -466,7 +466,8 @@ class TelegramMenu:
             data = await self.rpc("monthly_report", month=args[0], limit=8)
             summary = data["summary"]
             text = "Monatsbericht " + args[0] + " · Mainnet\n" + f"Abgeschlossen: {summary['trades']} · vollständig: {summary['complete']} · ausgeschlossen: {summary['excluded']}\n"
-            text += "Netto je Währung: " + str(summary["net_by_currency"]) + "\nTrefferquote: " + number(summary["win_rate_percent"]) + " %\n" + summary["roe_sum_label"] + ": " + number(summary["roe_sum_percent"]) + " %"
+            text += "Netto je Währung: " + ("; ".join(number(value, places=6) + " " + currency for currency, value in sorted(summary["net_by_currency"].items())) or "nicht bestätigt")
+            text += "\nTrefferquote: " + number(summary["win_rate_percent"], places=2) + " %\n" + summary["roe_sum_label"] + ": " + number(summary["roe_sum_percent"], places=2) + " %"
             return await self.display(bot, text, [("Trades im Journal", "select_scope", "period", True, args[0])])
         if action == "trade_evidence":
             self.pending = None

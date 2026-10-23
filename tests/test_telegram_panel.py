@@ -127,6 +127,22 @@ async def test_dashboard_rounds_only_monetary_display_and_keeps_missing_values_u
 
 
 @pytest.mark.asyncio
+async def test_monthly_menu_formats_currency_and_percentages_without_rewriting_accounting(panel):
+    menu, bot, _, changes, *_ = panel
+    summary = {"trades": 6, "complete": 3, "excluded": 3, "net_by_currency": {"USDC": "2.636418"},
+               "win_rate_percent": "33.33333333333333333333333333", "roe_sum_label": "Summe der Trade-Renditen",
+               "roe_sum_percent": "18.78822364199948851410691416"}
+    before = copy.deepcopy(summary)
+    async def monthly(*args, **kwargs):
+        return {"summary": summary}
+    menu.rpc = monthly
+    await menu.run(bot, "month", "2026-10")
+    text = (bot.edits or bot.sent)[-1]["text"]
+    assert "2,636418 USDC" in text and "33,33 %" in text and "18,79 %" in text
+    assert summary == before and not changes
+
+
+@pytest.mark.asyncio
 async def test_evidence_distinguishes_replaced_orders_and_operation_phases(panel):
     menu, bot, _, changes, *_ = panel
     async def evidence(_server, tool, args):
