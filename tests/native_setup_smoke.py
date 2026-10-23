@@ -266,6 +266,7 @@ def main():
             assert panel_edits, "Native menu must edit its existing panel"
             from aqla_agent.telegram_menu import HOME
             panel_created = len(created)
+            panel_edited = len(panel_edits)
             panel_revision = read_snapshot(home / "data/state.sqlite3")["configuration_revision"]
             for sequence, (label, action) in enumerate(HOME, start=60):
                 await app.process_update(Update.de_json(payload("/aqla", sequence * 2), app.bot))
@@ -276,7 +277,8 @@ def main():
                         "chat": {"id": 12345, "type": "private"}, "from": {"id": 999, "is_bot": True, "first_name": "Synthetic bot"}, "text": label}}}
                 await app.process_update(Update.de_json(panel_callback, app.bot))
                 assert not any(marker in sent[-1]["text"] for marker in ("vorübergehend nicht verfügbar", "Nicht gespeichert", "Änderung nicht ausgeführt")), (action, sent[-1]["text"])
-            assert len(created) == panel_created and admitted == []
+            assert len(created) == panel_created + len(HOME) and admitted == []
+            assert len(panel_edits) == panel_edited + len(HOME)
             assert read_snapshot(home / "data/state.sqlite3")["configuration_revision"] == panel_revision
             # New source controls run through the actual native registry/PTB
             # dispatcher and real MCP revision/setup gates, with no model turn.
@@ -311,16 +313,19 @@ def main():
                 raise AssertionError("Revoked native grant was accepted")
             await app.process_update(Update.de_json(payload("/setup", 4), app.bot))
             old_prompt = extension.setup.challenge.prompt_id
+            candidate_deleted_before = len(deleted)
             forwarded = payload(SYNTHETIC_PASSWORD, 5)
             forwarded["message"]["forward_origin"] = {"type": "user", "date": 1791490000,
                 "sender_user": {"id": 6789, "is_bot": False, "first_name": "Synthetic source"}}
             await app.process_update(Update.de_json(forwarded, app.bot))
-            assert extension.setup.claims() is None and len(deleted) == 2 and admitted == []
+            assert extension.setup.claims() is None and len(deleted) == candidate_deleted_before + 1 and admitted == []
+            assert deleted[-1]["message_id"] == 5
             edited = payload(SYNTHETIC_PASSWORD, 6)
             edited["edited_message"] = edited.pop("message")
             edited["edited_message"]["edit_date"] = 1791490001
             await app.process_update(Update.de_json(edited, app.bot))
-            assert extension.setup.claims() is None and len(deleted) == 3 and admitted == []
+            assert extension.setup.claims() is None and len(deleted) == candidate_deleted_before + 2 and admitted == []
+            assert deleted[-1]["message_id"] == 6
             # Recreate ingress state as after process restart. The reply metadata
             # is authenticated by the actual PTB Update parser and current bot.
             extension.revoke_setup()
@@ -332,7 +337,8 @@ def main():
                 "chat": {"id": 12345, "type": "private"},
                 "from": {"id": app.bot.id, "is_bot": True, "first_name": "Synthetic"}, "text": SETUP_PROMPT}
             await app.process_update(Update.de_json(late, app.bot))
-            assert extension.setup.claims() is None and len(deleted) == 4 and admitted == []
+            assert extension.setup.claims() is None and len(deleted) == candidate_deleted_before + 3 and admitted == []
+            assert deleted[-1]["message_id"] == 7
             # Factory, handler rebuild, plugin replacement and runtime undo all
             # retain one earliest handler and remove the previous authority.
             replacement = factory._create_adapter(Platform.TELEGRAM, PlatformConfig(extra={"allow_from": ["12345"]}))
@@ -371,7 +377,8 @@ def main():
                           "early_not_ready_failclosed": True, "native_catalog_pages_acl": True, "native_long_status_chunks": True,
                           "authentic_wrong_password_rejected": True, "authentic_delete_ack_false_rejected": True,
                           "rejected_passwords_absent_from_tools_history_logs": True,
-                          "candidate_deletions": len(deleted), "model_admissions": len(admitted)}))
+                          "candidate_deletions": sum(row["message_id"] in (2, 5, 6, 7) for row in deleted),
+                          "cleanup_deletions": len(deleted), "model_admissions": len(admitted)}))
     try:
         asyncio.run(run())
     finally:

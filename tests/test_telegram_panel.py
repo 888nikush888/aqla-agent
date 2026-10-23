@@ -72,6 +72,50 @@ async def test_menu_navigates_one_message_and_rejects_old_buttons(panel):
 
 
 @pytest.mark.asyncio
+async def test_explicit_open_is_visible_at_chat_bottom_and_retires_only_the_previous_panel(panel):
+    menu, bot, _, changes, *_ = panel
+    await menu.intercept(update("/aqla"), bot)
+    previous = menu.message_id
+    old_token = choose(bot, "⚙️ Profile & Handelsregeln")
+    await menu.intercept(update("/aqla"), bot)
+    assert len(bot.sent) == 2 and not bot.edits
+    assert bot.deleted == [{"chat_id": "12345", "message_id": previous}]
+    assert menu.message_id != previous
+    await menu.intercept(callback(menu, old_token, message_id=previous), bot)
+    assert not bot.edits and not changes
+    await menu.intercept(callback(menu, choose(bot, "⚙️ Profile & Handelsregeln")), bot)
+    assert len(bot.sent) == 2 and len(bot.edits) == 1
+
+
+@pytest.mark.asyncio
+async def test_new_panel_ack_precedes_deletion_and_failed_cleanup_keeps_one_active_receipt(panel):
+    menu, bot, _, changes, *_ = panel
+    await menu.intercept(update("/aqla"), bot)
+    previous = menu.message_id
+    async def failed_delete(**kwargs):
+        assert menu.message_id != previous and len(bot.sent) == 2
+        raise TimeoutError("synthetic deletion unavailable")
+    bot.delete_message = failed_delete
+    await menu.intercept(update("/aqla"), bot)
+    assert json.loads(menu.receipt_file.read_text())["message_id"] == menu.message_id
+    assert len(bot.sent) == 2 and not menu.fresh and not changes
+
+
+@pytest.mark.asyncio
+async def test_failed_reopen_does_not_delete_the_existing_panel(panel):
+    menu, bot, _, changes, *_ = panel
+    await menu.home(bot)
+    previous = menu.message_id
+    async def unavailable(**kwargs):
+        raise TimeoutError("synthetic send unavailable")
+    bot.send_message = unavailable
+    menu.fresh = True
+    with pytest.raises(TimeoutError):
+        await menu.home(bot)
+    assert menu.message_id == previous and not bot.deleted and not changes
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("owner,chat_type", [("stranger", "private"), ("12345", "group")])
 async def test_menu_authenticates_actual_callback_actor(panel, owner, chat_type):
     menu, bot, _, changes, *_ = panel

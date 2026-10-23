@@ -68,6 +68,7 @@ class TelegramMenu:
     def __init__(self, commands):
         self.commands, self.extension = commands, commands.extension
         self.message_id = None
+        self.fresh = False
         self.tokens, self.pending = {}, None
         self.deadline, self.binding = 0, None
         self.serial = asyncio.Lock()
@@ -112,7 +113,8 @@ class TelegramMenu:
             text = pages[page] + f"\n\nSeite {page + 1}/{len(pages)}"
         rows.append([self.button("⌂ Hauptmenü", "home"), self.button("Abbrechen", "cancel")])
         payload = {"chat_id": self.extension.owner, "text": text, "parse_mode": None, "reply_markup": {"inline_keyboard": rows}}
-        if self.message_id is not None:
+        previous = self.message_id
+        if self.message_id is not None and not self.fresh:
             try:
                 await asyncio.wait_for(bot.edit_message_text(message_id=self.message_id, **payload), 10)
                 return
@@ -123,10 +125,16 @@ class TelegramMenu:
                     raise AqlaError("Telegram-Menü vorübergehend nicht aktualisierbar") from None
         sent = await asyncio.wait_for(bot.send_message(**payload), 10)
         self.message_id = sent.message_id
+        self.fresh = False
         self.receipt_file.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.receipt_file.with_suffix(".tmp")
         temporary.write_text(json.dumps({"owner": self.extension.owner, "message_id": self.message_id}), encoding="utf-8")
         temporary.replace(self.receipt_file)
+        if previous is not None and previous != self.message_id:
+            try:
+                await asyncio.wait_for(bot.delete_message(chat_id=self.extension.owner, message_id=previous), 10)
+            except Exception:
+                pass  # The new receipt already invalidates the old panel if Telegram cannot delete it.
 
     async def paged(self, bot, title, rows, action, args=(), page=0):
         page = max(0, min(page, max(0, (len(rows) - 1) // 8)))
@@ -654,6 +662,10 @@ class TelegramMenu:
         from .native_setup import addressed_to_bot
         if not addressed_to_bot(head, bot):
             return command in aliases
+        from .native_commands import COMMANDS
+        if (text.startswith("/") and command.lstrip("/") in COMMANDS and self.extension.setup.private_owner(message)
+                and not any(getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))):
+            self.fresh = True
         relevant = command in aliases or self.pending is not None and not text.startswith("/")
         if not relevant:
             if text.startswith("/"):

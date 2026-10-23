@@ -1,6 +1,6 @@
 # Telegram-Steuerzentrale
 
-`/aqla` öffnet das private Betreiberpanel. Untermenüs bearbeiten dieselbe Nachricht. Zurück, Hauptmenü, Aktualisieren und Seitenwahl bleiben erreichbar. Der Bot verwendet native Inline-Buttons; ein zusätzlicher Webdienst ist nicht nötig.
+`/aqla` öffnet das private Betreiberpanel unten im Chat. Erst nach bestätigtem Versand wird das vorherige Menü entfernt; Handelsmeldungen und Journal bleiben erhalten. Untermenüs bearbeiten dieselbe Nachricht. Zurück, Hauptmenü, Aktualisieren und Seitenwahl bleiben erreichbar. Der Bot verwendet native Inline-Buttons; ein zusätzlicher Webdienst ist nicht nötig.
 
 ## Bereiche
 
