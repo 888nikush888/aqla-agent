@@ -510,12 +510,12 @@ class NativeCommands:
                 + "Eigentumskonflikte: " + str(sum(row.get("status") == "conflicted" for row in snapshot.get("trades", []))) + "\n"
                 + "\nBenachrichtigungen und abgeschlossene Verarbeitung sind getrennte Zähler.")
         elif command == "aqla_kanaele":
-            ranking = await self.extension.mcp_call(self.extension.server, "ranking_status", {})
-            lines = [f"{row.get('name', identity)} · {identity}: {row['tier']} · Nachweise {row.get('proof_total', 0)} · ausgeschlossen {row.get('excluded_count', 0)}\nMetriken: {json.dumps(row.get('metrics', {}), ensure_ascii=False)}\nNachweise: {json.dumps(row.get('evidence', []), ensure_ascii=False)}\nAusschlüsse: {json.dumps(row.get('exclusions', []), ensure_ascii=False)}" for identity, row in ranking["sources"].items()]
-            selected = snapshot.get("sources", list(ranking["sources"]))
-            title = "Aktuell ausgewählte Kanäle · Konfigurationsrevision " + str(snapshot.get("configuration_revision", "—"))
-            selection = [snapshot.get("source_names", {}).get(identity, identity) + " · " + identity for identity in selected]
-            await self.reply(bot, title + "\n" + ("\n".join(selection) or "Keine Kanäle konfiguriert.") + "\n\nRanghistorie/Nachweise:\n" + ("\n\n".join(lines) or "—"))
+            from .ranking import active_sources
+            selected = sorted(active_sources(snapshot))
+            title = f"Aktuell ausgewählte Kanäle ({len(selected)}) · Konfigurationsrevision " + str(snapshot.get("configuration_revision", "—"))
+            lines = [snapshot.get("source_names", {}).get(identity, identity) + " · " + identity + " · "
+                     + snapshot.get("source_ranks", {}).get(identity, {}).get("tier", "Rang nicht bestätigt") for identity in selected]
+            await self.reply(bot, title + "\n" + ("\n".join(lines) or "Keine Kanäle konfiguriert.") + "\n\nRangnachweise und Routing: /aqla → Quellen & Routing.")
         elif command == "aqla_profile":
             lines = [f"{row['name']} · {identity}\n" + "\n".join(f"{name}: {getattr(Parameters.model_validate(row['parameters']), name)}" + (" · " + parameter_unit(name, row['parameters']) if name in ("fallback_stop_loss_percent", "fallback_take_profit_percentages") else "") for name in Parameters.model_fields)
                      for identity, row in snapshot["profiles"].items() if row.get("parameters")]
