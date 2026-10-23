@@ -176,9 +176,8 @@ def build(project: Path, output: Path):
             previous.append(_checked_stat(target))
         except FileNotFoundError:
             previous.append(None)
-    if any(previous):
-        if not all(previous):
-            raise ValueError(f"Incomplete existing ZIP/checksum pair: {output}")
+    if any(previous) and not all(previous):
+        raise ValueError(f"Incomplete existing ZIP/checksum pair: {output}")
     files = _collect_sources(project)
     if all(previous):
         _verify_pair(output, sha, output.name)

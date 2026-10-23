@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import binascii
 import json
 import zlib
 from collections import deque
 from functools import reduce
 from operator import or_
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field, TypeAdapter, create_model
 from typing_extensions import TypedDict
@@ -41,7 +40,7 @@ class StreamReadResult(TypedDict):
     rest_reconciliation_required: bool
     diagnostics: StreamDiagnostics
 
-SUBSCRIPTION_FIELDS = {
+SUBSCRIPTION_FIELDS: dict[str, dict[str, Any]] = {
     "allMids": {"dex": (str | None, None)},
     "notification": {"user": (Address, ...)},
     "webData3": {"user": (Address, ...)},
@@ -68,9 +67,13 @@ SUBSCRIPTION_FIELDS = {
     "fastAssetCtxs": {},
 }
 SUBSCRIPTION_MODELS = {name: create_model("Subscribe" + name[:1].upper() + name[1:], __base__=Model,
-                                        type=(Literal[name], name), **fields) for name, fields in SUBSCRIPTION_FIELDS.items()}
-Subscription = Annotated[reduce(or_, SUBSCRIPTION_MODELS.values()), Field(discriminator="type")]
-SUBSCRIPTION_ADAPTER = TypeAdapter(Subscription)
+                                        **{"type": (Literal[name], name), **fields}) for name, fields in SUBSCRIPTION_FIELDS.items()}
+if TYPE_CHECKING:
+    Subscription = Model
+else:
+    # Runtime schemas come from the pinned native API catalog.
+    Subscription = Annotated[reduce(or_, SUBSCRIPTION_MODELS.values()), Field(discriminator="type")]
+SUBSCRIPTION_ADAPTER: TypeAdapter[Model] = TypeAdapter(Subscription)
 
 
 class Streams:
@@ -125,11 +128,9 @@ class Streams:
                     async for raw in socket:
                         try:
                             self.receive(json.loads(raw))
-                        except (ValueError, TypeError, KeyError, AttributeError, AqlaError, binascii.Error, zlib.error):
+                        except (ValueError, TypeError, KeyError, AttributeError, zlib.error):
                             self._failure("decode")
                             self._event({"channel": "gap", "data": {"reason": "decode_failure", "rest_reconciliation_required": True}})
-            except asyncio.CancelledError:
-                raise
             except TimeoutError:
                 self._failure("timeout")
             except Exception:
@@ -253,7 +254,7 @@ class Streams:
             raise AqlaError("Stream read limit must be 1..1000")
         if after > self.sequence:
             raise AqlaError("Stream cursor cannot refer to a future event")
-        rows = []
+        rows: list[dict] = []
         for row in self.events:
             if row["sequence"] <= after:
                 continue

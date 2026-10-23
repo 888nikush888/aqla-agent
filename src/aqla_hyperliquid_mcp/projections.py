@@ -23,7 +23,8 @@ class ReaderOverview(TypedDict):
 def reader_overview(snapshot, context_limit: int) -> ReaderOverview:
     """Group recent and active IDs in one event scan; preserve the reader contract."""
     active_refs = {ref for trade in snapshot["trades"].values() if trade["status"] in OPEN for ref in trade["plan"]["source_refs"]}
-    grouped, active, pending = {}, {}, []
+    grouped: dict[str, set[int]] = {}
+    active: dict[str, set[int]] = {}
     event_rows = []
     for row in snapshot["events"].values():
         if not is_source_row(row):

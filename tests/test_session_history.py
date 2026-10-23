@@ -88,16 +88,21 @@ def test_invalid_session_is_not_partially_imported_or_silently_skipped(tmp_path)
     path.write_text('{"role":"user","content":"first"}\n{invalid secret\n', encoding="utf-8")
     before = path.read_bytes()
     class DB:
-        def _execute_write(self, callback):
+        @staticmethod
+        def _execute_write(callback):
             class Connection:
-                def execute(self, *args):
+                @staticmethod
+                def execute(*args):
                     return None
             return callback(Connection())
-        def _read_all(self, *args):
+        @staticmethod
+        def _read_all(*args):
             return [(0, "source_metadata")]
-        def _read_one(self, *args):
+        @staticmethod
+        def _read_one(*args):
             return None
-        def _validate_import_payload(self, *args):
+        @staticmethod
+        def _validate_import_payload(*args):
             pytest.fail("Invalid file reached native import validation")
     with pytest.raises(HistoryImportError) as failure:
         migrate_session_history(tmp_path, db=DB())

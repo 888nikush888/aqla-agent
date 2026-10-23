@@ -31,7 +31,7 @@ def runtime(tmp_path, monkeypatch):
     notices = SimpleNamespace(_buffer_fallback_notice=lambda agent,text: agent.notices.append(text))
     monkeypatch.setitem(sys.modules,"agent",SimpleNamespace(fallback_cooldown=native,agent_runtime_helpers=helpers,chat_completion_helpers=notices))
     monkeypatch.setitem(sys.modules,"agent.error_classifier",SimpleNamespace(FailoverReason=SimpleNamespace(rate_limit="limited")))
-    quota.install(lambda target,name,fn: setattr(target,name,fn))
+    quota.install(setattr)
     def agent(key="synthetic-primary-key", model="fixture"):
         value=SimpleNamespace(_primary_runtime={"provider":"custom","model":model,"base_url":"https://synthetic.invalid","api_key":key},
             _fallback_activated=False,_rate_limited_until=0,route="primary",fallback_available=True,notices=[])

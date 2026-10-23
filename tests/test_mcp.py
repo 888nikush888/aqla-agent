@@ -40,7 +40,7 @@ def test_reader_overview_single_scan_matches_complete_original_output(chats, cou
     for chat, values in tracked.items():
         recent = sorted(set(values))[-50:]
         active = [row["source"]["message_id"] for row in events.values() if row["source"]["chat_id"] == chat and row["source_id"] in active_refs]
-        tracked[chat] = sorted(set([*recent, *active]))
+        tracked[chat] = sorted({*recent, *active})
     expected = {"sources": snapshot["sources"], "cursors": snapshot["cursors"], "context_cutoffs": snapshot["context_cutoffs"],
                 "context_ids": snapshot["context_ids"], "source_aliases": snapshot["source_aliases"], "tracked_ids": tracked,
                 "pending": [row["event_id"] for row in events.values() if row["status"] in UNFINISHED][:50], "notification_pending": 1}

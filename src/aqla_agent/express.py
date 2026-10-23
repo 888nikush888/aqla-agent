@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from contextvars import ContextVar
 from decimal import Decimal
+from typing import Any
 
 from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent
 
@@ -65,9 +66,11 @@ def compile_template(source: SourceEvent):
     packet = {"messages": [{"text": source.text, "source_id": ref, "event_id": source.event_id}]}
     try:
         spans = candidates(packet)
-    except (AqlaError, ValueError):
+    except ValueError:
         return None
-    proofs, values, targets = [], {}, []
+    proofs: list[Evidence] = []
+    values: dict[str, Any] = {}
+    targets: list[Decimal] = []
 
     def proof(field, quote):
         proofs.append(Evidence(field=field, source_id=ref, quote=quote))
@@ -127,7 +130,7 @@ def compile_template(source: SourceEvent):
                 return None
         if "entry" not in values or "stop_loss" not in values or not targets:
             return None
-        return Interpretation(kind="new_signal", source_refs=[ref], symbol=symbol, side=side.lower(),
+        return Interpretation(kind="new_signal", source_refs=[ref], symbol=symbol, side="long" if side.upper() == "LONG" else "short",
                               take_profits=targets, evidence=proofs, **values)
-    except (AqlaError, ValueError):
+    except ValueError:
         return None

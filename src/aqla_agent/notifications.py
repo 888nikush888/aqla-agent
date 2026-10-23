@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import base64
-import binascii
 import hashlib
 import hmac
 import json
@@ -115,7 +114,7 @@ def _decode_cursor(cursor: str, snapshot, key: bytes, purpose: str, fields: set[
         if not hmac.compare_digest(expected, value["signature"]) or body["purpose"] != purpose or body["scope"] != _scope(snapshot):
             raise ValueError("Invalid signature, purpose or scope")
         return body
-    except (ValueError, TypeError, KeyError, UnicodeError, binascii.Error, RecursionError) as error:
+    except (ValueError, TypeError, KeyError, RecursionError) as error:
         raise AqlaError("Notification cursor is invalid, has another purpose or belongs to another account/network") from error
 
 
@@ -146,10 +145,10 @@ def notification_page(snapshot, key: bytes | None, exchanges, *, cursor: str | N
     if view not in ("full", "facts", "rendered"):
         raise AqlaError("Notification view must be full, facts or rendered")
     if require_key or cursor is not None:
-        _require_key(key)
+        key = _require_key(key)
     anchor = None
     if cursor is not None:
-        body = _decode_cursor(cursor, snapshot, key, "notifications_read", {"last"})
+        body = _decode_cursor(cursor, snapshot, _require_key(key), "notifications_read", {"last"})
         last = body["last"]
         if not isinstance(last, list) or len(last) != 4 or any(type(value) is not int for value in last[:3]) or not isinstance(last[3], str):
             raise AqlaError("Invalid notification cursor sort key")
@@ -166,7 +165,7 @@ def notification_page(snapshot, key: bytes | None, exchanges, *, cursor: str | N
         notices = {identity: _summary(identity, source[identity]) if summary else source[identity] for _, identity in chosen}
         versions = {identity: all_versions[identity] for _, identity in chosen}
         more = count < len(ordered)
-        result = {"notifications": dict(notices), "notification_versions": dict(versions),
+        result: NotificationReadResult = {"notifications": dict(notices), "notification_versions": dict(versions),
                 "telegram_view": telegram_view({**snapshot, "notifications": notices}, exchanges,
                                                notification_versions=versions, include_status=False),
                 "pending": len(source), "next_cursor": _cursor(snapshot, key, "notifications_read", last=chosen[-1][0]) if chosen and more and key is not None else None}

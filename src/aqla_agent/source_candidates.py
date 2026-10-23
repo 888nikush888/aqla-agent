@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from aqla_hyperliquid_mcp.models import Model, digest
+from aqla_hyperliquid_mcp.models import Model, digest, require_first
 from aqla_hyperliquid_mcp.rules import SOURCE_NUMBERS, number_is_ordinal, quoted_leverage_numbers
 
 from .evidence import position_fractions
@@ -151,7 +151,7 @@ def choice(instructions, options):
 
 def linked_candidate_refs(packet):
     """Python owns actual reply links; unlinked neighbouring setups cannot supply values."""
-    anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     refs = {anchor["source_id"]}
     reply = anchor.get("reply_to_id")
     seen = set()
@@ -169,7 +169,7 @@ def linked_candidate_refs(packet):
 def questions_for(packet, spans):
     from .semantic_contract import LIMIT, MARKET
     linked = linked_candidate_refs(packet)
-    anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     order_mentions = [{"quote": match.group(), "start": match.start(), "end": match.end(), "form": form}
         for form, matcher in (("market", MARKET), ("limit", LIMIT))
         for match in matcher.finditer(anchor["text"])]
@@ -189,7 +189,7 @@ def questions_for(packet, spans):
             reply, depth = parent.get("reply_to_id"), depth + 1
         for span in sorted(spans, key=lambda span: (span.source_id != packet["anchor_source_id"], order.get(span.source_id, 0), span.start)):
             if span.kind == kind and span.source_id in linked:
-                original = next(row["text"] for row in packet["messages"] if row["source_id"] == span.source_id)
+                original = require_first(row["text"] for row in packet["messages"] if row["source_id"] == span.source_id)
                 before = original[original.rfind("\n", 0, span.start) + 1:span.start]
                 if kind == "symbol" and re.fullmatch(r"[xх](?:\d+)?", span.quote, re.I) and any(
                         n.kind == "number" and n.source_id == span.source_id and n.start == span.start
@@ -245,7 +245,7 @@ def questions_for(packet, spans):
     for identity, alternatives in numeric_occurrences(spans):
         span = alternatives[0]
         if span.notation != "ordinal" and span.source_id in linked:
-            original = next(row["text"] for row in reversed(packet["messages"]) if row["source_id"] == span.source_id)
+            original = require_first(row["text"] for row in reversed(packet["messages"]) if row["source_id"] == span.source_id)
             occurrence = span.model_dump(mode="json")
             if len(alternatives) > 1:
                 # There is one role for the original text, independent of which

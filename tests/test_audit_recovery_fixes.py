@@ -1,4 +1,5 @@
 """Independent regressions for the seven confirmed full-program audit findings."""
+
 import copy
 import json
 from decimal import ROUND_CEILING, Decimal
@@ -16,7 +17,7 @@ from aqla_agent.router import Router
 from aqla_agent.source_worker import SourceWorker
 from aqla_agent.usage_metrics import source_efficiency
 from aqla_hyperliquid_mcp.api import Hyperliquid
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Market, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Market, SourceEvent, now_ms, require_first
 from aqla_hyperliquid_mcp.rules import backup_prices
 from aqla_hyperliquid_mcp.server import close_server, create_server
 from aqla_hyperliquid_mcp.state import State
@@ -84,7 +85,7 @@ async def test_full_mcp_status_preserves_opaque_notice_and_legacy_event(setup):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["source_record", "source_apply"])
 async def test_model_validity_survives_only_failures_after_recording(worker_boundary, monkeypatch, phase):  # noqa: F811 -- async fixture
-    extension, server, state, fake, _, _ = worker_boundary
+    extension, server, _state, fake, _, _ = worker_boundary
     source = SourceEvent(chat_id="channel", message_id=907, sent_at=now_ms(), text="Result report")
     server.aqla_trading.ingest(source)
     async def decision(*args, **kwargs):
@@ -179,7 +180,7 @@ async def test_pending_target_recovery_preserves_later_financial_facts(setup, si
     quantity = Decimal(trade["remaining_quantity"])
     second = None
     if later == "terminal":
-        stop = next(order for order in trade["orders"] if order["kind"] == "sl")
+        stop = require_first(order for order in trade["orders"] if order["kind"] == "sl")
         fake.fill(stop["cloid"], quantity, "90")
     elif later == "reduce":
         second, change = update(router, 3, "reduce", "Reduce 50%", reduce_percent=50)

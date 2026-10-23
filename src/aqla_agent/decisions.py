@@ -11,7 +11,7 @@ from typing import Literal
 import httpx
 from pydantic import Field, model_validator
 
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, Model, digest
+from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, Model, digest, require_first
 
 from .interpretation_contract import ENTRY_FORM_MARKERS as ENTRY_FORM_MARKERS
 from .interpretation_contract import DecisionFailure, validate_interpretation
@@ -89,7 +89,7 @@ def redundant_numeric_mention(packet, prior, span, role):
             or prior.end > span.start or prior.value != span.value
             or ("%" in prior.quote) != ("%" in span.quote) or prior.notation != span.notation):
         return False
-    original = next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    original = require_first(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     if re.search(r"(?:#|\b)[A-Z][A-Z0-9]{1,15}\s+(?:LONG|SHORT)\b", original[prior.end:span.start]):
         return False
     if role.startswith("target_"):
@@ -295,7 +295,7 @@ def assemble(packet, spans, values, probabilities, profile, *, collect=False, re
     if kind in ("report", "unrelated", "incomplete", "ambiguous"):
         if kind in ("report", "unrelated") and values.get("update_action") not in (NONE, UNKNOWN):
             raise DecisionFailure("conflicting_management_intent")
-        if not next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"]).strip():
+        if not require_first(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"]).strip():
             return Interpretation(kind="incomplete", source_refs=sorted(refs), reason="Originaltext fehlt.", reason_codes=["missing_source_text"])
         evidence.extend(Evidence(field="classification", source_id=span.source_id, quote=span.quote)
                         for span in spans if span.kind == "text" and span.source_id == packet["anchor_source_id"])
@@ -414,7 +414,7 @@ def assemble(packet, spans, values, probabilities, profile, *, collect=False, re
             one_sided_live_entry_limit,
             strict_deferred_price,
         )
-        anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+        anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
         if bounded_live_entry_range(packet, [selected.get("entry0"), selected.get("entry1")]):
             fields["entry"] = "range"
         elif one_sided_live_entry_limit(packet, selected.get("entry0"), fields.get("side")):

@@ -157,7 +157,7 @@ async def test_reduction_then_stop_survives_restart_with_one_fixed_quantity_basi
 
 @pytest.mark.asyncio
 async def test_unknown_reduction_blocks_the_stop_until_exact_reconciliation(setup, signal, monkeypatch):
-    _, state, fake, exchange, engine = setup
+    _, state, fake, _exchange, engine = setup
     source, value = signal
     plan = await engine.preview(source.event_id, value)
     trade = await engine.execute(plan["plan_id"])

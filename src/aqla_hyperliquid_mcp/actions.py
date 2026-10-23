@@ -9,7 +9,7 @@ from __future__ import annotations
 from decimal import Decimal
 from functools import reduce
 from operator import or_
-from typing import Annotated, ClassVar, Literal
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 
 from hyperliquid.utils import signing
 from pydantic import AfterValidator, Field, StrictBool, StrictInt, TypeAdapter, create_model, model_validator
@@ -188,8 +188,11 @@ class RegisterAsset(Model):
     schema_: DexSchema | None = Field(default=None, alias="schema")
 
 
-class RegisterAsset2(RegisterAsset):
+class RegisterAsset2(Model):
+    maxGas: UInt | None = None
     assetRequest: RegisterAssetRequest2
+    dex: Venue
+    schema_: DexSchema | None = Field(default=None, alias="schema")
 
 
 class Oracle(Model):
@@ -432,13 +435,13 @@ class ActivateOutcomeDeployer(OneVariant):
     deactivate: None = None
 
 
-NATIVE_MODELS = {name: model for name, model in (("order", PlaceOrders), ("cancel", Cancel), ("cancelByCloid", CancelByCloid),
-                                                ("modify", Modify), ("batchModify", BatchModify), ("perpDeploy", PerpDeploy),
-                                                ("userOutcome", UserOutcome), ("outcomeDeploy", OutcomeDeploy), ("activateOutcomeDeployer", ActivateOutcomeDeployer))}
+NATIVE_MODELS = {"order": PlaceOrders, "cancel": Cancel, "cancelByCloid": CancelByCloid,
+                                                "modify": Modify, "batchModify": BatchModify, "perpDeploy": PerpDeploy,
+                                                "userOutcome": UserOutcome, "outcomeDeploy": OutcomeDeploy, "activateOutcomeDeployer": ActivateOutcomeDeployer}
 
 
 def native(name, **fields):
-    model = create_model("Native" + name[:1].upper() + name[1:], __base__=Model, type=(Literal[name], name), **fields)
+    model = create_model("Native" + name[:1].upper() + name[1:], __base__=Model, **{"type": (Literal[name], name), **fields})
     NATIVE_MODELS[name] = model
     return model
 
@@ -461,8 +464,12 @@ native("validatorL1Stream", riskFreeRate=(DecimalString, ...))
 native("authorizeAqav2Role", token=(Asset, ...), role=(Literal["technical", "treasury"], ...))
 native("claimRewards")
 
-NativeRequest = Annotated[reduce(or_, NATIVE_MODELS.values()), Field(discriminator="type")]
-NATIVE_ADAPTER = TypeAdapter(NativeRequest)
+if TYPE_CHECKING:
+    NativeRequest = Model
+else:
+    # Runtime schemas come from the pinned native API catalog.
+    NativeRequest = Annotated[reduce(or_, NATIVE_MODELS.values()), Field(discriminator="type")]
+NATIVE_ADAPTER: TypeAdapter[Model] = TypeAdapter(NativeRequest)
 
 USER_SIGNED_TYPES = {
     "cDeposit": ("HyperliquidTransaction:CDeposit", [("hyperliquidChain", "string"), ("wei", "uint64"), ("nonce", "uint64")]),

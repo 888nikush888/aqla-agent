@@ -11,9 +11,9 @@ from aqla_hyperliquid_mcp.models import AqlaError, Model, digest, now_ms
 
 TIERS = ("F", "E", "D", "C", "B", "A", "S")
 Tier = Literal["S", "A", "B", "C", "D", "E", "F"]
-FACTORS = {"F": "0.25", "E": "0.5", "D": "0.75", "C": "1", "B": "1.25", "A": "1.5", "S": "2"}
-THRESHOLDS = {"F": 0, "E": 30, "D": 45, "C": 60, "B": 70, "A": 80, "S": 90}
-PROOF = {"F": 0, "E": 5, "D": 10, "C": 15, "B": 30, "A": 50, "S": 75}
+FACTORS: dict[Tier, str] = {"F": "0.25", "E": "0.5", "D": "0.75", "C": "1", "B": "1.25", "A": "1.5", "S": "2"}
+THRESHOLDS: dict[Tier, int] = {"F": 0, "E": 30, "D": 45, "C": 60, "B": 70, "A": 80, "S": 90}
+PROOF: dict[Tier, int] = {"F": 0, "E": 5, "D": 10, "C": 15, "B": 30, "A": 50, "S": 75}
 
 
 class RankingPolicy(Model):

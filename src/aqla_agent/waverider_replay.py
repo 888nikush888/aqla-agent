@@ -10,7 +10,14 @@ from bisect import bisect_right
 from decimal import Decimal
 from pathlib import Path
 
-from aqla_hyperliquid_mcp.models import AccountSnapshot, AqlaError, Interpretation, TradePlan, digest
+from aqla_hyperliquid_mcp.models import (
+    AccountSnapshot,
+    AqlaError,
+    Interpretation,
+    TradePlan,
+    digest,
+    require_first,
+)
 from aqla_hyperliquid_mcp.rules import backup_prices, make_plan, quantity_grid, slippage_price
 
 from .entry import PriceSnapshot, gate_state, validate_entry_prices
@@ -430,7 +437,7 @@ def evaluate(dataset):
         except ReplayEvidenceError as error:
             data_errors += 1
             failures.append({"id": digest(case["family"])[:16], "kind": "missing_evidence", "reason": str(error)})
-        except (AqlaError, ValueError, KeyError, ArithmeticError, TypeError) as error:
+        except (ValueError, KeyError, ArithmeticError, TypeError) as error:
             errors += 1
             failures.append({"id": digest(case["family"])[:16], "kind": "safety_or_invalid_input", "error_type": type(error).__name__})
     cohorts = {}
@@ -454,8 +461,8 @@ def evaluate(dataset):
             summary.update({("baseline_" if mode == "baseline" else "") + "net_pnl": str(equity),
                             ("baseline_" if mode == "baseline" else "") + "max_drawdown": str(maximum)})
         cohorts[cohort] = summary
-    aggregate = next(iter(cohorts.values())) if len(cohorts) == 1 else {key: None for key in ("net_pnl", "baseline_net_pnl", "max_drawdown", "baseline_max_drawdown")}
-    report = {"version": VERSION, "software_hash": software_hash(), "profile_hash": next(iter(profiles)) if len(profiles) == 1 else "mixed",
+    aggregate = require_first(iter(cohorts.values())) if len(cohorts) == 1 else {key: None for key in ("net_pnl", "baseline_net_pnl", "max_drawdown", "baseline_max_drawdown")}
+    report = {"version": VERSION, "software_hash": software_hash(), "profile_hash": require_first(iter(profiles)) if len(profiles) == 1 else "mixed",
         "cost_model": COST_MODEL, "cases_requested": len(families), "cases": len(rows), "critical_errors": errors,
         "data_errors": data_errors, "admission_rejections": admission_rejections,
         "failures": failures, "waves": sum(row["waverider"]["waves"] for row in rows),

@@ -1,3 +1,4 @@
+
 import copy
 import json
 
@@ -13,6 +14,7 @@ from aqla_agent.execution_outcome import (
 )
 from aqla_agent.messages import status_text, telegram_view
 from aqla_agent.tool_queries import source_lookup
+from aqla_hyperliquid_mcp.models import require_first
 from aqla_hyperliquid_mcp.server import close_server, create_server
 
 
@@ -282,7 +284,7 @@ def test_lookup_labels_old_fills_as_bound_history_for_a_later_revision():
     event["event_id"] = "later"
     snapshot["events"]["later"] = event
     result = source_lookup(snapshot, "1970-01-01T00:00:00+00:00", "1970-01-01T00:01:00+00:00")
-    retained = next(row for row in result["rows"] if row.get("event_id") == "later")
+    retained = require_first(row for row in result["rows"] if row.get("event_id") == "later")
     assert "bound_trade_history" in result["entry_fill_fields_scope"]
     assert retained["execution_outcome"]["state"] == "source_revision_unconfirmed"
     assert retained["execution_outcome"]["entry_fill_confirmed"] is None
@@ -291,7 +293,7 @@ def test_lookup_labels_old_fills_as_bound_history_for_a_later_revision():
 
 async def call(server, name, **arguments):
     result = await server.call_tool(name, arguments)
-    return result.structured_content or json.loads(next(block.text for block in result.content if block.type == "text"))
+    return result.structured_content or json.loads(require_first(block.text for block in result.content if block.type == "text"))
 
 
 @pytest.mark.asyncio

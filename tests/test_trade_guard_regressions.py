@@ -1,3 +1,4 @@
+
 import copy
 import json
 from decimal import Decimal
@@ -6,7 +7,7 @@ import httpx
 import pytest
 
 from aqla_agent.router import Router
-from aqla_hyperliquid_mcp.models import AqlaError, Interpretation
+from aqla_hyperliquid_mcp.models import AqlaError, Interpretation, require_first
 from aqla_hyperliquid_mcp.storage import read_snapshot
 
 
@@ -60,7 +61,7 @@ async def test_malformed_live_stop_is_not_accepted_as_effective_protection(setup
     source, interpretation = signal
     plan = await trading.preview(source.event_id, interpretation)
     trade = await trading.execute(plan["plan_id"])
-    initial = next(row for row in trade["orders"] if row["kind"] == "sl")
+    initial = require_first(row for row in trade["orders"] if row["kind"] == "sl")
     corrupt = {"reduceOnly": False, "isTrigger": False, "triggerPx": "80", "sz": "0.01", "side": "B"}
     fake.orders[initial["cloid"]]["order"][field] = corrupt[field]
     await trading.refresh_trade(trade["trade_id"])
@@ -127,7 +128,7 @@ async def test_cancel_fill_race_rechecks_stop_widening_budget(setup, signal, lat
     trade = await trading.execute(plan["plan_id"])
     assert injected and trade["status"] == "open"
     assert Decimal(trade["remaining_quantity"]) == Decimal("2.40" if late_evidence else "4.80")
-    initial_stop = next(row for row in trade["orders"] if row["kind"] == "sl")
+    initial_stop = require_first(row for row in trade["orders"] if row["kind"] == "sl")
     before = len(fake.actions)
     update_started = True
     if late_evidence and reveal_at == "after_prepared":

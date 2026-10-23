@@ -8,7 +8,7 @@ import os
 import random
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from typing_extensions import TypedDict
 
@@ -57,7 +57,7 @@ class ReaderRetry:
 
 def reader_metadata_token(settings: Settings, configuration: Path):
     """Internal-only metadata observation, never reads credential contents."""
-    result = []
+    result: list[tuple[str, int, int, int] | tuple[str, Literal["unavailable"]] | None] = []
     for path in (configuration, settings.telegram_api_hash_file, settings.telegram_session_file):
         if path is None:
             result.append(None)
@@ -106,22 +106,22 @@ class TelegramReader:
         self.closed = False
         self.resolve = resolve
         self.bootstrap = bootstrap
-        self.aliases = {}
+        self.aliases: dict[str, str] = {}
         self.selected = None
-        self.entities = {}
+        self.entities: dict[str, Any] = {}
         self.intake_lock = asyncio.Lock()
         self.last_backfill = 0.0
-        self.unavailable_sources = []
-        self.missing_sources = []
-        self.failed_sources = {}
+        self.unavailable_sources: list[str] = []
+        self.missing_sources: list[str] = []
+        self.failed_sources: dict[str, list[str]] = {}
         if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 1 <= value <= 86400
                for value in (history_interval, dialog_interval)):
             raise ValueError("Reader history/dialog intervals must be finite seconds between 1 and 86400")
         self.clock = clock or time.monotonic
         self.history_interval, self.dialog_interval = history_interval, dialog_interval
         self.last_dialog_scan = None
-        self.history_reads = {}
-        self.last_delivered_versions = set()
+        self.history_reads: dict[str, float] = {}
+        self.last_delivered_versions: set[tuple[str, int, int | None]] = set()
 
     def status_error(self):
         return {"code": "sources_unavailable", "sources": list(self.unavailable_sources)} if self.unavailable_sources else None
@@ -232,7 +232,7 @@ class TelegramReader:
                 context_ids = sorted(message.id for message in history)
                 if self.bootstrap:
                     await self.bootstrap({chat: cutoff}, {chat: context_ids})
-            ids = sorted(set([*(context_ids or []), *configuration.get("tracked_ids", {}).get(chat, [])]))
+            ids = sorted({*(context_ids or []), *configuration.get("tracked_ids", {}).get(chat, [])})
             if ids and reread:
                 messages = await self.client.get_messages(entity, ids=ids)
                 for message in sorted((message for message in messages if message is not None), key=lambda item: item.id):

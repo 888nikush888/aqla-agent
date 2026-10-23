@@ -1,4 +1,5 @@
 """Real MCP 2.2 results through the pinned native renderer/envelope, offline."""
+
 import argparse
 import asyncio
 import json
@@ -7,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+from aqla_hyperliquid_mcp.models import require_first
 
 
 async def produce(destination: Path):
@@ -90,7 +93,7 @@ async def produce(destination: Path):
                     long_reason = "🚀 [Daten]* \\ \"\n" * 100000
                     venue.pause_entries(long_reason)
                     page = await emit(server, "notifications_read", "protection-A", limit=1)
-                    identity = next(iter(page["notifications"]))
+                    identity = require_first(iter(page["notifications"]))
                     version = page["notification_versions"][identity]
                     assert page["notifications"][identity]["detail_level"] == "summary"
                     originals = state.snapshot()["notifications"][identity]
@@ -148,7 +151,7 @@ def main():
 
     config_path = destination / "hermes-home/config.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    guard = next(Path(item) for item in os.environ["PYTHONPATH"].split(os.pathsep) if (Path(item) / "sitecustomize.py").is_file())
+    guard = require_first(Path(item) for item in os.environ["PYTHONPATH"].split(os.pathsep) if (Path(item) / "sitecustomize.py").is_file())
     extra = {"PYTHONPATH": str(guard) + os.pathsep + str(destination / "src"), "UV_OFFLINE": "1", "PYTHONDONTWRITEBYTECODE": "1",
              "HERMES_DISABLE_LAZY_INSTALLS": "1", "HERMES_SKIP_UPDATE_CHECK": "1", "AQLA_AUDIT_NETWORK_LOG": os.environ["AQLA_AUDIT_NETWORK_LOG"]}
     for server in config["mcp_servers"].values():
@@ -172,7 +175,7 @@ def main():
             for line in source:
                 record = json.loads(line)
                 wire = CallToolResult.model_validate(record["wire"])
-                payload = record["wire"].get("structuredContent") or json.loads(next(block["text"] for block in record["wire"]["content"] if block["type"] == "text"))
+                payload = record["wire"].get("structuredContent") or json.loads(require_first(block["text"] for block in record["wire"]["content"] if block["type"] == "text"))
                 raw = _render_call_tool_result(wire, "aqla")
                 size = len(raw.encode("utf-8"))
                 tool = record["tool"]

@@ -15,7 +15,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 
-from aqla_hyperliquid_mcp.models import AqlaError
+from aqla_hyperliquid_mcp.models import AqlaError, require_first
 
 from .native_setup import addressed_to_bot
 from .pipelines import AccountLimits, Parameters, TradingProfile
@@ -185,7 +185,7 @@ def split_direct(raw, count):
         match = re.match(r'''(?:"([^"\n]*)"|'([^'\n]*)'|(\S+))(?:\s+|$)''', rest)
         if not match:
             raise ValueError("Direkte Syntax ist unvollständig.")
-        parts.append(next(value for value in match.groups() if value is not None))
+        parts.append(require_first(value for value in match.groups() if value is not None))
         rest = rest[match.end():].strip()
     return parts, rest
 
@@ -300,7 +300,8 @@ class NativeCommands:
         buttons.append(("Abbrechen", token))
         return buttons
 
-    def targets(self, dialog):
+    @staticmethod
+    def targets(dialog):
         snapshot = dialog.snapshot
         if dialog.command == "aqla_rang":
             from .ranking import active_sources, source_key
@@ -600,7 +601,7 @@ class NativeCommands:
                         await self.show_value(bot)
                     elif action == "value":
                         await self.commit(bot, value)
-                except (ValueError, AqlaError):
+                except ValueError:
                     if self.live():
                         await self.show_value(bot, "Wert oder Änderung nicht zulässig. Prüfe die vollständigen Profilregeln.\n")
                     else:
@@ -665,7 +666,7 @@ class NativeCommands:
                         await self.reply(bot, "Wähle zuerst die Schaltflächen oder /cancel.")
                     else:
                         await self.commit(bot, parse_value(text, self.schema()))
-            except (ValueError, AqlaError):
+            except ValueError:
                 if self.live() and self.dialog.field is not None:
                     await self.show_value(bot, "Wert oder Änderung nicht zulässig. Prüfe die vollständigen Profilregeln.\n")
                 else:

@@ -1,3 +1,4 @@
+
 import copy
 from decimal import Decimal
 from itertools import permutations
@@ -6,13 +7,14 @@ import pytest
 
 from aqla_agent.lifecycle import close_reason, record_lifecycle
 from aqla_agent.messages import MAX_NOTIFICATIONS, literal, number, split_blocks, telegram_view
+from aqla_hyperliquid_mcp.models import require_first
 
 READY = {'hyperliquid': {'configured': True, 'enabled': True, 'network': 'testnet'}}
 
 
 def test_open_position_details_include_entry_stop_and_targets_without_an_opening_notice(opened):
     from aqla_agent.messages import trade_block
-    trade = next(iter(opened['trades'].values()))
+    trade = require_first(iter(opened['trades'].values()))
     trade['status'] = 'open'
     brief = trade_block(opened, trade, [])
     detailed = trade_block(opened, trade, [], detailed=True)
@@ -22,7 +24,7 @@ def test_open_position_details_include_entry_stop_and_targets_without_an_opening
 
 
 def test_delayed_target_notification_uses_current_terminal_outcome(opened):
-    trade=next(iter(opened['trades'].values()))
+    trade=require_first(iter(opened['trades'].values()))
     trade.update(status='rejected',filled_quantity='0',remaining_quantity='0',fill_events={})
     marker={'authority':'preview','attempts':1,'next_retry_at':1000,'deadline_at':9999999999999,'exhausted':False,'code':'read_unavailable','stage':'market'}
     old={'pipeline_id':'legacy','exchange':'hyperliquid','profile_id':'standard','network':'testnet','status':'pending','observation_retry':marker}
@@ -36,7 +38,7 @@ def test_delayed_target_notification_uses_current_terminal_outcome(opened):
 
 @pytest.mark.parametrize('allocation',['adaptive','first_target'])
 def test_only_adaptive_mode_reports_adaptive_selection_and_backup_labels_use_active_targets(opened,allocation):
-    trade=next(iter(opened['trades'].values()))
+    trade=require_first(iter(opened['trades'].values()))
     trade['status']='protecting'
     trade['plan']['policy']['take_profit_allocation']=allocation
     trade['plan']['source_take_profit_count']=8
@@ -86,7 +88,7 @@ def test_unique_last_exit_retains_chronological_evidence():
 
 
 def test_existing_immutable_closed_lifecycle_is_not_rewritten(opened):
-    identity, trade = next(iter(opened["trades"].items()))
+    identity, trade = require_first(iter(opened["trades"].items()))
     trade["status"] = "closed"
     record_lifecycle(opened, identity, "closed")
     frozen = copy.deepcopy(trade["lifecycle_events"]["closed"])
@@ -99,7 +101,7 @@ def test_existing_immutable_closed_lifecycle_is_not_rewritten(opened):
 
 
 def test_tied_exit_reason_is_honest_in_formatter_and_lifecycle(opened):
-    identity, trade = next(iter(opened["trades"].items()))
+    identity, trade = require_first(iter(opened["trades"].items()))
     exits, base = exit_trade(["stop_loss", "take_profit"])
     trade.update(base, fill_events={**base["fill_events"], **{str(row["oid"]): row for row in exits}},
                  status="closed", remaining_quantity="0")
@@ -126,7 +128,7 @@ async def opened(setup, signal):
     result = state.snapshot()
     # Existing status-card coverage uses legacy notifications; immutable lifecycle
     # cards have separate rapid-entry/exit tests.
-    trade = next(iter(result['trades'].values()))
+    trade = require_first(iter(result['trades'].values()))
     result['notifications'] = {'legacy-open': {'trade_id': trade['trade_id'], 'change': {'status': 'open'}, 'previous': {'status': 'opening'}}}
     return result
 
@@ -145,7 +147,7 @@ def test_view_is_pure_and_opening_has_only_confirmed_values(opened):
 
 
 def test_maker_modes_and_native_role_are_distinct_from_intent(opened):
-    trade = next(iter(opened['trades'].values()))
+    trade = require_first(iter(opened['trades'].values()))
     trade['plan'].update(entry_execution='maker_only', take_profit_execution='maker_only')
     trade['fill_execution_roles'] = {identity: 'taker' for identity in trade['fill_events']}
     rendered = text(telegram_view(opened, READY))
@@ -157,7 +159,7 @@ def test_maker_modes_and_native_role_are_distinct_from_intent(opened):
 
 
 def test_maker_target_rejection_remains_visible_with_live_stop(opened):
-    trade = next(iter(opened['trades'].values()))
+    trade = require_first(iter(opened['trades'].values()))
     trade.update(status='protecting', maker_target_rejection='Native maker TP rejected')
     rendered = text(telegram_view(opened, READY))
     assert '**TP abgelehnt:**' in rendered and 'vorhandener SL bleibt aktiv' in rendered
@@ -165,7 +167,7 @@ def test_maker_target_rejection_remains_visible_with_live_stop(opened):
 
 @pytest.mark.parametrize('stage', ['closed', 'closing', 'cleanup', 'cancelled', 'rejected'])
 def test_historical_maker_rejection_never_claims_live_stop_during_exit(opened, stage):
-    trade = next(iter(opened['trades'].values()))
+    trade = require_first(iter(opened['trades'].values()))
     trade.update(status=stage, maker_target_rejection='Native maker TP rejected', execution_incident='Emergency protection close')
     rendered = text(telegram_view(opened, READY))
     assert '**TP abgelehnt:**' not in rendered and 'vorhandener SL bleibt aktiv' not in rendered
@@ -173,7 +175,7 @@ def test_historical_maker_rejection_never_claims_live_stop_during_exit(opened, s
 
 @pytest.mark.parametrize('missing', ['order_observation', 'coverage', 'price', 'remaining', 'emergency'])
 def test_maker_rejection_does_not_invent_live_stop_protection(opened, missing):
-    trade = next(iter(opened['trades'].values()))
+    trade = require_first(iter(opened['trades'].values()))
     trade.update(status='protecting', maker_target_rejection='Native maker TP rejected')
     if missing == 'order_observation':
         trade['order_observations'] = {}
@@ -195,7 +197,7 @@ def test_maker_rejection_does_not_invent_live_stop_protection(opened, missing):
 def test_lifecycle_displays_role_enrichment_without_rewriting_frozen_facts(opened):
     from aqla_agent.messages import lifecycle_block
 
-    trade = next(iter(opened['trades'].values()))
+    trade = require_first(iter(opened['trades'].values()))
     event = trade['lifecycle_events']['entry_fill']
     before = copy.deepcopy(event)
     trade['fill_execution_roles'] = {identity: 'maker' for identity in trade['fill_events']}
@@ -210,7 +212,7 @@ def test_german_numbers_keep_precision(value,expected):
 
 @pytest.mark.parametrize('phase,label',[('opening','Entry wartet'),('unknown','Ausführung ungeklärt'),('protecting','Schutz wird abgeglichen')])
 def test_pending_and_unknown_entries_are_not_reported_as_open(opened,phase,label):
-    trade=next(iter(opened['trades'].values()))
+    trade=require_first(iter(opened['trades'].values()))
     trade['status']=phase
     if phase=='opening':
         trade.update(filled_quantity='0',remaining_quantity='0',fill_events={},entry_vwap=None)
@@ -221,7 +223,7 @@ def test_pending_and_unknown_entries_are_not_reported_as_open(opened,phase,label
 
 
 def test_partial_entry_is_explicit(opened):
-    trade=next(iter(opened['trades'].values()))
+    trade=require_first(iter(opened['trades'].values()))
     trade['filled_quantity']=str(Decimal(trade['plan']['quantity'])/2)
     trade['remaining_quantity']=trade['filled_quantity']
     for fill in trade['fill_events'].values():
@@ -232,7 +234,7 @@ def test_partial_entry_is_explicit(opened):
 
 
 def test_sl_and_tp_updates_are_bundled_without_repeating_opening(opened):
-    identity,trade=next(iter(opened['trades'].items()))
+    identity,trade=require_first(iter(opened['trades'].items()))
     trade.update(stop_price='100',tp_filled=['1','0'],target_budgets=['1','1'],remaining_quantity='1',filled_quantity='2')
     trade['fill_events']={'entry':{'kind':'entry','sz':'2','px':'100'},'tp':{'kind':'tp','sz':'1','px':'101'}}
     opened['notifications']={'sl':{'trade_id':identity,'change':{'stop_price':'100'},'previous':{'stop_price':'99'}},
@@ -244,7 +246,7 @@ def test_sl_and_tp_updates_are_bundled_without_repeating_opening(opened):
 
 
 def test_mixed_venue_results_share_one_signal_message(opened):
-    trade=next(iter(opened['trades'].values()))
+    trade=require_first(iter(opened['trades'].values()))
     event=opened['events'][trade['event_id']]
     opened['notifications']['rejection']={'event_id':trade['event_id'],'targets':[{'exchange':'aster','profile_id':'standard','error':'Signal SL is missing and Backup SL percentage is not configured'}]}
     view=telegram_view(opened,READY)
@@ -263,7 +265,7 @@ def test_protection_alert_has_priority_and_never_waits_for_siblings(opened):
 
 
 def test_closed_pnl_is_only_shown_with_known_fees(opened):
-    identity,trade=next(iter(opened['trades'].items()))
+    identity,trade=require_first(iter(opened['trades'].items()))
     trade.update(status='closed',remaining_quantity='0',fill_events={'entry':{'kind':'entry','sz':'1','px':'100','fee':'0.1','feeToken':'USDC'},
                                                                   'exit':{'kind':'tp','sz':'1','px':'110','fee':'0.1','feeToken':'USDC'}})
     opened['notifications']={'closed':{'trade_id':identity,'change':{'status':'closed'}}}
@@ -273,7 +275,7 @@ def test_closed_pnl_is_only_shown_with_known_fees(opened):
 
 
 def test_leverage_and_backup_provenance(opened):
-    trade=next(iter(opened['trades'].values()))
+    trade=require_first(iter(opened['trades'].values()))
     trade['plan'].update(signal_leverage_original='12.78',signal_leverage=12,effective_leverage=10,backup_fields=['stop_loss'])
     result=text(telegram_view(opened,READY))
     assert '12,78× → abgerundet 12× → wirksam 10×' in result
@@ -281,7 +283,7 @@ def test_leverage_and_backup_provenance(opened):
 
 
 def test_backup_roe_intent_uses_original_margin_and_saved_values(opened):
-    trade=next(iter(opened['trades'].values()))
+    trade=require_first(iter(opened['trades'].values()))
     trade['plan'].update(backup_fields=['stop_loss','take_profits'],backup_values={
         'fallback_stop_loss_percent':'40','fallback_stop_loss_unit':'roe_percent',
         'fallback_take_profit_percentages':['25','50'],'fallback_take_profit_unit':'roe_percent'})
@@ -336,7 +338,7 @@ def test_unknown_target_is_not_a_rejection(setup,signal):
 
 
 def test_incomplete_exit_fills_do_not_produce_pnl(opened):
-    identity,trade=next(iter(opened['trades'].items()))
+    identity,trade=require_first(iter(opened['trades'].items()))
     trade.update(status='closed',fill_events={'entry':{'kind':'entry','sz':'1','px':'100','fee':'0.1'}})
     opened['notifications']={'closed':{'trade_id':identity,'change':{'status':'closed'}}}
     assert 'PnL nicht vollständig bestätigt' in text(telegram_view(opened,READY))

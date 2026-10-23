@@ -57,7 +57,8 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
                       HERMES_STREAM_RETRIES="0")
     sys.path.insert(0, str(args.hermes_source))
     allowed_host = "127.0.0.1" if local_fixture else "opencode.ai"
-    assert local_fixture or model_url == DEFAULT_MODEL_URL
+    if not (local_fixture or model_url == DEFAULT_MODEL_URL):
+        raise AssertionError
     config = {"model": {"default": DEFAULT_MODEL, "provider": "custom", "base_url": model_url},
               "agent": {"stream": False, "api_max_retries": 1, "auto_recovery_cycles": 0},
               "compression": {"enabled": False}, "plugins": {"enabled": []}, "fallback_providers": [],
@@ -77,7 +78,8 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     if fixture.get("caveman"):
         from agent.skill_commands import build_auto_load_prompt
         skill_prompt, loaded, missing = build_auto_load_prompt(user_config=config, home_override=home)
-        assert loaded == ["caveman", "aqla-master"] and missing == []
+        if not (loaded == ['caveman', 'aqla-master'] and missing == []):
+            raise AssertionError
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
     from hermes_constants import parse_reasoning_effort
     from run_agent import AIAgent
@@ -85,7 +87,8 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     from tools.mcp_tool_lifecycle import shutdown_mcp_servers
     from tools.registry import registry
 
-    assert get_reasoning_stale_timeout_floor(DEFAULT_MODEL) == 600
+    if not (get_reasoning_stale_timeout_floor(DEFAULT_MODEL) == 600):
+        raise AssertionError
 
     from aqla_agent.hermes_runtime import install_strict_profile
     from aqla_agent.provider_cooldown import REPLAY
@@ -99,7 +102,8 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
     cooldown_token = REPLAY.set(True)
     register_reader(SimpleNamespace(register_tool=registry.register))
     names = discover_mcp_tools()
-    assert any(n.endswith("source_check_interpretation") for n in names)
+    if not (any(n.endswith('source_check_interpretation') for n in names)):
+        raise AssertionError
     allowed_tools = {"mcp__aqla__source_context", "mcp__aqla__source_context_batch", "mcp__aqla__source_check_interpretation",
                      "mcp__aqla__get_prompt", "mcp__aqla__list_prompts", "mcp__aqla__list_resources", "mcp__aqla__read_resource",
                      "aqla_read_tool_result", "tool_search", "tool_describe", "tool_call"}
@@ -134,11 +138,15 @@ def native_worker(args, *, model_url=DEFAULT_MODEL_URL, model_key=None, local_fi
         agent._try_recover_primary_transport = lambda *_args, **_kwargs: False
 
         def guard(request):
-            assert request.method == "POST" and request.url.host == allowed_host
-            assert request.url.path.endswith("/chat/completions")
+            if not (request.method == 'POST' and request.url.host == allowed_host):
+                raise AssertionError
+            if not (request.url.path.endswith('/chat/completions')):
+                raise AssertionError
             body = json.loads(request.content)
-            assert body["model"] == DEFAULT_MODEL and body.get("reasoning_effort") == "high"
-            assert {t["function"]["name"] for t in body.get("tools", [])} <= allowed_tools
+            if not (body['model'] == DEFAULT_MODEL and body.get('reasoning_effort') == 'high'):
+                raise AssertionError
+            if not ({t['function']['name'] for t in body.get('tools', [])} <= allowed_tools):
+                raise AssertionError
             stamp = datetime.now(UTC)
             peak = stamp.weekday() < 5 and (1 <= stamp.hour < 4 or 6 <= stamp.hour < 10)
             requests.append({"started_utc": stamp.isoformat(), "effort": "high", "price_multiplier": 2 if peak else 1})
@@ -244,13 +252,15 @@ def main():
             observed = {"completed": False, "checks": [], "worker_error_type": type(error).__name__, "order_requests": 0}
         write_private_json(args.worker_fixture.parent / "observed.private.json", observed)
         return
-    assert args.dataset and args.master and args.output
+    if not (args.dataset and args.master and args.output):
+        raise AssertionError
     payload = json.loads(args.dataset.read_text(encoding="utf-8"))
     cases = payload["cases"]
     master = args.master.read_text(encoding="utf-8")
     caveman = args.caveman.read_text(encoding="utf-8") if args.caveman else None
     manifest = payload.get("protocol", payload.get("manifest"))
-    assert digest(cases) == manifest["dataset_sha256"]
+    if not (digest(cases) == manifest['dataset_sha256']):
+        raise AssertionError
     identity = {"version": "high-tools-native-v3", "source_sha256": source_digest(),
                 "dataset_sha256": digest(cases), "master_sha256": hashlib.sha256(master.encode()).hexdigest(),
                 "effort": "high", "model": DEFAULT_MODEL, "draft_limit": 3, "transport_attempt_limit": 3,
@@ -264,11 +274,13 @@ def main():
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
     seal = args.output / "identity.json"
     if seal.exists():
-        assert json.loads(seal.read_text(encoding="utf-8")) == identity, "Frozen experiment changed"
+        if not (json.loads(seal.read_text(encoding='utf-8')) == identity):
+            raise AssertionError('Frozen experiment changed')
     else:
         write_private_json(seal, identity)
     selected = [c for c in cases if not args.case_id or c["id"] in args.case_id]
-    assert selected and (not args.case_id or set(args.case_id) <= {c["id"] for c in cases})
+    if not (selected and (not args.case_id or set(args.case_id) <= {c['id'] for c in cases})):
+        raise AssertionError
     schedule = [(c, run) for run in range(args.runs) for c in sorted(selected, key=lambda c: digest(c["id"]))]
     budget_lock = threading.Lock()
     budget_used = [0.0]

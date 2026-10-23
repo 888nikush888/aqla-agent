@@ -1,3 +1,4 @@
+
 import copy
 from decimal import Decimal
 
@@ -13,6 +14,7 @@ from aqla_hyperliquid_mcp.models import (
     SourceEvent,
     TradePlan,
     now_ms,
+    require_first,
 )
 from aqla_hyperliquid_mcp.rules import make_plan, selected_targets, split_targets
 
@@ -77,7 +79,7 @@ async def test_ladder_waits_for_full_own_fills_and_moves_in_order(setup, side):
     trade=await trading.execute(plan['plan_id'])
     assert all(row['r'] for action in fake.actions if action['type']=='order' for row in action['orders'] if row['c']!=trade['entry_cloid'])
     for index in range(4):
-        target=next(row for row in trade['orders'] if row['kind']=='tp' and row['index']==index)
+        target=require_first(row for row in trade['orders'] if row['kind']=='tp' and row['index']==index)
         fake.mid=str(Decimal(target['price'])+(1 if side=='long' else -1))
         amount=Decimal(target['quantity'])
         if index==0:
@@ -103,7 +105,7 @@ async def test_unknown_stop_result_retains_old_stop_and_reuses_intent(setup, mon
     source,signal=setup_signal(trading)
     plan=await trading.preview(source.event_id,signal)
     trade=await trading.execute(plan['plan_id'])
-    target=next(row for row in trade['orders'] if row['kind']=='tp' and row['index']==0)
+    target=require_first(row for row in trade['orders'] if row['kind']=='tp' and row['index']==0)
     fake.mid='115'
     fake.fill(target['cloid'],target['quantity'],'110')
     original_status=exchange.order_status
@@ -123,7 +125,7 @@ async def test_unknown_stop_result_retains_old_stop_and_reuses_intent(setup, mon
     await trading.refresh_trade(trade['trade_id'])
     current=state.snapshot()['trades'][trade['trade_id']]
     assert Decimal(current['stop_price'])==90
-    assert fake.orders[next(row['cloid'] for row in trade['orders'] if row['kind']=='sl')]['status']=='open'
+    assert fake.orders[require_first(row['cloid'] for row in trade['orders'] if row['kind']=='sl')]['status']=='open'
     frozen=copy.deepcopy(current['stop_ladder_intents'])
     count=len([action for action in fake.actions if action['type']=='order'])
     blocked['value']=False
@@ -141,13 +143,13 @@ async def test_target_update_cannot_rewrite_completed_ladder_reference(setup):
     plan=await trading.preview(source.event_id,signal)
     trade=await trading.execute(plan['plan_id'])
     fake.mid='115'
-    target=next(row for row in trade['orders'] if row['kind']=='tp' and row['index']==0)
+    target=require_first(row for row in trade['orders'] if row['kind']=='tp' and row['index']==0)
     fake.fill(target['cloid'],target['quantity'],'110')
     await trading.refresh_trade(trade['trade_id'])
     await trading.replace_targets(trade['trade_id'],[Decimal(value) for value in (115,125,135,145,155,165)],'new-targets')
     for index in (1,2):
         current=state.snapshot()['trades'][trade['trade_id']]
-        target=next(row for row in current['orders'] if row['kind']=='tp' and row['index']==index and not row.get('retired'))
+        target=require_first(row for row in current['orders'] if row['kind']=='tp' and row['index']==index and not row.get('retired'))
         fake.mid=str(Decimal(target['price'])+1)
         fake.fill(target['cloid'],target['quantity'],target['price'])
         await trading.refresh_trade(trade['trade_id'])
@@ -176,7 +178,7 @@ async def test_first_target_closes_entire_trade_with_stop_kept_until_fill(setup)
     trade=await trading.execute(plan['plan_id'])
     targets=[row for row in trade['orders'] if row['kind']=='tp']
     assert len(targets)==1 and Decimal(targets[0]['quantity'])==Decimal(trade['filled_quantity'])
-    stop=next(row for row in trade['orders'] if row['kind']=='sl')
+    stop=require_first(row for row in trade['orders'] if row['kind']=='sl')
     assert fake.orders[stop['cloid']]['status']=='open'
     fake.fill(targets[0]['cloid'],targets[0]['quantity'],targets[0]['price'])
     await trading.refresh_trade(trade['trade_id'])

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import time
+from collections.abc import Iterator
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Annotated, Literal
@@ -24,6 +25,8 @@ from pydantic import (
 Positive = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 Nonnegative = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 Address = Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{40}$")]
+UpdateAction = Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"]
+DEFAULT_UPDATES: tuple[UpdateAction, ...] = ("move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry")
 
 
 def now_ms() -> int:
@@ -72,7 +75,7 @@ class Policy(Model):
     take_profit_weights: list[Positive] = Field(default_factory=list, max_length=20)
     break_even_after_tp: int | None = Field(default=None, ge=1, le=20)
     stop_management: Literal["break_even", "tp_ladder"] = "break_even"
-    allowed_updates: list[Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"]] = Field(default_factory=lambda: ["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"])
+    allowed_updates: list[UpdateAction] = Field(default_factory=lambda: list(DEFAULT_UPDATES))
     allow_stop_widening: bool = False
     cost_reserve_bps: Nonnegative = Field(default=Decimal("10"), le=1000)
 
@@ -633,6 +636,14 @@ class TradePlan(Model):
 
 class AqlaError(ToolError, ValueError):
     """A safe, human-readable domain error; never contains credentials."""
+
+
+def require_first[T](values: Iterator[T], message: str = "Required state item is missing") -> T:
+    """Keep a missing owned item a controlled failure, including in async code."""
+    try:
+        return next(values)
+    except StopIteration:
+        raise AqlaError(message) from None
 
 
 class ExternalInterference(AqlaError):

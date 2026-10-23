@@ -57,7 +57,7 @@ def test_submitted_clarification_preserves_origin(extension):  # noqa: F811 -- f
 def test_pending_trading_work_can_cancel_a_question_without_touching_trade_state(extension,monkeypatch):  # noqa: F811 -- fixture
     ext,_=extension
     calls=[]
-    gateway=SimpleNamespace(get_pending_for_session=lambda key,**kwargs:object(),clear_session=lambda key:calls.append(key))
+    gateway=SimpleNamespace(get_pending_for_session=lambda key,**kwargs:object(),clear_session=calls.append)
     monkeypatch.setitem(sys.modules,'tools.clarify_gateway',gateway)
     ext.session_key='owner-session'
     ext.yield_clarification()

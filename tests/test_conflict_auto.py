@@ -1,3 +1,4 @@
+
 import copy
 from decimal import Decimal
 
@@ -7,7 +8,7 @@ from test_operator_recovery import conflicted, manual_fill, terminal_orders
 
 from aqla_agent.conflict_review import observe_conflict
 from aqla_agent.router import Router
-from aqla_hyperliquid_mcp.models import AqlaError, digest, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, digest, now_ms, require_first
 from aqla_hyperliquid_mcp.state import State
 
 
@@ -99,7 +100,7 @@ async def test_automatic_resolution_requires_complete_identity_and_flat_boundary
     elif case == 'missing_start':
         fake.fills[-1].pop('startPosition')
     elif case == 'unknown_operation':
-        operation = next(iter(state.snapshot()['operations']))
+        operation = require_first(iter(state.snapshot()['operations']))
         state.update(lambda data: data['operations'][operation].update(phase='unknown'))
         async def unavailable(*_):
             raise AqlaError('Reconciliation unavailable')

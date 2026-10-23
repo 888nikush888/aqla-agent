@@ -1,3 +1,4 @@
+
 import copy
 import json
 from decimal import Decimal
@@ -24,6 +25,7 @@ from aqla_hyperliquid_mcp.models import (
     TradePlan,
     digest,
     now_ms,
+    require_first,
 )
 from aqla_hyperliquid_mcp.rules import make_plan
 
@@ -307,7 +309,7 @@ async def test_later_fill_role_enrichment_preserves_all_financial_proofs(setup, 
     state, fake, _, trading, _, trade = await open_maker(setup, signal, monkeypatch)
     fake.fill(trade["entry_cloid"], trade["plan"]["quantity"], trade["plan"]["entry_price"])
     trade = await trading.refresh_trade(trade["trade_id"])
-    identity = next(iter(trade["fill_events"]))
+    identity = require_first(iter(trade["fill_events"]))
     before = copy.deepcopy(trade)
     financial_keys = ("fill_events", "entry_accounting", "entry_validated_fingerprint", "initial_sl_risk", "lifecycle_events")
     state.update(lambda data: data["trades"][trade["trade_id"]].update(funding_coverage={"fill_fingerprint": digest(trade["fill_events"])}))
@@ -450,7 +452,7 @@ async def test_maker_adaptive_ladder_uses_own_full_tp_fills_and_trigger_stop(set
     trade = await trading.execute(plan["plan_id"])
     fake.fill(trade["entry_cloid"], plan["quantity"], plan["entry_price"])
     trade = await trading.refresh_trade(trade["trade_id"])
-    target = next(order for order in trade["orders"] if order["kind"] == "tp" and order["index"] == 0)
+    target = require_first(order for order in trade["orders"] if order["kind"] == "tp" and order["index"] == 0)
     fake.fill(target["cloid"], Decimal(target["quantity"]) / 2, target["price"])
     trade = await trading.refresh_trade(trade["trade_id"])
     assert Decimal(trade["stop_price"]) == Decimal("90")
@@ -535,7 +537,7 @@ def test_role_enrichment_and_conflict_preserve_complete_financial_report_fingerp
     for identity in row["fill_events"]:
         merge_role(row["fill_execution_roles"], row["fill_execution_role_conflicts"], identity, "maker")
     assert monthly_report(data(row), "2026-10") == before
-    identity = next(iter(row["fill_events"]))
+    identity = require_first(iter(row["fill_events"]))
     merge_role(row["fill_execution_roles"], row["fill_execution_role_conflicts"], identity, "taker")
     assert monthly_report(data(row), "2026-10") == before
     assert row["fill_events"] == facts and row["entry_accounting"] == entry and row["funding_coverage"] == coverage

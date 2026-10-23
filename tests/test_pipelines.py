@@ -1,3 +1,4 @@
+
 import copy
 from decimal import Decimal
 
@@ -6,7 +7,14 @@ import pytest
 
 from aqla_agent.pipelines import AccountLimits, Parameters, Pipeline, TradingProfile, migrate, route_control
 from aqla_agent.router import Router
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.models import (
+    AqlaError,
+    Evidence,
+    Interpretation,
+    SourceEvent,
+    now_ms,
+    require_first,
+)
 
 
 @pytest.fixture
@@ -45,7 +53,7 @@ async def test_admission_checks_the_current_transaction_snapshot(routed, setup, 
     router, _ = routed
     source, value = signal
     raw = await router.preview(source.event_id, value)
-    plan = TradePlan.model_validate(next(row["plan"] for row in raw["targets"] if row["exchange"] == "hyperliquid"))
+    plan = TradePlan.model_validate(require_first(row["plan"] for row in raw["targets"] if row["exchange"] == "hyperliquid"))
     engine = router.engines["hyperliquid"]
     current = engine.state.snapshot()
     current["paused"] = True
@@ -282,7 +290,7 @@ async def test_account_limits_apply_to_other_profiles_and_unknown_reservations(r
             "plan": {"exchange": "hyperliquid", "network": setup[0].network, "account": setup[0].account.lower(), "market": {"asset_id": 999, "quote_token": "USDC"}, "source_refs": []}}
     state.update(reserved)
     result = await router.preview(source.event_id, interpretation)
-    target = next(row for row in result["targets"] if row["exchange"] == "hyperliquid")
+    target = require_first(row for row in result["targets"] if row["exchange"] == "hyperliquid")
     assert "Maximum open trade count" in target["error"]
     assert not any(row.get("plan_id") for row in result["targets"])
     await router.close()

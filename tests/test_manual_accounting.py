@@ -1,3 +1,4 @@
+
 import copy
 from decimal import Decimal
 
@@ -14,7 +15,7 @@ from aqla_agent.monthly import report_row
 from aqla_agent.presentation import PresentationScope, build_presentation
 from aqla_agent.reporting import Reporting
 from aqla_agent.router import Router
-from aqla_hyperliquid_mcp.models import AqlaError, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, now_ms, require_first
 
 
 async def manual_trade(setup, signal, monkeypatch, *, mixed=False):
@@ -84,7 +85,7 @@ async def test_manual_pnl_is_evidence_bound_and_reaches_trade_fill_and_visible_j
     if mixed:
         assert closes[0]['values'][4] == 'manual_close_allocated'
     visible = build_presentation(snapshot, PresentationScope(network='testnet', period='all'))
-    selected = next(row for row in visible.journal if row.trade_id == identity)
+    selected = require_first(row for row in visible.journal if row.trade_id == identity)
     assert selected.complete and selected.net_pnl == Decimal(report['net_pnl']) and selected.exit_price == 110
     assert ('anteilig' in ' '.join(selected.issues)) == mixed
     saved = copy.deepcopy(trade['manual_accounting'])
@@ -159,7 +160,7 @@ async def test_manual_accounting_cannot_outlive_changed_bound_evidence(setup, si
     def change(data):
         row = data['trades'][identity]
         if root == 'fill_events':
-            next(iter(row[root].values()))['px'] = '999'
+            require_first(iter(row[root].values()))['px'] = '999'
         elif root == 'manual_accounting':
             row[root]['gross_pnl'] = '999'
         else:

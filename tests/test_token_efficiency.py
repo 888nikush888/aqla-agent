@@ -1,3 +1,4 @@
+
 import copy
 import json
 import sqlite3
@@ -11,7 +12,14 @@ from aqla_agent.efficiency import WakeSchedule, decision_batch
 from aqla_agent.source_disposition import issue_receipt, verify_disposition
 from aqla_agent.tool_outputs import PAGE_BYTES, OutputStore, reader_text
 from aqla_agent.usage_metrics import UsageRun
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceClassification, SourceEvent
+from aqla_hyperliquid_mcp.models import (
+    AqlaError,
+    Evidence,
+    Interpretation,
+    SourceClassification,
+    SourceEvent,
+    require_first,
+)
 from aqla_hyperliquid_mcp.server import close_server, create_server
 
 
@@ -25,7 +33,7 @@ async def efficiency_server(setup):
 
 async def call(server, name, **arguments):
     result = await server.call_tool(name, arguments)
-    return result.structured_content or json.loads(next(block.text for block in result.content if block.type == "text"))
+    return result.structured_content or json.loads(require_first(block.text for block in result.content if block.type == "text"))
 
 
 def report_item(source, receipt):
@@ -114,7 +122,7 @@ async def test_decision_context_and_batch_keep_originals_quotes_replies_and_rece
         assert batch["messages"][source.event_id]["source"]["text"] == source.text
         for identity in item["interpretation_assistance"]["candidate_ids"]:
             span = batch["interpretation_candidates"][identity]
-            original = next(row["source"]["text"] for row in batch["messages"].values() if row["source_id"] == span["source_id"])
+            original = require_first(row["source"]["text"] for row in batch["messages"].values() if row["source_id"] == span["source_id"])
             assert original[span["start"]:span["end"]] == span["quote"]
         interpretation = Interpretation.model_validate({key: value for key, value in report_item(source, item["source_read_receipt"]).items()
                                                         if key not in ("event_id", "source_read_receipt")})
@@ -229,7 +237,7 @@ async def test_notification_views_preserve_versioned_rendering_and_ack(efficienc
     assert facts["notifications"] == full["notifications"] == original
     assert rendered["notification_versions"] == full["notification_versions"]
     assert len(json.dumps(rendered)) < len(json.dumps(full))
-    identity = next(iter(rendered["notification_versions"]))
+    identity = require_first(iter(rendered["notification_versions"]))
     version = rendered["notification_versions"][identity]
     result = await call(efficiency_server, "notifications_ack", notification_ids=[identity], versions={identity: version},
                         context_auth=efficiency_server.aqla_authority.sign("source", "notice"))
@@ -242,11 +250,11 @@ async def test_diagnostic_sections_deduplicate_source_revisions(efficiency_serve
     _, state, *_ = setup
     state.update(lambda data: lifecycle_fixture(data, setup[0], count=1, fills=2))
     data = state.snapshot()
-    identity = next(iter(data["trades"]))
+    identity = require_first(iter(data["trades"]))
     legacy = await call(efficiency_server, "trade_diagnostics", trade_id=identity, sections=["sources"])
     assert legacy["missing_original_sources"][0]["reason"] == "legacy_plan_has_no_revision_binding"
     assert legacy["retained_revisions_with_missing_original"][0]["relative_to_missing_original"] == "unknown"
-    source = next(iter(data["events"].values()))
+    source = require_first(iter(data["events"].values()))
     state.update(lambda data: data["trades"][identity]["plan"].update(source_revisions={source["source_id"]: source["event_id"]}))
     result = await call(efficiency_server, "trade_diagnostics", trade_id=identity, sections=["sources", "fills"])
     assert result["scope"]["network"] == "testnet"
@@ -254,7 +262,7 @@ async def test_diagnostic_sections_deduplicate_source_revisions(efficiency_serve
     assert result["fill_events"] == data["trades"][identity].get("fill_events", {})
     for ref, original in result["original_sources"].items():
         assert result["source_messages"][original["event_id"]]["source_id"] == ref
-    assert "source" not in next(iter(result["original_sources"].values()))
+    assert "source" not in require_first(iter(result["original_sources"].values()))
 
 
 @pytest.mark.asyncio
@@ -262,7 +270,7 @@ async def test_filtered_diagnostic_compact_continuations_preserve_sections_and_v
     from test_notifications import lifecycle_fixture
     _, state, *_ = setup
     state.update(lambda data: lifecycle_fixture(data, setup[0], count=1, fills=2))
-    identity = next(iter(state.snapshot()["trades"]))
+    identity = require_first(iter(state.snapshot()["trades"]))
     first = await call(efficiency_server, "trade_diagnostics", trade_id=identity, sections=["fills"], view="compact", limit=1)
     result, rows = first, list(first["rows"])
     while result.get("next_page"):

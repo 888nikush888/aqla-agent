@@ -1,3 +1,4 @@
+
 import json
 from decimal import Decimal
 
@@ -20,7 +21,7 @@ from aqla_agent.decisions import (
     replay_decision,
     verification_questions,
 )
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent
+from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, require_first
 
 
 def packet_for(text="BTC long. Entry 100. SL 90. TP 110 / 120.", *, messages=None):
@@ -45,7 +46,7 @@ def response_for(questions, *, kind="new_signal", overrides=None):
         if key == "symbol":
             selected = next((k for k, v in prepared.items() if isinstance(v, dict) and v.get("value") == "BTC"), "not_present")
         elif key.startswith("proof."):
-            selected = next(k for k, v in prepared.items() if isinstance(v, dict))
+            selected = require_first(k for k, v in prepared.items() if isinstance(v, dict))
         elif key.startswith("role."):
             instructions = json.loads(question["instructions"]) if isinstance(question["instructions"], str) else question["instructions"]
             raw = instructions["occurrence"]["quote"]
@@ -97,7 +98,7 @@ def test_ambiguous_numeric_occurrence_has_one_normalization_choice_and_one_role(
         role_occurrence = json.loads(questions["role." + identity]["instructions"])["occurrence"]
         assert role_occurrence["quote"] == "12.473" and "value" not in role_occurrence
         assert role_occurrence["candidate_ids"] == [span.candidate_id for span in group]
-    unique = next(span for span in spans if span.quote == "100%")
+    unique = require_first(span for span in spans if span.quote == "100%")
     assert "role." + unique.candidate_id in questions
     assert "normalization." + unique.candidate_id not in questions
 
@@ -108,7 +109,7 @@ def test_ambiguous_numeric_occurrence_has_one_normalization_choice_and_one_role(
 async def test_only_model_selected_normalization_receives_shared_occurrence_role(quote, value):
     packet = packet_for("BTC long. Entry limit " + quote + ".")
     identity, group = numeric_occurrences(candidates(packet))[0]
-    selected = next(span for span in group if Decimal(span.value) == Decimal(value))
+    selected = require_first(span for span in group if Decimal(span.value) == Decimal(value))
     requests, observation = [], {}
 
     def upstream(request):
@@ -175,7 +176,7 @@ def test_separate_equal_quotes_choose_values_independently_and_dates_stay_unrequ
     overrides = {}
     for (identity, group), role, value in zip(groups, ("entry0", "stop_loss"), ("1234", "1.234"), strict=True):
         overrides["role." + identity] = role
-        overrides["normalization." + identity] = next(span.candidate_id for span in group if span.value == value)
+        overrides["normalization." + identity] = require_first(span.candidate_id for span in group if span.value == value)
     result = replay_decision(packet, CalibrationProfile(), [response_for(questions_for(packet, candidates(packet)), overrides=overrides),
         response_for(verification_questions())], model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
     assert result.interpretation.entry_prices == [1234] and result.interpretation.stop_loss == Decimal("1.234")
@@ -183,19 +184,19 @@ def test_separate_equal_quotes_choose_values_independently_and_dates_stay_unrequ
 
 def test_percent_normalization_preserves_original_quote_and_unit():
     packet = packet_for("BTC long. Entry 100. TP1 1.234%.")
-    identity, group = next((identity, group) for identity, group in numeric_occurrences(candidates(packet)) if len(group) > 1)
-    selected = next(span for span in group if span.value == "1.234")
+    identity, group = require_first((identity, group) for identity, group in numeric_occurrences(candidates(packet)) if len(group) > 1)
+    selected = require_first(span for span in group if span.value == "1.234")
     overrides = {"role." + identity: "target_1", "normalization." + identity: selected.candidate_id}
     result = replay_decision(packet, CalibrationProfile(), [response_for(questions_for(packet, candidates(packet)), overrides=overrides),
         response_for(verification_questions())], model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
     assert result.interpretation.take_profits == [Decimal("1.234")]
     assert result.interpretation.take_profit_unit == "roe_percent"
-    assert next(proof.quote for proof in result.interpretation.evidence if proof.field == "take_profits.0") == "1.234%"
+    assert require_first(proof.quote for proof in result.interpretation.evidence if proof.field == "take_profits.0") == "1.234%"
 
 
 def test_ignored_ambiguous_number_does_not_require_a_guessed_normalization():
     packet = packet_for("BTC long. Entry 100. Historical reference 12.473.")
-    identity, _ = next((identity, group) for identity, group in numeric_occurrences(candidates(packet)) if len(group) > 1)
+    identity, _ = require_first((identity, group) for identity, group in numeric_occurrences(candidates(packet)) if len(group) > 1)
     response = response_for(questions_for(packet, candidates(packet)), overrides={"normalization." + identity: "unclear"})
     result = replay_decision(packet, CalibrationProfile(), [response, response_for(verification_questions())],
         model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)
@@ -230,7 +231,7 @@ async def test_native_worker_reviews_uncertain_normalization_without_any_financi
     def upstream(request):
         body = json.loads(request.content)
         calls.append(body)
-        normalization = next(key for key in body["questions"] if key.startswith("normalization."))
+        normalization = require_first(key for key in body["questions"] if key.startswith("normalization."))
         identity = normalization.removeprefix("normalization.")
         return httpx.Response(200, json=response_for(body["questions"], overrides={
             "role." + identity: "entry0", normalization: "unclear"}))
@@ -261,7 +262,7 @@ async def test_native_worker_reviews_uncertain_normalization_without_any_financi
 def test_exact_fraction_words_are_candidates_only_for_position_reduction(word, value):
     packet = packet_for("BTC: " + word + " position.")
     spans = candidates(packet)
-    span = next(s for s in spans if s.notation == "position_fraction")
+    span = require_first(s for s in spans if s.notation == "position_fraction")
     assert span.quote == word and Decimal(span.value) == value
     assert packet["messages"][0]["text"][span.start:span.end] == word
     criteria = questions_for(packet, spans)["role." + span.candidate_id]["criteria"]
@@ -271,7 +272,7 @@ def test_exact_fraction_words_are_candidates_only_for_position_reduction(word, v
 @pytest.mark.parametrize("quote", ["х10", "Х10", "10х", "х 10", "x10", "10×"])
 def test_multiplier_notation_preserves_cyrillic_and_latin_original_quotes(quote):
     from aqla_hyperliquid_mcp.rules import quoted_leverage_numbers
-    span = next(s for s in candidates(packet_for("BTC плечо " + quote)) if s.kind == "number")
+    span = require_first(s for s in candidates(packet_for("BTC плечо " + quote)) if s.kind == "number")
     assert span.quote == quote and Decimal(span.value) == 10
     assert list(quoted_leverage_numbers(span.quote)) == [Decimal(10)]
 
@@ -544,7 +545,7 @@ def test_packet_keeps_actual_replies_and_own_setup_context_but_prunes_unbound_hi
 def test_complete_identity_with_new_intent_cannot_be_silently_stored_incomplete(symbol,side,text):
     packet=packet_for(text)
     questions=questions_for(packet,candidates(packet))
-    selected=next(key for key,value in questions["symbol"]["criteria"].items()
+    selected=require_first(key for key,value in questions["symbol"]["criteria"].items()
                   if isinstance(value,str) and value.startswith("{") and json.loads(value).get("value")==symbol)
     response=response_for(questions,kind="incomplete",overrides={"symbol":selected,"side":side})
     response["answers"]["live_action"]["noul"]=0.999
@@ -589,7 +590,7 @@ def test_calibrated_numeric_roles_have_separate_thresholds_and_disabled_families
 def test_digit_prefixed_asset_candidates_preserve_original_positions(symbol):
     packet = packet_for("#" + symbol + " LONG. Entry 100. SL 90. TP 110.")
     spans = candidates(packet)
-    selected = next(span for span in spans if span.kind == "symbol" and span.value == symbol)
+    selected = require_first(span for span in spans if span.kind == "symbol" and span.value == symbol)
     assert packet["messages"][0]["text"][selected.start:selected.end] == selected.quote == symbol
     options = questions_for(packet, spans)["symbol"]["criteria"]
     assert selected.candidate_id in options
@@ -598,7 +599,7 @@ def test_digit_prefixed_asset_candidates_preserve_original_positions(symbol):
 @pytest.mark.parametrize("symbol", ["wld", "near", "ena", "fartcoin"])
 def test_lowercase_explicit_setup_headings_are_generic_symbol_candidates(symbol):
     packet = packet_for(symbol + " short\nEntry 100. SL 110. TP 90.")
-    span = next(span for span in candidates(packet) if span.kind == "symbol" and span.value == symbol)
+    span = require_first(span for span in candidates(packet) if span.kind == "symbol" and span.value == symbol)
     assert span.quote == symbol and span.start == 0
     assert span.candidate_id in questions_for(packet, candidates(packet))["symbol"]["criteria"]
 
@@ -618,7 +619,7 @@ def test_timeframes_numeric_sizes_and_multipliers_are_not_new_digit_prefixed_sym
 @pytest.mark.asyncio
 async def test_complete_outgoing_decision_size_is_checked_before_catalog_or_provider():
     requests = []
-    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: requests.append(request))) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(requests.append)) as client:
         adapter = OpenRouterDecisionAdapter("synthetic", client=client)
         with pytest.raises(DecisionFailure, match="source_context_limit"):
             await adapter.interpret(packet_for(), CalibrationProfile(), max_context_characters=100)
@@ -808,7 +809,7 @@ def test_update_venue_absence_does_not_require_historical_footer_confidence():
 @pytest.mark.parametrize("quote,value", [("1/2",50),("1/4",25),("3/4",75),("2/4",50)])
 def test_exact_fractional_position_quantities_keep_original_quotes(quote,value):
     packet=packet_for("BTC: close "+quote+" of the position now.")
-    span=next(s for s in candidates(packet) if s.notation=="position_fraction")
+    span=require_first(s for s in candidates(packet) if s.notation=="position_fraction")
     assert span.quote==quote and span.value==str(value)
     interpretation=Interpretation(kind="trade_update",symbol="BTC",update_action="reduce",reduce_percent=value,
         source_refs=[packet["anchor_source_id"]],evidence=[Evidence(field="symbol",source_id=packet["anchor_source_id"],quote="BTC"),
@@ -913,7 +914,7 @@ def test_market_commentary_does_not_force_an_unstated_order_form(comment):
 def test_close_action_cannot_discard_a_selected_partial_reduction(amount):
     packet = packet_for("BTC: close " + amount + " of the position now.")
     spans = candidates(packet)
-    fraction = next(span for span in spans if span.kind == "number")
+    fraction = require_first(span for span in spans if span.kind == "number")
     questions = questions_for(packet, spans)
     response = response_for(questions, kind="trade_update", overrides={
         "update_action": "close", "side": "not_present", "role." + fraction.candidate_id: "reduce_percent"})

@@ -1,10 +1,19 @@
+
 import copy
 
 import pytest
 
 from aqla_agent.source_disposition import issue_receipt
 from aqla_agent.source_queue import queue_overview, repair_queue
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, digest, now_ms
+from aqla_hyperliquid_mcp.models import (
+    AqlaError,
+    Evidence,
+    Interpretation,
+    SourceEvent,
+    digest,
+    now_ms,
+    require_first,
+)
 from aqla_hyperliquid_mcp.projections import reader_overview
 from aqla_hyperliquid_mcp.rules import latest_sources
 
@@ -344,7 +353,7 @@ def test_receipt_concurrent_classification_cannot_overwrite_and_unrelated_arriva
     with ThreadPoolExecutor(max_workers=2) as pool:
         outcomes = list(pool.map(classify, values))
     assert outcomes.count("stale") == 1
-    assert state.snapshot()["events"][source.event_id]["status"] == next(value for value in outcomes if value != "stale")
+    assert state.snapshot()["events"][source.event_id]["status"] == require_first(value for value in outcomes if value != "stale")
 
 
 @pytest.mark.asyncio

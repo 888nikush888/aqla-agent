@@ -62,7 +62,8 @@ def serve_fixture(path):
     fixture = json.loads(Path(path).read_text(encoding="utf-8"))
     packet = fixture["packet"]
     directory = Path(path).parent
-    assert not packet.get("trades"), "Owned trade fixtures require explicit isolated reconstruction"
+    if not (not packet.get("trades")):
+        raise AssertionError("Owned trade fixtures require explicit isolated reconstruction")
     settings = Settings(network="testnet", account="0x" + "1" * 40,
                         state_path=directory / "state.sqlite3", sources=sorted({m["chat_id"] for m in packet["messages"]}))
     state = State(settings)
@@ -81,7 +82,8 @@ def serve_fixture(path):
     for tool in asyncio.run(server.list_tools()):
         if tool.name not in allowed:
             server.remove_tool(tool.name)
-    assert {t.name for t in asyncio.run(server.list_tools())} == allowed
+    if not ({t.name for t in asyncio.run(server.list_tools())} == allowed):
+        raise AssertionError
     check = source_assistance.check_interpretation
     checks = []
 
@@ -103,7 +105,8 @@ def serve_fixture(path):
         server.run(transport="stdio")
     finally:
         source_assistance.check_interpretation = check
-        assert not state.snapshot()["plans"] and not state.snapshot()["operations"] and not state.snapshot()["trades"]
+        if not (not state.snapshot()["plans"] and not state.snapshot()["operations"] and not state.snapshot()["trades"]):
+            raise AssertionError
         state.close()
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 
-from aqla_hyperliquid_mcp.models import EVIDENCE_FIELDS, AqlaError, Interpretation, digest
+from aqla_hyperliquid_mcp.models import EVIDENCE_FIELDS, AqlaError, Interpretation, digest, require_first
 from aqla_hyperliquid_mcp.rules import number_is_ordinal, numeric_evidence_values, quoted_numbers
 
 from .interpretation_contract import DecisionFailure, validate_interpretation
@@ -105,7 +105,7 @@ def source_assistance(context):
         unbound_setup_update_failure,
         unsupported_structure,
     )
-    anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     vetoes = {}
     for kind in ("new_signal", "trade_update", "report", "unrelated"):
         draft = Interpretation(kind=kind, source_refs=[packet["anchor_source_id"]])
@@ -187,7 +187,7 @@ def check_interpretation(context, interpretation: Interpretation):
     result = precise_numeric_evidence(packet, interpretation)
     errors = []
     from .semantic_contract import supported_action_failure, unbound_setup_update_failure
-    anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     for failure in (supported_action_failure(anchor["text"], result), unbound_setup_update_failure(packet, result)):
         if failure:
             errors.append({"code": failure, "field_paths": REPAIR_FIELDS.get(failure, ["kind"]), "message": failure,
@@ -198,7 +198,7 @@ def check_interpretation(context, interpretation: Interpretation):
         validate_interpretation(packet, result, own_setup_refs=context.get("bound_source_refs", ()))
         if result.kind == "new_signal" and result.entry in ("market", "limit"):
             from .semantic_contract import LIMIT, MARKET, source_price_boundary_failure, strict_deferred_price
-            text = next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+            text = require_first(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
             if result.entry == "market" and not MARKET.search(text):
                 raise DecisionFailure("source_market_form_not_explicit_use_unspecified")
             if (result.entry == "limit" and not LIMIT.search(text)

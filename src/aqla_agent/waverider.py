@@ -10,7 +10,15 @@ from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 
-from aqla_hyperliquid_mcp.models import TERMINAL_ORDER, AqlaError, ReplaySettings, TradePlan, digest, now_ms
+from aqla_hyperliquid_mcp.models import (
+    TERMINAL_ORDER,
+    AqlaError,
+    ReplaySettings,
+    TradePlan,
+    digest,
+    now_ms,
+    require_first,
+)
 from aqla_hyperliquid_mcp.rules import quantity_grid, slippage_price
 
 from .entry import passive_entry_price
@@ -257,8 +265,9 @@ def capture(path, setup_id, stamp, record, *, max_bytes=512 * 1024 * 1024, reten
                 plan = json.loads(raw)["plan"]
                 last = json.loads(db.execute("SELECT payload FROM observations WHERE setup=? ORDER BY stamp DESC LIMIT 1", (identity,)).fetchone()[0])
                 if last.get("state", {}).get("finished") or plan["policy"].get("waverider_lifetime", "signal_deadline") == "signal_deadline" and plan["deadline_at"] < cutoff:
-                    for table in ("observations", "original_fills", "setups"):
-                        db.execute("DELETE FROM " + table + " WHERE setup=?", (identity,))
+                    db.execute("DELETE FROM observations WHERE setup=?", (identity,))
+                    db.execute("DELETE FROM original_fills WHERE setup=?", (identity,))
+                    db.execute("DELETE FROM setups WHERE setup=?", (identity,))
                     removed = True
             if removed:
                 db.commit()
@@ -349,11 +358,16 @@ def ended(plan, trade, quote=None):
         or quote is not None and (quote.bid >= target if plan.side == "long" else quote.ask <= target))
 
 
+def observation_marker(state):
+    return tuple(state.get(key) for key in ("checkpoint", "endpoint_reached_at", "finished", "operation_id",
+        "phase", "cycle", "sale_price", "sold_quantity", "resume_phase"))
+
+
 async def tick(engine, trade_id, quote):
     trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
     persisted = dict(trade.get("waverider", {}))
-    marker = (persisted.get("checkpoint"), persisted.get("endpoint_reached_at"), persisted.get("finished"), persisted.get("operation_id"))
+    marker = observation_marker(persisted)
     memory = getattr(engine, "_waverider_observations", {})
     state = dict(memory[trade_id][1]) if trade_id in memory and memory[trade_id][0] == marker else dict(persisted)
     if state.get("finished"):
@@ -369,9 +383,14 @@ async def tick(engine, trade_id, quote):
     permitted = authority is not None
     state.update(shadow=not permitted, live_authority=authority)
     try:
+        if state.get("phase") in ("warming_up", "paused"):
+            state["phase"] = state.pop("resume_phase", "waiting_rise")
         if permitted and state.get("phase") in ("pending_reduce", "pending_reenter"):
             state = await resume_cycle(engine, trade_id, state)
             trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+            if state.get("phase") in ("pending_reduce", "pending_reenter"):
+                engine._patch(trade_id, waverider=state)
+                return
         facts = state.get("market_facts")
         if not facts or not 0 <= now_ms() - facts["observed_at"] < 60000:
             facts = await read_observation(lambda: market_facts(engine.exchange, plan.market), "waverider_market")
@@ -403,8 +422,6 @@ async def tick(engine, trade_id, quote):
         if capacity < quantity:
             raise AqlaError("Waverider depth cannot cover its flexible quantity within the price bound")
         cost = price * (Decimal(facts["fee_rate"]) * 2 + plan.policy.max_slippage_percent / 50)
-        if state.get("phase") in ("warming_up", "paused"):
-            state["phase"] = state.pop("resume_phase", "waiting_rise")
         state, action = advance(state, side=plan.side, price=price, basis=basis,
             volatility=Decimal(facts["atr"]), cycle_cost=cost, tick=plan.market.price_tick or Decimal(1).scaleb(-6 + plan.market.size_decimals), stamp=quote.observed_at)
         if now_ms() - state.get("last_captured_at", 0) >= 1000:
@@ -423,7 +440,7 @@ async def tick(engine, trade_id, quote):
             for field in ("confirmation_since", "confirmation_count", "wave_atr"):
                 state.pop(field, None)
         state.update(reason=None, net_realized=str(realized - fees))
-    except (AqlaError, KeyError, ValueError, TypeError, OSError, sqlite3.Error) as error:
+    except (KeyError, ValueError, TypeError, OSError, sqlite3.Error) as error:
         if state.get("phase") != "paused":
             state["resume_phase"] = state.get("phase", "waiting_rise")
         state.update(phase="paused", reason=str(error) if isinstance(error, AqlaError) else "Waverider market evidence is unavailable")
@@ -431,36 +448,54 @@ async def tick(engine, trade_id, quote):
         state["checkpoint"] = now_ms()
         engine._patch(trade_id, waverider=state)
         persisted = state
-    marker = (persisted.get("checkpoint"), persisted.get("endpoint_reached_at"), persisted.get("finished"), persisted.get("operation_id"))
+    marker = observation_marker(persisted)
     memory[trade_id] = (marker, state)
     engine._waverider_observations = memory
 
 
 def reset_phase(state, phase):
-    result = {key: value for key, value in state.items() if key not in ("confirmation_since", "confirmation_count", "extreme", "wave_atr", "last_observed_at")}
+    result = {key: value for key, value in state.items() if key not in ("confirmation_since", "confirmation_count", "extreme", "wave_atr", "last_observed_at", "operation_id", "action", "decision_at", "resume_phase")}
     return {**result, "phase": phase}
 
 
 async def resume_cycle(engine, trade_id, state):
     trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-    identity = state["operation_id"]
-    operation = engine.state.read("operations")["operations"].get(identity)
+    operations = engine.state.read("operations")["operations"]
+    reentering = state["phase"] == "pending_reenter"
+    action = "reenter" if reentering else state.get("action", "reduce")
+    expected = f"waverider:{trade_id}:{state.get('cycle', 0)}:{action}"
+    rows = [row for row in trade["entry_orders"] if row.get("cycle") == state.get("cycle", 0)
+            and row["kind"] == "waverider" and not row.get("not_sent")] if reentering else []
+    if reentering and not rows:
+        if expected in operations:
+            raise AqlaError("Waverider reentry operation has no matching owned entry; reconciliation is required")
+        # A pre-send guard can fail after advance(), before a new entry is staged.
+        result = reset_phase(state, "waiting_rebound")
+        engine._patch(trade_id, waverider=result)
+        return result
+    identity = rows[-1]["operation_id"] if reentering else expected
+    operation = operations.get(identity)
+    if not reentering and operation is None and not trade.get("suspended_wave_targets"):
+        result = reset_phase(state, "waiting_retrace")
+        engine._patch(trade_id, waverider=result)
+        return result
+    state = {**state, "operation_id": identity}
     if operation and operation.get("outcome") == "not_sent":
         result = {**reset_phase(state, "waiting_retrace" if state["phase"] == "pending_reduce" else "waiting_rebound"), "cycle": state.get("cycle", 0) + 1}
         engine._patch(trade_id, waverider=result)
         return result
-    cloid = engine.exchange.cloid(identity)
-    if state["phase"] == "pending_reenter":
-        rows = [row for row in trade["entry_orders"] if row.get("cycle") == state.get("cycle", 0) and row["kind"] == "waverider" and not row.get("not_sent")]
-        if rows:
-            cloid = rows[-1]["cloid"]
+    cloid = rows[-1]["cloid"] if reentering else engine.exchange.cloid(identity)
     raw = await engine.order_status(cloid)
     if raw.get("order", {}).get("status") not in TERMINAL_ORDER:
         return state
     await engine.capture_fills(trade_id)
     current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     oid = raw["order"]["order"]["oid"]
-    fills = [row for row in current["fill_events"].values() if row["oid"] == oid]
+    fills = [row for row in current["fill_events"].values() if row["oid"] == oid
+             and (row["kind"] == "entry" and row.get("entry_role") == "waverider" if reentering
+                  else row["kind"] in ("waverider", "waverider_retirement"))]
+    if raw["order"]["status"] == "filled" and not fills:
+        return state
     quantity = sum((Decimal(row["sz"]) for row in fills), Decimal(0))
     if state["phase"] == "pending_reduce":
         if quantity:
@@ -604,7 +639,7 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
                 return
             from aqla_hyperliquid_mcp.api import wire_number
             order["s"] = wire_number(quantity)
-            engine.state.update(lambda data: next(row for row in data["trades"][trade_id]["exit_orders"] if row["cloid"] == order["c"]).update(quantity=order["s"]))
+            engine.state.update(lambda data: require_first(row for row in data["trades"][trade_id]["exit_orders"] if row["cloid"] == order["c"]).update(quantity=order["s"]))
         if quantity > available["flex"] or not corrective and latest.get("entries_disabled"):
             await resume_exit(engine, trade_id)
             return
@@ -637,7 +672,9 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
     maker = plan.entry_execution == "maker_only"
     limit = passive_entry_price(plan.market, plan.side, quote) if maker else slippage_price(quote.ask if buy else quote.bid, plan.policy.max_slippage_percent, plan.market, buy=buy)
     if (Decimal(state["sale_price"]) - limit) * (1 if buy else -1) <= cycle_cost:
-        raise AqlaError("Waverider reentry has no price advantage after costs")
+        state.update(phase="waiting_rebound", reason="Worst allowed reentry has no price advantage after costs")
+        engine._patch(trade_id, waverider=state)
+        return
     stop = Decimal(trade["stop_price"])
     direction = Decimal(1) if plan.side == "long" else Decimal(-1)
     open_risk = (inventory["core"] * max(Decimal(0), (inventory["core_basis"] - stop) * direction)
@@ -657,7 +694,7 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
         raise AqlaError("Original lifetime risk budget cannot fund a Waverider reentry")
     row = {"kind": "waverider", "index": 0, "quantity": str(quantity), "price": str(limit), "limit": str(limit),
            "entry_kind": "limit" if maker else "market", "timing": "standard", "operation_id": identity, "cloid": engine.exchange.cloid(identity), "phase": "pending", "cycle": cycle}
-    def stage(data):
+    def stage_reentry(data):
         current = data["trades"][trade_id]
         if current.get("entries_disabled") or current["waverider"].get("finished"):
             raise AqlaError("Waverider reentry was terminated")
@@ -665,6 +702,6 @@ async def execute(engine, trade_id, state, action, quantity, quote, cycle_cost):
             raise AqlaError("Waverider reentry identity already exists")
         current["entry_orders"].append(row)
         current["waverider"] = {**state, "phase": "pending_reenter", "operation_id": identity}
-    engine.state.update(stage)
+    engine.state.update(stage_reentry)
     await dispatch_next(engine, trade_id)
     patch_row(engine, trade_id, row["cloid"], cycle=cycle)

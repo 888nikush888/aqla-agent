@@ -1,6 +1,5 @@
 """Stateless evidence receipts, separate from operator authorization."""
 import base64
-import binascii
 import hashlib
 import hmac
 import json
@@ -109,7 +108,7 @@ def verify_disposition(snapshot, event_id, interpretation, token, key, *, stamp=
                 or claims["event_id"] != event_id or claims["expires_at"] <= stamp
                 or claims["fingerprint"] != fingerprint(snapshot["events"], event_id, claims["refs"])):
             raise ValueError(REREAD)
-    except (ValueError, KeyError, TypeError, binascii.Error, zlib.error, RecursionError) as error:
+    except (ValueError, KeyError, TypeError, zlib.error, RecursionError) as error:
         raise AqlaError(REREAD) from error
     row = snapshot["events"][event_id]
     if row["status"] in ("executed", "updated") or event_id in recovery_ids(snapshot):

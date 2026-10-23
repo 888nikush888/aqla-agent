@@ -40,7 +40,8 @@ async def run(cycles, history):
         state = State(settings)
         fake, reads = FakeExchange(signer.address), Counter()
         def transport(request):
-            assert request.url.host == "fixture.invalid", "Only the local mock transport is permitted"
+            if not (request.url.host == "fixture.invalid"):
+                raise AssertionError("Only the local mock transport is permitted")
             if request.url.path == "/info":
                 reads[json.loads(request.content)["type"]] += 1
             return fake.handle(request)
@@ -67,7 +68,8 @@ async def run(cycles, history):
             started = time.perf_counter()
             await engine.refresh_trade(trade["trade_id"])
             durations.append((time.perf_counter() - started) * 1000)
-        assert len(fake.actions) == before, "A normal no-op refresh must not issue another fake order"
+        if not (len(fake.actions) == before):
+            raise AssertionError("A normal no-op refresh must not issue another fake order")
         whole_bytes = len(json.dumps(state.snapshot()).encode())
         patched = []
         original = state._store.save_roots
@@ -76,13 +78,15 @@ async def run(cycles, history):
             return original(changed)
         state._store.save_roots = patch
         state.update_metadata(("cursors",), lambda part: part["cursors"].update(benchmark=1))
-        assert patched and patched[-1] < whole_bytes / 10
+        if not (patched and patched[-1] < whole_bytes / 10):
+            raise AssertionError
         sparse_bytes = patched[-1]
         server = create_server(settings, state=state, exchange=exchange)
         sent, model_calls = [], []
         async def mcp_call(_, tool, arguments):
             response = await server.call_tool(tool, arguments)
-            assert not response.is_error
+            if not (not response.is_error):
+                raise AssertionError
             return response.structured_content or json.loads(response.content[0].text)
         async def send(owner, text):
             sent.append((owner, text))
@@ -102,7 +106,8 @@ async def run(cycles, history):
             worker = SourceWorker(extension, {"mode": "legacy"}, adapter=SimpleNamespace(decide=forbidden), fallback=forbidden)
             await worker.deliver()
             await worker.deliver()
-            assert len(sent) == 1 and not model_calls
+            if not (len(sent) == 1 and not model_calls):
+                raise AssertionError
             report = {"fake_exchange_only": True, "real_transports": 0, "cycles": cycles, "synthetic_history_events": history,
                 "refresh_p50_ms": statistics.median(durations), "refresh_max_ms": max(durations),
                 "info_calls_per_cycle": {key: value / cycles for key, value in sorted(reads.items())},

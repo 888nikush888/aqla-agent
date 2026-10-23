@@ -1,3 +1,4 @@
+
 import asyncio
 import base64
 import json
@@ -7,7 +8,7 @@ import zlib
 import pytest
 
 from aqla_agent.notifications import native_response_bytes
-from aqla_hyperliquid_mcp.models import AqlaError
+from aqla_hyperliquid_mcp.models import AqlaError, require_first
 from aqla_hyperliquid_mcp.streams import SUBSCRIPTION_ADAPTER, SUBSCRIPTION_MODELS, Streams
 
 
@@ -157,7 +158,7 @@ async def test_actual_stream_loop_decodes_failures_continues_and_cancels_without
             self.consumed = asyncio.Event()
         async def __anext__(self):
             try:
-                return next(self.rows)
+                return require_first(self.rows)
             except StopIteration:
                 self.consumed.set()
                 await self.done.wait()

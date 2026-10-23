@@ -139,7 +139,7 @@ class PresentationSnapshot(Model):
         if digest(data) != self.fingerprint:
             raise ValueError("Presentation content does not match its fingerprint")
         if any(row.network != self.scope.network or row.currency != self.scope.currency
-               or self.scope.exchange != "all" and row.exchange != self.scope.exchange for row in self.journal):
+               or self.scope.exchange not in ("all", row.exchange) for row in self.journal):
             raise ValueError("Presentation rows do not match the selected financial scope")
         if self.scope.currency not in self.available_currencies or self.scope.period not in self.available_periods:
             raise ValueError("Presentation selection is unavailable")
@@ -208,6 +208,8 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
     clock = now_ms() if clock is None else clock
     current = datetime.fromtimestamp(clock / 1000, BERLIN).strftime("%Y-%m")
     period = current if scope.period == "current" else scope.period
+    start: int | None
+    end: int | None
     if period in ("today", "7d", "30d"):
         today = datetime.fromtimestamp(clock / 1000, BERLIN).replace(hour=0, minute=0, second=0, microsecond=0)
         days = {"today": 1, "7d": 7, "30d": 30}[period]
@@ -219,7 +221,7 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
         plan = trade["plan"]
         currency = plan["market"].get("quote_token", "USDC")
         exchange = plan.get("exchange", "hyperliquid")
-        if plan["network"] != scope.network or currency != scope.currency or scope.exchange != "all" and exchange != scope.exchange:
+        if plan["network"] != scope.network or currency != scope.currency or scope.exchange not in ("all", exchange):
             continue
         row = report_row(data, trade)
         report_rows[id(trade)] = row
@@ -239,7 +241,7 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
             fills = {identity: fill for identity, fill in fills.items() if isinstance(fill.get("time"), int) and fill["time"] < end}
         entries = [fill for fill in fills.values() if fill["kind"] == "entry"]
         entered = min((fill["time"] for fill in entries if isinstance(fill.get("time"), int)), default=None)
-        roles = {"maker": 0, "taker": 0, "unknown": 0}
+        roles: dict[Literal["maker", "taker", "unknown"], int] = {"maker": 0, "taker": 0, "unknown": 0}
         for identity in fills:
             role = trade.get("fill_execution_roles", {}).get(identity, "unknown")
             roles[role if role in roles else "unknown"] += 1
@@ -276,7 +278,7 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
     complete, excluded = outcomes(data, selected_ids=selected_ids, report_rows=report_rows)
     channels = []
     sources = set(data.get("source_ranks", {})) | {source_key(data, row.source_id) for row in journal}
-    last_changes = {}
+    last_changes: dict[str, int] = {}
     if sources:
         for row in data.get("ranking_history", {}).values():
             identity, stamp = row.get("source_id"), row.get("time")
@@ -299,16 +301,16 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
     periods = sorted({current, *data.get("monthly_reports", {}), *(datetime.fromtimestamp((trade.get("closed_at") or trade["plan"]["created_at"]) / 1000, BERLIN).strftime("%Y-%m") for trade in data.get("trades", {}).values())})
     if scope.period not in ("current", "all", "today", "7d", "30d"):
         periods = sorted({*periods, scope.period})
-    body = dict(schema_version=1, scope=scope, scope_binding=digest({"account": data["account"], "trading_account": data.get("trading_account", data["account"]), "network": data["network"]}),
-        revision=data["sequence"], generated_at=clock, resolved_period=period, period_start=start, period_end_exclusive=end,
-        available_currencies=currencies, available_periods=["current", "today", "7d", "30d", "all", *periods],
-        journal=journal, channels=channels, parameters=_parameters(data), months=[PresentationMonth(month=month, revision=row.get("revision", 0),
+    body = {"schema_version": 1, "scope": scope, "scope_binding": digest({"account": data["account"], "trading_account": data.get("trading_account", data["account"]), "network": data["network"]}),
+        "revision": data["sequence"], "generated_at": clock, "resolved_period": period, "period_start": start, "period_end_exclusive": end,
+        "available_currencies": currencies, "available_periods": ["current", "today", "7d", "30d", "all", *periods],
+        "journal": journal, "channels": channels, "parameters": _parameters(data), "months": [PresentationMonth(month=month, revision=row.get("revision", 0),
             published_at=row.get("published_at")) for month, row in sorted(data.get("monthly_reports", {}).items())],
-        net_pnl=net, fees=fees, funding=funding,
-        hit_rate_percent=Decimal(sum(row.net_pnl > 0 for row in known)) / len(known) * 100 if known else None,
-        open_trades=sum(row.cohort == "open" for row in journal), complete_trades=sum(row.complete for row in evaluated),
-        evaluated_trades=len(evaluated), daily_pnl=daily, monthly_pnl=months_chart, cumulative_realized_net=cumulative,
-        net_r_basis="complete_setup_families_as_ranking", equity_curve=False)
+        "net_pnl": net, "fees": fees, "funding": funding,
+        "hit_rate_percent": Decimal(sum(row.net_pnl > 0 for row in known if row.net_pnl is not None)) / len(known) * 100 if known else None,
+        "open_trades": sum(row.cohort == "open" for row in journal), "complete_trades": sum(row.complete for row in evaluated),
+        "evaluated_trades": len(evaluated), "daily_pnl": daily, "monthly_pnl": months_chart, "cumulative_realized_net": cumulative,
+        "net_r_basis": "complete_setup_families_as_ranking", "equity_curve": False}
     # Model JSON is the exact fingerprint representation consumed by the publisher.
     values = {key: value.model_dump(mode="json") if isinstance(value, Model) else [row.model_dump(mode="json") if isinstance(row, Model) else row for row in value]
               if isinstance(value, list) else value for key, value in body.items() if key not in ("revision", "generated_at")}

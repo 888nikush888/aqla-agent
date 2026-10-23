@@ -1,3 +1,4 @@
+
 import copy
 from decimal import Decimal
 
@@ -5,7 +6,7 @@ import pytest
 
 from aqla_agent.operator_management import ManagementRequest, dispatch, fingerprint, submit
 from aqla_agent.router import Router
-from aqla_hyperliquid_mcp.models import AqlaError
+from aqla_hyperliquid_mcp.models import AqlaError, require_first
 
 
 async def opened(setup, signal):
@@ -82,7 +83,7 @@ async def test_owner_request_survives_crash_before_native_dispatch(setup, signal
 @pytest.mark.asyncio
 async def test_an_unclear_existing_order_blocks_a_new_management_identity(setup, signal):
     state, fake, router, trade = await opened(setup, signal)
-    identity = next(iter(state.snapshot()["operations"]))
+    identity = require_first(iter(state.snapshot()["operations"]))
     state.update(lambda value: value["operations"][identity].update(phase="unknown"))
     count = len(fake.actions)
     request = ManagementRequest(trade_id=trade["trade_id"], action="reduce", percent=25, expected_fingerprint=fingerprint(trade))

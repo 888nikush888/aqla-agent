@@ -1,3 +1,4 @@
+
 import copy
 import json
 from decimal import Decimal
@@ -9,11 +10,12 @@ from test_native_setup import update
 
 from aqla_agent.pipelines import Parameters
 from aqla_agent.telegram_menu import GROUPS, HOME, PREFIX, TelegramMenu, input_value, setting_value
+from aqla_hyperliquid_mcp.models import require_first
 
 
 @pytest.fixture
 def panel(controls, tmp_path):  # noqa: F811 -- shared native fixture
-    commands, bot, data, mutations, now, binding, hook = controls
+    commands, bot, data, mutations, now, binding, _hook = controls
     commands.extension.config_path = tmp_path / "config.yaml"
     menu = TelegramMenu(commands)
     commands.menu = menu
@@ -35,7 +37,7 @@ def callback(menu, token, *, owner="12345", chat_type="private", message_id=None
 
 def choose(bot, label):
     source = (bot.edits or bot.sent)[-1]
-    return next(button["callback_data"] for row in source["reply_markup"]["inline_keyboard"] for button in row if button["text"] == label)
+    return require_first(button["callback_data"] for row in source["reply_markup"]["inline_keyboard"] for button in row if button["text"] == label)
 
 
 def test_every_profile_parameter_is_reachable_once():
@@ -263,7 +265,7 @@ async def test_unexpected_text_input_error_stays_native_and_does_not_leak_detail
 
 @pytest.mark.asyncio
 async def test_stale_revision_expired_setup_and_invalid_combination_do_not_write(panel):
-    menu, bot, data, changes, now, _ = panel
+    menu, bot, _data, changes, now, _ = panel
     await menu.field(bot, "profile", "standard", "sizing_mode")
     with pytest.raises(ValueError):
         await menu.commit_field(bot, "fixed_notional")

@@ -16,7 +16,8 @@ class Context:
     def get_config(self, key, default=None):
         return self.configuration.get(key, default)
 
-    def call_mcp(self, server, tool, arguments, **_):
+    @staticmethod
+    def call_mcp(server, tool, arguments, **_):
         assert tool == "integration" and arguments["action"] == "source_notice"
         return {"ok": True, "result": {"recorded": True}}
 
@@ -121,7 +122,8 @@ async def test_reader_worker_auth_backoff_avoids_three_second_reconnect_loop(ext
     class Reader:
         def __init__(self, *args, **kwargs):
             pass
-        async def start(self):
+        @staticmethod
+        async def start():
             starts.append(clock[0])
             raise SourceAccessError("reader_session_unauthorized")
         async def close(self):
@@ -151,13 +153,15 @@ async def test_reader_retry_repair_resets_deadline_without_credential_output(ext
     class Reader:
         def __init__(self, *args, **kwargs):
             pass
-        async def start(self):
+        @staticmethod
+        async def start():
             starts.append(clock[0])
             if len(starts) == 1:
                 raise SourceAccessError("reader_session_unauthorized")
         async def sync_sources(self):
             pass
-        def status_error(self):
+        @staticmethod
+        def status_error():
             return None
         async def close(self):
             pass
@@ -400,7 +404,8 @@ async def test_reader_and_wake_continue_with_notification_backlog(extension, tmp
     class Reader:
         def __init__(self, *args, **kwargs):
             pass
-        async def start(self):
+        @staticmethod
+        async def start():
             started.set()
             if blocked_start:
                 await asyncio.Event().wait()

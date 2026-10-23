@@ -1,0 +1,21 @@
+version = 1
+test_patterns = ["tests/**"]
+# Frozen historical implementations are fixtures, never production import roots.
+exclude_patterns = ["tests/oracles/**", "**/__pycache__/**", "**/.venv/**", "**/venv/**", "**/.tox/**", "**/.pytest_cache/**", "**/*.egg-info/**", "**/dist/**", "**/build/**"]
+
+[[analyzers]]
+name = "docker"
+enabled = true
+
+[[analyzers]]
+name = "python"
+enabled = true
+  [analyzers.meta]
+  type_checker = "mypy"
+  max_line_length = 100
+  runtime_version = "3.x.x"
+  cyclomatic_complexity_threshold = "medium"
+
+[[analyzers]]
+name = "secrets"
+enabled = true

@@ -1,10 +1,11 @@
+
 import copy
 import json
 
 import httpx
 import pytest
 
-from aqla_hyperliquid_mcp.models import now_ms
+from aqla_hyperliquid_mcp.models import now_ms, require_first
 
 
 async def lost_target(setup, signal, monkeypatch):
@@ -49,7 +50,7 @@ async def test_expired_target_absence_retires_exact_generation_then_restores_onc
     assert result["operation"]["outcome"] == "absent_expired"
     repeated = await exchange.reconcile(staged["operation_id"])
     assert repeated["resolved"] and repeated["absence_is_proof"] and fake.actions == before
-    stop = next(row for row in trade["orders"] if row["kind"] == "sl")
+    stop = require_first(row for row in trade["orders"] if row["kind"] == "sl")
     assert fake.orders[stop["cloid"]]["status"] == "open"
     await trading.refresh_trade(trade["trade_id"])
     after = len(fake.actions)

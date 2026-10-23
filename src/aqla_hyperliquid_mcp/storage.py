@@ -62,13 +62,15 @@ class SQLiteStore:
 
     def save_roots(self, changed: dict):
         """Patch metadata in the same FULL transaction without serializing financial history."""
-        arguments, values = [], []
+        arguments: list[str] = []
+        values: list[str] = []
         for name, value in changed.items():
             arguments.append("?,json(?)")
             values.extend(("$." + json.dumps(name), json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)))
         try:
             with self.connection:
-                updated = self.connection.execute("UPDATE state SET body=json_set(body," + ",".join(arguments) + ") WHERE id=1", values)
+                # Only placeholder pairs vary; all JSON paths and values are bound.
+                updated = self.connection.execute("UPDATE state SET body=json_set(body," + ",".join(arguments) + ") WHERE id=1", values)  # skipcq: BAN-B608
                 if updated.rowcount != 1:
                     raise sqlite3.DatabaseError("Authoritative state row is missing")
         except sqlite3.Error as error:

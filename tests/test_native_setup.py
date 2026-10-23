@@ -45,7 +45,8 @@ def fixture_controller():
     gate = SetupGate(True, clock=lambda: now[0])
     calls, checks = [], []
     class Verifier:
-        async def verify(self, text):
+        @staticmethod
+        async def verify(text):
             checks.append(text)
             return text == MARKER
     async def request(action, **args):

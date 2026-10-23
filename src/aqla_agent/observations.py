@@ -22,9 +22,7 @@ class TemporaryObservation(AqlaError):
 async def read_observation(call, stage):
     try:
         return await call()
-    except TemporaryObservation:
-        raise
-    except (httpx.TransportError, TimeoutError, ConnectionError, OSError):
+    except (httpx.TransportError, OSError):
         raise TemporaryObservation("read_unavailable", stage, "transport") from None
     except httpx.HTTPStatusError as error:
         if error.response.status_code in (408, 429, 500, 502, 503, 504):

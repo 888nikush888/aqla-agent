@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from aqla_hyperliquid_mcp.models import AqlaError, Model, digest, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, Model, digest, now_ms, require_first
 from aqla_hyperliquid_mcp.rules import latest_sources, verify_evidence
 
 from .decisions import KINDS, VERSION, DecisionResult, build_packet, validate_interpretation
@@ -330,7 +330,8 @@ class SourceProcessor:
             return self.response(job, packet)
         return {"job": None}
 
-    def response(self, job, packet):
+    @staticmethod
+    def response(job, packet):
         response = {"job": job.model_dump(mode="json")}
         if len(json.dumps(packet, ensure_ascii=True)) <= 16000:
             response["packet"] = packet
@@ -338,7 +339,8 @@ class SourceProcessor:
             response["packet_required"] = True
         return response
 
-    def pending_previews(self, snapshot, job):
+    @staticmethod
+    def pending_previews(snapshot, job):
         targets = snapshot["events"].get(job.event_id, {}).get("targets", {})
         return [row for row in targets.values() if row.get("status") == "pending"
                 and row.get("observation_retry", {}).get("authority") == "preview"]
@@ -348,7 +350,8 @@ class SourceProcessor:
         return [row["plan_id"] for row in targets.values() if row.get("status") == "planned"
                 and row.get("plan_id") in job.plan_ids and not self.trading.target_started(snapshot, row)]
 
-    def check_intent(self, job, snapshot):
+    @staticmethod
+    def check_intent(job, snapshot):
         if job.result is None:
             raise AqlaError("Saved interpretation is missing")
         current = latest_sources(snapshot["events"], job.result.interpretation.source_refs)
@@ -398,7 +401,7 @@ class SourceProcessor:
         if result.question_version != VERSION:
             raise AqlaError("Decision questions changed; a current interpretation is required")
         if result.model == "python":
-            anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+            anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
             if anchor["text"].strip() or result.interpretation.kind != "incomplete":
                 raise AqlaError("Python-only interpretation is restricted to missing original text")
         if result.collection_only and self.mode != "shadow":

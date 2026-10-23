@@ -8,7 +8,7 @@ import secrets
 from decimal import Decimal
 from types import SimpleNamespace
 
-from aqla_hyperliquid_mcp.models import AqlaError
+from aqla_hyperliquid_mcp.models import AqlaError, require_first
 
 from .messages import number
 from .pipelines import AccountLimits, Parameters, Pipeline, TradingProfile
@@ -289,6 +289,7 @@ class TelegramMenu:
         self.commands.auth(protected=True)
         kind, identity, field = (pending[key] for key in ("kind", "identity", "field"))
         data = await self.config()
+        suffix = ""
         if kind == "profile":
             row = data["profiles"][identity]
             profile = TradingProfile(id=row["id"], name=row["name"], parameters=Parameters.model_validate({**row["parameters"], field: value}))
@@ -311,7 +312,7 @@ class TelegramMenu:
             suffix = "\nÜbernahme ausstehend; der native Dienst prüft die gespeicherte Einstellung erneut." if result["apply_status"] == "pending" else ""
         self.pending = None
         await self.display(bot, "Gespeichert · " + LABELS.get(field, field) + ": " + setting_value(value) + (suffix if kind == "technical" else ""),
-            [("Weitere Einstellungen", "profile_group", identity, next(group for group, fields in GROUPS.items() if field in fields))] if kind == "profile" else [("Zur Übersicht", "system" if kind == "technical" else "accounts" if kind == "limits" else "ranking")])
+            [("Weitere Einstellungen", "profile_group", identity, require_first(group for group, fields in GROUPS.items() if field in fields))] if kind == "profile" else [("Zur Übersicht", "system" if kind == "technical" else "accounts" if kind == "limits" else "ranking")])
 
     async def run(self, bot, action, *args):
         if action in ("home", "cancel"):
@@ -656,7 +657,7 @@ class TelegramMenu:
                 else:
                     async with self.serial:
                         await self.run(bot, action, *args)
-            except (ValueError, AqlaError) as error:
+            except ValueError as error:
                 await self.display(bot, "Änderung nicht ausgeführt.\n" + str(error)[:600] + "\nFür geschützte Änderungen Setup öffnen.", [("Setup", "setup")])
             except Exception:
                 self.pending = None
@@ -692,7 +693,7 @@ class TelegramMenu:
                     await self.run(bot, *aliases[command])
                 else:
                     await self.text_input(bot, text)
-        except (ValueError, AqlaError) as error:
+        except ValueError as error:
             await self.display(bot, "Nicht gespeichert.\n" + str(error)[:600], [("Setup", "setup")])
         except Exception:
             self.pending = None

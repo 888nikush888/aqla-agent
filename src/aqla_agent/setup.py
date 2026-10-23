@@ -17,9 +17,9 @@ from typing import Literal, TypedDict
 
 from aqla_hyperliquid_mcp.models import AqlaError
 
-SCRYPT_N = 131072
-SCRYPT_R = 8
-SCRYPT_P = 1
+SCRYPT_N: Literal[131072] = 131072
+SCRYPT_R: Literal[8] = 8
+SCRYPT_P: Literal[1] = 1
 SCRYPT_MAXMEM = 256 * 1024 * 1024
 _VERIFY_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aqla-setup-verifier")
 _VERIFY_SLOT = threading.BoundedSemaphore(1)
@@ -132,7 +132,7 @@ class SetupGate:
             active = bool(lease and binding == lease.binding and self._bindings.get(binding.owner_id) == binding and now < lease.expires_at)
             return {"configured": self.configured, "active": active,
                     "remaining_seconds": max(0, int(lease.expires_at - now)) if active else 0,
-                    "locked_seconds": max(0, int(self._locked_until.get(binding.owner_id if binding else owner_id, 0) - now))}
+                    "locked_seconds": max(0, int(self._locked_until.get(binding.owner_id if binding else owner_id or "", 0) - now))}
 
 
 class PasswordHashRecord(TypedDict):
@@ -161,14 +161,11 @@ def write_password_hash(path: Path, password: str) -> None:
     record = create_password_hash(password)
     payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
     descriptor = os.open(Path(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb") as target:
-            target.write(payload)
-            target.flush()
-            os.fsync(target.fileno())
-    except BaseException:
-        # The caller keeps the exclusive partial file for an explicit safe repair.
-        raise
+    # Keep the exclusive partial file for explicit repair if a durable write fails.
+    with os.fdopen(descriptor, "wb") as target:
+        target.write(payload)
+        target.flush()
+        os.fsync(target.fileno())
 
 
 @dataclass(frozen=True, repr=False)
@@ -208,7 +205,7 @@ class SetupVerifier:
             if len(raw) > 4096:
                 raise ValueError
             return cls.from_record(json.loads(raw))
-        except (OSError, ValueError, TypeError, AqlaError):
+        except (OSError, ValueError, TypeError):
             raise AqlaError("Private setup verifier is invalid or unavailable") from None
 
     def matches(self, password: str) -> bool:
@@ -218,7 +215,7 @@ class SetupVerifier:
             actual = hashlib.scrypt(password.encode("utf-8"), salt=self._salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P,
                                     maxmem=SCRYPT_MAXMEM, dklen=32)
             return secrets.compare_digest(actual, self._digest)
-        except (ValueError, UnicodeError):
+        except ValueError:
             return False
 
     async def verify(self, password: str) -> bool:

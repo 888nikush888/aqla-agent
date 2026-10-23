@@ -153,7 +153,7 @@ class Reporting:
             async def fetch(low, high):
                 return await market_fills(adapter, market, low, high)
             observed = await bounded_history(fetch, trade["plan"]["created_at"], end, limit=2000)
-            selected = {}
+            selected: dict[str, dict] = {}
             for row in observed:
                 if row.get("coin") != market.symbol or not trade["plan"]["created_at"] <= row["time"] <= end:
                     continue
@@ -167,7 +167,7 @@ class Reporting:
                 payments = await adapter.funding_payments(market, start, end)
                 try:
                     attribution, assigned, fees = attribute_manual_closure(trade, observed, payments)
-                except (AqlaError, InvalidOperation, KeyError, ValueError, TypeError) as error:
+                except (InvalidOperation, KeyError, ValueError, TypeError) as error:
                     raise EvidenceConflict(str(error) if isinstance(error, AqlaError) else "Manual PnL attribution is unconfirmed") from None
                 coverage.update(complete=True, fill_fingerprint=digest(fills), payments_fingerprint=digest(assigned))
                 def save_manual(data):
@@ -287,6 +287,7 @@ class Reporting:
                 job_started = self.clock()
                 duration = min(self.job_time_seconds, max(0.0, tick.deadline - job_started))
                 job = ReadBudget("job", min(self.job_requests, self.max_requests - tick.requests), job_started + duration, self.clock)
+                reason: AttemptReason
                 with read_limits(tick, job):
                     try:
                         refreshed = await (self.wait_for or asyncio.wait_for)(self.refresh(trade_id), timeout=duration)

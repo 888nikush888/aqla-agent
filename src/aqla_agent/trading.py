@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from decimal import Decimal
-from typing import Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from pydantic import Field
 
@@ -20,6 +21,7 @@ from aqla_hyperliquid_mcp.models import (
     digest,
     margin_leverage,
     now_ms,
+    require_first,
 )
 from aqla_hyperliquid_mcp.rules import (
     backup_prices,
@@ -49,6 +51,9 @@ from .source_queue import is_source_row
 
 OPEN = {"waiting_entry", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
 UNFINISHED = {"pending", "interpreted", "needs_reconciliation"}
+
+if TYPE_CHECKING:
+    from .pipelines import VenueState
 
 
 class EntryBudgetChanged(AqlaError):
@@ -91,11 +96,14 @@ class StopEvidencePending(AqlaError):
 
 
 class Trading:
-    def __init__(self, exchange: Hyperliquid, state: State):
+    def __init__(self, exchange: Hyperliquid, state: State | VenueState):
         self.exchange, self.state = exchange, state
         self.lock = AccountLock()
         self.recovery_lock = asyncio.Lock()
         self.recovery_checked = False
+        self.express_ingress: Callable | None = None
+        self.express_admission: Callable | None = None
+        self.entry_wake: Callable | None = None
 
     def ingest(self, source: SourceEvent, *, native_forward=False):
         legacy_event_id = digest([source.source_id, source.edited_at, source.text, source.media])[:32]
@@ -1144,7 +1152,7 @@ class Trading:
                 confirmed = entry_quantity_evidence(status)
                 if confirmed is not None:
                     def confirm(data, cloid=entry["cloid"], quantity=confirmed):
-                        row = next(row for row in data["trades"][trade_id]["entry_orders"] if row["cloid"] == cloid)
+                        row = require_first(row for row in data["trades"][trade_id]["entry_orders"] if row["cloid"] == cloid)
                         row["confirmed_filled"] = quantity
                         row["phase"] = "terminal"
                     self.state.update(confirm)
@@ -2222,7 +2230,7 @@ class Trading:
                 if not plan.policy.allow_stop_widening and (requested_stop < old if plan.side == "long" else requested_stop > old):
                     raise AqlaError("Stop widening is not permitted")
             update_targets = signal.take_profits
-            update_spec = {"unit": "price"}
+            update_spec: dict[str, Any] = {"unit": "price"}
             if signal.update_action == "replace_targets":
                 if signal.take_profit_unit != "price":
                     from .percent_targets import prices
@@ -2275,6 +2283,8 @@ class Trading:
                 if signal.update_action in ("close", "cancel_entry"):
                     result = await self.cancel_entry(trade["trade_id"])
                 elif signal.update_action == "move_stop":
+                    if signal.stop_loss is None:
+                        raise AqlaError("Stop update needs a source-backed price")
                     stop = price_grid(signal.stop_loss, plan.market, up=plan.side == "long")
                     self._patch(trade["trade_id"], stop_price=str(stop), management_revision=trade["management_revision"] + 1)
                     result = {"waiting_stop_updated": True}

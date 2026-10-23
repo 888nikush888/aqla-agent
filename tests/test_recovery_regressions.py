@@ -1,10 +1,11 @@
+
 from decimal import Decimal
 
 import pytest
 from test_updates import stop_update, waiting_gtc
 
 from aqla_agent.trading import Trading
-from aqla_hyperliquid_mcp.models import AqlaError
+from aqla_hyperliquid_mcp.models import AqlaError, require_first
 from aqla_hyperliquid_mcp.server import close_server, create_server
 from aqla_hyperliquid_mcp.state import State
 
@@ -67,7 +68,7 @@ async def test_owned_stop_exit_cannot_adopt_foreign_reopen_before_refresh(setup,
     source, interpretation = signal
     plan = await trading.preview(source.event_id, interpretation)
     trade = await trading.execute(plan["plan_id"])
-    stop = next(order for order in trade["orders"] if order["kind"] == "sl")
+    stop = require_first(order for order in trade["orders"] if order["kind"] == "sl")
     fake.fill(stop["cloid"], trade["remaining_quantity"])
     fake.position = 1.0
     count = len([action for action in fake.actions if action["type"] == "order"])
@@ -138,8 +139,8 @@ async def test_fill_between_history_and_position_reads_keeps_live_protection(set
     source, interpretation = signal
     plan = await trading.preview(source.event_id, interpretation)
     trade = await trading.execute(plan["plan_id"])
-    target = next(row for row in trade["orders"] if row["kind"] == "tp")
-    stop = next(row for row in trade["orders"] if row["kind"] == "sl")
+    target = require_first(row for row in trade["orders"] if row["kind"] == "tp")
+    stop = require_first(row for row in trade["orders"] if row["kind"] == "sl")
     original = trading.positions
     injected = False
     async def late_fill(market):
@@ -165,7 +166,7 @@ async def test_crash_before_exit_cleanup_keeps_market_reserved_until_restart(set
     source, interpretation = signal
     plan = await trading.preview(source.event_id, interpretation)
     trade = await trading.execute(plan["plan_id"])
-    stop = next(row for row in trade["orders"] if row["kind"] == "sl")
+    stop = require_first(row for row in trade["orders"] if row["kind"] == "sl")
     fake.fill(stop["cloid"], trade["remaining_quantity"])
     original = trading._cancel_owned_orders
     async def crash(*args, **kwargs):

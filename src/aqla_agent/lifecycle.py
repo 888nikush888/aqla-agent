@@ -13,7 +13,7 @@ def exit_reason(trade, fill) -> tuple[str, str]:
     if fill["kind"] == "tp":
         return "take_profit", "Take-Profit"
     if fill["kind"] == "close":
-        match = next((order for order in trade.get("exit_orders", []) if order.get("oid") == fill["oid"] or trade.get("order_observations", {}).get(order["cloid"], {}).get("oid") == fill["oid"]), {})
+        match: dict = next((order for order in trade.get("exit_orders", []) if order.get("oid") == fill["oid"] or trade.get("order_observations", {}).get(order["cloid"], {}).get("oid") == fill["oid"]), {})
         reason = match.get("reason", "unconfirmed")
         label = {"operator_close": "Nutzerauftrag", "source_close": "Quellenauftrag", "protection_failure": "Schutzmaßnahme"}.get(reason, "Grund nicht vollständig belegt")
         return reason, label

@@ -1,3 +1,4 @@
+
 import copy
 from decimal import Decimal
 
@@ -9,7 +10,7 @@ from aqla_agent.conflict_review import observe_conflict
 from aqla_agent.messages import number, recovery_block, telegram_view
 from aqla_agent.recovery_notices import reader_notice_signature, record_recovery_notices, record_source_notice
 from aqla_agent.sources import change_sources, supported_source
-from aqla_hyperliquid_mcp.models import AqlaError, digest, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, digest, now_ms, require_first
 from aqla_hyperliquid_mcp.server import close_server
 
 
@@ -26,7 +27,7 @@ def test_recovery_notices_transitions_survive_ack_restart_and_keep_accounts_dist
     rows[0]["replacement_unconfirmed"] = True
     record_recovery_notices(restarted, rows)
     assert len(restarted["notifications"]) == 1
-    assert next(iter(restarted["notifications"].values()))["severity"] == "urgent"
+    assert require_first(iter(restarted["notifications"].values()))["severity"] == "urgent"
     restarted["notifications"].clear()
     stamp = now_ms()
     complete = {account: {"category": "complete", "last_attempt_at": stamp, "last_success_at": stamp, "duration_ms": 0, "error_count": 0}
@@ -125,7 +126,7 @@ async def test_actual_router_timeout_cannot_publish_false_trade_recovery(setup, 
     monkeypatch.setattr(router, "_recover_account", timeout)
     record_recovery_notices(data, await router.recover(diagnostics_sink=sink), sink)
     assert len(data["notifications"]) == 1
-    assert not next(iter(data["notifications"].values()))["resolved"]
+    assert not require_first(iter(data["notifications"].values()))["resolved"]
     assert sink["hyperliquid:testnet"]["category"] == "timeout"
     data["notifications"].clear()
     async def protected(engine):
@@ -143,7 +144,7 @@ def test_safe_recovery_renderer_discards_rpc_secrets_and_names_real_account():
     secret = "supersecret-provider-token"
     data = {"source_status": {}, "notifications": {}}
     record_recovery_notices(data, [{"account_key": "hyperliquid:mainnet", "trade_id": "abc", "market": "BTC", "error": secret}])
-    notice = next(iter(data["notifications"].values()))
+    notice = require_first(iter(data["notifications"].values()))
     rendered = recovery_block(notice)
     assert secret not in str(notice) and secret not in rendered
     assert "hyperliquid:mainnet" in rendered and "BTC" in rendered and "abc" in rendered
@@ -181,7 +182,7 @@ def test_missing_protection_is_urgent_and_changed_replacement_identity_is_not_lo
     from aqla_agent.notifications import notification_sort_key
     data = {"source_status": {}, "notifications": {}}
     record_recovery_notices(data, [{"account_key": "hyperliquid:mainnet", "trade_id": "t", "error": "No confirmed effective stop loss"}])
-    identity, notice = next(iter(data["notifications"].items()))
+    identity, notice = require_first(iter(data["notifications"].items()))
     assert notice["severity"] == "urgent" and notification_sort_key(identity, notice)[0] == 0
     record_recovery_notices(data, [{"account_key": "hyperliquid:mainnet", "trade_id": "t", "replacement_unconfirmed": True, "operation": {"operation_id": "stop-1"}}])
     count = len(data["notifications"])
@@ -305,7 +306,7 @@ async def test_ownership_review_never_adopts_mixed_or_unproved_exposure(setup, s
     elif case == "unknown_operation":
         manual_fill(fake, own, start=own)
         fake.position = 0
-        operation = next(iter(state.snapshot()["operations"]))
+        operation = require_first(iter(state.snapshot()["operations"]))
         state.update(lambda data: data["operations"][operation].update(phase="unknown"))
     else:
         fake.position = 0
@@ -407,7 +408,7 @@ async def test_removed_source_cannot_execute_a_saved_plan(setup, signal):
 @pytest.mark.asyncio
 async def test_new_entry_receipt_requires_existing_quantity_reconciliation(setup, signal):
     state, fake, trading, identity = await conflicted(setup, signal)
-    entry = next(row for row in fake.fills if row["oid"] == fake.orders[state.snapshot()["trades"][identity]["entry_cloid"]]["order"]["oid"])
+    entry = require_first(row for row in fake.fills if row["oid"] == fake.orders[state.snapshot()["trades"][identity]["entry_cloid"]]["order"]["oid"])
     own = Decimal(state.snapshot()["trades"][identity]["filled_quantity"])
     fake.fills.append({**entry, "tid": 2000, "sz": "0.01", "time": now_ms()})
     manual_fill(fake, own + Decimal("0.01"), start=own + Decimal("0.01"))

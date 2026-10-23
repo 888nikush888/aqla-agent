@@ -65,16 +65,20 @@ def main():
     adapter = TelegramAdapter(PlatformConfig(extra={'allow_from': ['12345']}))
     delivered = []
     class Bot:
-        async def send_message(self, **kwargs):
+        @staticmethod
+        async def send_message(**kwargs):
             delivered.append(kwargs)
             assert kwargs['parse_mode'] == ParseMode.MARKDOWN_V2
             assert len(kwargs['text'].encode('utf-16-le')) // 2 <= 4096
             return SimpleNamespace(message_id=len(delivered))
-        async def send_chat_action(self, **kwargs):
+        @staticmethod
+        async def send_chat_action(**kwargs):
             return True
-        async def send_document(self, **kwargs):
+        @staticmethod
+        async def send_document(**kwargs):
             raise AssertionError("Unexpected document from formatter label")
-        async def send_photo(self, **kwargs):
+        @staticmethod
+        async def send_photo(**kwargs):
             raise AssertionError("Unexpected image from formatter label")
     adapter._bot = Bot()
     async def verify():

@@ -1,9 +1,12 @@
 """One financial writer per account, with reentrant bounded priority work packets."""
+
 import asyncio
 import heapq
 import itertools
 import time
 from contextlib import asynccontextmanager
+
+from aqla_hyperliquid_mcp.models import require_first
 
 
 class AccountLock:
@@ -31,7 +34,7 @@ class AccountLock:
             self.observed_wait(priority, started)
             return True
         future = asyncio.get_running_loop().create_future()
-        heapq.heappush(self.waiters, (priority, next(self.sequence), future, task))
+        heapq.heappush(self.waiters, (priority, require_first(self.sequence), future, task))
         try:
             await future
             self.observed_wait(priority, started)

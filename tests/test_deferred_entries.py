@@ -1,4 +1,5 @@
 """Delayed LINK reproduction, executable-price guards and immutable lifecycle facts."""
+
 import copy
 import json
 from decimal import Decimal
@@ -20,6 +21,7 @@ from aqla_hyperliquid_mcp.models import (
     TradePlan,
     digest,
     now_ms,
+    require_first,
 )
 from aqla_hyperliquid_mcp.rules import verify_evidence
 
@@ -198,7 +200,7 @@ async def test_deferred_partial_ioc_has_confirmed_remainder_and_replacement_sl(s
             entry = fake.orders[waiting["entry_cloid"]]
             entry["status"] = "canceled"
             entry["order"]["sz"] = str(full - half)
-            fake.orders[next(key for key in fake.orders if key != waiting["entry_cloid"])]["status"] = "canceled"
+            fake.orders[require_first(key for key in fake.orders if key != waiting["entry_cloid"])]["status"] = "canceled"
         return response
     exchange.client._transport = __import__("httpx").MockTransport(partial)
     fake.mid = "100"
@@ -294,7 +296,7 @@ async def test_immediate_entry_and_stop_exit_produce_separate_frozen_messages(se
     saved = await trading.preview(source.event_id, value)
     row = await trading.execute(saved["plan_id"])
     entry_notice = copy.deepcopy(state.snapshot()["notifications"]["lifecycle:" + row["trade_id"] + ":entry_fill"])
-    sl = next(order for order in row["orders"] if order["kind"] == "sl")
+    sl = require_first(order for order in row["orders"] if order["kind"] == "sl")
     native = fake.orders[sl["cloid"]]
     native["status"] = "filled"
     fake.fills.append({"oid": native["order"]["oid"], "tid": 888, "coin": "BTC", "time": min(f["time"] for f in fake.fills) + 500,
@@ -305,8 +307,8 @@ async def test_immediate_entry_and_stop_exit_produce_separate_frozen_messages(se
     assert snapshot["notifications"]["lifecycle:" + row["trade_id"] + ":entry_fill"] == entry_notice
     cards = telegram_view(snapshot, {})["messages"]
     texts = ["\n".join(card["texts"]) for card in cards]
-    first = next(index for index, text in enumerate(texts) if "Einstieg ausgeführt" in text)
-    last = next(index for index, text in enumerate(texts) if "Trade geschlossen" in text)
+    first = require_first(index for index, text in enumerate(texts) if "Einstieg ausgeführt" in text)
+    last = require_first(index for index, text in enumerate(texts) if "Trade geschlossen" in text)
     assert first < last and "Stop-Loss" in texts[last]
     assert "100 USDC" in texts[first] and "Schutz:" in texts[first]
     notice_ids = [identity for card in cards for identity in card["notification_ids"]]

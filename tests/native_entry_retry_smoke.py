@@ -3,6 +3,7 @@
 The model is a loopback script and the exchange uses MockTransport exclusively.
 --project-root selects the integrated implementation, independently of this test.
 """
+
 import argparse
 import asyncio
 import json
@@ -19,6 +20,8 @@ from types import SimpleNamespace
 
 import portalocker
 import yaml
+
+from aqla_hyperliquid_mcp.models import require_first
 
 BOOTSTRAP = '''import json
 import os
@@ -207,7 +210,7 @@ config_path.write_text(yaml.safe_dump(config))
     discover_plugins(force=True)
     assert "mcp__aqla__trade_execute" in discover_mcp_tools()
     assert len(EXTENSIONS) == 1
-    extension = next(iter(EXTENSIONS))
+    extension = require_first(iter(EXTENSIONS))
     original = SourceEvent(chat_id="12345", message_id=42, sent_at=initial_time,
         forward_from="native-owner-forward", text="BTC LONG X35. Entry market. SL 90. TP 110; 120.")
     interpretation = {"kind": "new_signal", "symbol": "BTC", "side": "long", "entry": "market", "leverage": 35,
@@ -302,7 +305,7 @@ config_path.write_text(yaml.safe_dump(config))
             assert first["final_response"] and any(not request.get("tools") for request in requests)
             data = read_snapshot(destination / "data" / "state.sqlite3")
             assert len(data["plans"]) == 1 and not data["trades"] and not entries(destination)
-            identity, saved = next(iter(data["plans"].items()))
+            identity, saved = require_first(iter(data["plans"].items()))
             immutable = saved["plan"]
             assert not saved.get("execution_requested") and saved["event_id"] == original.event_id
             assert immutable["effective_leverage"] == 20

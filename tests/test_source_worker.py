@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 import sqlite3
@@ -16,12 +17,19 @@ from aqla_agent.decisions import (
     OpenRouterDecisionAdapter,
 )
 from aqla_agent.source_worker import SourceWorker
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.models import (
+    AqlaError,
+    Evidence,
+    Interpretation,
+    SourceEvent,
+    now_ms,
+    require_first,
+)
 from aqla_hyperliquid_mcp.server import close_server, create_server
 
 
 def report(packet):
-    anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     return Interpretation(kind="report", source_refs=[anchor["source_id"]], reason="Result report",
         reason_codes=["result_report"], evidence=[Evidence(field="classification", source_id=anchor["source_id"], quote=anchor["text"])])
 
@@ -130,7 +138,7 @@ async def test_fallback_domain_rejection_persists_safe_code_without_secret_or_re
     worker = SourceWorker(extension, {"mode": "hybrid"}, adapter=SimpleNamespace(interpret=decision), fallback=fallback)
     await worker.tick()
     await worker.tick()
-    saved = next(iter(state.snapshot()["source_jobs"].values()))
+    saved = require_first(iter(state.snapshot()["source_jobs"].values()))
     assert saved["status"] == "failed" and saved["failure_code"] == "fallback_domain_rejected"
     assert saved["failure_detail"] == {"phase": "interpretation_fallback", "code": "fallback_domain_rejected",
         "exception_type": "AqlaError", "retryable": False, "field_paths": []}
@@ -406,7 +414,7 @@ async def test_full_outgoing_input_limit_blocks_both_models_without_truncating_e
             adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="fixture/revision"))
         await worker.tick()
         await worker.tick()
-    job = next(iter(state.snapshot()["source_jobs"].values()))
+    job = require_first(iter(state.snapshot()["source_jobs"].values()))
     assert job["status"] == "review" and job["failure_code"] == "source_context_limit"
     assert not job["failure_detail"]["retryable"]
     assert state.snapshot()["events"][source.event_id]["source"]["text"] == text
@@ -473,7 +481,7 @@ async def test_proven_unsupported_original_uses_mercury_first_then_review_withou
             adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="fixture/revision"))
         await worker.tick()
         await worker.tick()
-    saved = next(iter(state.snapshot()["source_jobs"].values()))
+    saved = require_first(iter(state.snapshot()["source_jobs"].values()))
     assert saved["status"] == "review" and saved["failure_code"] == code
     assert saved["review_sources"] == {source.source_id: source.event_id}
     assert saved["failure_detail"]["phase"] == "validate" and not saved["failure_detail"]["retryable"]
@@ -513,7 +521,7 @@ async def test_falsely_actionable_original_is_identically_vetoed_offline_and_by_
     with pytest.raises(DecisionFailure, match=code):
         replay_decision(requests[0]["state"], CalibrationProfile(), responses,
             model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL, collect=True)
-    saved = next(iter(state.snapshot()["source_jobs"].values()))
+    saved = require_first(iter(state.snapshot()["source_jobs"].values()))
     assert saved["status"] == "review" and saved["failure_code"] == code
     assert len(requests) == 1 and not fallbacks and not fake.actions
     assert not state.snapshot()["operations"] and not state.snapshot()["plans"]
@@ -543,7 +551,7 @@ async def test_recovered_model_provider_resumes_same_durable_source_job(worker_b
         worker = SourceWorker(extension, {"mode": "hybrid", "retry_backoff_seconds": 1}, fallback=fallback,
             adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="fixture/revision"))
         await worker.tick()
-        saved = next(iter(state.snapshot()["source_jobs"].values()))
+        saved = require_first(iter(state.snapshot()["source_jobs"].values()))
         assert saved["status"] == "retry_wait" and saved["failure_detail"]["code"] == "provider_timeout"
         assert "SYNTHETIC_PROVIDER_SECRET" not in json.dumps(saved)
         await worker.tick()
@@ -575,7 +583,7 @@ async def test_interrupted_model_work_is_never_measured_as_completed_interpretat
         metrics = json.loads(connection.execute("SELECT metrics FROM runs").fetchone()[0])
     assert metrics["interrupted"] is True and metrics["completed"] is False
     assert not metrics["workflow"]["interpretation_valid"]
-    assert next(iter(state.snapshot()["source_jobs"].values()))["status"] == "prepared"
+    assert require_first(iter(state.snapshot()["source_jobs"].values()))["status"] == "prepared"
     assert not fake.actions
 
 
@@ -602,7 +610,7 @@ async def test_original_signal_expiry_stops_retry_before_any_further_model_or_di
         worker = SourceWorker(extension, {"mode": "hybrid", "retry_max_age_seconds": 900}, fallback=failed_fallback,
             adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="fixture/revision"))
         await worker.tick()
-        job = next(iter(state.snapshot()["source_jobs"].values()))
+        job = require_first(iter(state.snapshot()["source_jobs"].values()))
         assert job["status"] == "retry_wait" and job["retry_deadline_at"] == source.sent_at + 5000
         assert job["retry_deadline_at"] < job["created_at"] + 900000
         clock = job["retry_deadline_at"]
@@ -658,7 +666,7 @@ async def test_only_the_actual_model_route_must_fit_its_input_budget(worker_boun
             "calibration_file": str(path) if calibrated else None}, fallback=forbidden,
             adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision="inception/mercury-decide:free"))
         await worker.tick()
-    job = next(iter(state.snapshot()["source_jobs"].values()))
+    job = require_first(iter(state.snapshot()["source_jobs"].values()))
     if calibrated:
         assert job["status"] == "done" and state.snapshot()["events"][source.event_id]["status"] == "report"
     else:
@@ -705,7 +713,7 @@ async def test_common_nonaction_contract_matches_native_worker_and_offline_repla
         worker = SourceWorker(extension, {"mode": "hybrid", "calibration_file": str(path)}, fallback=forbidden,
             adapter=OpenRouterDecisionAdapter("synthetic", client=client, model_revision=DEFAULT_DECISION_MODEL))
         await worker.tick()
-    job = next(iter(state.snapshot()["source_jobs"].values()))
+    job = require_first(iter(state.snapshot()["source_jobs"].values()))
     if failure:
         with pytest.raises(DecisionFailure, match=failure):
             replay_decision(requests[0]["state"], profile, responses, model=DEFAULT_DECISION_MODEL, revision=DEFAULT_DECISION_MODEL)

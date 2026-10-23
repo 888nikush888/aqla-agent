@@ -1,4 +1,5 @@
 """Pinned native dispatch reproductions and bounded-result recovery; no live services."""
+
 import argparse
 import asyncio
 import json
@@ -11,6 +12,8 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+
+from aqla_hyperliquid_mcp.models import require_first
 
 
 def main():
@@ -141,7 +144,7 @@ async def verify_reload_and_agent(home, mcp_python):
     try:
         discover_plugins(force=True)
         manager = get_plugin_manager()
-        extension = next(row for row in EXTENSIONS if row.ctx._manager is manager)
+        extension = require_first(row for row in EXTENSIONS if row.ctx._manager is manager)
         adapter = runner._create_adapter(Platform.TELEGRAM, PlatformConfig(extra={"allow_from": ["12345"]}))
         adapter.set_message_handler(handler)
         runner.adapters = {Platform.TELEGRAM: adapter}
@@ -158,7 +161,7 @@ async def verify_reload_and_agent(home, mcp_python):
             manager.unload()
             assert not old_claim.can_change() and not extension.binding and not extension.setup.lease
         discover_plugins(force=True)
-        fresh = next(row for row in EXTENSIONS if row.ctx._manager is manager)
+        fresh = require_first(row for row in EXTENSIONS if row.ctx._manager is manager)
         assert fresh is not extension and fresh.gateway is None
         update = Update.de_json({"update_id": 1, "message": {"message_id": 1, "date": 1,
             "chat": {"id": 12345, "type": "private"}, "from": {"id": 12345, "is_bot": False, "first_name": "Owner"},
@@ -184,7 +187,7 @@ async def verify_reload_and_agent(home, mcp_python):
             runner._rewire_plugin_handlers()
             await asyncio.sleep(0)
             assert len(active) == 2 and len(app.handlers[-100]) == 1
-        fresh = next(row for row in EXTENSIONS if row.ctx._manager is manager)
+        fresh = require_first(row for row in EXTENSIONS if row.ctx._manager is manager)
         settings = Settings.load(destination / "config.yaml")
         stamp = int(datetime.fromisoformat("2026-10-11T17:39:00+02:00").timestamp() * 1000)
         body = "Retained source, no fill proof. " + "X" * 14900

@@ -1,3 +1,4 @@
+
 import copy
 import json
 from datetime import UTC, datetime
@@ -8,7 +9,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from aqla_agent.lifecycle import record_lifecycle
 from aqla_agent.messages import summary_block
 from aqla_agent.notifications import NATIVE_BYTE_BUDGET, _summary, canonical_json, native_response_bytes
-from aqla_hyperliquid_mcp.models import Market, Policy, SourceEvent, TradePlan, digest
+from aqla_hyperliquid_mcp.models import Market, Policy, SourceEvent, TradePlan, digest, require_first
 from aqla_hyperliquid_mcp.server import close_server, create_server
 from aqla_hyperliquid_mcp.state import State
 
@@ -25,7 +26,7 @@ async def call(server, tool, **arguments):
     result = await server.call_tool(tool, arguments)
     payload = result_payload(result)
     if tool in ("notifications_read", "notifications_details"):
-        text = next(block.text for block in result.content if block.type == "text")
+        text = require_first(block.text for block in result.content if block.type == "text")
         assert len(json.dumps({"result": text}, ensure_ascii=False).encode("utf-8")) == native_response_bytes(payload)
     return payload
 
@@ -49,7 +50,7 @@ async def test_notification_consumers_use_detached_bounded_views_without_full_sn
     monkeypatch.setattr(state, "snapshot", lambda: pytest.fail("Notification consumer copied the full state"))
     actual = await call(server, "notifications_read", limit=2)
     assert actual == expected
-    identity = next(iter(actual["notifications"]))
+    identity = require_first(iter(actual["notifications"]))
     version = actual["notification_versions"][identity]
     expected_details = notification_details(before, server.aqla_authority.key, identity, version)
     assert await call(server, "notifications_details", notification_id=identity, version=version) == expected_details
@@ -86,7 +87,7 @@ async def details(server, identity, version, limit=65536):
 
 
 def result_payload(result):
-    return result.structured_content or json.loads(next(block.text for block in result.content if block.type == "text"))
+    return result.structured_content or json.loads(require_first(block.text for block in result.content if block.type == "text"))
 
 
 def lifecycle_fixture(data, settings, count=200, fills=100):
@@ -253,7 +254,7 @@ async def test_new_urgent_notice_visible_on_next_start_page(notification_server)
     following = await call(server, "notifications_read", cursor=page["next_cursor"], limit=1)
     assert list(following["notifications"]) == ["notice-00001"]
     start = await call(server, "notifications_read", limit=1)
-    assert next(iter(start["notifications"])).startswith("protection:")
+    assert require_first(iter(start["notifications"])).startswith("protection:")
 
 
 @pytest.mark.asyncio
@@ -273,7 +274,7 @@ async def test_details_rejects_changed_version_and_other_purpose(notification_se
     server = notification_server
     add_notices(server.aqla_state, 3)
     page = await call(server, "notifications_read", limit=1)
-    identity = next(iter(page["notifications"]))
+    identity = require_first(iter(page["notifications"]))
     version = page["notification_versions"][identity]
     with pytest.raises(ToolError, match="cursor"):
         await call(server, "notifications_details", notification_id=identity, version=version, cursor=page["next_cursor"])

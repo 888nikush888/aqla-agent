@@ -1,3 +1,4 @@
+
 import copy
 import json
 
@@ -7,7 +8,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from aqla_agent.decisions import build_packet
 from aqla_agent.efficiency import SOURCE_TOOLS
 from aqla_agent.source_assistance import check_interpretation, precise_numeric_evidence, source_assistance
-from aqla_hyperliquid_mcp.models import Evidence, Interpretation, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.models import Evidence, Interpretation, SourceEvent, now_ms, require_first
 from aqla_hyperliquid_mcp.server import close_server, create_server
 
 
@@ -249,7 +250,7 @@ def test_binding_profit_span_requires_ambiguity_and_cannot_use_backup(goal, setu
     "Маржа: только 3-4% депозита.", "Риск не более 3-4%.",
 ])
 def test_binding_risk_or_allocation_span_is_not_an_exit_instruction(metadata):
-    source, context, draft = material("BTC LONG\n" + metadata)
+    _source, context, draft = material("BTC LONG\n" + metadata)
     draft.entry_prices, draft.stop_loss, draft.take_profits = [], None, []
     draft.evidence = draft.evidence[:2]
     assert check_interpretation(context, draft)["valid"]
@@ -308,7 +309,7 @@ def test_discrete_entry_error_explains_why_renaming_to_range_is_not_a_correction
         source_refs=[source.source_id], evidence=[Evidence(field=f, source_id=source.source_id, quote=q) for f,q in (
             ("symbol","BTC"),("side","LONG"),("entry_prices.0","95"),("entry_prices.1","100"))])
     checked = check_interpretation(context, value)
-    error = next(e for e in checked["errors"] if e["code"] == "entry_legs_not_representable")
+    error = require_first(e for e in checked["errors"] if e["code"] == "entry_legs_not_representable")
     assert not checked["valid"] and {"kind","entry","entry_prices"} <= set(error["field_paths"])
     assert "single_entry_form" in error["repair"] and "ambiguous" in error["repair"]
 

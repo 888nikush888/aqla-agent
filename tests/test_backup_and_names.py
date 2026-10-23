@@ -234,7 +234,7 @@ async def test_lost_backup_sl_reply_reconciles_exact_identity(setup,signal,monke
 
 @pytest.mark.asyncio
 async def test_multi_target_backup_keeps_each_profile_and_shared_limits(routed,setup,signal):  # noqa: F811 -- fixture
-    router,boundaries=routed
+    router,_boundaries=routed
     _,state,*_=setup
     configure(state,stop='2',targets=['2','3'])
     source,value=signal

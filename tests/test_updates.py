@@ -1,3 +1,4 @@
+
 import copy
 import json
 from decimal import Decimal
@@ -7,7 +8,15 @@ import pytest
 
 from aqla_agent.messages import trade_block
 from aqla_agent.router import Router
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, TradePlan, now_ms
+from aqla_hyperliquid_mcp.models import (
+    AqlaError,
+    Evidence,
+    Interpretation,
+    SourceEvent,
+    TradePlan,
+    now_ms,
+    require_first,
+)
 
 
 @pytest.fixture
@@ -237,7 +246,7 @@ async def test_pending_stop_waits_for_terminal_quantity_and_complete_own_fills(s
     assert state.snapshot()["events"][source.event_id]["status"] == "needs_reconciliation"
     assert "update:" + source.event_id not in state.snapshot()["operations"]
     assert len(fake.actions) == before
-    old_stop = next(order for order in trade["orders"] if order["kind"] == "sl")
+    old_stop = require_first(order for order in trade["orders"] if order["kind"] == "sl")
     assert fake.orders[old_stop["cloid"]]["status"] == "open"
     visibility["hidden"] = False
     await trading.recover()
@@ -254,7 +263,7 @@ async def test_terminal_quantity_lag_does_not_silence_missing_initial_protection
     _, state, fake, exchange, trading = setup
     exchange.fail_closed_protection = True
     trade, visibility = await lagged_final_entry(setup, signal)
-    initial = next(order for order in trade["orders"] if order["kind"] == "sl")
+    initial = require_first(order for order in trade["orders"] if order["kind"] == "sl")
     if old_stop == "canceled":
         fake.orders[initial["cloid"]]["status"] = "canceled"
     else:
@@ -434,7 +443,7 @@ async def test_unknown_stop_is_reconciled_before_independent_management(setup, s
     trade, original, _, visibility = await unconfirmed_stop(setup, signal)
     operation_id = "update:" + original.event_id
     saved = copy.deepcopy(state.snapshot()["operations"][operation_id])
-    old_stop = next(order for order in trade["orders"] if order["kind"] == "sl")
+    old_stop = require_first(order for order in trade["orders"] if order["kind"] == "sl")
     later, instruction = management_update(trading, action)
     before = len(fake.actions)
     with pytest.raises(AqlaError, match="[Rr]econcile"):
@@ -458,8 +467,8 @@ async def test_unknown_pending_stop_defers_automatic_stop_revision_without_emerg
     state.update(lambda data: data["policy"].update(break_even_after_tp=1))
     exchange.fail_closed_protection = True
     trade, source, _, visibility = await unconfirmed_stop(setup, signal)
-    old_stop = next(order for order in trade["orders"] if order["kind"] == "sl")
-    target = next(order for order in trade["orders"] if order["kind"] == "tp" and order["index"] == 0)
+    old_stop = require_first(order for order in trade["orders"] if order["kind"] == "sl")
+    target = require_first(order for order in trade["orders"] if order["kind"] == "tp" and order["index"] == 0)
     fake.mid = "115"
     fake.fill(target["cloid"], target["quantity"], "110")
     remaining = Decimal(str(fake.position))
@@ -483,12 +492,12 @@ async def test_unknown_pending_stop_does_not_bypass_missing_or_malformed_initial
     state.update(lambda data: data["policy"].update(break_even_after_tp=1))
     exchange.fail_closed_protection = True
     trade, source, _, visibility = await unconfirmed_stop(setup, signal)
-    original_stop = next(order for order in trade["orders"] if order["kind"] == "sl")
+    original_stop = require_first(order for order in trade["orders"] if order["kind"] == "sl")
     if old_stop == "missing":
         fake.orders[original_stop["cloid"]]["status"] = "canceled"
     else:
         fake.orders[original_stop["cloid"]]["order"]["reduceOnly"] = False
-    target = next(order for order in trade["orders"] if order["kind"] == "tp" and order["index"] == 0)
+    target = require_first(order for order in trade["orders"] if order["kind"] == "tp" and order["index"] == 0)
     fake.mid = "115"
     fake.fill(target["cloid"], target["quantity"], "110")
     before = len(fake.actions)
@@ -514,7 +523,7 @@ async def test_rejected_pending_replacement_waits_for_confirmed_emergency_exit(s
     trade = await waiting_gtc(setup, signal)
     source, instruction = stop_update(trading)
     await trading.update_trade(source.event_id, instruction)
-    old_stop = next(order for order in trade["orders"] if order["kind"] == "sl")
+    old_stop = require_first(order for order in trade["orders"] if order["kind"] == "sl")
     fake.mid = "100"
     fake.reject_stop = True
     fake.fill(trade["entry_cloid"], trade["plan"]["quantity"])
@@ -601,7 +610,7 @@ async def test_initial_protection_revision_preserves_pending_stop(setup, signal,
     await trading.update_trade(source.event_id, interpretation)
     original = copy.deepcopy(state.snapshot()["trades"][trade["trade_id"]]["pending_stop_update"])
     if initialization == "initial_protection":
-        old = next(order for order in trade["orders"] if order["kind"] == "sl")
+        old = require_first(order for order in trade["orders"] if order["kind"] == "sl")
         fake.orders[old["cloid"]]["status"] = "canceled"
     fake.mid = "101" if initialization == "backup" else "100"
     amount = Decimal(trade["plan"]["quantity"]) / (2 if initialization == "backup" else 1)
@@ -756,7 +765,7 @@ async def test_partial_entry_is_frozen_before_targets_are_sized(setup, signal):
 async def test_tp_partial_fill_is_not_reallocated_when_targets_change(setup, signal):
     _, state, fake, _, trading = setup
     trade = await opened(setup, signal)
-    target = next(order for order in trade["orders"] if order["kind"] == "tp" and order["index"] == 0)
+    target = require_first(order for order in trade["orders"] if order["kind"] == "tp" and order["index"] == 0)
     fake.mid = "115"
     consumed = Decimal(target["quantity"]) / 2
     fake.fill(target["cloid"], consumed, "110")
@@ -766,7 +775,7 @@ async def test_tp_partial_fill_is_not_reallocated_when_targets_change(setup, sig
     await trading.update_trade(source.event_id, interpretation)
     current = state.snapshot()["trades"][trade["trade_id"]]
     active = [order for order in current["orders"] if order["kind"] == "tp" and not order.get("retired")]
-    first = next(order for order in active if order["index"] == 0)
+    first = require_first(order for order in active if order["index"] == 0)
     assert Decimal(first["quantity"]) == Decimal(target["quantity"]) - consumed
     assert sum(Decimal(order["quantity"]) for order in active) == Decimal(str(fake.position))
     assert all(order["cloid"] != target["cloid"] for order in active)
@@ -778,7 +787,7 @@ async def test_completed_tp_budget_moves_stop_only_from_own_exchange_fills(setup
     state.update(lambda row: row["policy"].update(break_even_after_tp=1))
     trade = await opened(setup, signal)
     fake.mid = "115"
-    target = next(order for order in trade["orders"] if order["kind"] == "tp" and order["index"] == 0)
+    target = require_first(order for order in trade["orders"] if order["kind"] == "tp" and order["index"] == 0)
     fake.fill(target["cloid"], Decimal(target["quantity"]) / 2, "110")
     await trading.refresh_trade(trade["trade_id"])
     assert Decimal(state.snapshot()["trades"][trade["trade_id"]]["stop_price"]) == 90
@@ -799,7 +808,7 @@ async def test_break_even_uses_reduced_replacement_target_budget(setup, signal):
     interpretation.evidence = [Evidence(field="take_profits.0", source_id=source.source_id, quote="115"), Evidence(field="take_profits.1", source_id=source.source_id, quote="125")]
     await trading.update_trade(source.event_id, interpretation)
     current = state.snapshot()["trades"][trade["trade_id"]]
-    target = next(order for order in current["orders"] if order["kind"] == "tp" and order["index"] == 0 and not order.get("retired"))
+    target = require_first(order for order in current["orders"] if order["kind"] == "tp" and order["index"] == 0 and not order.get("retired"))
     assert Decimal(target["quantity"]) == Decimal("1.20")
     fake.mid = "115"
     fake.fill(target["cloid"], target["quantity"], "115")

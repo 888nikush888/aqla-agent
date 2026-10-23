@@ -6,6 +6,8 @@ import threading
 
 import portalocker
 
+from aqla_hyperliquid_mcp.models import require_first
+
 from .models import AqlaError, Settings
 from .storage import SQLiteStore, database_path, read_snapshot
 
@@ -55,7 +57,7 @@ class State:
                 targets.update(row["plan"]["account"].lower() for row in self.data["trades"].values())
                 targets.update(row["request"]["account"].lower() for row in self.data["operations"].values()
                                if row.get("request", {}).get("account") and not row["request"].get("leader"))
-                inferred = next(iter(targets)) if len(targets) == 1 else settings.account.lower() if not targets else None
+                inferred = require_first(iter(targets)) if len(targets) == 1 else settings.account.lower() if not targets else None
                 if inferred != target:
                     raise AqlaError("Legacy execution state belongs to another or ambiguous trading target")
                 self.data["trading_account"] = inferred

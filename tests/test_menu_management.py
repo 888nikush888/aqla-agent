@@ -1,3 +1,4 @@
+
 import json
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from aqla_agent.native_commands import NativeCommands
 from aqla_agent.pipelines import VenueState
 from aqla_agent.trading import Trading
 from aqla_hyperliquid_mcp.api import Hyperliquid
+from aqla_hyperliquid_mcp.models import require_first
 from aqla_hyperliquid_mcp.server import close_server, create_server
 from aqla_hyperliquid_mcp.state import State
 
@@ -71,7 +73,7 @@ async def test_actual_menu_close_uses_original_network_and_one_identity(setup, s
             assert not snapshot.get('operator_requests') and boundary.position!=0 and boundary.actions==before
             return
         assert snapshot['operator_requests'], (bot.edits or bot.sent)[-1]['text']
-        request=next(iter(snapshot['operator_requests'].values()))
+        request=require_first(iter(snapshot['operator_requests'].values()))
         assert request['status']=='done' and request['account_key']==target.state.account_key
         assert boundary.position==0
         if secondary:

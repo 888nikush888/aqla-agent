@@ -67,7 +67,7 @@ class InventoryStream(Streams):
                 self.sizes[identity] = len(json.dumps(data, separators=(",", ":")).encode())
                 if sum(self.sizes.values()) > self.max_event_bytes:
                     raise AqlaError("DEX snapshot exceeds its bounded memory budget")
-            except (AqlaError, ValueError, TypeError, KeyError) as error:
+            except (ValueError, TypeError, KeyError) as error:
                 self.error = error if isinstance(error, AqlaError) else AqlaError("DEX snapshot is malformed")
         if self.error is not None:
             self._clear()

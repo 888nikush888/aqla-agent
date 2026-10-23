@@ -109,7 +109,8 @@ class ReaderClient:
     async def connect(self):
         pass
 
-    async def is_user_authorized(self):
+    @staticmethod
+    async def is_user_authorized():
         return True
 
     def add_event_handler(self, callback, event):
@@ -122,7 +123,8 @@ class ReaderClient:
         if "min_id" not in kwargs:
             yield self.message
 
-    async def get_messages(self, entity, ids):
+    @staticmethod
+    async def get_messages(entity, ids):
         return [message(identity, edited=True) for identity in ids]
 
     async def disconnect(self):
@@ -506,10 +508,12 @@ async def test_channel_rpc_error_isolates_source_and_recovers_without_skipping(p
         configuration["cursors"][item.chat_id] = max(item.message_id, configuration["cursors"].get(item.chat_id, 0))
     class Client:
         failing = True
-        async def iter_dialogs(self):
+        @staticmethod
+        async def iter_dialogs():
             for identity, name in ((-1001, "gone"), (-1002, "good")):
                 yield SimpleNamespace(id=identity, entity=SimpleNamespace(username=name, identity=identity))
-        def item(self, entity, identity):
+        @staticmethod
+        def item(entity, identity):
             item = message(identity)
             item.chat_id = entity.identity
             return item

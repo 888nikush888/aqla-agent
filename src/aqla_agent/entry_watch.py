@@ -38,7 +38,8 @@ class EntryWatch:
         for engine in router.engines.values():
             engine.entry_wake = self.changed.set
 
-    def latch(self, engine, identity, bid, ask, stamp):
+    @staticmethod
+    def latch(engine, identity, bid, ask, stamp):
         trade = engine.state.read("trades", entries={"trades": [identity]})["trades"].get(identity)
         if not trade or trade["status"] not in ("waiting_entry", "preparing", "opening", "protecting", "open", "unknown"):
             return
@@ -132,7 +133,7 @@ class EntryWatch:
                             book = parse_book(venue, market, frame)
                             if book:
                                 receive(book)
-                except (OSError, TimeoutError, AqlaError, ValueError, KeyError, IndexError, WebSocketException):
+                except (OSError, ValueError, KeyError, IndexError, WebSocketException):
                     await asyncio.sleep(delay)
                     delay = min(30, delay * 2)
         finally:

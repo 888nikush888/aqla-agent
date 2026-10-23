@@ -5,14 +5,20 @@ import copy
 import json
 import types
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 import httpx
 from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import signing
 
+from aqla_hyperliquid_mcp.models import require_first
+
 from .models import TERMINAL_ORDER, AccountSnapshot, AqlaError, Market, Settings, digest, now_ms
 from .state import State
+
+if TYPE_CHECKING:
+    from aqla_agent.pipelines import VenueState
 
 SDK_PRINCIPAL_L1 = frozenset({
     "set_referrer", "create_sub_account", "sub_account_transfer", "sub_account_spot_transfer", "vault_usd_transfer",
@@ -87,7 +93,7 @@ class Hyperliquid:
         from aqla_agent.funding import hyperliquid_funding
         return await hyperliquid_funding(self, market, start, end)
 
-    def __init__(self, settings: Settings, state: State, client=None):
+    def __init__(self, settings: Settings, state: State | VenueState, client=None):
         self.settings, self.state = settings, state
         self.client = client or httpx.AsyncClient(base_url=settings.base_url, timeout=settings.timeout_seconds)
         self.mutations = asyncio.Lock()
@@ -97,7 +103,7 @@ class Hyperliquid:
         except Exception as error:
             raise AqlaError("Invalid configured signing key") from error
         self.market_cache: dict[str, Market] = {}
-        self.last_inventory = None
+        self.last_inventory: AccountSnapshot | None = None
 
     @property
     def account(self):
@@ -182,7 +188,7 @@ class Hyperliquid:
                 if normalized.endswith(suffix):
                     normalized = normalized[:-len(suffix)]
                     break
-        candidates = [market for key, market in markets.items() if key == normalized or key == symbol]
+        candidates = [market for key, market in markets.items() if key in (normalized, symbol)]
         unique = {item.asset_id: item for item in candidates}
         if len(unique) != 1:
             if not unique and product == "perp":
@@ -194,7 +200,7 @@ class Hyperliquid:
             if symbol == "xyz:GOLD":
                 raise AqlaError(f"Configured Gold market xyz:GOLD is unavailable on {self.settings.network}; no substitute is used")
             raise AqlaError("Source market cannot be resolved uniquely; no substitute market is used")
-        market = next(iter(unique.values()))
+        market = require_first(iter(unique.values()))
         if market.quote_token != "USDC" or market.product == "perp" and market.collateral_token != 0:
             raise AqlaError("Automatic risk sizing currently requires USDC quote currency")
         return market
@@ -210,8 +216,8 @@ class Hyperliquid:
                 raise AqlaError("No USDC balance for spot entry")
             available = Decimal(balance["total"]) - Decimal(balance.get("hold", "0"))
             position = next((row for row in raw["balances"] if row["coin"] == market.base_token), None)
-            size = Decimal(position["total"]) if position else Decimal(0)
-            return AccountSnapshot(equity=Decimal(balance["total"]), available_margin=available, position_size=size, observed_at=started)
+            spot_size = Decimal(position["total"]) if position else Decimal(0)
+            return AccountSnapshot(equity=Decimal(balance["total"]), available_margin=available, position_size=spot_size, observed_at=started)
         abstraction = await self.info("userAbstraction", user=self.account)
         if abstraction not in ("disabled", None):
             raise AqlaError("Automatic sizing requires standard account abstraction; other modes remain available through the full MCP")
@@ -298,6 +304,8 @@ class Hyperliquid:
             available = min(available, max(Decimal(0), ceilings[0]))
         else:
             raw = states.get(market.dex if market else "")
+            if raw is None:
+                raise AqlaError("Required native account scope is missing; no entry permitted")
             equity, available = Decimal(raw["marginSummary"]["accountValue"]), Decimal(raw["withdrawable"])
         if now_ms() - stamp > 10000:
             from aqla_agent.observations import TemporaryObservation
@@ -597,15 +605,18 @@ class Hyperliquid:
             coin_to_asset = {market.symbol: market.asset_id for market in metadata.values()}
             asset_to_sz_decimals = {market.asset_id: market.size_decimals for market in metadata.values()}
 
-            def name_to_asset(self, name):
+            @staticmethod
+            def name_to_asset(name):
                 if name not in metadata:
                     raise AqlaError("Unknown market in exchange action")
                 return metadata[name].asset_id
 
-            def all_mids(self, dex=""):
+            @staticmethod
+            def all_mids(dex=""):
                 return {market.symbol: str(market.mid) for market in metadata.values() if market.dex == dex}
 
-            def user_state(self, address, dex=""):
+            @staticmethod
+            def user_state(address, dex=""):
                 if address.lower() != self_account.lower() or dex not in positions:
                     raise AqlaError("Market-close helper lacks a fresh bound position snapshot")
                 return positions[dex]

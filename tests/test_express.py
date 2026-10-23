@@ -1,3 +1,4 @@
+
 import asyncio
 from pathlib import Path
 
@@ -6,7 +7,7 @@ import pytest
 from aqla_agent.express import CLAIM, HEADINGS, compile_template
 from aqla_agent.source_assistance import check_interpretation
 from aqla_agent.source_queue import queue_overview
-from aqla_hyperliquid_mcp.models import AqlaError, ExpressSettings, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, ExpressSettings, SourceEvent, now_ms, require_first
 from aqla_hyperliquid_mcp.server import close_server, create_server
 
 TEXT = """➡️ LONG BTC
@@ -40,7 +41,7 @@ async def test_final_express_proof_uses_current_original_without_rebuilding_cont
     event = source()
     router.ingest(event)
     await worker.tick()
-    plan = TradePlan.model_validate(next(iter(state.snapshot()["trades"].values()))["plan"])
+    plan = TradePlan.model_validate(require_first(iter(state.snapshot()["trades"].values()))["plan"])
 
     def unavailable(*args, **kwargs):
         raise AssertionError("Final entry proof must not rebuild neighbouring context")
@@ -66,8 +67,8 @@ async def test_express_routed_budget_drift_keeps_original_job_and_sends_one_smal
     express_server.aqla_trading.ingest(event)
     await express_server.aqla_express.tick()
     snapshot = state.snapshot()
-    job = next(iter(snapshot["source_jobs"].values()))
-    trade = next(iter(snapshot["trades"].values()))
+    job = require_first(iter(snapshot["source_jobs"].values()))
+    trade = require_first(iter(snapshot["trades"].values()))
     original = snapshot["plans"][job["plan_ids"][0]]
     assert job["status"] == "done" and job["express_timings"]["model_calls"] == 0
     assert trade["status"] == "open" and original["refreshed_plan_id"] == trade["plan"]["plan_id"]

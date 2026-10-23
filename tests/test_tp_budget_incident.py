@@ -1,3 +1,4 @@
+
 import asyncio
 import copy
 from decimal import Decimal
@@ -10,7 +11,7 @@ from test_pipelines import routed  # noqa: F401
 
 from aqla_agent.observations import TemporaryObservation
 from aqla_agent.trading import EntryBudgetChanged, Trading
-from aqla_hyperliquid_mcp.models import AccountSnapshot, AqlaError, Market, Policy
+from aqla_hyperliquid_mcp.models import AccountSnapshot, AqlaError, Market, Policy, require_first
 from aqla_hyperliquid_mcp.rules import executable_targets, split_targets
 
 
@@ -50,7 +51,7 @@ async def test_small_adaptive_trade_keeps_native_stop_and_frozen_count_for_updat
     assert len(plan['take_profits'])==3 and plan['source_take_profit_count']==6
     trade=await engine.execute(plan['plan_id'])
     assert trade['status']=='open' and len([row for row in trade['orders'] if row['kind']=='tp'])==3
-    stop=next(row for row in trade['orders'] if row['kind']=='sl')
+    stop=require_first(row for row in trade['orders'] if row['kind']=='sl')
     assert fake.orders[stop['cloid']]['status']=='open'
     await engine.replace_targets(trade['trade_id'],list(map(Decimal,('115','125','135','145','155','165'))),'target-update')
     await Trading(exchange,state).recover()

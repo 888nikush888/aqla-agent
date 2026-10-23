@@ -10,7 +10,16 @@ from typing import Annotated, Literal
 
 from pydantic import Field, model_serializer, model_validator
 
-from aqla_hyperliquid_mcp.models import AqlaError, Model, Policy, Positive, digest, now_ms
+from aqla_hyperliquid_mcp.models import (
+    DEFAULT_UPDATES,
+    AqlaError,
+    Model,
+    Policy,
+    Positive,
+    UpdateAction,
+    digest,
+    now_ms,
+)
 
 Venue = Literal["hyperliquid"]
 Identifier = Annotated[str, Field(pattern=r"^[a-zA-Z0-9_-]{1,64}$")]
@@ -49,7 +58,7 @@ class Parameters(Model):
     take_profit_weights: list[Positive] = Field(default_factory=list, max_length=20)
     break_even_after_tp: int | None = Field(default=None, ge=1, le=20)
     stop_management: Literal["break_even", "tp_ladder"] = "break_even"
-    allowed_updates: list[Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"]] = Field(default_factory=lambda: ["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"])
+    allowed_updates: list[UpdateAction] = Field(default_factory=lambda: list(DEFAULT_UPDATES))
     allow_stop_widening: bool = False
     cost_reserve_bps: Annotated[Decimal, Field(ge=0, le=1000)] = Decimal("10")
 

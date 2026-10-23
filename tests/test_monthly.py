@@ -1,3 +1,4 @@
+
 import copy
 from datetime import datetime
 from decimal import Decimal
@@ -16,7 +17,7 @@ from aqla_agent.monthly import (
     monthly_report,
 )
 from aqla_agent.reporting import Reporting
-from aqla_hyperliquid_mcp.models import AqlaError, Market, digest
+from aqla_hyperliquid_mcp.models import AqlaError, Market, digest, require_first
 
 
 def millis(text):
@@ -80,9 +81,9 @@ def test_currency_separation_and_arithmetic_sum():
 def test_missing_evidence_is_not_zero_and_excluded(damage):
     row = trade()
     if damage == "fee":
-        next(iter(row["fill_events"].values()))["fee"] = None
+        require_first(iter(row["fill_events"].values()))["fee"] = None
     elif damage == "currency":
-        next(iter(row["fill_events"].values()))["feeToken"] = "HYPE"
+        require_first(iter(row["fill_events"].values()))["feeToken"] = "HYPE"
     elif damage == "funding":
         row.pop("funding_coverage")
     elif damage == "exit":

@@ -7,7 +7,7 @@ import types
 from functools import reduce
 from operator import or_
 from pathlib import Path
-from typing import Annotated, Literal, get_args, get_origin, get_type_hints, is_typeddict
+from typing import TYPE_CHECKING, Annotated, Literal, get_args, get_origin, get_type_hints, is_typeddict
 
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils.types import Cloid
@@ -56,8 +56,12 @@ def make_info_models():
 
 
 INFO_MODELS = make_info_models()
-InfoRequest = Annotated[reduce(or_, INFO_MODELS.values()), Field(discriminator="type")]
-INFO_ADAPTER = TypeAdapter(InfoRequest)
+if TYPE_CHECKING:
+    InfoRequest = Model
+else:
+    # Runtime schemas come from the pinned native API catalog.
+    InfoRequest = Annotated[reduce(or_, INFO_MODELS.values()), Field(discriminator="type")]
+INFO_ADAPTER: TypeAdapter[Model] = TypeAdapter(InfoRequest)
 
 
 def validate_info(request):
@@ -90,7 +94,7 @@ SDK_NAMES = (
 )
 SDK_METHODS = {name: vars(Exchange)[name] for name in SDK_NAMES}
 SDK_HELPERS = {name: vars(Exchange)[name] for name in ("c_signer_inner", "spot_deploy_token_action_inner")}
-_converted = {}
+_converted: dict[object, type[Model]] = {}
 
 
 def sdk_type(annotation):
@@ -146,8 +150,12 @@ def make_sdk_models():
 
 
 SDK_MODELS = make_sdk_models()
-SdkRequest = Annotated[reduce(or_, SDK_MODELS.values()), Field(discriminator="operation")]
-SDK_ADAPTER = TypeAdapter(SdkRequest)
+if TYPE_CHECKING:
+    SdkRequest = Model
+else:
+    # Runtime schemas come from the pinned native API catalog.
+    SdkRequest = Annotated[reduce(or_, SDK_MODELS.values()), Field(discriminator="operation")]
+SDK_ADAPTER: TypeAdapter[Model] = TypeAdapter(SdkRequest)
 
 
 def validate_sdk(request):

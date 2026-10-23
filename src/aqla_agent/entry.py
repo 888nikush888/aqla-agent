@@ -68,7 +68,7 @@ class PriceSnapshot(BookSnapshot):
 
 
 def gate_state(plan, quote, *, as_of=None):
-    quote.fresh() if as_of is None else quote.fresh(as_of=as_of)
+    quote.fresh(as_of=as_of)
     origin = Decimal(plan.entry_gate["origin_mid"])
     low = plan.entry_price * (1 - plan.policy.max_slippage_percent / 100)
     high = plan.entry_price * (1 + plan.policy.max_slippage_percent / 100)
@@ -106,7 +106,7 @@ def validate_entry_prices(plan, quote, *, stop=None, targets=None, as_of=None):
         from .managed_entries import leg_view
         return {"legs": [validate_entry_prices(leg_view(plan, {"index": leg.index, "quantity": str(leg.quantity)}),
                       quote, stop=stop, targets=targets, as_of=as_of) for leg in plan.entry_legs if leg.timing != "deferred"]}
-    quote.fresh() if as_of is None else quote.fresh(as_of=as_of)
+    quote.fresh(as_of=as_of)
     if quote.market != plan.market.symbol:
         raise AqlaError("Entry price observation belongs to another market")
     stop = Decimal(str(stop)) if stop is not None else plan.stop_loss

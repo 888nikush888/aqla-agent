@@ -195,7 +195,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
 
             from aqla_agent.pipelines import Parameters
             from aqla_agent.waverider import live_authority
-            permissions = {}
+            permissions: dict[str, dict] = {}
             for identity, profile_row in data["profiles"].items():
                 if not profile_row.get("parameters"):
                     continue
@@ -281,7 +281,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         from aqla_agent.monthly import report_row
         if account_key is not None and account_key not in ("hyperliquid:mainnet", "hyperliquid:testnet"):
             raise AqlaError("Select a configured execution account")
-        data, groups = state.snapshot(), {}
+        data = state.snapshot()
+        groups: dict[str, dict] = {}
         labels = {"Quelle": "chat_id", "Symbol": "symbol", "Richtung": "side", "Börse": "exchange", "Pipeline": "pipeline_id", "Profil": "profile_id", "Währung": "currency"}
         for trade in data["trades"].values():
             if trade["status"] != "closed":
@@ -350,7 +351,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         """Read Setup availability and remaining fixed lease time; no private credential data."""
         claims = authorize(context_auth, operator=True) if context_auth else None
         lease_id, binding = setup_context(claims)
-        return setup_gate.status(binding, lease_id, owner_id=settings.telegram_owner_id)
+        return dict(setup_gate.status(binding, lease_id, owner_id=settings.telegram_owner_id))
 
     @server.tool(annotations=read)
     async def ranking_status(source: str | None = None, history_limit: int = 30) -> dict:
@@ -820,11 +821,11 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             if action == "setup_bind":
                 return {"generation": setup_gate.bind(binding), "locked_seconds": setup_gate.status(binding)["locked_seconds"]}
             if action == "setup_failed":
-                return setup_gate.failed(binding)
+                return dict(setup_gate.failed(binding))
             if action == "setup_grant":
                 setup_gate.register(binding, lease_id, None, generation)
                 return {"registered": True, "remaining_seconds": setup_gate.status(binding, lease_id)["remaining_seconds"]}
-            return setup_gate.status(binding, lease_id)
+            return dict(setup_gate.status(binding, lease_id))
         if action == "seed_context":
             snapshot = state.read("sources", "source_aliases")
             allowed = {*snapshot["sources"], *snapshot.get("source_aliases", {}).values()}
@@ -919,7 +920,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                     raise AqlaError("subscription_id is required")
                 return await streams.unsubscribe(subscription_id)
             if action == "read":
-                return streams.read(after, limit)
+                return dict(streams.read(after, limit))
             if action == "post_info":
                 if info_request is None:
                     raise AqlaError("A typed info request is required")

@@ -1,9 +1,17 @@
+
 from decimal import Decimal
 
 import pytest
 
 from aqla_agent.source_assistance import check_interpretation, source_assistance
-from aqla_hyperliquid_mcp.models import Evidence, Interpretation, SourceEntryLeg, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.models import (
+    Evidence,
+    Interpretation,
+    SourceEntryLeg,
+    SourceEvent,
+    now_ms,
+    require_first,
+)
 
 
 def pair(trading, *, first=50, second=50, third=False):
@@ -42,7 +50,7 @@ def test_weight_repair_identifies_the_missing_context_without_changing_values(se
     value.evidence = [proof.model_copy(update={"quote": proof.quote.split(" (")[0]})
                       if proof.field.endswith(".kind") else proof for proof in value.evidence]
     rejected = check_interpretation(trading.context(source.event_id), value)
-    failure = next(row for row in rejected["errors"] if row["code"] == "split_entry_weights_missing_or_changed")
+    failure = require_first(row for row in rejected["errors"] if row["code"] == "split_entry_weights_missing_or_changed")
     assert "entry_legs.i.kind" in failure["repair"] and "INCLUDING its price AND allocation" in failure["repair"]
     assert [row["weight_percent"] for row in rejected["interpretation"]["entry_legs"]] == ["25", "75"]
 
@@ -57,7 +65,7 @@ def test_tp_label_digit_cannot_merge_with_its_three_digit_price(setup):
         "quote": "TP1 110" if proof.field == "take_profits.0" else proof.quote}) for proof in value.evidence]
     result = check_interpretation(trading.context(source.event_id), value)
     assert result["valid"], result["errors"]
-    assert next(row["quote"] for row in result["interpretation"]["evidence"] if row["field"] == "take_profits.0") == "110"
+    assert require_first(row["quote"] for row in result["interpretation"]["evidence"] if row["field"] == "take_profits.0") == "110"
     assert "entry_prices=[]" in source_assistance(trading.context(source.event_id))["contract"]["entry"]["criteria"]["split"]
 
 

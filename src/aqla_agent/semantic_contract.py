@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
+from aqla_hyperliquid_mcp.models import require_first
 from aqla_hyperliquid_mcp.rules import quoted_numbers
 
 
@@ -99,7 +100,7 @@ def one_sided_live_entry_limit(packet, span, side):
     """One directional price boundary is a limit, never an invented second bound."""
     if span is None or span.source_id != packet["anchor_source_id"] or span.kind != "number" or "%" in span.quote:
         return False
-    text = next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    text = require_first(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     return one_sided_entry_limit(text, span.start, span.end, side)
 
 
@@ -144,7 +145,7 @@ def source_leverage_interval_failure(text, interpretation):
 def unbound_setup_update_failure(packet, interpretation):
     if interpretation.kind != "trade_update" or packet.get("anchor_setup_bound"):
         return None
-    text = next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    text = require_first(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     live = current_structure_text(text)
     if (NEW_ENTRY.search(live) or SETUP_HEADING.search(live)) and not current_actions(text, include_tp_footers=False):
         return "unbound_setup_edit_is_not_management"
@@ -160,7 +161,7 @@ def update_identity_failure(packet, interpretation):
     if not interpretation.symbol or not any(proof.field == "symbol" and proof.source_id in linked
                                             for proof in interpretation.evidence):
         return "update_identity_missing"
-    anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     if (re.search(WORD + re.escape(interpretation.symbol) + END, anchor["text"], re.I)
             and not any(proof.field == "symbol" and proof.source_id == packet["anchor_source_id"]
                         for proof in interpretation.evidence)):
@@ -176,7 +177,7 @@ def bounded_live_entry_range(packet, spans):
     first, second = sorted(spans, key=lambda span: span.start)
     if first.end > second.start or Decimal(first.value) == Decimal(second.value):
         return False
-    text = next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    text = require_first(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     return (not entry_structure_failure(text) and bool(re.fullmatch(
         r"\s*(?:[-–—]|to|bis|до)\s*", text[first.end:second.start], re.I)))
 VERB = r"(?:move|set|put|bring|raise|lower|trail|adjust|переносим|перенести|переводим|перевести|перестав\w*|двигаем|подтягиваем|ставим|ставлю|ставь|setz\w*|zieh\w*|verschieb\w*)"
@@ -480,7 +481,7 @@ def unsupported_structure(packet):
     It does not classify or grant execution. A definite current entry marker
     is required for entry/stop structural checks, avoiding old status context.
     """
-    text = next(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    text = require_first(row["text"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     failure = incomplete_financial_instruction_failure(text) or future_entry_opportunity_failure(text)
     if failure:
         return failure

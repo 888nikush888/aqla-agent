@@ -12,6 +12,7 @@ from aqla_hyperliquid_mcp.models import (
     TradePlan,
     digest,
     now_ms,
+    require_first,
 )
 from aqla_hyperliquid_mcp.rules import (
     backup_prices,
@@ -191,7 +192,7 @@ def initialize_trade(trade, plan, quote, exchange):
 
 def patch_row(engine, trade_id, cloid, **values):
     def apply(data):
-        row = next(row for row in data["trades"][trade_id]["entry_orders"] if row["cloid"] == cloid)
+        row = require_first(row for row in data["trades"][trade_id]["entry_orders"] if row["cloid"] == cloid)
         row.update(values)
     engine.state.update(apply)
 
@@ -241,7 +242,7 @@ def protected(engine, trade, status_rows):
             # Maker legacy checks exact size; a managed leg owns an explicit size.
             covered += Decimal(native.get("sz") or 0)
             seen.add(oid)
-    return covered >= size and size > 0
+    return covered >= size > 0
 
 
 def finalize_prices(engine, trade_id):
@@ -395,7 +396,7 @@ async def restore_targets(engine, trade_id):
             return False
         if raw["order"]["status"] in TERMINAL_ORDER:
             def retire(data, cloid=order["cloid"]):
-                next(row for row in data["trades"][trade_id]["orders"] if row["cloid"] == cloid)["retired"] = True
+                require_first(row for row in data["trades"][trade_id]["orders"] if row["cloid"] == cloid)["retired"] = True
             engine.state.update(retire)
     engine._patch(trade_id, managed_target_fingerprint=None)
     if not await sync_targets(engine, trade_id):
@@ -488,7 +489,7 @@ async def start(engine, plan, trade):
 
 async def _start(engine, plan, trade):
     quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
-    first = next(row for row in trade["entry_orders"] if not row.get("not_sent"))
+    first = require_first(row for row in trade["entry_orders"] if not row.get("not_sent"))
     first_view = leg_view(plan, first)
     if first_view.entry_timing == "deferred" and gate_state(first_view, quote) == "waiting":
         return trade
@@ -530,7 +531,7 @@ async def _start(engine, plan, trade):
             identity = engine.state.update(rearm)
             existing = None
     if existing is None:
-        first = next(row for row in trade["entry_orders"] if not row.get("not_sent"))
+        first = require_first(row for row in trade["entry_orders"] if not row.get("not_sent"))
         view = leg_view(plan, first)
         if view.entry_timing == "deferred":
             quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
@@ -681,7 +682,7 @@ async def _dispatch_next(engine, trade_id):
     def stage(data):
         final_guard(data)
         current = data["trades"][trade_id]
-        owned = next(item for item in current["entry_orders"] if item["cloid"] == row["cloid"])
+        owned = require_first(item for item in current["entry_orders"] if item["cloid"] == row["cloid"])
         if owned["phase"] == "dispatching" and row["operation_id"] in data["operations"]:
             return
         if owned["phase"] != "pending" or current.get("entries_disabled"):
@@ -701,7 +702,7 @@ async def _dispatch_next(engine, trade_id):
             identity = f"entry:{trade_id}:leg:{row['index']}:observation:{generation}"
             replacement = {key: value for key, value in row.items() if key not in ("not_sent", "confirmed_filled")}
             replacement.update(operation_id=identity, cloid=engine.exchange.cloid(identity), phase="pending")
-            current["entry_orders"].insert(current["entry_orders"].index(next(item for item in current["entry_orders"] if item["cloid"] == row["cloid"])) + 1, replacement)
+            current["entry_orders"].insert(current["entry_orders"].index(require_first(item for item in current["entry_orders"] if item["cloid"] == row["cloid"])) + 1, replacement)
             if row["kind"] == "waverider":
                 current["waverider"]["operation_id"] = identity
             for order in current["orders"]:

@@ -1,7 +1,8 @@
 """Provider-independent production interpretation and original-evidence checks."""
+
 import re
 
-from aqla_hyperliquid_mcp.models import AqlaError
+from aqla_hyperliquid_mcp.models import AqlaError, require_first
 from aqla_hyperliquid_mcp.rules import (
     quoted_leverage_numbers,
     verify_entry_shape,
@@ -32,7 +33,7 @@ def validate_reduction_quantity(packet, interpretation):
         for proof in interpretation.evidence:
             if proof.field != "reduce_percent":
                 continue
-            original = next(row["text"] for row in packet["messages"] if row["source_id"] == proof.source_id)
+            original = require_first(row["text"] for row in packet["messages"] if row["source_id"] == proof.source_id)
             for occurrence in re.finditer(re.escape(proof.quote), original):
                 for percentage in re.finditer(r"(?<![\w.])\d+(?:[.,]\d+)*\s*%", proof.quote):
                     before = original[:occurrence.start() + percentage.start()].rstrip()
@@ -65,7 +66,7 @@ def validate_interpretation(packet, interpretation, *, own_setup_refs=()):
     verify_evidence(interpretation, events)
     verify_setup_references(interpretation, packet["anchor_source_id"],
                             [*own_setup_refs, *(ref for trade in packet.get("trades", []) for ref in trade["source_refs"])])
-    anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     if not anchor["text"].strip() and interpretation.kind != "incomplete":
         raise DecisionFailure("empty_source_requires_incomplete")
     if interpretation.kind == "new_signal" and packet.get("anchor_setup_bound"):

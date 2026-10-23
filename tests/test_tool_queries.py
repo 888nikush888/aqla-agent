@@ -1,3 +1,4 @@
+
 import copy
 import json
 import time
@@ -8,7 +9,7 @@ from jsonschema import Draft202012Validator
 
 from aqla_agent.tool_queries import BYTE_CAP, compact_view, source_attribution, source_lookup
 from aqla_agent.tool_schema import nullable_schema
-from aqla_hyperliquid_mcp.models import AqlaError, SourceEvent
+from aqla_hyperliquid_mcp.models import AqlaError, SourceEvent, require_first
 from aqla_hyperliquid_mcp.server import close_server, create_server
 
 
@@ -169,7 +170,7 @@ def test_single_oversized_journal_row_is_truthful_compact_data():
     raw = {"rows": [{"ID": "stable", "Text": "😺\n" * 100000, "_verified": True}], "next_offset": 1}
     before = copy.deepcopy(raw)
     result = compact_view(raw, "journal_read", {"table": "Signale", "offset": 0, "limit": 1})
-    row = next(item["value"] for item in result["rows"] if item["section"] == "rows")
+    row = require_first(item["value"] for item in result["rows"] if item["section"] == "rows")
     assert row["_verified"] is False and row["full_record_fingerprint_verified"] is True and row["body_complete"] is False
     assert len(json.dumps(result, ensure_ascii=True).encode()) <= BYTE_CAP
     assert result["full_details"]["arguments"]["view"] == "full" and raw == before

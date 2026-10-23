@@ -1,8 +1,16 @@
+
 import pytest
 from test_updates import stop_update, waiting_gtc
 
 from aqla_agent.router import Router
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.models import (
+    AqlaError,
+    Evidence,
+    Interpretation,
+    SourceEvent,
+    now_ms,
+    require_first,
+)
 
 
 async def rejected_sources(setup, monkeypatch, kind="rejected"):
@@ -187,7 +195,7 @@ def test_retention_trims_finished_source_bodies_but_keeps_pending_and_dedupe(set
     snapshot = state.snapshot()
     assert len(snapshot["events"]) == 100
     assert snapshot["event_tombstones"]
-    tombstone = next(source for source in originals if source.event_id in snapshot["event_tombstones"])
+    tombstone = require_first(source for source in originals if source.event_id in snapshot["event_tombstones"])
     assert trading.ingest(tombstone)["status"] == "already_processed"
     assert tombstone.event_id not in state.snapshot()["events"]
     assert state.snapshot()["sequence"] == snapshot["sequence"]

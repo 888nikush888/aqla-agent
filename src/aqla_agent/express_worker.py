@@ -55,7 +55,7 @@ class ExpressWorker:
             return
         try:
             draft = compile_template(source)
-        except (AqlaError, ValueError):
+        except ValueError:
             return
         if draft is None:
             return
@@ -194,8 +194,6 @@ class ExpressWorker:
             updated = SourceJob.model_validate(self.state.read("source_jobs", entries={"source_jobs": [job.job_id]})["source_jobs"][job.job_id])
             updated.express_timings["application_reply_at"] = now_ms()
             self.processor.save(updated)
-        except asyncio.CancelledError:
-            raise
         except Exception as error:
             current = SourceJob.model_validate(self.state.read("source_jobs", entries={"source_jobs": [job.job_id]})["source_jobs"][job.job_id])
             observed = self.state.snapshot()
@@ -220,8 +218,6 @@ class ExpressWorker:
             self.signal.clear()
             try:
                 await self.tick()
-            except asyncio.CancelledError:
-                raise
             except Exception as error:
                 LOG.warning("Express worker unavailable (%s); sources remain durable", type(error).__name__)
             try:

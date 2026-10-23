@@ -1,4 +1,5 @@
 """Pathless immutable output receipts bound to the native profile and session."""
+
 import hashlib
 import hmac
 import json
@@ -12,12 +13,14 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
+from aqla_hyperliquid_mcp.models import require_first
+
 CAPTURE = ContextVar("aqla_output_capture", default=None)
 GENERATED = ContextVar("aqla_generated_outputs", default=None)
 PAGE_BYTES = 32768
 MAX_READ_CHARS = 16384
 _LOCK = threading.RLock()
-_CLEANED_AT = {}
+_CLEANED_AT: dict[str, float] = {}
 
 
 def encoded(value):
@@ -83,7 +86,8 @@ class OutputStore:
                 raise ValueError("Output storage changed during access")
             return data
 
-    def write_file(self, path, data):
+    @staticmethod
+    def write_file(path, data):
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0), 0o600)
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
@@ -202,7 +206,7 @@ def select_json(text, sections, record_ids):
         root = json.loads(text)
         for _ in range(4):
             if isinstance(root, dict) and set(root) in ({"result"}, {"data"}):
-                root = next(iter(root.values()))
+                root = require_first(iter(root.values()))
                 if isinstance(root, str):
                     root = json.loads(root)
             else:

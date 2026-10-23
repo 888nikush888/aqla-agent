@@ -1,3 +1,4 @@
+
 import copy
 import json
 
@@ -6,7 +7,7 @@ import pytest
 
 from aqla_agent.observations import TemporaryObservation
 from aqla_agent.router import Router
-from aqla_hyperliquid_mcp.models import AqlaError, TradePlan
+from aqla_hyperliquid_mcp.models import AqlaError, TradePlan, require_first
 from aqla_hyperliquid_mcp.server import close_server, create_server
 from aqla_hyperliquid_mcp.state import State
 
@@ -18,7 +19,7 @@ async def test_inventory_socket_refresh_disconnect_holds_managed_protection_with
     from websockets.exceptions import ConnectionClosedError
 
     from aqla_agent.inventory_stream import observe
-    state, fake, engine, plan, trade = await opened_zone(setup)
+    state, fake, engine, _plan, trade = await opened_zone(setup)
     first = trade["entry_orders"][0]
     fake.fill(first["cloid"], first["quantity"], first["price"])
     await engine.refresh_trade(trade["trade_id"])
@@ -58,7 +59,7 @@ async def test_protection_read_outage_recovers_without_close_or_disabling_accoun
     preview = await router.preview(source.event_id, interpretation)
     trade = await router.execute(preview['targets'][0]['plan_id'])
     trade_id = trade['trade_id']
-    identity = next(row['cloid'] for row in trade['orders'] if row['kind'] == kind)
+    identity = require_first(row['cloid'] for row in trade['orders'] if row['kind'] == kind)
     before = copy.deepcopy(state.snapshot())
     actions = copy.deepcopy(fake.actions)
     original, calls = fake.handle, 0

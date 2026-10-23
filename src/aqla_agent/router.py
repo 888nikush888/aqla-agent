@@ -13,12 +13,13 @@ from aqla_hyperliquid_mcp.models import (
     TradePlan,
     digest,
     now_ms,
+    require_first,
 )
 
 from .accounting import inventory_view
 from .observations import TemporaryObservation, diagnostic, retry_due, retry_marker
 from .pipelines import ConfigurationChanged, VenueState, validate_ranking_binding
-from .trading import OPEN, PendingStopUpdate, StopUpdatePhase, Trading
+from .trading import OPEN, PendingStopUpdate, Trading
 from .venues import execution_settings, public_operation
 
 RecoveryCategory = Literal["complete", "incomplete", "unavailable", "timeout", "cancelled"]
@@ -34,7 +35,7 @@ class RecoveryDiagnostic(TypedDict):
 
 def recovery_diagnostics(data) -> dict[str, RecoveryDiagnostic]:
     """Bounded safe metadata; no source text, exception or provider payload."""
-    result = {}
+    result: dict[str, RecoveryDiagnostic] = {}
     for venue in ("hyperliquid",):
         for network in ("mainnet", "testnet"):
             key = venue + ":" + network
@@ -44,8 +45,8 @@ def recovery_diagnostics(data) -> dict[str, RecoveryDiagnostic]:
             numbers = ("last_attempt_at", "duration_ms", "error_count")
             if any(type(row.get(name)) is not int or row[name] < 0 for name in numbers):
                 continue
-            fact = {name: row[name] for name in numbers}
-            fact["category"] = row["category"]
+            fact: RecoveryDiagnostic = {"last_attempt_at": row["last_attempt_at"], "duration_ms": row["duration_ms"],
+                                        "error_count": row["error_count"], "category": row["category"]}
             if type(row.get("last_success_at")) is int and row["last_success_at"] >= 0:
                 fact["last_success_at"] = row["last_success_at"]
             result[key] = fact
@@ -189,7 +190,8 @@ class Router:
         except Exception as error:
             return {"hyperliquid": {"available": False, "reason": str(error) if isinstance(error, AqlaError) else "Complete account inventory is unavailable"}}
 
-    def selected_targets(self, row, data):
+    @staticmethod
+    def selected_targets(row, data):
         source = row["source"]["chat_id"]
         aliases = {value: key for key, value in data.get("source_aliases", {}).items()}
         result = {}
@@ -286,6 +288,7 @@ class Router:
             target.pop("fallback_reason", None)
             target.pop("skipped_replacements", None)
             engine = self.engine_for(requested, network)
+            deadline = None
             try:
                 if engine is None:
                     raise AqlaError(self.errors.get(requested + ":" + network, self.errors.get(requested, "Required account/network is unavailable")))
@@ -314,7 +317,7 @@ class Router:
                 row["entry_diagnostic"] = diagnostic(error, "preview")
                 if marker:
                     row["observation_retry"] = {**marker, "exhausted": True, "completed": True, "attempt_inflight": False}
-                if isinstance(error, TemporaryObservation) and engine is not None:
+                if isinstance(error, TemporaryObservation) and engine is not None and deadline is not None:
                     retry = retry_marker(marker, error, deadline, "preview")
                     retry.update(configuration_revision=preview_basis["configuration_revision"], ranking_revision=preview_basis["ranking_revision"])
                     row.update(status="rejected" if retry["exhausted"] else "pending", observation_retry=retry)
@@ -413,7 +416,7 @@ class Router:
             families = {tuple(sorted(row["plan"]["source_refs"])) for row in self.state.snapshot()["trades"].values() if row["trade_id"] in parents or parent in row["plan"]["source_refs"]}
             if len(families) != 1:
                 raise AqlaError("The replied source does not identify one executed setup family")
-            selected = next(iter(families))
+            selected = require_first(iter(families))
             candidates = {name: [row for row in rows if tuple(sorted(row["plan"]["source_refs"])) == selected]
                           for name, rows in candidates.items() if any(tuple(sorted(row["plan"]["source_refs"])) == selected for row in rows)}
         families = {tuple(sorted(row["plan"]["source_refs"])) for rows in candidates.values() for row in rows}
@@ -444,7 +447,7 @@ class Router:
 
     @staticmethod
     def stop_event_statuses(data) -> dict[str, Literal["needs_reconciliation", "updated", "superseded", "rejected"]]:
-        phases: dict[str, list[StopUpdatePhase]] = {}
+        phases: dict[str, list[str]] = {}
         for trade in data["trades"].values():
             for event_id, sequence in trade.get("management_sequences", {}).items():
                 phase = sequence["phase"] if sequence.get("completed") else "unknown"
@@ -462,7 +465,7 @@ class Router:
             for saved in requests.values():
                 request = PendingStopUpdate.model_validate(saved)
                 phases.setdefault(request.event_id, []).append(request.phase)
-        result = {}
+        result: dict[str, Literal["needs_reconciliation", "updated", "superseded", "rejected"]] = {}
         for event_id, values in phases.items():
             result[event_id] = ("needs_reconciliation" if any(phase in ("waiting_fill", "replacing", "unknown") for phase in values)
                                 else "updated" if "confirmed" in values else "superseded" if all(phase == "superseded" for phase in values) else "rejected")

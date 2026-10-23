@@ -1,4 +1,5 @@
 """Reproducible response-size comparison; optional same-model, order-free replay."""
+
 import argparse
 import asyncio
 import contextlib
@@ -11,6 +12,8 @@ import sys
 import tempfile
 from decimal import Decimal
 from pathlib import Path
+
+from aqla_hyperliquid_mcp.models import require_first
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = "1c4e4ce674920a7cac558e23ddedffd9623c5b00"
@@ -55,11 +58,12 @@ async def packets():
             reduced = await read("source_context_batch", event_ids=[source.event_id for source in sources[:8]])
             notification = await read("notifications_read")
             rendered = await read("notifications_read", view="rendered")
-            assert notification["telegram_view"] == rendered["telegram_view"]
+            if not (notification['telegram_view'] == rendered['telegram_view']):
+                raise AssertionError
             for item in reduced["items"]:
                 for identity in item["message_ids"]:
-                    assert reduced["messages"][identity]["source"]["text"] == next(
-                        row["source"]["text"] for context in original for row in context["messages"] if row["event_id"] == identity)
+                    if not (reduced['messages'][identity]['source']['text'] == require_first(row['source']['text'] for context in original for row in context['messages'] if row['event_id'] == identity)):
+                        raise AssertionError
             pairs = {"status": (await read("status"), await read("status", view="summary")),
                      "eight_source_contexts": (original, reduced), "notifications": (notification, rendered)}
             output = {}
@@ -124,15 +128,16 @@ def replay(hermes_source, output_home, key, *, limit=8, selected_ids=None):
                 result = Interpretation.model_validate_json(response)
                 verify_evidence(result, {row["event_id"]: row for row in rows})
                 if result.kind in ("report", "unrelated", "incomplete", "ambiguous"):
-                    assert result.reason.strip() and any(proof.field == "classification" and proof.source_id == rows[-1]["source_id"]
-                                                         and proof.quote in rows[-1]["source"]["text"] for proof in result.evidence), "classification_proof"
+                    if not (result.reason.strip() and any(proof.field == 'classification' and proof.source_id == rows[-1]['source_id'] and (proof.quote in rows[-1]['source']['text']) for proof in result.evidence)):
+                        raise AssertionError('classification_proof')
                 for field, expected in case["expected"].items():
                     actual = getattr(result, field)
                     if isinstance(actual, Decimal):
                         expected = Decimal(expected)
                     elif field == "take_profits":
                         expected = [Decimal(value) for value in expected]
-                    assert actual == expected, field
+                    if not (actual == expected):
+                        raise AssertionError(field)
                 reports.append({"mode": mode, "passed": True, "kind": result.kind, **{name: getattr(agent, "session_" + name, None)
                                 for name in ("input_tokens", "output_tokens", "cache_read_tokens", "reasoning_tokens", "api_calls")}})
             except Exception as error:

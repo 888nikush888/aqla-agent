@@ -1,3 +1,4 @@
+
 import asyncio
 import copy
 import json
@@ -9,11 +10,12 @@ from test_native_setup import fixture_controller, update
 from aqla_agent.native_commands import CALLBACK_PREFIX, COMMANDS, NativeCommands, register_commands
 from aqla_agent.pipelines import Parameters
 from aqla_hyperliquid_mcp.auth import Authority
+from aqla_hyperliquid_mcp.models import require_first
 
 
 @pytest.fixture
 def controls():
-    native, bot, gate, now, current, calls, checks = fixture_controller()
+    native, bot, gate, now, current, _calls, _checks = fixture_controller()
     native.lease = "a" * 64, current[0], 1300.0
     generation = gate.bind(current[0])
     gate.register(current[0], "a" * 64, None, generation)
@@ -171,7 +173,7 @@ async def test_native_cosmetic_name_uses_actual_mcp_when_setup_is_unconfigured(c
         assert after["source_names"]["-101"] == "New display name"
         assert after["source_names_revision"] == before["source_names_revision"] + 1
         assert after["sources"] == before["sources"] and after["configuration_revision"] == before["configuration_revision"]
-        control_args = next(arguments for tool, arguments in calls if tool == "control")
+        control_args = require_first(arguments for tool, arguments in calls if tool == "control")
         assert "setup" not in server.aqla_authority.verify(control_args["context_auth"], operator=True)
         assert not after["trades"] and not after["plans"] and not after["operations"] and not fake.actions
     finally:
@@ -180,7 +182,7 @@ async def test_native_cosmetic_name_uses_actual_mcp_when_setup_is_unconfigured(c
 
 def button(bot, label):
     keyboard = bot.sent[-1]["reply_markup"]["inline_keyboard"]
-    return next(item["callback_data"] for row in keyboard for item in row if item["text"] == label)
+    return require_first(item["callback_data"] for row in keyboard for item in row if item["text"] == label)
 
 
 @pytest.mark.asyncio

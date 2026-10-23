@@ -11,7 +11,7 @@ from aqla_hyperliquid_mcp.models import AqlaError
 @pytest.fixture
 def shared(setup,monkeypatch):
     from aqla_agent import inventory_stream
-    settings,state,fake,exchange,trading=setup
+    settings,_state,fake,exchange,trading=setup
     settings.shared_account=True
     manual={'ETH':'1','SOL':'2'}
     orders=[]

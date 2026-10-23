@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_FLOOR, ROUND_UP, Decimal, InvalidOperation, localcontext
-from typing import Literal
+from typing import Any, Literal
 
 from .models import (
     EVIDENCE_FIELDS,
@@ -73,7 +73,7 @@ def split_targets(quantity: Decimal, count: int, policy: Policy, market: Market)
         if count > 5:
             raise AqlaError("Adaptive distribution uses at most five targets")
         weights = [Decimal(value) for value in ("50", "25", "12.5", "7.5")[:count - 1]]
-        weights += [100 - sum(weights)]
+        weights += [Decimal(100) - sum(weights, Decimal(0))]
     elif policy.take_profit_allocation == "first_target":
         if count != 1:
             raise AqlaError("First-target distribution uses exactly one target")
@@ -84,7 +84,7 @@ def split_targets(quantity: Decimal, count: int, policy: Policy, market: Market)
             raise AqlaError("TP weight count differs from signal target count")
     elif policy.take_profit_allocation == "halving":
         weights = [Decimal(100) / (Decimal(2) ** (i + 1)) for i in range(count - 1)]
-        weights += [100 - sum(weights)]
+        weights += [Decimal(100) - sum(weights, Decimal(0))]
     else:
         weights = [Decimal(100) / count] * count
     quantities = [quantity_grid(quantity * weight / 100, market) for weight in weights[:-1]]
@@ -289,7 +289,7 @@ def verify_evidence(signal: Interpretation, events: dict):
     texts = {ref: row["source"]["text"] for ref, row in latest_sources(events, signal.source_refs).items()}
     if any(ref not in texts for ref in signal.source_refs):
         raise AqlaError("Unknown source reference")
-    fields = {}
+    fields: dict[str, list[str]] = {}
     for proof in signal.evidence:
         if proof.source_id not in signal.source_refs or proof.quote not in texts[proof.source_id]:
             raise AqlaError("Evidence does not occur in its original source")
@@ -310,9 +310,9 @@ def verify_evidence(signal: Interpretation, events: dict):
         if leg.weight_percent is not None:
             from aqla_agent.evidence import position_fractions
             quotes = fields.get(f"entry_legs.{index}.weight_percent", [])
-            supported = any({value for _, value in position_fractions(quote)} == {leg.weight_percent}
+            weight_supported = any({value for _, value in position_fractions(quote)} == {leg.weight_percent}
                             or len(list(re.finditer(r"\d+(?:[.,]\d+)?\s*%", quote))) == 1 and leg.weight_percent in set(quoted_numbers(quote)) for quote in quotes)
-            if not supported:
+            if not weight_supported:
                 errors.append(f"Entry position weight needs its own fraction/percent evidence: entry_legs.{index}.weight_percent")
         if not fields.get(f"entry_legs.{index}.kind"):
             errors.append(f"Entry leg form needs original contextual evidence: entry_legs.{index}.kind")
@@ -330,14 +330,14 @@ def verify_evidence(signal: Interpretation, events: dict):
             errors.append(f"Numeric source evidence must isolate one number: {field} (complete compatible original value; numbering labels are not prices)")
     if signal.reduce_percent is not None:
         from aqla_agent.evidence import position_fractions
-        supported = False
+        reduction_supported = False
         for quote in fields.get("reduce_percent", []):
             quantities = [{value} for _, value in position_fractions(quote)]
             quantities.extend(set(quoted_numbers(match.group())) for match in re.finditer(
                 r"(?<![\w.])\d+(?:[.,]\d+)*\s*%", quote))
             if len(quantities) == 1 and signal.reduce_percent in quantities[0]:
-                supported = True
-        if not supported:
+                reduction_supported = True
+        if not reduction_supported:
             errors.append("Reduction percentage is not supported by source evidence: reduce_percent")
     if signal.leverage is not None and not any(
             signal.leverage in set(quoted_leverage_numbers(quote)) for quote in fields.get("leverage", [])):
@@ -489,8 +489,15 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
             selected_targets(backup.fallback_take_profit_percentages, policy) if "take_profits" in fields else (),
             stop_unit=backup.fallback_stop_loss_unit if backup else "course_percent",
             take_profit_unit=backup.fallback_take_profit_unit if backup else "course_percent", leverage=leverage)
-        stop = derived_stop if "stop_loss" in fields else price_grid(signal.stop_loss, market, up=not long)
-        source_tp = None
+        if "stop_loss" in fields:
+            stop = derived_stop
+        elif signal.stop_loss is not None:
+            stop = price_grid(signal.stop_loss, market, up=not long)
+        else:
+            raise AqlaError("Source stop or approved Backup stop is required")
+        if stop is None:
+            raise AqlaError("Approved stop could not be established")
+        source_tp: dict[str, Any] | None = None
         from aqla_agent.percent_targets import reference_entry
         source_reference = reference_entry(signal, policy)
         if signal.take_profit_unit != "price" and signal.take_profits:
@@ -523,6 +530,8 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         maximum = min(budget / distance, policy.max_notional_usdc / position_price,
                       account.available_margin * margin_leverage(leverage, market) / position_price)
         if policy.sizing_mode == "fixed_notional":
+            if policy.fixed_notional_usdc is None:
+                raise AqlaError("Fixed-notional sizing requires its approved amount")
             maximum = min(maximum, policy.fixed_notional_usdc / position_price)
         quantity = quantity_grid(min(maximum, market.max_quantity) if market.max_quantity else maximum, market)
         if market.leverage_tiers:
@@ -578,15 +587,15 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
             source_tp["values"] = source_tp["values"][:len(targets)]
             source_tp["preview_prices"] = source_tp["preview_prices"][:len(targets)]
         trade_id = digest([*binding, sorted(signal.source_refs)])[:32]
-        values = dict(trade_id=trade_id, source_refs=signal.source_refs, policy_revision=revision, policy=policy,
-                      signal_leverage=int(Decimal(signal.leverage).to_integral_value(rounding=ROUND_FLOOR)) if signal.leverage is not None else None,
-                      signal_leverage_original=signal.leverage, effective_leverage=leverage, source_symbol=signal.symbol,
-                      backup_fields=fields, backup_values=backup.model_copy(deep=True) if fields else None, backup_profile_revision=backup_revision if fields else None,
-                      network=binding[0], account=binding[1], principal=principal, market=market, side=signal.side, entry_kind=kind,
-                      entry_price=entry, entry_limit=limit, stop_loss=stop, take_profits=targets, quantity=quantity,
-                      source_take_profit_count=len(signal.take_profits),
-                      tp_quantities=tp_sizes, risk_usdc=quantity * distance,
-                      deadline_at=source_time + policy.max_signal_age_seconds * 1000, created_at=stamp)
+        values = {"trade_id": trade_id, "source_refs": signal.source_refs, "policy_revision": revision, "policy": policy,
+                      "signal_leverage": int(Decimal(signal.leverage).to_integral_value(rounding=ROUND_FLOOR)) if signal.leverage is not None else None,
+                      "signal_leverage_original": signal.leverage, "effective_leverage": leverage, "source_symbol": signal.symbol,
+                      "backup_fields": fields, "backup_values": backup.model_copy(deep=True) if fields else None, "backup_profile_revision": backup_revision if fields else None,
+                      "network": binding[0], "account": binding[1], "principal": principal, "market": market, "side": signal.side, "entry_kind": kind,
+                      "entry_price": entry, "entry_limit": limit, "stop_loss": stop, "take_profits": targets, "quantity": quantity,
+                      "source_take_profit_count": len(signal.take_profits),
+                      "tp_quantities": tp_sizes, "risk_usdc": quantity * distance,
+                      "deadline_at": source_time + policy.max_signal_age_seconds * 1000, "created_at": stamp}
         if policy.entry_execution != "standard":
             values["entry_execution"] = policy.entry_execution
         if policy.take_profit_execution != "standard":

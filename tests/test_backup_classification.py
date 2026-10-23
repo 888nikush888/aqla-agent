@@ -1,4 +1,5 @@
 """Synthetic sources only; no live credentials, accounts or exchange transports."""
+
 import copy
 import json
 from decimal import Decimal
@@ -9,7 +10,14 @@ from test_backup_roe import configure_roe
 
 from aqla_agent.source_assistance import check_interpretation
 from aqla_agent.source_disposition import issue_receipt, verify_disposition
-from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, now_ms
+from aqla_hyperliquid_mcp.models import (
+    AqlaError,
+    Evidence,
+    Interpretation,
+    SourceEvent,
+    now_ms,
+    require_first,
+)
 from aqla_hyperliquid_mcp.server import close_server, create_server
 
 TEXT = "BTCUSDT.P SHORT\nSHORT-zone: 100+\nLeverage: 10x (cross)\nTargets: 50% / 100%\nMargin: <=2% of deposit"
@@ -90,7 +98,7 @@ async def test_public_writes_recheck_policy_without_planning_or_ordering(setup, 
             item = {**draft.model_dump(mode="json", include={"kind", "reason", "reason_codes", "source_refs", "evidence"}),
                     "event_id": source.event_id, "source_read_receipt": receipt}
             response = await server.call_tool(tool, {"items": [item], "context_auth": args["context_auth"]})
-            payload = response.structured_content or json.loads(next(c.text for c in response.content if c.type == "text"))
+            payload = response.structured_content or json.loads(require_first(c.text for c in response.content if c.type == "text"))
             assert payload["succeeded"] == 0 and not payload["items"][0]["ok"]
         else:
             with pytest.raises(ToolError, match="Missing source SL/TP/leverage alone"):
@@ -132,7 +140,7 @@ async def test_corrected_source_uses_only_backup_stop_and_preserves_both_source_
     current = state.snapshot()["trades"][trade["trade_id"]]
     assert current["status"] == "open" and Decimal(current["stop_price"]) == 104
     targets = [row for row in current["orders"] if row["kind"] == "tp" and not row.get("retired")]
-    assert list(map(lambda r: Decimal(r["price"]), targets)) == [95, 90]
+    assert [Decimal(r["price"]) for r in targets] == [95, 90]
     assert all(fake.orders[row["cloid"]]["order"]["reduceOnly"] for row in current["orders"] if not row.get("retired"))
     sent = copy.deepcopy(fake.actions)
     await trading.recover()

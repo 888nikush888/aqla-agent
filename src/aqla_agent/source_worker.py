@@ -7,7 +7,7 @@ import os
 import time
 from pathlib import Path
 
-from aqla_hyperliquid_mcp.models import AqlaError, Interpretation, digest
+from aqla_hyperliquid_mcp.models import Interpretation, digest, require_first
 
 from .decisions import (
     QUESTION_CONTRACT_VERSION,
@@ -259,17 +259,17 @@ class SourceWorker:
                 if packet is None:
                     raise DecisionFailure("source_packet_limit")
             packet["approved_source_guidance"] = self.extension.master_path.read_text(encoding="utf-8")
-            selected_anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+            selected_anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
             measured.workflow["source_work_type"] = "cached" if job.get("result") is not None else "interpretation" if selected_anchor["text"].strip() else "empty"
             if job.get("result") is not None:
                 result = DecisionResult.model_validate(job["result"])
                 if job.get("policy_version") != policy_version or result.question_version != VERSION or result.collection_only:
                     raise DecisionFailure("cached_decision_policy_changed")
                 if not result.fallback and result.model != "python" and (
-                        not profile.permits(source=next(row["chat_id"] for row in packet["messages"]
+                        not profile.permits(source=require_first(row["chat_id"] for row in packet["messages"]
                             if row["event_id"] == packet["anchor_event_id"]), master_hash=master_hash,
                             model=result.model, model_revision=result.model_revision)
-                        or not profile.permits_kind(next(row["chat_id"] for row in packet["messages"]
+                        or not profile.permits_kind(require_first(row["chat_id"] for row in packet["messages"]
                             if row["event_id"] == packet["anchor_event_id"]), result.interpretation.kind)):
                     raise DecisionFailure("cached_decision_not_calibrated")
                 measured.workflow["cache_hit"] = True
@@ -277,7 +277,7 @@ class SourceWorker:
             else:
                 usage = measured.api
                 try:
-                    anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+                    anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
                     if not anchor["text"].strip():
                         result = DecisionResult(model="python", interpretation=Interpretation(
                             kind="incomplete", source_refs=[anchor["source_id"]], reason="Originaltext fehlt.",
@@ -294,7 +294,7 @@ class SourceWorker:
                         # Use the same interpretation-aware admission as offline
                         # replay. Original-only heuristics belong to failure review.
                         validate_interpretation(packet, result.interpretation)
-                except (AqlaError, ValueError) as error:
+                except ValueError as error:
                     code = str(error) if isinstance(error, DecisionFailure) else "decision_invalid"
                     mark_decision_failure(usage, code)
                     if code in ("source_context_limit", "candidate_limit"):
@@ -353,7 +353,7 @@ class SourceWorker:
     async def interpret(self, packet, profile, master_hash, revision, usage, *, spans=None):
         if len(json.dumps(packet, ensure_ascii=False)) > self.config.max_context_characters:
             raise DecisionFailure("source_context_limit")
-        source = next(row["chat_id"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+        source = require_first(row["chat_id"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
         permitted = profile.permits(source, master_hash, model=self.config.model, model_revision=revision)
         # Calibration controls admission, not whether the decision model is used.
         # Unapproved sources produce explicitly collection-only proposals for review.
@@ -370,7 +370,7 @@ class SourceWorker:
                     raise DecisionFailure("source_not_calibrated")
                 if not profile.permits_kind(source, result.interpretation.kind):
                     raise DecisionFailure("source_decision_kind_not_calibrated")
-        except (AqlaError, ValueError) as error:
+        except ValueError as error:
             code = str(error) if isinstance(error, DecisionFailure) else "decision_invalid"
             packet["decision_review"] = {
                 "model": self.config.model, "model_revision": revision, "question_version": VERSION,
@@ -411,8 +411,6 @@ class SourceWorker:
             success = result.success is True
             message_id = getattr(result, "message_id", None)
             message_id = str(message_id) if message_id is not None else None
-        except asyncio.CancelledError:
-            raise
         except Exception:
             pass
         await self.internal("delivery_complete", delivery_id=selected["delivery_id"],

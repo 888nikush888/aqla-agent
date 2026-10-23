@@ -1,3 +1,4 @@
+
 import copy
 from decimal import Decimal
 
@@ -6,7 +7,7 @@ from test_monthly import data, millis, trade
 
 from aqla_agent.presentation import PresentationScope, PresentationSnapshot, build_presentation
 from aqla_agent.ranking import RankingPolicy, outcomes
-from aqla_hyperliquid_mcp.models import digest
+from aqla_hyperliquid_mcp.models import digest, require_first
 
 CLOCK = millis("2026-10-09T12:00:00+02:00")
 
@@ -47,7 +48,7 @@ def test_presentation_finance_oracle_separates_network_currency_and_missing_evid
     usdc, usdt, testnet, missing = trade("hl"), trade("aster", currency="USDT"), trade("testnet", currency="USDT"), trade("missing", currency="USDT")
     usdt["plan"]["exchange"] = missing["plan"]["exchange"] = "aster"
     testnet["plan"].update(exchange="aster", network="testnet")
-    next(iter(missing["fill_events"].values()))["fee"] = None
+    require_first(iter(missing["fill_events"].values()))["fee"] = None
     missing["funding_coverage"]["fill_fingerprint"] = digest(missing["fill_events"])
     source = state_data(usdc, usdt, testnet, missing)
     before = copy.deepcopy(source)
@@ -149,7 +150,7 @@ def test_missing_cost_fx_and_execution_evidence_never_becomes_zero(missing):
     if missing == "funding":
         row.pop("funding_coverage")
     elif missing == "fee_currency":
-        next(iter(row["fill_events"].values()))["feeToken"] = "BNB"
+        require_first(iter(row["fill_events"].values()))["feeToken"] = "BNB"
         row["funding_coverage"]["fill_fingerprint"] = digest(row["fill_events"])
     else:
         row.pop("entry_fill_quantity_confirmed")
@@ -238,7 +239,7 @@ def test_scoped_outcomes_reuse_only_current_build_rows_and_keep_cross_currency_f
     source = state_data(selected, sibling, unrelated)
     for row in (selected, sibling):
         row["plan"].update(setup_id="shared-family", source_refs=["shared-source"])
-    expected_r = Decimal(next(row["net_r"] for row in original_outcomes(source)[0]["-1001"]
+    expected_r = Decimal(require_first(row["net_r"] for row in original_outcomes(source)[0]["-1001"]
                              if row["setup_id"] == "shared-family"))
     calls, original = [], monthly.report_row
 

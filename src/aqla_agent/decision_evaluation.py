@@ -12,7 +12,7 @@ from collections import Counter
 from decimal import Decimal
 from pathlib import Path
 
-from aqla_hyperliquid_mcp.models import SourceEvent, digest
+from aqla_hyperliquid_mcp.models import SourceEvent, digest, require_first
 
 from .decisions import (
     DEFAULT_DECISION_MODEL,
@@ -274,7 +274,7 @@ def question_labels(packet, expected, actual=None, candidate_occurrences=None):
         "entry": {expected.get("entry", "unspecified")}, "entry_timing": {expected.get("entry_timing", "standard")},
         "update_action": {expected.get("update_action") or "not_present"}}
     from .semantic_contract import strict_deferred_price
-    anchor = next(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
+    anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     if expected.get("entry") == "limit" and strict_deferred_price(
             anchor["text"], expected.get("entry_timing"), expected.get("entry_prices") or []):
         labels["entry"].add("unspecified")
@@ -402,7 +402,7 @@ def validate_splits(dataset, sources=()):
         for case in dataset:
             if case.get("origin") == "real":
                 packet = case_packet(case)
-                represented.add(next(row["chat_id"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"]))
+                represented.add(require_first(row["chat_id"] for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"]))
         if not set(sources) <= represented:
             raise ValueError("Activation sources must have independently annotated real anchor messages")
     return by_id
@@ -552,7 +552,7 @@ async def evaluate(dataset, adapter, *, profile=None, master="", collect=False, 
             except DecisionFailure:
                 baseline_passed = False
         rows.append({"id": case["id"], "source_hash": digest(packet), "annotation_hash": annotation_identity(case), "kind": predicted,
-                     "source_id": next(r["chat_id"] for r in packet["messages"] if r["event_id"] == packet["anchor_event_id"]),
+                     "source_id": require_first(r["chat_id"] for r in packet["messages"] if r["event_id"] == packet["anchor_event_id"]),
                      "expected_kind": expected_kind, "passed": failure is None and not mismatches,
                      "raw_correct": failure is None and not mismatches, "accepted": accepted, "deferred": not accepted,
                      "baseline_gate_passed": baseline_passed,

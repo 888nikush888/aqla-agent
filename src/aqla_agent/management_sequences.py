@@ -1,8 +1,9 @@
 """Durable reduction-then-stop instructions; Python owns order and fixed quantity basis."""
+
 import re
 from decimal import Decimal
 
-from aqla_hyperliquid_mcp.models import AqlaError, Interpretation, TradePlan, digest, now_ms
+from aqla_hyperliquid_mcp.models import AqlaError, Interpretation, TradePlan, digest, now_ms, require_first
 from aqla_hyperliquid_mcp.rules import management_steps, price_grid, quantity_grid
 
 from .interpretation_contract import validate_reduction_quantity
@@ -23,7 +24,7 @@ def finish(engine, trade_id, event_id, phase, reason=None):
 
 async def start(engine, event_id, signal):
     packet = build_packet(engine.context(event_id))
-    text = current_structure_text(next(row["text"] for row in packet["messages"] if row["event_id"] == event_id))
+    text = current_structure_text(require_first(row["text"] for row in packet["messages"] if row["event_id"] == event_id))
     symbols = {market.symbol.split(":")[-1].upper().removesuffix("USDT").removesuffix("USDC") for market in engine.exchange.market_cache.values()}
     symbols.update(row["symbol"].split(":")[-1].upper() for row in packet["trades"] if row.get("symbol"))
     named = {symbol for symbol in symbols - {"LONG", "SHORT", "BUY", "SELL"} if re.search(r"(?<!\w)" + re.escape(symbol) + r"(?:USDT|USDC)?(?:\.P)?(?!\w)", text, re.I)}

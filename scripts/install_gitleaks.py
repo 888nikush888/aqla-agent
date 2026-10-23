@@ -7,6 +7,7 @@ import tarfile
 import urllib.request
 import zipfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 VERSION = "8.30.1"
 ASSETS = {
@@ -20,7 +21,10 @@ def main():
         raise SystemExit("This CI scanner installer requires Linux or Windows x64")
     asset, expected = ASSETS[platform.system()]
     url = f"https://github.com/gitleaks/gitleaks/releases/download/v{VERSION}/gitleaks_{VERSION}_{asset}"
-    with urllib.request.urlopen(url, timeout=60) as response:
+    if urlsplit(url).scheme != "https" or urlsplit(url).hostname != "github.com":
+        raise SystemExit("Scanner downloads require the pinned HTTPS release host")
+    # A fixed HTTPS release URL is authenticated by the reviewed digest below.
+    with urllib.request.urlopen(url, timeout=60) as response:  # skipcq: BAN-B310
         payload = response.read()
     if hashlib.sha256(payload).hexdigest() != expected:
         raise SystemExit("Gitleaks release checksum does not match the reviewed binary")
@@ -38,7 +42,7 @@ def main():
     target = Path(".cache/tools") / name
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(executable)
-    os.chmod(target, 0o755)
+    os.chmod(target, 0o700)
     print(f"Installed checksum-verified Gitleaks {VERSION}")
 
 

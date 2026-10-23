@@ -1,4 +1,5 @@
 """Current source contracts repair errors without changing archived interpretations."""
+
 import copy
 import json
 from decimal import Decimal
@@ -16,6 +17,7 @@ from aqla_hyperliquid_mcp.models import (
     SourceClassification,
     SourceEvent,
     now_ms,
+    require_first,
 )
 from aqla_hyperliquid_mcp.rules import verify_evidence
 from aqla_hyperliquid_mcp.server import close_server, create_server
@@ -89,7 +91,7 @@ async def test_actual_mcp_schema_has_indexed_fields_and_decimal_guidance(setup):
     settings, state, _, exchange, trading = setup
     server = create_server(settings, state=state, exchange=exchange)
     try:
-        tool = next(tool for tool in await server.list_tools() if tool.name == "interpret_source")
+        tool = require_first(tool for tool in await server.list_tools() if tool.name == "interpret_source")
         schema = tool.input_schema
         _, value = axs(trading)
         arguments = {"event_id": "fixture", "interpretation": value.model_dump(mode="json")}
@@ -230,7 +232,7 @@ async def test_batch_percent_failure_cannot_commit_or_authorize_other_item(setup
         before = copy.deepcopy(state.snapshot()["events"][first.event_id])
         result = await server.call_tool("interpret_source_batch", {
             "items": items, "context_auth": server.aqla_authority.sign("source", "fixture")})
-        payload = result.structured_content or json.loads(next(block.text for block in result.content if block.type == "text"))
+        payload = result.structured_content or json.loads(require_first(block.text for block in result.content if block.type == "text"))
         assert payload["succeeded"] == 1 and payload["partial_success"]
         assert not payload["items"][0]["ok"] and "source-roe-v1" in payload["items"][0]["error"]
         assert payload["items"][1]["ok"] and payload["items"][1]["status"] == "ambiguous"

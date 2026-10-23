@@ -1,3 +1,4 @@
+
 import pytest
 
 from aqla_agent.decision_evaluation import (
@@ -15,7 +16,7 @@ from aqla_agent.decision_evaluation import (
     source_gate_diagnostics,
 )
 from aqla_agent.decisions import DecisionFailure, DecisionResult
-from aqla_hyperliquid_mcp.models import Interpretation
+from aqla_hyperliquid_mcp.models import Interpretation, require_first
 
 
 def test_calibration_separates_kind_labels_and_intent_polarities():
@@ -63,7 +64,8 @@ async def test_complete_default_fields_do_not_disappear_from_annotation_comparis
     from aqla_agent.decision_evaluation import complete_fields
     from aqla_hyperliquid_mcp.models import Evidence
     class Adapter:
-        async def interpret(self, packet, profile, **kwargs):
+        @staticmethod
+        async def interpret(packet, profile, **kwargs):
             return DecisionResult(model="synthetic", interpretation=Interpretation(kind="report",
                 source_refs=[packet["anchor_source_id"]], evidence=[Evidence(field="classification",
                     source_id=packet["anchor_source_id"], quote="Original report")], reason="Result"))
@@ -80,7 +82,8 @@ async def test_complete_default_fields_do_not_disappear_from_annotation_comparis
 async def test_checkpoint_resumes_same_observation_without_another_request(tmp_path):
     calls = []
     class Adapter:
-        async def interpret(self, packet, profile, **kwargs):
+        @staticmethod
+        async def interpret(packet, profile, **kwargs):
             calls.append(packet)
             return DecisionResult(model="synthetic", collection_only=True,
                 interpretation=Interpretation(kind="report", source_refs=[packet["anchor_source_id"]]))
@@ -100,7 +103,8 @@ async def test_checkpoint_resumes_same_observation_without_another_request(tmp_p
 async def test_checkpoint_provider_failure_requires_explicit_retry(tmp_path):
     calls = []
     class Adapter:
-        async def interpret(self, packet, profile, **kwargs):
+        @staticmethod
+        async def interpret(packet, profile, **kwargs):
             calls.append(packet)
             if len(calls) == 1:
                 raise DecisionFailure("decision_api_unavailable")
@@ -253,7 +257,8 @@ def test_probability_buckets_tolerate_float_noise_but_never_round_errors_down():
 @pytest.mark.asyncio
 async def test_high_confidence_missed_action_is_a_critical_error():
     class Adapter:
-        async def interpret(self, packet, profile, **kwargs):
+        @staticmethod
+        async def interpret(packet, profile, **kwargs):
             return DecisionResult(model="inception/mercury-decide:free", interpretation=Interpretation(
                 kind="ambiguous", source_refs=[packet["anchor_source_id"]], reason="Synthetic wrong classification"))
 
@@ -274,7 +279,8 @@ def test_real_source_revision_overlap_is_rejected_even_with_distinct_groups():
 @pytest.mark.asyncio
 async def test_split_source_leakage_is_rejected_before_any_paid_request():
     class Forbidden:
-        async def interpret(self, *args, **kwargs):
+        @staticmethod
+        async def interpret(*args, **kwargs):
             raise AssertionError("Leaking dataset must not make a model call")
 
     source = {"chat_id": "channel", "message_id": 17, "sent_at": 1000, "text": "Original"}
@@ -289,7 +295,8 @@ async def test_evaluation_preserves_real_edit_and_reply_metadata():
     observed = []
 
     class Adapter:
-        async def interpret(self, packet, profile, **kwargs):
+        @staticmethod
+        async def interpret(packet, profile, **kwargs):
             observed.append(packet)
             return DecisionResult(model="inception/mercury-decide:free", interpretation=Interpretation(
                 kind="report", source_refs=[packet["anchor_source_id"]], reason="Synthetic report"))
@@ -375,7 +382,7 @@ def test_gold_labels_one_role_and_exact_normalization_choice_per_original_occurr
     identity, group = numeric_occurrences(candidates(packet))[0]
     expected = {field.split(".")[0]: [expected_value], "evidence": [
         {"field": field, "source_id": packet["anchor_source_id"], "quote": "Value " + quote}]}
-    selected = next(span for span in group if span.value == expected_value)
+    selected = require_first(span for span in group if span.value == expected_value)
     labels = question_labels(packet, expected)
     assert labels["role." + identity] == {role}
     assert labels["normalization." + identity] == {selected.candidate_id}
@@ -387,7 +394,7 @@ def test_gold_labels_one_role_and_exact_normalization_choice_per_original_occurr
     assert [row["correct"] for row in measured] == [True, True]
     assert [row["family"] for row in measured] == ["number_role." + role, "number_normalization"]
     assert measured[1]["prediction"] == selected.candidate_id and measured[1]["confidence"] == 0.9991
-    observed["values"]["normalization." + identity] = next(span.candidate_id for span in group if span != selected)
+    observed["values"]["normalization." + identity] = require_first(span.candidate_id for span in group if span != selected)
     wrong = calibration_question_results(packet, expected, observed, None)
     assert wrong[0]["correct"] and not wrong[1]["correct"]
 
@@ -408,7 +415,7 @@ def test_equal_ambiguous_quotes_need_occurrence_annotations_for_both_role_and_no
                    for (_, group), field in zip(groups, ("stop_loss", "take_profits.0"), strict=True)]
     labels = question_labels(packet, expected, candidate_occurrences=annotations)
     for (identity, group), role in zip(groups, ("stop_loss", "target_1"), strict=True):
-        selected = next(span for span in group if span.value == "1.234")
+        selected = require_first(span for span in group if span.value == "1.234")
         assert labels["role." + identity] == {role} and labels["normalization." + identity] == {selected.candidate_id}
     observed = {"values": {"normalization." + groups[0][0]: groups[0][1][0].candidate_id},
                 "probabilities": {"normalization." + groups[0][0]: 1},
@@ -466,7 +473,7 @@ def test_occurrence_annotation_cannot_use_a_quote_from_a_superseded_revision():
     original = {"chat_id": "channel", "message_id": 1, "sent_at": 1000, "text": "SL 7"}
     edited = {**original, "edited_at": 2000, "text": "TP 7"}
     packet = case_packet({"id": "edited-proof", "messages": [original, edited]})
-    span = next(span for span in candidates(packet) if span.kind == "number")
+    span = require_first(span for span in candidates(packet) if span.kind == "number")
     expected = {"stop_loss": 7, "evidence": [{"field": "stop_loss", "source_id": span.source_id, "quote": "SL 7"}]}
     annotation = {"field": "stop_loss", "source_id": span.source_id, "start": span.start, "end": span.end, "quote": "7"}
     with pytest.raises(ValueError, match="original position and Evidence"):
@@ -477,7 +484,8 @@ def test_occurrence_annotation_cannot_use_a_quote_from_a_superseded_revision():
 async def test_changed_gold_cannot_resume_cached_observation_under_same_input(tmp_path):
     calls = []
     class Adapter:
-        async def interpret(self, packet, profile, **kwargs):
+        @staticmethod
+        async def interpret(packet, profile, **kwargs):
             calls.append(packet)
             return DecisionResult(model="synthetic", interpretation=Interpretation(kind="report",
                 source_refs=[packet["anchor_source_id"]]))
@@ -603,9 +611,11 @@ async def test_swapped_same_value_occurrence_roles_are_a_critical_error_even_whe
 @pytest.mark.asyncio
 async def test_invalid_occurrence_annotation_is_rejected_before_any_catalog_or_model_request():
     class Forbidden:
-        async def identity(self):
+        @staticmethod
+        async def identity():
             raise AssertionError("Invalid gold must not fetch a model catalog")
-        async def interpret(self, *args, **kwargs):
+        @staticmethod
+        async def interpret(*args, **kwargs):
             raise AssertionError("Invalid gold must not make a model request")
     source = {"chat_id": "channel", "message_id": 1, "sent_at": 1000, "text": "BTC LONG. SL 7."}
     case = {"id": "invalid", "messages": [source], "expected": {"stop_loss": 7}, "split": "calibration",
