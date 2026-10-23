@@ -114,31 +114,31 @@ def test_settings_are_readable_without_python_representations():
 @pytest.mark.asyncio
 async def test_dashboard_rounds_only_monetary_display_and_keeps_missing_values_unknown(panel):
     menu, bot, _, changes, *_ = panel
-    amount = "14.22275700000000000000000001"
+    amount = "12.34567800000000000000000001"
     async def dashboard(*args, **kwargs):
         return {"net_pnl": {"value": amount, "known": 3, "total": 4}, "paused": False,
-                "resolved_period": "all", "fees": {"value": "1.024368"}, "funding": {"value": None},
+                "resolved_period": "all", "fees": {"value": "0.123456"}, "funding": {"value": None},
                 "open_trades": 1, "source_queue": {}}
     menu.rpc = dashboard
     await menu.dashboard(bot)
     text = (bot.edits or bot.sent)[-1]["text"]
-    assert "14,222757 USDC" in text and "Funding: nicht bestätigt" in text
-    assert amount == "14.22275700000000000000000001" and not changes
+    assert "12,345678 USDC" in text and "Funding: nicht bestätigt" in text
+    assert amount == "12.34567800000000000000000001" and not changes
 
 
 @pytest.mark.asyncio
 async def test_monthly_menu_formats_currency_and_percentages_without_rewriting_accounting(panel):
     menu, bot, _, changes, *_ = panel
-    summary = {"trades": 6, "complete": 3, "excluded": 3, "net_by_currency": {"USDC": "2.636418"},
-               "win_rate_percent": "33.33333333333333333333333333", "roe_sum_label": "Summe der Trade-Renditen",
-               "roe_sum_percent": "18.78822364199948851410691416"}
+    summary = {"trades": 6, "complete": 3, "excluded": 3, "net_by_currency": {"USDC": "3.456789"},
+               "win_rate_percent": "66.66666666666666666666666667", "roe_sum_label": "Summe der Trade-Renditen",
+               "roe_sum_percent": "21.123456789123456789"}
     before = copy.deepcopy(summary)
     async def monthly(*args, **kwargs):
         return {"summary": summary}
     menu.rpc = monthly
     await menu.run(bot, "month", "2026-10")
     text = (bot.edits or bot.sent)[-1]["text"]
-    assert "2,636418 USDC" in text and "33,33 %" in text and "18,79 %" in text
+    assert "3,456789 USDC" in text and "66,67 %" in text and "21,12 %" in text
     assert summary == before and not changes
 
 
