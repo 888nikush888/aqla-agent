@@ -257,6 +257,9 @@ class Evidence(Model):
                        description="Exact original substring. Each numeric price/percentage proof needs one actual value (include % when present). Verified target numbering may remain as context. Keep a longer unique original span when a bare number is ambiguous; never combine several trade values into one proof.")
 
 
+CLASSIFICATION_EVIDENCE_DESCRIPTION = 'Nonempty originals require field=classification, current anchor source_id and an exact original quote. For an EMPTY original use kind=incomplete and evidence=[]; no quote exists. Never borrow a parent/neighbour quote to classify an empty anchor.'
+
+
 class SourceClassification(Model):
     """A non-actionable batch item cannot carry any trade instruction."""
     event_id: str = Field(min_length=1, max_length=256)
@@ -264,7 +267,7 @@ class SourceClassification(Model):
     source_refs: list[str] = Field(min_length=1, max_length=20,
         description="Only the selected anchor source_id is classified. Reply/parent context remains readable but is not an additional classification target.")
     evidence: list[Evidence] = Field(default_factory=list, max_length=60,
-        description="Nonempty originals require field=classification, current anchor source_id and an exact original quote. For an EMPTY original use kind=incomplete and evidence=[]; no quote exists. Never borrow a parent/neighbour quote to classify an empty anchor.")
+        description=CLASSIFICATION_EVIDENCE_DESCRIPTION)
     reason: str = Field(min_length=1, max_length=2000)
     reason_codes: list[ClassificationReason] = Field(default_factory=list, max_length=8,
         description="Optional independent reasons for a non-actionable classification; use declared codes or omit the list, with specifics in reason. percentage_basis alone cannot block a source % TP: source-roe-v1 defines it as nominal ROE on own initial margin. Other genuine ambiguity remains non-actionable.")
@@ -342,7 +345,7 @@ class Interpretation(Model):
         description="Only for trade_update/update_action=sequence: exactly [reduce, break_even|move_stop] in original order. Fraction is of own position before the WHOLE instruction. Each action needs its complete original clause in management_steps.i.action evidence, plus its own .reduce_percent or .stop_loss proof. No conditional/future actions; never omit a separate instruction.")
     bound_trade_id: str | None = None
     evidence: list[Evidence] = Field(default_factory=list, max_length=60,
-        description="Original evidence for each populated field. For non-actionable results: " + SourceClassification.model_fields["evidence"].description)
+        description="Original evidence for each populated field. For non-actionable results: " + CLASSIFICATION_EVIDENCE_DESCRIPTION)
     reason: str = Field(default="", max_length=2000)
     reason_codes: list[ClassificationReason] = Field(default_factory=list, max_length=8,
         description=SourceClassification.model_fields["reason_codes"].description)
@@ -656,3 +659,47 @@ class SymbolUnavailable(AqlaError):
 
 class ExchangeMinimum(AqlaError):
     """TP quantity/notional cannot fit this venue, without increasing entry size."""
+
+
+OPEN = {"waiting_entry", "preparing", "opening", "open", "protecting", "unknown", "closing", "cleanup", "conflicted"}
+
+
+UNFINISHED = {"pending", "interpreted", "needs_reconciliation"}
+
+
+StopUpdatePhase = Literal["waiting_fill", "replacing", "unknown", "confirmed", "rejected", "superseded", "closed_without_application"]
+
+
+STOP_UPDATE_ACTIVE = {"waiting_fill", "replacing", "unknown"}
+
+
+def wire_number(value) -> str:
+    number = Decimal(str(value))
+    if not number.is_finite():
+        raise AqlaError("Non-finite exchange number")
+    return format(number, "f").rstrip("0").rstrip(".") if number % 1 else format(number.quantize(Decimal(1)), "f")
+
+
+class DecisionFailure(AqlaError):
+    """Safe failure code, never a provider response or model-supplied exception."""
+
+
+def management_steps(signal):
+    """Project each typed step onto the existing single-action evidence contract."""
+    children = []
+    if any(proof.field not in EVIDENCE_FIELDS for proof in signal.evidence):
+        raise AqlaError("Unsupported source evidence fields in management sequence")
+    for index, step in enumerate(signal.management_steps):
+        prefix = f"management_steps.{index}."
+        proofs = []
+        for proof in signal.evidence:
+            if proof.field.startswith(prefix):
+                field = proof.field[len(prefix):]
+                proofs.append(proof.model_copy(update={"field": "update_action" if field == "action" else field}))
+            elif not proof.field.startswith("management_steps."):
+                proofs.append(proof.model_copy(deep=True))
+        if not any(proof.field == "update_action" for proof in proofs):
+            raise AqlaError("Each management step needs its original action clause")
+        children.append(signal.model_copy(update={"management_steps": [], "update_action": step.action,
+            "reduce_percent": step.reduce_percent, "stop_loss": step.stop_loss, "evidence": proofs}))
+    return children

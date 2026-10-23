@@ -106,23 +106,23 @@ async def observe(adapter, names, *, connector=connect):
                 states = feed.states
                 acknowledged = new or feed.aggregate_ack > requested_after and feed.state_sequence > feed.aggregate_ack
                 complete = states is not None and set(feed.orders) == expected and feed.state_sequence > after and feed.ready.is_set() and acknowledged
-                def fresh(states=states):
+                def fresh(states):
                     return states is not None and all(type(row.get("time")) is int and -2000 <= now_ms() - row["time"] <= 10000 for row in states.values())
-                if complete and fresh():
+                if complete and fresh(states):
                     # The connected, ordered feed retains all scopes; no budget snapshot is reused.
                     orders = dict(feed.orders)
                     generation, state_sequence = feed.generation, feed.state_sequence
                     limiter = asyncio.Semaphore(3)
-                    async def details(dex, orders=orders, states=states, limiter=limiter):
+                    async def details(dex, *, orders, states, limiter):
                         values = orders[dex]
                         if values:
                             async with limiter:
                                 values = await read_observation(lambda: adapter.info("frontendOpenOrders", user=adapter.account, **({"dex": dex} if dex else {})), "inventory_details")
                         return dex, states[dex], values
-                    result = await asyncio.gather(*(details(dex) for dex in names))
+                    result = await asyncio.gather(*(details(dex, orders=orders, states=states, limiter=limiter) for dex in names))
                     if feed.error is not None:
                         raise feed.error
-                    if fresh() and generation == feed.generation and feed.ready.is_set():
+                    if fresh(states) and generation == feed.generation and feed.ready.is_set():
                         return result
                     after = state_sequence
                 await feed.changed.wait()

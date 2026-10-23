@@ -15,6 +15,7 @@ from aqla_hyperliquid_mcp.models import (
     now_ms,
     require_first,
 )
+from aqla_hyperliquid_mcp.rules import latest_sources
 
 from .accounting import inventory_view
 from .observations import TemporaryObservation, diagnostic, retry_due, retry_marker
@@ -292,7 +293,6 @@ class Router:
             try:
                 if engine is None:
                     raise AqlaError(self.errors.get(requested + ":" + network, self.errors.get(requested, "Required account/network is unavailable")))
-                from aqla_hyperliquid_mcp.rules import latest_sources
                 with engine.state.scope(target, preview_snapshot=preview_basis):
                     basis = engine.state.preview_snapshot()
                     deadline = min(item["source"]["sent_at"] for item in latest_sources(basis["events"], interpretation.source_refs).values()) + basis["policy"]["max_signal_age_seconds"] * 1000

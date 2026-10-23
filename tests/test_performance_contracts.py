@@ -104,7 +104,6 @@ async def test_price_identity_and_freshness_validation_stay_strict(monkeypatch, 
         if kind == 'metaAndAssetCtxs':
             return [{'universe': [{'name': 'BTC'}]}, [{'markPx': '100'}]]
         return {'coin': 'ETH' if invalid == 'identity' else 'BTC', 'time': stamp, 'levels': [[{'px': '99'}], [{'px': '101'}]]}
-        return {'symbol': 'ETHUSDT' if invalid == 'identity' else 'BTCUSDT', 'time': stamp, 'price': '100', 'bidPrice': '99', 'askPrice': '101'}
     monkeypatch.setattr(adapter, 'info', read)
     if invalid:
         with pytest.raises(TemporaryObservation if invalid == 'stale' else AqlaError):
@@ -112,7 +111,7 @@ async def test_price_identity_and_freshness_validation_stay_strict(monkeypatch, 
     else:
         quote = await adapter.price_snapshot(market)
         assert quote.market == 'BTC' and quote.mid == quote.stop_reference == 100
-    assert len(started) == (4 if 'hyperliquid' == 'hyperliquid' and invalid == 'stale' else 2)
+    assert len(started) == (4 if invalid == 'stale' else 2)
 
 
 

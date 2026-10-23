@@ -103,7 +103,6 @@ def passive_entry_price(market, side, quote) -> Decimal:
 
 def validate_entry_prices(plan, quote, *, stop=None, targets=None, as_of=None):
     if plan.entry_legs:
-        from .managed_entries import leg_view
         return {"legs": [validate_entry_prices(leg_view(plan, {"index": leg.index, "quantity": str(leg.quantity)}),
                       quote, stop=stop, targets=targets, as_of=as_of) for leg in plan.entry_legs if leg.timing != "deferred"]}
     quote.fresh(as_of=as_of)
@@ -144,3 +143,12 @@ def validate_entry_prices(plan, quote, *, stop=None, targets=None, as_of=None):
     if risk > plan.risk_usdc:
         raise AqlaError("Live execution would exceed the reserved SL risk")
     return {"marketable": marketable, "limit": str(limit), "expected_entry": str(price), "expected_risk": str(risk)}
+
+
+def leg_view(plan, row):
+    leg = next((leg for leg in plan.entry_legs if leg.index == row["index"]), None)
+    return plan.model_copy(update={"entry_legs": [], "entry_kind": row.get("entry_kind", leg.kind if leg else plan.entry_kind),
+        "entry_price": Decimal(row.get("price", str(leg.price if leg else plan.entry_price))),
+        "entry_limit": Decimal(row.get("limit", str(leg.limit if leg else plan.entry_limit))),
+        "quantity": Decimal(row["quantity"]), "entry_timing": row.get("timing", leg.timing if leg else plan.entry_timing),
+        "entry_gate": row.get("entry_gate", plan.entry_gate)})

@@ -13,49 +13,22 @@ from pydantic import Field, model_validator
 
 from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, Model, digest, require_first
 
-from .interpretation_contract import ENTRY_FORM_MARKERS as ENTRY_FORM_MARKERS
-from .interpretation_contract import DecisionFailure, validate_interpretation
+from .interpretation_contract import ENTRY_FORM_MARKERS, DecisionFailure, validate_interpretation
 from .source_candidates import (
-    EXCHANGES as EXCHANGES,
-)
-from .source_candidates import (
-    NONE as NONE,
-)
-from .source_candidates import (
-    NUMBERS as NUMBERS,
-)
-from .source_candidates import (
-    PACKET_VERSION as PACKET_VERSION,
-)
-from .source_candidates import (
-    SYMBOLS as SYMBOLS,
-)
-from .source_candidates import (
-    UNKNOWN as UNKNOWN,
-)
-from .source_candidates import (
-    CandidateSpan as CandidateSpan,
-)
-from .source_candidates import (
-    build_packet as build_packet,
-)
-from .source_candidates import (
-    candidates as candidates,
-)
-from .source_candidates import (
-    choice as choice,
-)
-from .source_candidates import (
-    linked_candidate_refs as linked_candidate_refs,
-)
-from .source_candidates import (
-    numeric_occurrences as numeric_occurrences,
-)
-from .source_candidates import (
-    questions_for as questions_for,
-)
-from .source_candidates import (
-    verification_questions as verification_questions,
+    EXCHANGES,
+    NONE,
+    NUMBERS,
+    PACKET_VERSION,
+    SYMBOLS,
+    UNKNOWN,
+    CandidateSpan,
+    build_packet,
+    candidates,
+    choice,
+    linked_candidate_refs,
+    numeric_occurrences,
+    questions_for,
+    verification_questions,
 )
 
 VERSION = "aqla-decisions-v45"
@@ -603,3 +576,6 @@ class OpenRouterDecisionAdapter:
         except DecisionFailure as error:
             mark_decision_failure(usage, str(error))
             raise
+
+# Public compatibility names resolve to the shared production implementations.
+__all__ = ['CalibrationProfile', 'CandidateSpan', 'DecisionResult', 'ENTRY_FORM_MARKERS', 'EXCHANGES', 'NONE', 'NUMBERS', 'OpenRouterDecisionAdapter', 'PACKET_VERSION', 'SYMBOLS', 'SourceProcessingConfig', 'UNKNOWN', 'assemble', 'build_packet', 'calibration_family', 'candidates', 'checked_answers', 'choice', 'first_decision', 'linked_candidate_refs', 'mark_decision_failure', 'numeric_occurrences', 'questions_for', 'redundant_numeric_mention', 'replay_decision', 'verification_questions']

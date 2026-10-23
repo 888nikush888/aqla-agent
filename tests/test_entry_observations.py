@@ -92,7 +92,7 @@ async def test_terminal_rejection_completes_retry_and_updates_current_target(set
             "plan_id": plan["plan_id"], "trade_id": plan["trade_id"],
             "observation_retry": data["trades"][plan["trade_id"]]["observation_retry"].copy()}}
     state.update(attach)
-    engine._patch(plan["trade_id"], status="rejected", reserved_risk="0", unsent_reason="Manual entry reserves this market")
+    engine.patch_trade(plan["trade_id"], status="rejected", reserved_risk="0", unsent_reason="Manual entry reserves this market")
     snapshot = state.snapshot()
     target = snapshot["events"][source.event_id]["targets"]["legacy:hyperliquid"]
     assert target["status"] == "rejected" and target["observation_retry"]["completed"]

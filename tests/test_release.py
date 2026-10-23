@@ -80,14 +80,14 @@ def test_artifact_rules_reject_zip_links_and_tar_links_before_extract():
 
 
 def test_check_repository_runs_without_installed_dependencies():
-    result = subprocess.run([sys.executable, "-I", "-S", str(ROOT / "scripts/check_repository.py")], cwd=ROOT, capture_output=True, text=True)
+    result = subprocess.run([sys.executable, "-I", "-S", str(ROOT / "scripts/check_repository.py")], cwd=ROOT, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     assert "Repository hygiene passed" in result.stdout
 
 
 def test_verifier_rule_import_runs_without_installed_dependencies(tmp_path):
     code = f"import runpy; module=runpy.run_path({str(ROOT / 'scripts/verify_artifacts.py')!r}); assert module['forbidden']('src/local.sqlite3-wal'); assert not module['forbidden']('src/.env.example')"
-    result = subprocess.run([sys.executable, "-I", "-S", "-c", code], cwd=tmp_path, capture_output=True, text=True)
+    result = subprocess.run([sys.executable, "-I", "-S", "-c", code], cwd=tmp_path, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
 
 
@@ -131,7 +131,7 @@ def test_windows_junction_before_traversal(release_project, tmp_path, monkeypatc
     link.rmdir()
     assert target.resolve().is_relative_to(tmp_path.resolve())
     assert link.parent.resolve().is_relative_to(tmp_path.resolve())
-    created = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
+    created = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True, check=False)
     if created.returncode:
         pytest.skip(f"Junction unavailable: {created.stderr}")
     try:
@@ -177,7 +177,7 @@ def test_windows_junction_output_and_cache_before_use(release_project, tmp_path,
         output = tmp_path / "out.zip"
     assert target.resolve().is_relative_to(tmp_path.resolve())
     assert link.parent.resolve().is_relative_to(tmp_path.resolve())
-    result = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
+    result = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True, check=False)
     if result.returncode:
         pytest.skip(f"Junction unavailable: {result.stderr}")
     original = release.os.scandir
@@ -292,7 +292,7 @@ def test_cli_returns_nonzero_without_success_json_for_forbidden_source(release_p
         monkeypatch.setenv("PYTHONPATH", os.pathsep.join(reversed(entries)))
     inherited = [entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep) if entry]
     environment = dict(os.environ, PYTHONPATH=os.pathsep.join([str(release_project / "src"), *inherited]))
-    result = subprocess.run([sys.executable, "-m", "aqla_agent.release", "--output", str(tmp_path / "out.zip")], cwd=release_project, env=environment, capture_output=True, text=True)
+    result = subprocess.run([sys.executable, "-m", "aqla_agent.release", "--output", str(tmp_path / "out.zip")], cwd=release_project, env=environment, capture_output=True, text=True, check=False)
     assert result.returncode != 0
     assert result.stdout == ""
     assert "local.sqlite3" in result.stderr
@@ -465,7 +465,7 @@ def test_interruption_retains_recovery_pair_and_verifier_rejects_mixed_pair(rele
     assert output.read_bytes() != previous[0] and sha.read_bytes() == previous[1]
     with pytest.raises(ValueError, match="Invalid ZIP/checksum pair"):
         release._verify_pair(output, sha, output.name)
-    result = subprocess.run([sys.executable, str(ROOT / "scripts/verify_artifacts.py")], cwd=tmp_path, capture_output=True, text=True)
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/verify_artifacts.py")], cwd=tmp_path, capture_output=True, text=True, check=False)
     assert result.returncode != 0
     assert "VPS archive checksum mismatch" in result.stderr
     assert "passed" not in result.stdout

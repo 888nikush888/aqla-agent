@@ -11,8 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import yaml
-
-from aqla_hyperliquid_mcp.models import require_first
+from native_helpers import require_first
 
 SYNTHETIC_PASSWORD = "/native-fixture-marker-never-a-user-credential"
 WRONG_SYNTHETIC_PASSWORD = "/native-wrong-fixture-marker-never-a-user-credential"

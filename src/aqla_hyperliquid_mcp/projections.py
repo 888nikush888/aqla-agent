@@ -2,7 +2,7 @@
 from typing import TypedDict
 
 from aqla_agent.source_queue import is_source_row, queue_overview
-from aqla_agent.trading import OPEN
+from aqla_hyperliquid_mcp.models import OPEN
 
 from .models import digest
 

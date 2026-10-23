@@ -8,7 +8,6 @@ from aqla_hyperliquid_mcp.models import (
     AqlaError,
     EntryLegPlan,
     ExchangeMinimum,
-    SourceEntryLeg,
     TradePlan,
     digest,
     now_ms,
@@ -16,16 +15,16 @@ from aqla_hyperliquid_mcp.models import (
 )
 from aqla_hyperliquid_mcp.rules import (
     backup_prices,
-    entry_prices,
-    executable_targets,
-    make_plan,
+    entry_targets,
+    make_entry_plan,
     price_grid,
     quantity_grid,
     selected_targets,
     split_targets,
 )
 
-from .entry import execution_limit, gate_state, validate_entry_prices
+from .accounting import position_basis
+from .entry import execution_limit, gate_state, leg_view, validate_entry_prices
 from .observations import TemporaryObservation, read_observation, retry_due, retry_marker
 
 
@@ -33,66 +32,8 @@ def enabled(plan):
     return bool(plan.entry_legs or plan.policy.entry_range_choice == "split" or plan.policy.management_mode == "waverider")
 
 
-def entry_targets(quantity, targets, policy, market, leg_quantities=()):
-    # Reuse the configured adaptive rule at every stage, including the first protected fill.
-    count = min(len(executable_targets(size, targets, policy, market)[0]) for size in (quantity, *leg_quantities))
-    return executable_targets(quantity, targets[:count], policy, market)
 
 
-def make_entry_plan(signal, market, account, policy, revision, source_time, binding,
-                    reserved_risk, stamp, principal, backup, backup_revision, maker_price):
-    if signal.kind != "new_signal":
-        raise AqlaError("Only a new setup can allocate two original entries")
-    legs = signal.entry_legs if signal.entry == "split" else [
-        SourceEntryLeg(kind="limit", price=value, timing=signal.entry_timing)
-        for value in signal.entry_prices]
-    if len(legs) != 2:
-        raise AqlaError("Both original entries are required")
-    selections = []
-    backup_entry = False
-    for index, leg in enumerate(legs):
-        if leg.kind == "unspecified":
-            if backup and backup.entry_mode == "source_or_market":
-                backup_entry = True
-            elif policy.entry_mode != "source_or_market":
-                raise AqlaError("Unstated entry form needs the configured market-entry fallback")
-        single = signal.model_copy(update={"entry": leg.kind, "entry_legs": [],
-            "entry_prices": [leg.price] if leg.price is not None else [], "entry_timing": leg.timing})
-        selected = entry_prices(single, market, policy, maker_price=maker_price)
-        selections.append((index, leg, selected))
-    if signal.entry == "range" and selections[0][2].price == selections[1][2].price:
-        raise AqlaError("Source zone collapses to one native tick; two distinct entries cannot be invented")
-    # Size conservatively at the worst allowed entry. Never use averaging to enlarge risk.
-    worst = (max if signal.side == "long" else min)(row[2].limit for row in selections)
-    anchor = signal.model_copy(update={"entry": "limit", "entry_prices": [worst], "entry_legs": [], "entry_timing": "standard"})
-    base = make_plan(anchor, market, account, policy, revision, source_time, binding, reserved_risk,
-                     stamp, principal, backup, backup_revision, maker_price, _managed=True)
-    weights = [leg.weight_percent or Decimal(50) for leg in legs]
-    quantities = [quantity_grid(base.quantity * weights[0] / 100, base.market)]
-    quantities.append(base.quantity - quantities[0])
-    planned = []
-    for (index, leg, selected), size in zip(selections, quantities, strict=True):
-        if size <= 0 or size < base.market.min_quantity or size * selected.limit < base.market.min_notional:
-            raise ExchangeMinimum("A source entry leg is below the exchange minimum; neither leg may be dropped or enlarged")
-        if not (base.stop_loss < selected.price < min(base.take_profits) if base.side == "long"
-                else base.stop_loss > selected.price > max(base.take_profits)):
-            raise AqlaError("Both source entries must have valid common SL/TP structure")
-        planned.append(EntryLegPlan(index=index, kind=selected.kind, price=selected.price,
-            limit=selected.limit, quantity=size, timing=leg.timing))
-    # Market intent first; otherwise the near limit fills before the far limit.
-    planned.sort(key=lambda leg: (leg.kind != "market", -leg.limit if base.side == "long" else leg.limit, leg.index))
-    values = base.model_dump()
-    if backup_entry and "entry" not in base.backup_fields:
-        values.update(backup_fields=[*base.backup_fields, "entry"], backup_values=backup.model_copy(deep=True), backup_profile_revision=backup_revision)
-    targets, quantities = entry_targets(base.quantity, base.take_profits, policy, base.market, [leg.quantity for leg in planned])
-    count = len(targets)
-    values.update(entry_legs=planned, entry_price=sum(leg.price * leg.quantity for leg in planned) / base.quantity,
-                  take_profits=targets, tp_quantities=quantities)
-    if base.source_tp:
-        values["source_tp"] = {**base.source_tp, "values": base.source_tp["values"][:count],
-                               "preview_prices": base.source_tp["preview_prices"][:count]}
-    values.pop("plan_id")
-    return TradePlan(plan_id=digest(values), **values)
 
 
 def cap_quantity(plan, ceiling):
@@ -163,13 +104,6 @@ def pending_quantity(trade):
                 and observations.get(row["cloid"], {}).get("status") not in TERMINAL_ORDER), Decimal(0))
 
 
-def leg_view(plan, row):
-    leg = next((leg for leg in plan.entry_legs if leg.index == row["index"]), None)
-    return plan.model_copy(update={"entry_legs": [], "entry_kind": row.get("entry_kind", leg.kind if leg else plan.entry_kind),
-        "entry_price": Decimal(row.get("price", str(leg.price if leg else plan.entry_price))),
-        "entry_limit": Decimal(row.get("limit", str(leg.limit if leg else plan.entry_limit))),
-        "quantity": Decimal(row["quantity"]), "entry_timing": row.get("timing", leg.timing if leg else plan.entry_timing),
-        "entry_gate": row.get("entry_gate", plan.entry_gate)})
 
 
 def initialize_trade(trade, plan, quote, exchange):
@@ -202,9 +136,9 @@ async def cancel(engine, trade_id, rows=None, *, permanent=True):
     plan = TradePlan.model_validate(trade["plan"])
     engine.assert_plan_binding(engine.state.snapshot(), plan)
     if permanent:
-        engine._patch(trade_id, entries_disabled=True)
+        engine.patch_trade(trade_id, entries_disabled=True)
         if trade.get("waverider"):
-            engine._patch(trade_id, waverider={**trade["waverider"], "finished": True, "phase": "finished"})
+            engine.patch_trade(trade_id, waverider={**trade["waverider"], "finished": True, "phase": "finished"})
     for row in rows if rows is not None else entry_orders(trade):
         if row.get("not_sent"):
             continue
@@ -238,7 +172,7 @@ def protected(engine, trade, status_rows):
         if oid is None or oid in seen or order.get("retired"):
             continue
         check = plan.model_copy(update={"entry_execution": "standard"})
-        if native.get("cloid") == order["cloid"] and raw.get("order", {}).get("status") == "open" and engine._stop_matches(raw, check, Decimal(0), Decimal(trade["stop_price"])):
+        if native.get("cloid") == order["cloid"] and raw.get("order", {}).get("status") == "open" and engine.stop_matches(raw, check, Decimal(0), Decimal(trade["stop_price"])):
             # Maker legacy checks exact size; a managed leg owns an explicit size.
             covered += Decimal(native.get("sz") or 0)
             seen.add(oid)
@@ -287,23 +221,6 @@ def finalize_prices(engine, trade_id):
     return True
 
 
-def position_basis(trade):
-    """Chronological average-cost ledger; turnover is never current exposure."""
-    quantity, cost, realized, fees = Decimal(0), Decimal(0), Decimal(0), Decimal(0)
-    direction = Decimal(1) if trade["plan"]["side"] == "long" else Decimal(-1)
-    for row in sorted(trade.get("fill_events", {}).values(), key=lambda row: (row["time"], str(row.get("tid")), str(row["oid"]))):
-        size, price = Decimal(row["sz"]), Decimal(row["px"])
-        if row.get("fee") is not None:
-            fees += Decimal(row["fee"])
-        if row["kind"] == "entry":
-            quantity, cost = quantity + size, cost + size * price
-        else:
-            if size > quantity or quantity <= 0:
-                raise AqlaError("Own exit exceeds chronological entry evidence")
-            average = cost / quantity
-            realized += size * (price - average) * direction
-            quantity, cost = quantity - size, cost - size * average
-    return quantity, cost / quantity if quantity else Decimal(0), realized, fees
 
 
 def current_reference(trade):
@@ -329,7 +246,7 @@ async def validate_actual(engine, trade_id):
     direction = Decimal(1) if plan.side == "long" else Decimal(-1)
     own_risk = size * (max(Decimal(0), (average - stop) * direction) + average * plan.policy.cost_reserve_bps / 10000)
     if plan.policy.management_mode == "waverider":
-        from .waverider import pools
+        pools = engine.waves.pools
         inventory = pools(trade, plan.policy.waverider_flex_percent)
         own_risk = (inventory["core"] * max(Decimal(0), (inventory["core_basis"] - stop) * direction)
             + inventory["flex"] * max(Decimal(0), (inventory["flex_basis"] - stop) * direction)
@@ -352,7 +269,7 @@ async def validate_actual(engine, trade_id):
     accepted_equity = Decimal(trade.get("entry_equity_snapshot", {}).get("equity", str(account.equity)))
     if own_risk > accepted_equity * plan.policy.risk_percent / 100 or own_risk + others > account.equity * limits.max_total_risk_percent / 100:
         raise AqlaError("Managed fills exceed the accepted individual or current shared account risk limit")
-    engine._patch(trade_id, current_entry_vwap=str(average), managed_entry_validated=True)
+    engine.patch_trade(trade_id, current_entry_vwap=str(average), managed_entry_validated=True)
 
 
 def target_allocations(plan, quantity, previous=None, consumed=None, completed=()):
@@ -385,7 +302,7 @@ async def restore_targets(engine, trade_id):
     plan = TradePlan.model_validate(trade["plan"])
     await engine.capture_fills(trade_id)
     remaining = engine.owned_remaining(trade_id, engine.position_size(await engine.positions(plan.market), plan.market))
-    engine._patch(trade_id, remaining_quantity=str(remaining))
+    engine.patch_trade(trade_id, remaining_quantity=str(remaining))
     if not remaining:
         return True
     for order in trade["orders"]:
@@ -398,13 +315,13 @@ async def restore_targets(engine, trade_id):
             def retire(data, cloid=order["cloid"]):
                 require_first(row for row in data["trades"][trade_id]["orders"] if row["cloid"] == cloid)["retired"] = True
             engine.state.update(retire)
-    engine._patch(trade_id, managed_target_fingerprint=None)
+    engine.patch_trade(trade_id, managed_target_fingerprint=None)
     if not await sync_targets(engine, trade_id):
         return False
     await engine.ensure_protection(trade_id)
     if engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]["status"] != "open":
         return False
-    engine._patch(trade_id, protection_repair_pending=None)
+    engine.patch_trade(trade_id, protection_repair_pending=None)
     return True
 
 
@@ -433,19 +350,19 @@ async def sync_targets(engine, trade_id):
         working[order["index"]] += max(Decimal(0), Decimal(order["quantity"]) - filled)
         prices_match &= Decimal(order["price"]) == Decimal(trade["targets"][order["index"]])
     if prices_match and working == budgets:
-        engine._patch(trade_id, completed_target_indices=sorted(completed), managed_target_fingerprint=fingerprint)
+        engine.patch_trade(trade_id, completed_target_indices=sorted(completed), managed_target_fingerprint=fingerprint)
         return True
     if any(budgets[index] < plan.market.min_quantity or budgets[index] * Decimal(trade["targets"][index]) < plan.market.min_notional for index in active):
         raise ExchangeMinimum("Retained core targets are below native minimums")
     generation = trade.get("managed_target_generation", 0) + 1
-    engine._patch(trade_id, completed_target_indices=sorted(completed), managed_target_generation=generation,
+    engine.patch_trade(trade_id, completed_target_indices=sorted(completed), managed_target_generation=generation,
         target_budgets=[str(value + Decimal(spent)) for value, spent in zip(budgets, trade["tp_filled"], strict=True)])
     if any(row["kind"] == "tp" and not row.get("retired") for row in trade["orders"]):
         identity = f"managed-targets:{trade_id}:{generation}:{fingerprint}"
         result = await engine.replace_targets(trade_id, list(map(Decimal, trade["targets"])), identity)
         if result.get("phase") not in ("acknowledged", "reconciled") and not result.get("no_unfilled_targets"):
             raise AqlaError("Managed target generation has no confirmed accepted outcome")
-    engine._patch(trade_id, managed_target_fingerprint=fingerprint)
+    engine.patch_trade(trade_id, managed_target_fingerprint=fingerprint)
     return True
 
 
@@ -463,17 +380,17 @@ async def retain_retry(engine, trade_id, error):
     marker = {**retry_marker(previous, error, deadline, "execute"), "completed": False}
     if wave_retry:
         marker["wave_cycle"] = wave.get("cycle", 0)
-    engine._patch(trade_id, managed_entry_retry=marker, entry_diagnostic=error.diagnostic())
+    engine.patch_trade(trade_id, managed_entry_retry=marker, entry_diagnostic=error.diagnostic())
     if marker["exhausted"]:
         if wave_retry:
-            from .waverider import reset_phase
+            reset_phase = engine.waves.reset_phase
             await cancel(engine, trade_id, [wave_row], permanent=False)
-            engine._patch(trade_id, managed_entry_retry={**marker, "completed": True},
+            engine.patch_trade(trade_id, managed_entry_retry={**marker, "completed": True},
                 waverider={**reset_phase(wave, "waiting_rebound"), "cycle": wave.get("cycle", 0) + 1})
             return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         await cancel(engine, trade_id)
         if not Decimal(trade["filled_quantity"]):
-            engine._patch(trade_id, status="rejected", reserved_risk="0", unsent_reason="Original managed entry read budget exhausted")
+            engine.patch_trade(trade_id, status="rejected", reserved_risk="0", unsent_reason="Original managed entry read budget exhausted")
     return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
 
 
@@ -495,7 +412,7 @@ async def _start(engine, plan, trade):
         return trade
     if entry_missed(trade, quote):
         await cancel(engine, plan.trade_id)
-        engine._patch(plan.trade_id, status="rejected", reserved_risk="0", unsent_reason="Source target or stop was reached before the first entry")
+        engine.patch_trade(plan.trade_id, status="rejected", reserved_risk="0", unsent_reason="Source target or stop was reached before the first entry")
         return engine.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
     identity = trade.get("leverage_operation_id", "leverage:" + plan.trade_id)
     existing = engine.state.read("operations")["operations"].get(identity)
@@ -540,7 +457,7 @@ async def _start(engine, plan, trade):
                 return trade
             if state == "missed":
                 await cancel(engine, plan.trade_id)
-                engine._patch(plan.trade_id, status="cancelled", reserved_risk="0", unsent_reason="Deferred source entry was missed")
+                engine.patch_trade(plan.trade_id, status="cancelled", reserved_risk="0", unsent_reason="Deferred source entry was missed")
                 return engine.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
         latest_account, latest_quote = None, None
         async def guard():
@@ -561,9 +478,9 @@ async def _start(engine, plan, trade):
         engine.raise_temporary_not_sent(existing)
         if existing["phase"] == "rejected" and (existing.get("outcome") == "rejected" or existing.get("outcome") == "not_sent" and not existing.get("legs")):
             await cancel(engine, plan.trade_id)
-            engine._patch(plan.trade_id, status="rejected", reserved_risk="0", unsent_reason=existing.get("result", {}).get("error", "Configuration guard rejected before transport"))
+            engine.patch_trade(plan.trade_id, status="rejected", reserved_risk="0", unsent_reason=existing.get("result", {}).get("error", "Configuration guard rejected before transport"))
             return engine.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
-        engine._patch(plan.trade_id, status="unknown" if existing["phase"] == "unknown" else "protecting", waiting_error="Leverage configuration requires exact reconciliation")
+        engine.patch_trade(plan.trade_id, status="unknown" if existing["phase"] == "unknown" else "protecting", waiting_error="Leverage configuration requires exact reconciliation")
         return engine.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
     await dispatch_next(engine, plan.trade_id)
     current = engine.state.read("trades", entries={"trades": [plan.trade_id]})["trades"][plan.trade_id]
@@ -601,7 +518,8 @@ async def _dispatch_next(engine, trade_id):
     if now_ms() >= plan.deadline_at and not (row["kind"] == "waverider" and plan.policy.waverider_lifetime == "until_target"):
         return "unchanged"
     if row["kind"] == "waverider":
-        from .waverider import ended, live_permission
+        ended = engine.waves.ended
+        live_permission = engine.waves.live_permission
         wave = trade["waverider"]
         if (not live_permission(engine, plan) or ended(plan, trade) or wave.get("phase") != "pending_reenter"
                 or wave.get("cycle", 0) != row.get("cycle", 0)):
@@ -661,7 +579,7 @@ async def _dispatch_next(engine, trade_id):
     guard.invalidate_account = invalidate_account
     def final_guard(data):
         if row["kind"] == "waverider":
-            from .waverider import live_permission
+            live_permission = engine.waves.live_permission
             if not live_permission(engine, plan):
                 raise AqlaError("Waverider authorization changed before reentry transport")
         engine.validate_admission(data, view, latest_account, owned=True,
@@ -715,11 +633,11 @@ async def _dispatch_next(engine, trade_id):
             raise
         await cancel(engine, trade_id)
     elif result["phase"] == "unknown":
-        engine._patch(trade_id, status="unknown")
+        engine.patch_trade(trade_id, status="unknown")
     elif any(item["index"] == 1 and item["disposition"] == "rejected" for item in result.get("legs", [])):
         await cancel(engine, trade_id)
     if marker:
-        engine._patch(trade_id, managed_entry_retry={**marker, "completed": True})
+        engine.patch_trade(trade_id, managed_entry_retry={**marker, "completed": True})
     if row["kind"] == "waverider" and view.entry_execution == "maker_only" and result["phase"] in ("acknowledged", "reconciled"):
         await cancel(engine, trade_id, [row], permanent=False)
     return "unknown" if result["phase"] == "unknown" else "sent"
@@ -736,7 +654,7 @@ async def refresh(engine, trade_id, *, dispatch=True):
     if not sent and not trade.get("entries_disabled"):
         if now_ms() >= plan.deadline_at:
             await cancel(engine, trade_id)
-            engine._patch(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Original signal deadline expired")
+            engine.patch_trade(trade_id, status="cancelled", reserved_risk="0", unsent_reason="Original signal deadline expired")
             return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         return await start(engine, plan, trade)
     total, cost = await engine.capture_fills(trade_id)
@@ -758,7 +676,7 @@ async def refresh(engine, trade_id, *, dispatch=True):
     quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
     reached = (quote.bid >= Decimal(trade["targets"][0]) if plan.side == "long" else quote.ask <= Decimal(trade["targets"][0]))
     if total:
-        from .waverider import queue_evidence
+        queue_evidence = engine.waves.queue_evidence
         queue_evidence(engine, trade_id, quote)
     invalid = quote.stop_reference <= Decimal(trade["stop_price"]) if plan.side == "long" else quote.stop_reference >= Decimal(trade["stop_price"])
     # A pre-fill percentage preview is not evidence that a real TP has been reached.
@@ -769,16 +687,16 @@ async def refresh(engine, trade_id, *, dispatch=True):
         await cancel(engine, trade_id, [row for row in trade["entry_orders"] if row["kind"] == "original"], permanent=False)
         if new_source_tp:
             await cancel(engine, trade_id, [row for row in trade["entry_orders"] if row["kind"] == "waverider"], permanent=False)
-        from .waverider import ended
+        ended = engine.waves.ended
         if plan.policy.management_mode != "waverider" or ended(plan, trade, quote) or invalid or any(fill["kind"] in ("sl", "close") for fill in trade["fill_events"].values()):
             await cancel(engine, trade_id)
         total, cost = await engine.capture_fills(trade_id)
         signed = engine.position_size(await engine.positions(plan.market), plan.market)
         remaining = engine.owned_remaining(trade_id, signed)
         trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-        engine._patch(trade_id, source_tp_observed_fingerprint=source_tp_fingerprint)
+        engine.patch_trade(trade_id, source_tp_observed_fingerprint=source_tp_fingerprint)
     if remaining:
-        engine._patch(trade_id, filled_quantity=str(total), entry_vwap=str(cost / total), remaining_quantity=str(remaining),
+        engine.patch_trade(trade_id, filled_quantity=str(total), entry_vwap=str(cost / total), remaining_quantity=str(remaining),
                       status="open" if trade["status"] == "open" else "protecting")
         current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
         originals_done = all(row.get("not_sent") or row["phase"] == "terminal" for row in current["entry_orders"] if row["kind"] == "original")
@@ -786,18 +704,18 @@ async def refresh(engine, trade_id, *, dispatch=True):
             reference = source_reference(current)
             original_quantity = sum((Decimal(row["sz"]) for row in original_fills(current)), Decimal(0))
             amount = plan.risk_usdc if plan.policy.management_mode == "waverider" else original_quantity * abs(reference - Decimal(current["stop_price"]))
-            engine._patch(trade_id, initial_sl_risk={"amount": str(amount), "entry": str(reference), "stop": current["stop_price"],
+            engine.patch_trade(trade_id, initial_sl_risk={"amount": str(amount), "entry": str(reference), "stop": current["stop_price"],
                 "quantity": str(original_quantity), "currency": plan.market.quote_token, "entry_fingerprint": digest(original_fills(current))})
         try:
             if current.get("suspended_wave_targets"):
-                from .waverider import resume_exit
+                resume_exit = engine.waves.resume_exit
                 if not await resume_exit(engine, trade_id):
                     await engine.ensure_protection(trade_id)
                     return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
                 await engine.capture_fills(trade_id)
                 trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
                 remaining = engine.owned_remaining(trade_id, engine.position_size(await engine.positions(plan.market), plan.market))
-                engine._patch(trade_id, remaining_quantity=str(remaining))
+                engine.patch_trade(trade_id, remaining_quantity=str(remaining))
                 if not remaining:
                     return await refresh(engine, trade_id, dispatch=False)
             pending = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("pending_stop_update")
@@ -816,7 +734,9 @@ async def refresh(engine, trade_id, *, dispatch=True):
             if not protected(engine, trade, stops):
                 raise AqlaError("No confirmed stop covers the managed position")
             if plan.policy.management_mode == "waverider":
-                from .waverider import execute, pools, tick
+                execute = engine.waves.execute
+                pools = engine.waves.pools
+                tick = engine.waves.tick
                 inventory = pools(trade, plan.policy.waverider_flex_percent)
                 excess = quantity_grid(max(Decimal(0), inventory["flex"] - inventory["rights"]), plan.market)
                 if excess:
@@ -824,16 +744,16 @@ async def refresh(engine, trade_id, *, dispatch=True):
                     return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
                 await tick(engine, trade_id, quote)
         except TemporaryObservation as error:
-            engine._patch(trade_id, status="protecting", protection_observation_pending=error.diagnostic())
+            engine.patch_trade(trade_id, status="protecting", protection_observation_pending=error.diagnostic())
             raise
         except AqlaError as error:
-            engine._patch(trade_id, execution_incident="Managed protection failed: " + str(error))
+            engine.patch_trade(trade_id, execution_incident="Managed protection failed: " + str(error))
             await cancel(engine, trade_id)
             if getattr(engine.exchange, "fail_closed_protection", False):
                 engine.state.pause_entries("Managed protection could not be confirmed")
                 return await engine.close_position(trade_id, Decimal(100), "protection-failure:" + trade_id)
             raise
-        engine._patch(trade_id, protection_observation_pending=None)
+        engine.patch_trade(trade_id, protection_observation_pending=None)
         if dispatch and engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]["status"] == "open":
             if await dispatch_next(engine, trade_id) != "unchanged":
                 return await refresh(engine, trade_id, dispatch=False)
@@ -847,3 +767,6 @@ async def refresh(engine, trade_id, *, dispatch=True):
         engine.begin_cleanup(trade_id, "rejected")
         return await engine.finish_cleanup(trade_id)
     return engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+
+# Named compatibility exports share the same implementation.
+__all__ = ['all_order_rows', 'cancel', 'cap_quantity', 'current_reference', 'dispatch_next', 'enabled', 'entry_final', 'entry_missed', 'entry_orders', 'entry_targets', 'finalize_prices', 'initialize_trade', 'leg_view', 'make_entry_plan', 'original_fills', 'patch_row', 'pending_quantity', 'position_basis', 'protected', 'refresh', 'restore_targets', 'retain_retry', 'source_reference', 'start', 'sync_targets', 'target_allocations', 'validate_actual']

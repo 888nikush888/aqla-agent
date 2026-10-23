@@ -6,6 +6,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from typing import Literal, TypedDict
 
 from aqla_hyperliquid_mcp.models import AqlaError, Market, TradePlan, digest, now_ms
@@ -169,7 +170,7 @@ class Reporting:
                     attribution, assigned, fees = attribute_manual_closure(trade, observed, payments)
                 except (InvalidOperation, KeyError, ValueError, TypeError) as error:
                     raise EvidenceConflict(str(error) if isinstance(error, AqlaError) else "Manual PnL attribution is unconfirmed") from None
-                coverage.update(complete=True, fill_fingerprint=digest(fills), payments_fingerprint=digest(assigned))
+                coverage.update({"complete": True, "fill_fingerprint": digest(fills), "payments_fingerprint": digest(assigned)})
                 def save_manual(data):
                     current = data["trades"][trade_id]
                     from .manual_accounting import closure_fingerprint
@@ -211,14 +212,17 @@ class Reporting:
                 assigned[identity] = fact
             if set(trade.get("funding_events", {})) - set(assigned):
                 raise AqlaError("Bereits gespeicherte Funding-Belege fehlen im erneuten vollständigen Abgleich")
-            coverage.update(complete=True, fill_fingerprint=digest(fills), payments_fingerprint=digest(assigned))
+            coverage.update({"complete": True, "fill_fingerprint": digest(fills), "payments_fingerprint": digest(assigned)})
             fee_evidence = {identity: {"fee": row.get("fee"), "feeToken": row.get("feeToken")}
                             for identity, row in observed.items()}
             for identity, fact in fee_evidence.items():
                 old = trade.get("report_fee_evidence", {}).get(identity, fills[identity])
                 for key in ("fee", "feeToken"):
                     if old.get(key) is not None:
-                        same = Decimal(old[key]) == Decimal(fact[key]) if key == "fee" and fact[key] is not None else old[key] == fact[key]
+                        previous_value, observed_value = old[key], fact[key]
+                        same = (Decimal(previous_value) == Decimal(observed_value)
+                                if key == "fee" and observed_value is not None and previous_value is not None
+                                else previous_value == observed_value)
                         if fact[key] is not None and not same:
                             raise EvidenceConflict("Ein bereits belegter eigener Gebührenwert wurde geändert")
                         fact[key] = old[key]
@@ -303,7 +307,7 @@ class Reporting:
                         complete, reason = False, "unavailable"
                 attempt: ReportingAttempt = {"trade_id": trade_id, "complete": complete, "reason": reason,
                     "requests": job.requests, "elapsed_seconds": max(0.0, self.clock() - job_started)}
-                def schedule(data, trade_id=trade_id, attempt=attempt):
+                def schedule(data, *, trade_id, attempt):
                     row = data["trades"][trade_id]
                     # A failed read is not a completed hourly evidence check.
                     transient = not attempt["complete"] and attempt["reason"] not in ("missing_lifecycle", "evidence_conflict")
@@ -318,7 +322,7 @@ class Reporting:
                         row.pop("reporting_last_error", None)
                     row.update(reporting_checked_at=self.wall_clock(), reporting_next_retry_at=self.wall_clock()+delay,
                                reporting_last_attempt=attempt)
-                self.state.update(schedule)
+                self.state.update(partial(schedule, trade_id=trade_id, attempt=attempt))
                 result["attempts"].append(attempt)
-            result.update(requests=tick.requests, elapsed_seconds=max(0.0, self.clock() - started))
+            result.update({"requests": tick.requests, "elapsed_seconds": max(0.0, self.clock() - started)})
             return result

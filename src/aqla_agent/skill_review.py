@@ -103,7 +103,7 @@ def install_skill_review(replace):
     from tools import skill_usage
     from tools import write_approval as approval
 
-    from .events import EXTENSIONS
+    from .extension_registry import EXTENSIONS
 
     master = get_hermes_home() / "skills" / "aqla-master" / "SKILL.md"
     cadence = ReviewCadence(get_hermes_home())

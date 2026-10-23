@@ -305,7 +305,7 @@ def status_view(data, *, include_inactive=False):
 
 
 def set_manual_rank(data, selector, tier, revision, operator):
-    from .sources import resolve_source
+    from .source_queue import resolve_source
     if not selector or tier not in TIERS or type(revision) is not int or not operator:
         raise AqlaError("Supply a source, valid tier and current source rank revision")
     source = source_key(data, resolve_source(data, selector))

@@ -21,8 +21,9 @@ def parameter_contract(function) -> str:
     while hasattr(function, "__aqla_contract_original__"):
         function = function.__aqla_contract_original__
     values = []
+    prefixes: dict[int, str] = {inspect.Parameter.POSITIONAL_ONLY: "/", inspect.Parameter.VAR_POSITIONAL: "*", inspect.Parameter.VAR_KEYWORD: "**", inspect.Parameter.KEYWORD_ONLY: "@"}
     for parameter in inspect.signature(function).parameters.values():
-        prefix = {inspect.Parameter.POSITIONAL_ONLY: "/", inspect.Parameter.VAR_POSITIONAL: "*", inspect.Parameter.VAR_KEYWORD: "**", inspect.Parameter.KEYWORD_ONLY: "@"}.get(parameter.kind, "")
+        prefix = prefixes.get(parameter.kind, "")
         values.append(prefix + parameter.name + ("=" if parameter.default is not inspect.Parameter.empty else ""))
     return ",".join(values)
 
@@ -32,7 +33,7 @@ def validate_hooks(contracts: list[HookContract]) -> None:
     for contract in contracts:
         function = getattr(contract.target, contract.name, None)
         original = function
-        while hasattr(original, "__aqla_contract_original__"):
+        while original is not None and hasattr(original, "__aqla_contract_original__"):
             original = original.__aqla_contract_original__
         try:
             valid = callable(function) and parameter_contract(function) == contract.parameters and inspect.iscoroutinefunction(original) == contract.asynchronous
@@ -107,6 +108,8 @@ def check_native_contract() -> None:
             raise RuntimeError(f"Pinned Hermes compatibility target missing: {module_name}.{class_name or name}; no Aqla patches installed") from error
         contracts.append(HookContract(target, name, parameters, asynchronous))
     gateway = importlib.import_module("gateway.run")
+    if gateway.__file__ is None:
+        raise RuntimeError("Pinned Hermes source location is missing; no Aqla patches installed")
     root = Path(gateway.__file__).resolve().parents[1]
     try:
         revision = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL, timeout=10).strip()

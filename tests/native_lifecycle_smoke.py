@@ -7,6 +7,7 @@ import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from functools import partial
 from types import MethodType, SimpleNamespace
 
 
@@ -135,8 +136,7 @@ async def verify_commands(extension, runner, adapter):
             assert extension.active_context is None
             assert extension.before_tool("mcp__aqla__interpret_source", {})["action"] == "block"
             thread_done.set()
-        async def blocked_handler(event, started=started, contexts=contexts, worker=blocked_worker,
-                                  thread_started=thread_started, during_command=during_command, probed=probed):
+        async def blocked_handler(event, *, started, contexts, worker, thread_started, during_command, probed):
             if event.message_id == "100":
                 started.set()
                 try:
@@ -149,7 +149,7 @@ async def verify_commands(extension, runner, adapter):
                 during_command.set()
                 assert await asyncio.to_thread(probed.wait, 2)
                 return None
-        adapter.set_message_handler(blocked_handler)
+        adapter.set_message_handler(partial(blocked_handler, started=started, contexts=contexts, worker=blocked_worker, thread_started=thread_started, during_command=during_command, probed=probed))
         extension.attach(MessageEvent(text="source", source=source, message_id="100"), runner)
         # This turn is a synthetic internal wake; source tools have source authority.
         event = MessageEvent(text="wake", source=source, message_id="100", internal=True,

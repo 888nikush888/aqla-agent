@@ -26,7 +26,7 @@ def binding_percentage_target_interval(text):
     intervals = {(m.span("lower"), m.span("upper")) for m in percentage_intervals(text)}
     if any((m.span("lower"), m.span("upper")) in intervals for m in SOURCE_TP_PERCENT_INTERVAL.finditer(text)):
         return True
-    from .semantic_contract import SENTENCES
+    from .source_text import SENTENCES
     for sentence in SENTENCES.split(text):
         for match in percentage_intervals(sentence):
             scope = sentence[max(0, match.start() - 60):match.end() + 60]
@@ -38,7 +38,7 @@ def binding_percentage_target_interval(text):
 
 def explicit_percentage_targets(text):
     """Recognize only unqualified percent-only target lines, never allocations."""
-    from aqla_hyperliquid_mcp.rules import quoted_numbers
+    from .source_text import quoted_numbers
     values = []
     for line in text.splitlines():
         match = SOURCE_TP_PERCENT.search(line)
@@ -69,7 +69,7 @@ def reference_entry(signal, policy):
 
 
 def prices(reference, side, market, unit, values, leverage=None):
-    from aqla_hyperliquid_mcp.rules import price_grid
+    from aqla_hyperliquid_mcp.precision import price_grid
     reference = Decimal(str(reference))
     if unit not in ("course_percent", "roi_percent", "roe_percent"):
         raise AqlaError("Unknown source percentage interpretation")

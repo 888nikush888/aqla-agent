@@ -16,6 +16,8 @@ from aqla_hyperliquid_mcp.models import (
     now_ms,
 )
 
+from .accounting import entry_quantity_evidence, fill_identity
+
 BERLIN = ZoneInfo("Europe/Berlin")
 FIRST_MONTH = "2026-10"
 SUM_LABEL = "Summe der Trade-Renditen — keine Kontorendite"
@@ -64,20 +66,8 @@ def stamp(value):
     return datetime.fromtimestamp(value / 1000, BERLIN).isoformat() if value is not None else None
 
 
-def fill_identity(row):
-    return digest([row["oid"], row.get("tid"), row.get("time"), row.get("sz"), row.get("px")])
 
 
-def entry_quantity_evidence(raw):
-    detail = raw.get("order", {})
-    status = detail.get("status")
-    order = detail.get("order", {})
-    if status not in TERMINAL_ORDER or order.get("origSz") is None or order.get("sz") is None:
-        return None
-    original = Decimal(str(order["origSz"]))
-    remaining = Decimal(str(order["sz"]))
-    value = original if status == "filled" else original - remaining
-    return str(value) if value.is_finite() and value >= 0 else None
 
 
 def accounting_facts(trade):
@@ -257,3 +247,6 @@ def scheduled_reports(data, clock=None):
                              "undated_closed_count": len(report["undated_closed_trades"]), "fingerprint": report["fingerprint"]})
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
     return selected
+
+# Preserve the public evidence helpers used by reporting and prior clients.
+__all__ = ['BERLIN', 'CLOSED', 'FIRST_MONTH', 'MAX_NATIVE_MONTHLY_BYTES', 'SUM_LABEL', 'accounting_facts', 'accounting_issues', 'due_at', 'entry_quantity_evidence', 'fill_identity', 'month_bounds', 'monthly_report', 'native_monthly_bytes', 'report_row', 'scheduled_reports', 'stamp']

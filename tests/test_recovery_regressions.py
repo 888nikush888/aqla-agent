@@ -168,10 +168,10 @@ async def test_crash_before_exit_cleanup_keeps_market_reserved_until_restart(set
     trade = await trading.execute(plan["plan_id"])
     stop = require_first(row for row in trade["orders"] if row["kind"] == "sl")
     fake.fill(stop["cloid"], trade["remaining_quantity"])
-    original = trading._cancel_owned_orders
+    original = trading.cancel_owned_orders
     async def crash(*args, **kwargs):
         raise RuntimeError("Crash immediately before cleanup dispatch")
-    monkeypatch.setattr(trading, "_cancel_owned_orders", crash)
+    monkeypatch.setattr(trading, "cancel_owned_orders", crash)
     with pytest.raises(RuntimeError):
         await trading.refresh_trade(trade["trade_id"])
     assert state.snapshot()["trades"][trade["trade_id"]]["status"] == "cleanup"
@@ -180,7 +180,7 @@ async def test_crash_before_exit_cleanup_keeps_market_reserved_until_restart(set
     replacement = interpretation.model_copy(update={"source_refs": [newer.source_id], "evidence": [proof.model_copy(update={"source_id": newer.source_id}) for proof in interpretation.evidence]})
     with pytest.raises(AqlaError, match="active trade already owns"):
         await trading.preview(newer.event_id, replacement)
-    monkeypatch.setattr(trading, "_cancel_owned_orders", original)
+    monkeypatch.setattr(trading, "cancel_owned_orders", original)
     await trading.recover()
     recovered = state.snapshot()["trades"][trade["trade_id"]]
     assert recovered["status"] == "closed" and recovered["cleanup_complete"]

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import threading
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -138,7 +139,7 @@ async def test_challenge_timeout_or_session_change_after_await_never_grants():
     for reason in ("expiry", "session", "stop"):
         native, bot, _, now, current, calls, checks = fixture_controller()
         await native.intercept(update("/setup"), bot)
-        async def delayed(checks=checks, reason=reason, now=now, current=current, native=native, bot=bot):
+        async def delayed(_text, *, checks, reason, now, current, native, bot):
             checks.append("worker-ran")
             if reason == "expiry":
                 now[0] = 1120
@@ -147,7 +148,7 @@ async def test_challenge_timeout_or_session_change_after_await_never_grants():
             else:
                 await native.intercept(update("/stop"), bot)
             return True
-        native.verifier.verify = lambda _: delayed()
+        native.verifier.verify = partial(delayed, checks=checks, reason=reason, now=now, current=current, native=native, bot=bot)
         await native.intercept(update(MARKER), bot)
         assert native.claims() is None and len(bot.deleted) == 1
         assert not any(row["action"] == "setup_grant" for row in calls)

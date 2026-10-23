@@ -12,6 +12,8 @@ from typing_extensions import TypedDict
 
 from aqla_hyperliquid_mcp.models import AqlaError, digest
 
+from .lifecycle import notification_sort_key
+
 NATIVE_BYTE_BUDGET = 600_000
 SortKey = tuple[int, int, int, str]
 Notice = dict[str, object]
@@ -74,11 +76,6 @@ def native_response_bytes(payload) -> int:
     return len(json.dumps({"result": text}, ensure_ascii=False).encode("utf-8"))
 
 
-def notification_sort_key(identity: str, notice) -> SortKey:
-    event = notice.get("lifecycle", {})
-    timestamp = event.get("time", notice.get("time", notice.get("observed_at", 0)))
-    return (0 if identity.startswith("protection:") or notice.get("severity") == "urgent" else 1, timestamp if type(timestamp) is int else 0,
-            int(event.get("kind", notice.get("kind")) == "closed"), identity)
 
 
 def _scope(snapshot) -> str:

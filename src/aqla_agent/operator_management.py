@@ -114,7 +114,7 @@ async def dispatch(engine, identity):
             trade = engine.state.read("trades", entries={"trades": [request.trade_id]})["trades"][request.trade_id]
             if trade.get("suspended_wave_targets"):
                 raise AqlaError("Zuerst den bereits begonnenen Waverider-Auftrag abgleichen")
-        engine._patch(request.trade_id, waverider_paused=action == "pause_waverider")
+        engine.patch_trade(request.trade_id, waverider_paused=action == "pause_waverider")
         save(engine, identity, status="done")
     return {"request_id": identity, "status": root.read("operator_requests")["operator_requests"][identity]["status"]}
 

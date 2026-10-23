@@ -156,11 +156,11 @@ def test_native_systemd_finds_actual_full_executable_and_preserves_modes(tmp_pat
     executable.chmod(0o700)
     command = ["systemd-analyze", "verify", "--generators=no", "--man=no", str(target / "aqla-agent.service")]
     environment = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
-    result = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
+    result = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30, check=False)
     assert result.returncode == 0 and not result.stderr, result.stderr
     # A passing syntax check alone is insufficient: removing only this executable
     # must identify its full real path and fail, proving the parser selected it.
     executable.unlink()
-    result = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30)
+    result = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=30, check=False)
     assert result.returncode != 0
     assert str(executable) in result.stderr and "is not executable" in result.stderr

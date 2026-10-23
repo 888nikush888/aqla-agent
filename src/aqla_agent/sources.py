@@ -1,15 +1,10 @@
 """Owner-supplied labels are independent of Telegram reader resolution."""
+
 import re
 
 from aqla_hyperliquid_mcp.models import AqlaError
 
-
-def resolve_source(data, selector):
-    names = data.get("source_names", {})
-    matches = [identity for identity, name in names.items() if name.casefold() == selector.strip().casefold()]
-    if len(matches) > 1:
-        raise AqlaError("Source name is ambiguous; use its Telegram ID")
-    return matches[0] if matches else selector
+from .source_queue import resolve_source
 
 
 def supported_source(data, selector):

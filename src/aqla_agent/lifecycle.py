@@ -68,3 +68,10 @@ def record_lifecycle(data, trade_id, kind):
     events[kind] = event
     data["notifications"].setdefault("lifecycle:" + trade_id + ":" + kind,
                                     {"trade_id": trade_id, "lifecycle": copy.deepcopy(event), "observed_at": event["observed_at"]})
+
+
+def notification_sort_key(identity: str, notice) -> tuple[int, int, int, str]:
+    event = notice.get("lifecycle", {})
+    timestamp = event.get("time", notice.get("time", notice.get("observed_at", 0)))
+    return (0 if identity.startswith("protection:") or notice.get("severity") == "urgent" else 1, timestamp if type(timestamp) is int else 0,
+            int(event.get("kind", notice.get("kind")) == "closed"), identity)

@@ -88,11 +88,11 @@ def _history_payload(path: Path, entries):
     except (OSError, UnicodeError):
         raise HistoryImportError(_issue(path, 1, "read_failed")) from None
     rows, locations = [], []
-    for number, line in enumerate(lines, 1):
-        if not line.strip():
+    for number, raw_line in enumerate(lines, 1):
+        if not raw_line.strip():
             continue
         try:
-            row = json.loads(line)
+            row = json.loads(raw_line)
         except json.JSONDecodeError:
             raise HistoryImportError(_issue(path, number, "json_decode")) from None
         rows.append(row)

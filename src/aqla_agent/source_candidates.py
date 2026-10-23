@@ -7,11 +7,10 @@ from typing import Literal
 
 from pydantic import Field
 
-from aqla_hyperliquid_mcp.models import Model, digest, require_first
-from aqla_hyperliquid_mcp.rules import SOURCE_NUMBERS, number_is_ordinal, quoted_leverage_numbers
+from aqla_hyperliquid_mcp.models import DecisionFailure, Model, digest, require_first
 
 from .evidence import position_fractions
-from .interpretation_contract import DecisionFailure
+from .source_text import SOURCE_NUMBERS, number_is_ordinal, quoted_leverage_numbers
 
 PACKET_VERSION = "aqla-decisions-v8"
 
@@ -167,7 +166,7 @@ def linked_candidate_refs(packet):
 
 
 def questions_for(packet, spans):
-    from .semantic_contract import LIMIT, MARKET
+    from .source_text import LIMIT, MARKET
     linked = linked_candidate_refs(packet)
     anchor = require_first(row for row in packet["messages"] if row["event_id"] == packet["anchor_event_id"])
     order_mentions = [{"quote": match.group(), "start": match.start(), "end": match.end(), "form": form}

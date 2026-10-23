@@ -23,13 +23,13 @@ def test_public_marker_exception_keeps_other_paths_and_api_keys_detectable(tmp_p
     report = tmp_path / "redacted-report.json"
     command = [binary, "dir", str(tmp_path / "source"), "--config", str(config), "--redact=100",
                "--report-format", "json", "--report-path", str(report), "--no-banner", "--no-color"]
-    clean = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    clean = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
     assert clean.returncode == 0 and json.loads(report.read_text()) == []
     synthetic = base64.urlsafe_b64encode(hashlib.sha256(b"aqla scanner synthetic credential").digest()).decode()
     target.write_text(marker_assignment + '\nAPI_KEY = "' + synthetic + '"\n', encoding="utf-8")
     other = target.with_name("other.py")
     other.write_text(marker_assignment, encoding="utf-8")
-    detected = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    detected = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
     assert detected.returncode == 1
     raw = report.read_text()
     if synthetic in raw + detected.stdout + detected.stderr:

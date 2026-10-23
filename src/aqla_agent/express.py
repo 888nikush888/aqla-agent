@@ -8,7 +8,7 @@ from typing import Any
 
 from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent
 
-from .decisions import candidates
+from .source_candidates import candidates
 
 VERSION = "express-fields-v2"
 QUALIFIED_MASTER = "1ef5231d0bcb8f05aa2e8379bd7276010804cb0cfc37e03168175a3cfc000235"

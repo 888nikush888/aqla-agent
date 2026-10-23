@@ -186,3 +186,11 @@ def queue_overview(snapshot, limit=50, *, event_rows=None, include_express=False
             "recovery_operation_total": len(operations), "recovery_operations": sorted(operations)[:limit],
             "recovery_signature": digest(sorted((identity, snapshot["operations"][identity].get("phase")) for identity in operations)),
             "historical_conflict_total": len(historical_conflicts), "historical_conflicts": historical_conflicts[:limit]}
+
+
+def resolve_source(data, selector):
+    names = data.get("source_names", {})
+    matches = [identity for identity, name in names.items() if name.casefold() == selector.strip().casefold()]
+    if len(matches) > 1:
+        raise AqlaError("Source name is ambiguous; use its Telegram ID")
+    return matches[0] if matches else selector

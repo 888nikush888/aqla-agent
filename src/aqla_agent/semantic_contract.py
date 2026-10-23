@@ -9,17 +9,9 @@ import re
 from decimal import Decimal
 
 from aqla_hyperliquid_mcp.models import require_first
-from aqla_hyperliquid_mcp.rules import quoted_numbers
 
+from .source_text import END, LIMIT, MARKET, SENTENCES, WORD, pattern, quoted_numbers
 
-def pattern(expression):
-    return re.compile(expression, re.I)
-
-
-WORD = r"(?<!\w)"
-END = r"(?!\w)"
-MARKET = pattern(WORD + r"(?:market|markt|рынок|маркет(?:у|ом)?|по\s+рынку)" + END)
-LIMIT = pattern(WORD + r"(?:limit|лимит(?:н(?:ый|ая|ые|ым|ую|ого|ой|ому|ом|ыми|ых)|к(?:а|и|ой|у|ами|ах)|ом)?)" + END)
 CURRENT_PRICE_ENTRY = pattern(WORD + r"(?:buy(?:ing)?|sell(?:ing)?|покупа(?:ем|ю)|прода(?:ем|ю)|kauf(?:e|en)|verkauf(?:e|en))\s+"
     r"(?:(?:at|по|zum?)\s+)?(?:current\s+prices?|текущ\w*\s+цен\w*|aktuell\w*\s+(?:preis|kurs)\w*)" + END)
 PENDING_ENTRY_ORDER = pattern(WORD + r"(?:(?:pending|deferred|resting)\s+(?:(?:buy|sell|limit)\s+)?orders?|"
@@ -39,7 +31,6 @@ PAST_MATCH = pattern(r"^" + PAST_VERB + END)
 PAST_GOVERNOR = pattern(WORD + PAST_VERB + r"\s+(?:\w+\s+){0,3}$")
 CLAUSES = pattern(r"\n+|[;!?]+|(?<!\d)\.(?!\d)|\b(?:and|und|и|затем)\b|\s*[,+]\s*")
 # Integer prices can end a sentence; a decimal point still precedes a digit.
-SENTENCES = pattern(r"\n+|[;!?]+|\.(?!\d)")
 CONJUNCTIONS = pattern(r"\b(?:and|und|и|затем|but|aber|но)\b|\s*[,+]\s*")
 CURRENT = pattern(WORD + r"(?:now|jetzt|сейчас|теперь)" + END)
 HYPOTHETICAL = pattern(WORD + r"(?:example(?:\s+only)?|hypothetical\w*|for\s+example|"
@@ -268,7 +259,7 @@ def matching_words(text):
 
 def analysis_only_entry_evidence(original, quote, value):
     """A real number still needs an entry role; reconstruct its original context."""
-    from aqla_hyperliquid_mcp.rules import SOURCE_NUMBERS, number_is_ordinal
+    from .source_text import SOURCE_NUMBERS, number_is_ordinal
     technical = pattern(r"\bhistoric(?:al)?\b|all[- ]time|previous\s+(?:high|low|peak|trough)|historisch\w*|"
         r"историческ\w*|(?:прошл\w*|предыдущ\w*)\s+(?:минимум\w*|максимум\w*)|"
         r"\b(?:support|resistance|poi|fvg)\b|order[- ]?block|ключев\w*\s+зон\w*|ликвидност\w*|поддержк\w*|сопротивлен\w*")
@@ -594,7 +585,7 @@ def supported_action_failure(text, interpretation):
     if interpretation.update_action == "sequence":
         if [step.action for step in interpretation.management_steps] != [action for action, _ in actions]:
             return "management_action_mismatch"
-        from aqla_hyperliquid_mcp.rules import management_steps
+        from aqla_hyperliquid_mcp.models import management_steps
         for child in management_steps(interpretation):
             if not any([action for action, _ in current_actions(proof.quote, include_tp_footers=False)] == [child.update_action]
                        for proof in child.evidence if proof.field == "update_action"):

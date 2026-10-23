@@ -1,5 +1,9 @@
 """Slot accounting over observed positions and durable own reservations."""
 
+from decimal import Decimal
+
+from aqla_hyperliquid_mcp.models import TERMINAL_ORDER, AqlaError, digest
+
 
 def occupied_markets(data, account, *, exclude_trade=None):
     markets = {symbol for symbol, size in (account.positions or {}).items() if size}
@@ -42,3 +46,38 @@ def inventory_view(data, account, limit):
             'occupied_count': len(occupied), 'limit': limit, 'free_slots': max(0, limit - len(occupied)),
             'available_margin_usdc': str(account.available_margin), 'equity_usdc': str(account.equity),
             'conflicted_markets': sorted(row['plan']['market']['symbol'] for row in data['trades'].values() if row['status']=='conflicted')}
+
+
+def position_basis(trade):
+    """Chronological average-cost ledger; turnover is never current exposure."""
+    quantity, cost, realized, fees = Decimal(0), Decimal(0), Decimal(0), Decimal(0)
+    direction = Decimal(1) if trade["plan"]["side"] == "long" else Decimal(-1)
+    for row in sorted(trade.get("fill_events", {}).values(), key=lambda row: (row["time"], str(row.get("tid")), str(row["oid"]))):
+        size, price = Decimal(row["sz"]), Decimal(row["px"])
+        if row.get("fee") is not None:
+            fees += Decimal(row["fee"])
+        if row["kind"] == "entry":
+            quantity, cost = quantity + size, cost + size * price
+        else:
+            if size > quantity or quantity <= 0:
+                raise AqlaError("Own exit exceeds chronological entry evidence")
+            average = cost / quantity
+            realized += size * (price - average) * direction
+            quantity, cost = quantity - size, cost - size * average
+    return quantity, cost / quantity if quantity else Decimal(0), realized, fees
+
+
+def fill_identity(row):
+    return digest([row["oid"], row.get("tid"), row.get("time"), row.get("sz"), row.get("px")])
+
+
+def entry_quantity_evidence(raw):
+    detail = raw.get("order", {})
+    status = detail.get("status")
+    order = detail.get("order", {})
+    if status not in TERMINAL_ORDER or order.get("origSz") is None or order.get("sz") is None:
+        return None
+    original = Decimal(str(order["origSz"]))
+    remaining = Decimal(str(order["sz"]))
+    value = original if status == "filled" else original - remaining
+    return str(value) if value.is_finite() and value >= 0 else None

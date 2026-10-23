@@ -255,7 +255,7 @@ async def conflicted(setup, signal):
     source, value = signal
     plan = await trading.preview(source.event_id, value)
     trade = await trading.execute(plan["plan_id"])
-    trading._patch(trade["trade_id"], status="conflicted", external_conflict="manual")
+    trading.patch_trade(trade["trade_id"], status="conflicted", external_conflict="manual")
     return state, fake, trading, trade["trade_id"]
 
 

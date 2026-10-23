@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from contextlib import asynccontextmanager
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
@@ -44,6 +44,7 @@ from aqla_agent.setup import SetupBinding, SetupGate
 from aqla_agent.source_queue import is_source_row, queue_overview
 from aqla_agent.tool_queries import compact_view, source_attribution
 from aqla_agent.tool_queries import source_lookup as lookup_sources
+from aqla_hyperliquid_mcp.models import OPEN
 
 from . import __version__
 from .actions import NATIVE_MODELS, NativeRequest
@@ -62,11 +63,23 @@ from .models import (
     now_ms,
 )
 from .multisig import Signature
-from .projections import ReaderOverview as ReaderOverview
-from .projections import reader_overview as reader_overview
+from .projections import ReaderOverview, reader_overview
 from .state import State
 from .streams import SUBSCRIPTION_MODELS, Streams, Subscription
-from .trades import OPEN
+
+if TYPE_CHECKING:
+    from aqla_agent.express_worker import ExpressWorker
+
+
+class AqlaServer(MCPServer):
+    """Native MCP server with explicit Aqla-owned lifecycle resources."""
+    aqla_state: State
+    aqla_exchange: Hyperliquid
+    aqla_trading: Router
+    aqla_authority: Authority | None
+    aqla_streams: Streams
+    aqla_express: ExpressWorker
+    _aqla_setup_gate: SetupGate
 
 
 def create_server(settings: Settings, *, profile="agent", exchange=None, state=None):
@@ -159,11 +172,11 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             await streams.close()
             state.close()
 
-    server = MCPServer("aqla-hyperliquid", version=__version__, lifespan=lifespan,
+    server = AqlaServer("aqla-hyperliquid", version=__version__, lifespan=lifespan,
                        instructions="Hermes interprets received sources. Python enforces user rules. Unknown exchange results are never automatically retried. Keep operation IDs stable.")
     server._aqla_setup_gate = setup_gate
-    read = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)
-    write = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True)
+    read = ToolAnnotations.model_validate({"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+    write = ToolAnnotations.model_validate({"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True})
 
     @server.tool(annotations=read)
     async def capabilities() -> dict:
@@ -635,7 +648,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             return state.update(set_ranking)
         if action in ("set_account_limits", "set_account_enabled"):
             data = state.snapshot()
-            if account_key not in data["execution_accounts"] or expected_revision != data["configuration_revision"]:
+            if account_key is None or account_key not in data["execution_accounts"] or expected_revision != data["configuration_revision"]:
                 raise AqlaError("Select a configured execution account and current configuration revision")
             if action == "set_account_enabled" and enabled:
                 engine = trading.engine_for(*account_key.split(":"))
@@ -823,6 +836,8 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             if action == "setup_failed":
                 return dict(setup_gate.failed(binding))
             if action == "setup_grant":
+                if lease_id is None or generation is None:
+                    raise AqlaError("Private native Setup lease and generation are required")
                 setup_gate.register(binding, lease_id, None, generation)
                 return {"registered": True, "remaining_seconds": setup_gate.status(binding, lease_id)["remaining_seconds"]}
             return dict(setup_gate.status(binding, lease_id))
@@ -946,3 +961,6 @@ async def close_server(server):
         await server.aqla_trading.close()
         await server.aqla_streams.close()
     server.aqla_state.close()
+
+# Public compatibility names resolve to the shared production implementations.
+__all__ = ['AqlaServer', 'ReaderOverview', 'close_server', 'create_server', 'reader_overview']

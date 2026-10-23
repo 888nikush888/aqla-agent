@@ -112,8 +112,7 @@ class State:
                 or not request.get("leader") and request.get("account", "").lower() != self.data["trading_account"]):
             raise AqlaError("Saved operation belongs to another trading target or network")
         if request.get("operation"):
-            # Import locally: the API uses State, but replay validation needs the
-            # same explicit SDK contract map without a second mutable registry.
+            # Reuse the explicit SDK contract map for saved-operation validation.
             from .api import sdk_signing_scope
             scope = sdk_signing_scope(request["operation"])
             if "signing_scope" not in request:
@@ -141,7 +140,7 @@ class State:
     def status_summary(self):
         from aqla_agent.execution_outcome import execution_counts
         from aqla_agent.source_queue import queue_overview
-        from aqla_agent.trading import OPEN
+        from aqla_hyperliquid_mcp.models import OPEN
 
         with self._thread_lock:
             data = self.data

@@ -2,63 +2,48 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from decimal import ROUND_DOWN, ROUND_FLOOR, ROUND_UP, Decimal, InvalidOperation, localcontext
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation, localcontext
 from typing import Any, Literal
+
+from aqla_agent.source_text import (
+    SOURCE_NUMBERS,
+    number_is_ordinal,
+    numeric_evidence_values,
+    quoted_leverage_numbers,
+    quoted_numbers,
+)
+from aqla_agent.source_text import (
+    complete_numeric_span as _complete_numeric_span,
+)
 
 from .models import (
     EVIDENCE_FIELDS,
     AccountSnapshot,
     AqlaError,
     BackupValues,
+    EntryLegPlan,
     ExchangeMinimum,
     Interpretation,
     Market,
     Policy,
+    SourceEntryLeg,
     TradePlan,
     digest,
+    management_steps,
     margin_leverage,
     now_ms,
 )
+from .precision import price_grid, quantity_grid, slippage_price
 
 UPDATE_VALUE_FIELDS = {"move_stop": "stop_loss", "replace_targets": "take_profits", "reduce": "reduce_percent"}
 
 
-def management_steps(signal):
-    """Project each typed step onto the existing single-action evidence contract."""
-    children = []
-    if any(proof.field not in EVIDENCE_FIELDS for proof in signal.evidence):
-        raise AqlaError("Unsupported source evidence fields in management sequence")
-    for index, step in enumerate(signal.management_steps):
-        prefix = f"management_steps.{index}."
-        proofs = []
-        for proof in signal.evidence:
-            if proof.field.startswith(prefix):
-                field = proof.field[len(prefix):]
-                proofs.append(proof.model_copy(update={"field": "update_action" if field == "action" else field}))
-            elif not proof.field.startswith("management_steps."):
-                proofs.append(proof.model_copy(deep=True))
-        if not any(proof.field == "update_action" for proof in proofs):
-            raise AqlaError("Each management step needs its original action clause")
-        children.append(signal.model_copy(update={"management_steps": [], "update_action": step.action,
-            "reduce_percent": step.reduce_percent, "stop_loss": step.stop_loss, "evidence": proofs}))
-    return children
 
 
-SOURCE_NUMBERS = re.compile(r"(?<![\w.])(?:[xх×]\s*)?\d+(?:[.,]\d+)*(?:[\u00a0\u202f]\d{3}(?:[.,]\d+)?)?(?:[xх×])?(?!\w|[.,]\d)", re.I)
 
 
-def quantity_grid(value: Decimal, market: Market):
-    if market.quantity_step is not None:
-        return (value / market.quantity_step).to_integral_value(rounding=ROUND_DOWN) * market.quantity_step
-    return value.quantize(Decimal(1).scaleb(-market.size_decimals), rounding=ROUND_DOWN)
 
 
-def price_grid(value: Decimal, market: Market, up=False):
-    if market.price_tick is not None:
-        return (value / market.price_tick).to_integral_value(rounding=ROUND_UP if up else ROUND_DOWN) * market.price_tick
-    decimals = (6 if market.product == "perp" else 8) - market.size_decimals
-    exponent = max(-decimals, value.adjusted() - 4) if value < 100000 else 0
-    return value.quantize(Decimal(1).scaleb(exponent), rounding=ROUND_UP if up else ROUND_DOWN)
 
 
 def selected_targets(prices, policy):
@@ -110,76 +95,14 @@ def executable_targets(quantity, targets, policy, market):
     raise ExchangeMinimum("A TP leg is below the exchange notional minimum")
 
 
-def number_is_ordinal(text, start, end):
-    if not re.fullmatch(r"\d{1,2}", text[start:end]) or text[end:end + 1] not in (":", ")"):
-        return False
-    before = text[text.rfind("\n", 0, start) + 1:start].strip()
-    return not before or bool(re.search(r"(?<!\w)(?:tp|target|take[-\s]?profit|тейк|цел[ьи]|ziel)\s*$", before, re.I))
 
 
-def _complete_numeric_span(original, start, end, tokens):
-    before, after = original[:start], original[end:]
-    return not (before[-1:].isdigit() or after[:1].isdigit() or re.search(r"\d[.,]$", before) or re.match(r"[.,]\d", after)
-                or any(low <= start and end <= high and (low, high) != (start, end) for low, high in tokens))
 
 
-def numeric_evidence_values(original, quote):
-    """Every original match must support one complete non-ordinal value."""
-    occurrences = list(re.finditer(re.escape(quote), original))
-    if not occurrences:
-        return None
-    tokens = [match.span() for match in SOURCE_NUMBERS.finditer(original)]
-    compatible = None
-    for occurrence in occurrences:
-        values = []
-        cropped = False
-        for number in SOURCE_NUMBERS.finditer(quote):
-            start, end = occurrence.start() + number.start(), occurrence.start() + number.end()
-            if not _complete_numeric_span(original, start, end, tokens):
-                cropped = True
-                break
-            if number_is_ordinal(original, start, end):
-                continue
-            alternatives = set(quoted_numbers(number.group()))
-            if not alternatives:
-                return None
-            values.append(alternatives)
-        if cropped:
-            continue  # A substring inside a larger decimal is not an occurrence of this value.
-        if len(values) != 1:
-            return None
-        compatible = values[0] if compatible is None else compatible & values[0]
-    return compatible or None
 
 
-def quoted_numbers(quote):
-    # General decimal notation only; no channel-specific syntax or field-role regex.
-    normalized = quote.replace("\u00a0", " ").replace("\u202f", " ")
-    # A sentence-ending period is punctuation; decimal/thousands dots stay untouched.
-    normalized = re.sub(r"(?<=\d)\.(?=$|[\s\"'»”);,!?\]])", " ", normalized)
-    normalized = re.sub(r"(?<=\d) (?=\d{3}(?:\b|[.,]))", "", normalized)
-    for token in re.findall(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])", normalized):
-        if "." in token and "," in token:
-            token = token.replace(",", "") if token.rfind(".") > token.rfind(",") else token.replace(".", "").replace(",", ".")
-        elif "," in token:
-            parts = token.split(",")
-            if parts[0] != "0" and all(len(part) == 3 for part in parts[1:]):
-                yield Decimal("".join(parts))
-            token = token.replace(",", ".")
-        elif "." in token and token.split(".")[0] != "0" and all(len(part) == 3 for part in token.split(".")[1:]):
-            yield Decimal(token.replace(".", ""))
-        try:
-            yield Decimal(token)
-        except Exception:
-            continue
 
 
-def quoted_leverage_numbers(quote):
-    # General multiplier notation, not channel patterns. Keep price evidence parsing unchanged.
-    numeric = r"\d+(?:[.,]\d+)*"
-    quote = re.sub(rf"(?<![\w.])[xх×]\s*({numeric})(?!\w)", r" \1 ", quote, flags=re.I)
-    quote = re.sub(rf"(?<![\w.])({numeric})\s*(?:[xх×]|fach)(?!\w)", r" \1 ", quote, flags=re.I)
-    return quoted_numbers(quote)
 
 
 def effective_leverage(signal: Interpretation, market: Market, policy: Policy, backup=None):
@@ -225,12 +148,6 @@ def latest_sources(events: dict, refs=None):
     return canonical_sources(events, refs)
 
 
-def slippage_price(reference: Decimal, percent: Decimal, market: Market, buy: bool):
-    bound = reference * (1 + (1 if buy else -1) * percent / 100)
-    result = price_grid(bound, market, up=not buy)
-    if result <= 0 or (result > bound if buy else result < bound):
-        raise AqlaError("No positive price grid point satisfies the slippage bound")
-    return result
 
 
 def verify_setup_references(signal, anchor_source_id, own_setup_refs=()):
@@ -446,7 +363,6 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
               revision: int, source_time: int, binding: tuple[str, str], reserved_risk=Decimal(0), stamp=None, principal=None,
               backup: BackupValues | None = None, backup_revision=None, maker_price: Decimal | None = None, *, _managed=False) -> TradePlan:
     if signal.entry == "split" or signal.entry == "range" and policy.entry_range_choice == "split":
-        from aqla_agent.managed_entries import make_entry_plan
         return make_entry_plan(signal, market, account, policy, revision, source_time, binding,
                                reserved_risk, stamp, principal, backup, backup_revision, maker_price)
     stamp = now_ms() if stamp is None else stamp
@@ -485,8 +401,8 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         managed = _managed or policy.entry_range_choice == "split" or policy.management_mode == "waverider"
         backup_reference = limit if managed else entry
         derived_stop, derived_targets = backup_prices(backup_reference, signal.side, market,
-            backup.fallback_stop_loss_percent if "stop_loss" in fields else None,
-            selected_targets(backup.fallback_take_profit_percentages, policy) if "take_profits" in fields else (),
+            backup.fallback_stop_loss_percent if backup is not None and "stop_loss" in fields else None,
+            selected_targets(backup.fallback_take_profit_percentages, policy) if backup is not None and "take_profits" in fields else (),
             stop_unit=backup.fallback_stop_loss_unit if backup else "course_percent",
             take_profit_unit=backup.fallback_take_profit_unit if backup else "course_percent", leverage=leverage)
         if "stop_loss" in fields:
@@ -546,8 +462,8 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
                     market = market.model_copy(update={"max_leverage": min(market.max_leverage, tier.max_leverage)})
                     leverage = effective_leverage(signal, market, policy, backup)
                     derived_stop, derived_targets = backup_prices(backup_reference, signal.side, market,
-                        backup.fallback_stop_loss_percent if "stop_loss" in fields else None,
-                        selected_targets(backup.fallback_take_profit_percentages, policy) if "take_profits" in fields else (),
+                        backup.fallback_stop_loss_percent if backup is not None and "stop_loss" in fields else None,
+                        selected_targets(backup.fallback_take_profit_percentages, policy) if backup is not None and "take_profits" in fields else (),
                         stop_unit=backup.fallback_stop_loss_unit, take_profit_unit=backup.fallback_take_profit_unit,
                         leverage=leverage)
                     if "stop_loss" in fields:
@@ -590,7 +506,7 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         values = {"trade_id": trade_id, "source_refs": signal.source_refs, "policy_revision": revision, "policy": policy,
                       "signal_leverage": int(Decimal(signal.leverage).to_integral_value(rounding=ROUND_FLOOR)) if signal.leverage is not None else None,
                       "signal_leverage_original": signal.leverage, "effective_leverage": leverage, "source_symbol": signal.symbol,
-                      "backup_fields": fields, "backup_values": backup.model_copy(deep=True) if fields else None, "backup_profile_revision": backup_revision if fields else None,
+                      "backup_fields": fields, "backup_values": backup.model_copy(deep=True) if backup is not None and fields else None, "backup_profile_revision": backup_revision if fields else None,
                       "network": binding[0], "account": binding[1], "principal": principal, "market": market, "side": signal.side, "entry_kind": kind,
                       "entry_price": entry, "entry_limit": limit, "stop_loss": stop, "take_profits": targets, "quantity": quantity,
                       "source_take_profit_count": len(signal.take_profits),
@@ -610,3 +526,69 @@ def make_plan(signal: Interpretation, market: Market, account: AccountSnapshot, 
         if source_reference is not None:
             values["source_entry_reference"] = source_reference
         return TradePlan(plan_id=digest(values), **values)
+
+
+def entry_targets(quantity, targets, policy, market, leg_quantities=()):
+    # Reuse the configured adaptive rule at every stage, including the first protected fill.
+    count = min(len(executable_targets(size, targets, policy, market)[0]) for size in (quantity, *leg_quantities))
+    return executable_targets(quantity, targets[:count], policy, market)
+
+
+def make_entry_plan(signal, market, account, policy, revision, source_time, binding,
+                    reserved_risk, stamp, principal, backup, backup_revision, maker_price):
+    if signal.kind != "new_signal":
+        raise AqlaError("Only a new setup can allocate two original entries")
+    legs = signal.entry_legs if signal.entry == "split" else [
+        SourceEntryLeg(kind="limit", price=value, timing=signal.entry_timing)
+        for value in signal.entry_prices]
+    if len(legs) != 2:
+        raise AqlaError("Both original entries are required")
+    selections = []
+    backup_entry = False
+    for index, leg in enumerate(legs):
+        if leg.kind == "unspecified":
+            if backup and backup.entry_mode == "source_or_market":
+                backup_entry = True
+            elif policy.entry_mode != "source_or_market":
+                raise AqlaError("Unstated entry form needs the configured market-entry fallback")
+        single = signal.model_copy(update={"entry": leg.kind, "entry_legs": [],
+            "entry_prices": [leg.price] if leg.price is not None else [], "entry_timing": leg.timing})
+        selected = entry_prices(single, market, policy, maker_price=maker_price)
+        selections.append((index, leg, selected))
+    if signal.entry == "range" and selections[0][2].price == selections[1][2].price:
+        raise AqlaError("Source zone collapses to one native tick; two distinct entries cannot be invented")
+    # Size conservatively at the worst allowed entry. Never use averaging to enlarge risk.
+    worst = (max if signal.side == "long" else min)(row[2].limit for row in selections)
+    anchor = signal.model_copy(update={"entry": "limit", "entry_prices": [worst], "entry_legs": [], "entry_timing": "standard"})
+    base = make_plan(anchor, market, account, policy, revision, source_time, binding, reserved_risk,
+                     stamp, principal, backup, backup_revision, maker_price, _managed=True)
+    weights = [leg.weight_percent or Decimal(50) for leg in legs]
+    quantities = [quantity_grid(base.quantity * weights[0] / 100, base.market)]
+    quantities.append(base.quantity - quantities[0])
+    planned = []
+    for (index, leg, selected), size in zip(selections, quantities, strict=True):
+        if size <= 0 or size < base.market.min_quantity or size * selected.limit < base.market.min_notional:
+            raise ExchangeMinimum("A source entry leg is below the exchange minimum; neither leg may be dropped or enlarged")
+        if not (base.stop_loss < selected.price < min(base.take_profits) if base.side == "long"
+                else base.stop_loss > selected.price > max(base.take_profits)):
+            raise AqlaError("Both source entries must have valid common SL/TP structure")
+        planned.append(EntryLegPlan(index=index, kind=selected.kind, price=selected.price,
+            limit=selected.limit, quantity=size, timing=leg.timing))
+    # Market intent first; otherwise the near limit fills before the far limit.
+    planned.sort(key=lambda leg: (leg.kind != "market", -leg.limit if base.side == "long" else leg.limit, leg.index))
+    values = base.model_dump()
+    if backup_entry and "entry" not in base.backup_fields:
+        values.update(backup_fields=[*base.backup_fields, "entry"], backup_values=backup.model_copy(deep=True), backup_profile_revision=backup_revision)
+    targets, quantities = entry_targets(base.quantity, base.take_profits, policy, base.market, [leg.quantity for leg in planned])
+    count = len(targets)
+    values.update(entry_legs=planned, entry_price=sum(leg.price * leg.quantity for leg in planned) / base.quantity,
+                  take_profits=targets, tp_quantities=quantities)
+    if base.source_tp:
+        values["source_tp"] = {**base.source_tp, "values": base.source_tp["values"][:count],
+                               "preview_prices": base.source_tp["preview_prices"][:count]}
+    values.pop("plan_id")
+    return TradePlan(plan_id=digest(values), **values)
+
+
+# Named compatibility exports share the same implementation.
+__all__ = ['EntryPrices', 'SOURCE_NUMBERS', 'backup_prices', 'effective_leverage', 'entry_prices', 'entry_targets', 'executable_targets', 'latest_sources', 'make_entry_plan', 'make_plan', 'management_steps', 'number_is_ordinal', 'numeric_evidence_values', 'price_grid', 'quantity_grid', 'quoted_leverage_numbers', 'quoted_numbers', 'selected_targets', 'slippage_price', 'split_targets', 'verify_entry_shape', 'verify_evidence', 'verify_setup_references', 'verify_update_shape']

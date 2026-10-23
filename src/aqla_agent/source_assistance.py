@@ -5,7 +5,6 @@ import json
 import re
 
 from aqla_hyperliquid_mcp.models import EVIDENCE_FIELDS, AqlaError, Interpretation, digest, require_first
-from aqla_hyperliquid_mcp.rules import number_is_ordinal, numeric_evidence_values, quoted_numbers
 
 from .interpretation_contract import DecisionFailure, validate_interpretation
 from .source_candidates import (
@@ -15,6 +14,7 @@ from .source_candidates import (
     questions_for,
     verification_questions,
 )
+from .source_text import number_is_ordinal, numeric_evidence_values, quoted_numbers
 
 VERSION = "source-assistance-v7"
 CONTRACT_FIELDS = ("kind", "symbol", "side", "entry", "entry_timing", "update_action",

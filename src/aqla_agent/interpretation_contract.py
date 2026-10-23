@@ -2,7 +2,7 @@
 
 import re
 
-from aqla_hyperliquid_mcp.models import AqlaError, require_first
+from aqla_hyperliquid_mcp.models import DecisionFailure, require_first
 from aqla_hyperliquid_mcp.rules import (
     quoted_leverage_numbers,
     verify_entry_shape,
@@ -22,8 +22,6 @@ ENTRY_FORM_MARKERS = re.compile(
     r"|(?<!\w)(?:market|markt)[-\s]+(?:entry|einstieg)(?!\w)", re.I)
 
 
-class DecisionFailure(AqlaError):
-    """Safe failure code, never a provider response or model-supplied exception."""
 
 
 

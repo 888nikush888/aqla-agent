@@ -20,8 +20,7 @@ from types import SimpleNamespace
 
 import portalocker
 import yaml
-
-from aqla_hyperliquid_mcp.models import require_first
+from native_helpers import require_first
 
 BOOTSTRAP = '''import json
 import os

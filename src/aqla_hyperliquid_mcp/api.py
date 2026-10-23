@@ -15,10 +15,11 @@ from hyperliquid.utils import signing
 from aqla_hyperliquid_mcp.models import require_first
 
 from .models import TERMINAL_ORDER, AccountSnapshot, AqlaError, Market, Settings, digest, now_ms
-from .state import State
 
 if TYPE_CHECKING:
     from aqla_agent.pipelines import VenueState
+
+    from .state import State
 
 SDK_PRINCIPAL_L1 = frozenset({
     "set_referrer", "create_sub_account", "sub_account_transfer", "sub_account_spot_transfer", "vault_usd_transfer",
@@ -50,11 +51,6 @@ def sdk_signing_scope(operation):
     raise AqlaError("No explicit signing scope for this SDK operation")
 
 
-def wire_number(value) -> str:
-    number = Decimal(str(value))
-    if not number.is_finite():
-        raise AqlaError("Non-finite exchange number")
-    return format(number, "f").rstrip("0").rstrip(".") if number % 1 else format(number.quantize(Decimal(1)), "f")
 
 
 class Hyperliquid:
@@ -104,6 +100,7 @@ class Hyperliquid:
             raise AqlaError("Invalid configured signing key") from error
         self.market_cache: dict[str, Market] = {}
         self.last_inventory: AccountSnapshot | None = None
+        self.fail_closed_protection = False
 
     @property
     def account(self):

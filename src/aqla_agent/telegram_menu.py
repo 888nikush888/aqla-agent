@@ -42,7 +42,7 @@ LABELS = {
 
 
 def input_value(text, schema):
-    from .native_commands import parse_value
+    from .command_catalog import parse_value
     selected = next((item for item in schema.get("anyOf", [schema]) if item.get("type") != "null"), schema)
     if selected.get("type") == "array" and not text.strip().startswith("["):
         text = json.dumps([part.strip() for part in text.split(";") if part.strip()], ensure_ascii=False)
@@ -240,7 +240,7 @@ class TelegramMenu:
         await self.paged(bot, title, rows, "profile_field", (identity,))
 
     async def field(self, bot, kind, identity, field):
-        from .native_commands import parameter_unit
+        from .command_catalog import parameter_unit
         data = await self.config()
         models = {"profile": Parameters, "ranking": RankingPolicy}
         if kind == "profile":
@@ -315,270 +315,450 @@ class TelegramMenu:
             [("Weitere Einstellungen", "profile_group", identity, require_first(group for group, fields in GROUPS.items() if field in fields))] if kind == "profile" else [("Zur Übersicht", "system" if kind == "technical" else "accounts" if kind == "limits" else "ranking")])
 
     async def run(self, bot, action, *args):
-        if action in ("home", "cancel"):
-            if self.extension.setup.challenge is not None:
-                await self.extension.setup.revoke()
-            return await self.home(bot)
-        if action == "dashboard":
-            return await self.dashboard(bot)
-        if action == "journal":
-            return await self.dashboard(bot, True, args[0] if args else 0)
-        if action in ("positions", "profiles"):
-            return await getattr(self, action)(bot)
-        if action in ("trade", "profile", "profile_group"):
-            return await getattr(self, action)(bot, *args)
-        if action == "page":
-            return await self.paged(bot, *args)
-        if action == "text_page":
-            return await self.display(bot, args[0], args[1], raw=args[2], page=args[3])
-        if action == "profile_field":
-            return await self.field(bot, "profile", *args)
-        if action == "initialize_profile":
-            data = await self.config()
-            row = data["profiles"][args[0]]
-            if row.get("parameters") is not None:
-                raise AqlaError("Profil ist inzwischen eingerichtet; aktuelle Werte verwenden")
-            profile = TradingProfile(id=args[0], name=row["name"], parameters=Parameters())
-            await self.commands.control(action="set_profile", profile=profile.model_dump(mode="json"), expected_revision=args[1])
-            return await self.profile(bot, args[0])
-        if action == "field":
-            return await self.field(bot, *args)
-        if action == "input":
-            return await self.commit_field(bot, args[0])
-        if action == "network":
-            self.network = "testnet" if self.network == "mainnet" else "mainnet"
-            return await self.dashboard(bot, args[0])
-        if action in ("period", "currency"):
-            data = await self.rpc("dashboard", network=self.network, period=self.period, currency=self.currency)
-            rows = [(label, label) for label in data["available_periods"] if action == "period"] if action == "period" else [(label, label) for label in data["available_currencies"]]
-            return await self.paged(bot, "Zeitraum wählen" if action == "period" else "Währung wählen", rows, "select_scope", (action, args[0]))
-        if action == "select_scope":
-            setattr(self, args[0], args[2])
-            return await self.dashboard(bot, args[1])
-        if action == "sources":
-            data = await self.config()
-            lines = [data.get("source_names", {}).get(key, key) + " · " + data.get("source_ranks", {}).get(key, {}).get("tier", "F") for key in sorted(active_sources(data))]
-            return await self.display(bot, "Quellen & Routing\n" + "\n".join(lines), [("Kanäle & Nachweise", "source_list"), ("Kanalrang ändern", "command", "aqla_rang"),
-                ("Quelle ergänzen", "prompt", "add_source", ""), ("Quelle entfernen", "prompt", "remove_source", ""),
-                ("Quelle benennen", "prompt", "rename_source", ""), ("Ranking-Regeln", "ranking"), ("Routing", "pipelines")])
-        if action == "source_list":
-            data = await self.config()
-            return await self.paged(bot, "Aktuelle Quellen · Rang, Metriken und Ausschlüsse", [(data.get("source_names", {}).get(key, key), key) for key in sorted(active_sources(data))], "source_details")
-        if action == "source_details":
-            result = await self.rpc("ranking_status", source=args[0], history_limit=8)
-            if not result["sources"]:
-                return await self.display(bot, "Quelle ist nicht mehr aktiv.\nHistorische Rangdaten und Handelsbelege bleiben erhalten; keine Bereinigung oder erneute Aufnahme nötig.", [("Aktuelle Quellen", "source_list")])
-            text = []
-            for key, row in result["sources"].items():
-                text += [row.get("name", key) + " · " + row["tier"], "Belege: " + str(row.get("proof_total", 0)),
-                         "Metriken: " + str(row.get("metrics", {})), "Nachweise: " + str(row.get("evidence", [])),
-                         "Ausschlüsse: " + str(row.get("exclusions", []))]
-            text.append("Letzte Rangwechsel: " + str(result.get("history", [])))
-            return await self.display(bot, "\n\n".join(text), [("Rang ändern", "source_tier", args[0]), ("Quellen", "source_list")])
-        if action == "source_tier":
-            return await self.commands.start(bot, "aqla_rang", json.dumps(args[0]) + " ")
-        if action == "ranking":
-            data = await self.config()
-            rows = []
-            for field, value in data["ranking_policy"].items():
-                rows += [(field + "." + key + ": " + str(item), field + "." + key) for key, item in value.items()] if isinstance(value, dict) else [(field + ": " + str(value), field)]
-            return await self.paged(bot, "Ranking · vollständige validierte Rangregeln", rows, "ranking_field")
-        if action == "ranking_field":
-            return await self.field(bot, "ranking", "", args[0])
-        if action == "accounts":
-            data = await self.config()
-            lines = [key + " · " + ("aktiv" if row.get("enabled") else "gesperrt") + " · max. " + str((row.get("limits") or {}).get("max_open_trades", "—")) + " Trades · Gesamtrisiko " + number((row.get("limits") or {}).get("max_total_risk_percent")) + " %" for key, row in data["execution_accounts"].items()]
-            return await self.display(bot, "Konten & Freigaben\n" + "\n".join(lines), [("Entries sofort pausieren", "pause"), ("Entries fortsetzen", "resume"),
-                ("Kontolimits", "limits_selection"), ("Konto aktivieren/sperren", "account_selection"), ("Eigentumskonflikte", "conflicts"),
-                ("Setup-Freigabe", "setup"), ("Profile anlegen", "prompt", "create_profile", "")])
-        if action in ("pause", "resume"):
-            await self.commands.control(action=action)
-            return await self.display(bot, "Neue Entries pausiert. Positionsschutz läuft weiter." if action == "pause" else "Neue Entries freigegeben.", [("Konten", "accounts")])
-        if action == "account_selection":
-            data = await self.config()
-            return await self.paged(bot, "Konto wählen", [(key, key) for key in data["execution_accounts"]], "account")
-        if action == "limits_selection":
-            data = await self.config()
-            return await self.paged(bot, "Limits je Ausführungskonto", [(key, key) for key, row in data["execution_accounts"].items() if row.get("configured")], "limit_fields")
-        if action == "limit_fields":
-            data = await self.config()
-            if not data["execution_accounts"][args[0]].get("limits"):
-                return await self.run(bot, "prompt", "initial_limits", args[0])
-            return await self.display(bot, args[0], [(LABELS[field], "field", "limits", args[0], field) for field in AccountLimits.model_fields])
-        if action == "account":
-            data = await self.config()
-            row = data["execution_accounts"][args[0]]
-            return await self.display(bot, args[0] + " · " + ("aktiv" if row.get("enabled") else "gesperrt"), [("Sperren" if row.get("enabled") else "Aktivieren", "account_apply", args[0], not row.get("enabled"), data["configuration_revision"])])
-        if action == "account_apply":
-            await self.commands.control(action="set_account_enabled", account_key=args[0], enabled=args[1], expected_revision=args[2])
-            return await self.run(bot, "accounts")
-        if action == "conflicts":
-            data = await self.config()
-            return await self.paged(bot, "Eigentumskonflikte · ausschließlich belegte eigene Abschlüsse", [
-                (row["plan"]["market"]["symbol"] + " · " + row["plan"]["network"], row["trade_id"]) for row in data["trades"] if row["status"] == "conflicted"], "conflict")
-        if action == "conflict":
-            review = await self.rpc("conflict_review", trade_id=args[0], context_auth=self.commands.auth())
-            text = "Eigentumsprüfung · " + args[0][:8] + "\nEigene Position: " + str(review["position_size"]) + "\n" + "\n".join(review["reasons"])
-            text += "\nEs werden keine fremden Positionen oder Orders übernommen. PnL bleibt bei fehlenden Belegen unvollständig."
-            buttons = [("Belegten eigenen Abschluss bestätigen", "resolve_conflict", args[0], review["fingerprint"])] if review["resolvable"] else []
-            return await self.display(bot, text, buttons)
-        if action == "resolve_conflict":
-            result = await self.commands.control(action="resolve_conflict", trade_id=args[0], review_fingerprint=args[1])
-            return await self.display(bot, "Eigener Abschluss bestätigt." if result["resolved"] else "Belege haben sich geändert; erneut prüfen.", [("Konflikte", "conflicts")])
-        if action == "system":
-            from .runtime_controls import RuntimeControls
-            technical = RuntimeControls(self.extension).read()
-            values = technical["values"]
-            from . import __version__
-            lines = ["System & KI · Aqla " + __version__, "Freigaben und Grenzen werden bei jeder Wirkung erneut geprüft."]
-            lines += [LABELS[key] + ": " + setting_value(value) for key, value in values.items()]
-            lines.append("Technische Übernahme: " + technical["apply_status"])
-            return await self.display(bot, "\n".join(lines), [("Technische Einstellungen", "technical"), ("Verlauf & Störungen", "activity", 0), ("Meldungsregeln", "notification_info"),
-                ("Erschöpfte Zustellungen erneut prüfen", "retry_delivery"), ("Aktualisieren", "system")])
-        if action == "retry_delivery":
-            self.commands.auth()
-            await self.extension.source_worker.bind()
-            result = await self.extension.source_worker.internal("delivery_retry")
-            return await self.display(bot, "Erneut vorgemerkt: " + str(result["requeued"]) + "\nBei früher verlorener Sendeantwort kann die Meldung bereits angekommen sein.")
-        if action == "technical":
-            from .runtime_controls import TechnicalSettings
-            return await self.paged(bot, "Technische Einstellung wählen", [(LABELS[key], key) for key in TechnicalSettings.model_fields], "technical_field")
-        if action == "technical_field":
-            return await self.field(bot, "technical", "", args[0])
-        if action == "notification_info":
-            return await self.display(bot, "Automatische Meldungen\nEinstieg, tatsächliche TP-/Teilabschlüsse, vollständige Waverider-Wellen, Schließung und relevante Störungen.\nReine Lesestörungen: ab 120 Sekunden. Schutz-/Ausführungsprobleme sofort.\nRoutine, Ablehnungen und Beobachtungen: im Verlauf.\nMonatsbericht: Monatserster 09:00 Berlin.")
-        if action == "activity":
-            data = await self.extension.setup_request("activity", offset=args[0], limit=8)
-            rows = [str(row.get("disposition", "—")) + " · " + str(row.get("reason") or row.get("notice", {}).get("error") or row.get("notice", {}).get("change") or row.get("notice", {}).get("source_notice") or row.get("notice", {}).get("recovery_reports") or "Handelsereignis")[:230] for row in data["rows"]]
-            buttons = [("Weitere →", "activity", data["next_offset"])] if data.get("next_offset") is not None else []
-            return await self.display(bot, "Verlauf · " + str(data["total"]) + " Ereignisse\n\n" + "\n\n".join(rows), buttons)
-        if action == "setup":
-            # The original private password ingress owns deletion, verification and lease issuance.
-            update = SimpleNamespace(effective_message=SimpleNamespace(text="/setup", from_user=SimpleNamespace(id=self.extension.owner, is_bot=False),
-                chat=SimpleNamespace(id=self.extension.owner, type="private")), edited_message=None, edited_channel_post=None)
-            await self.extension.setup.intercept(update, bot)
-            text = ("Die private Passwortnachfrage ist geöffnet. Passwort ausschließlich dort senden."
-                    if self.extension.setup.challenge is not None else "Beachte die private Setup-Antwort im Chat.")
-            return await self.display(bot, "Setup-Freigabe\n" + text + "\nAbbrechen oder Hauptmenü beendet eine offene Nachfrage.")
-        if action == "command":
-            command = args[0]
-            if command in ("aqla_rang", "aqla_limits", "aqla_parameter", "aqla_maker"):
-                if command == "aqla_limits":
-                    return await self.run(bot, "limits_selection")
-                return await self.commands.start(bot, command, "")
-            return await self.commands.ownership(bot, command, "")
-        if action == "help":
-            return await self.display(bot, "Aqla + Hermes\nMenü und Einstellungen laufen direkt in Python. Für Erklärungen kannst du normal schreiben.\n/aqla öffnet dieses Menü; /aqla_pause pausiert neue Entries sofort.\nSetup: private Freigabe für geschützte Änderungen.\nVorhandene zugelassene Hermes-Befehle: /help und /commands.", [("Setup", "setup"), ("Befehle anzeigen", "help_commands")])
-        if action == "help_commands":
-            from .native_commands import system_catalog
-            return await self.display(bot, system_catalog().replace("`", ""))
-        if action == "months":
-            data = await self.rpc("dashboard", network=self.network, period="all", currency=self.currency)
-            rows = [(value, value) for value in data["available_periods"] if value not in ("all", "current", "today", "7d", "30d")]
-            return await self.paged(bot, "Monatsberichte", rows, "month")
-        if action == "month":
-            data = await self.rpc("monthly_report", month=args[0], limit=8)
-            summary = data["summary"]
-            text = "Monatsbericht " + args[0] + " · Mainnet\n" + f"Abgeschlossen: {summary['trades']} · vollständig: {summary['complete']} · ausgeschlossen: {summary['excluded']}\n"
-            text += "Netto je Währung: " + ("; ".join(number(value, places=6) + " " + currency for currency, value in sorted(summary["net_by_currency"].items())) or "nicht bestätigt")
-            text += "\nTrefferquote: " + number(summary["win_rate_percent"], places=2) + " %\n" + summary["roe_sum_label"] + ": " + number(summary["roe_sum_percent"], places=2) + " %"
-            return await self.display(bot, text, [("Trades im Journal", "select_scope", "period", True, args[0])])
-        if action == "trade_evidence":
+        routes = {
+            'home': (self._menu_home, False),
+            'cancel': (self._menu_home, False),
+            'dashboard': (self._menu_dashboard, False),
+            'journal': (self._menu_journal, False),
+            'positions': (self._menu_positions, True),
+            'profiles': (self._menu_positions, True),
+            'trade': (self._menu_trade, True),
+            'profile': (self._menu_trade, True),
+            'profile_group': (self._menu_trade, True),
+            'page': (self._menu_page, False),
+            'text_page': (self._menu_text_page, False),
+            'profile_field': (self._menu_profile_field, False),
+            'initialize_profile': (self._menu_initialize_profile, False),
+            'field': (self._menu_field, False),
+            'input': (self._menu_input, False),
+            'network': (self._menu_network, False),
+            'period': (self._menu_period, True),
+            'currency': (self._menu_period, True),
+            'select_scope': (self._menu_select_scope, False),
+            'sources': (self._menu_sources, False),
+            'source_list': (self._menu_source_list, False),
+            'source_details': (self._menu_source_details, False),
+            'source_tier': (self._menu_source_tier, False),
+            'ranking': (self._menu_ranking, False),
+            'ranking_field': (self._menu_ranking_field, False),
+            'accounts': (self._menu_accounts, False),
+            'pause': (self._menu_pause, True),
+            'resume': (self._menu_pause, True),
+            'account_selection': (self._menu_account_selection, False),
+            'limits_selection': (self._menu_limits_selection, False),
+            'limit_fields': (self._menu_limit_fields, False),
+            'account': (self._menu_account, False),
+            'account_apply': (self._menu_account_apply, False),
+            'conflicts': (self._menu_conflicts, False),
+            'conflict': (self._menu_conflict, False),
+            'resolve_conflict': (self._menu_resolve_conflict, False),
+            'system': (self._menu_system, False),
+            'retry_delivery': (self._menu_retry_delivery, False),
+            'technical': (self._menu_technical, False),
+            'technical_field': (self._menu_technical_field, False),
+            'notification_info': (self._menu_notification_info, False),
+            'activity': (self._menu_activity, False),
+            'setup': (self._menu_setup, False),
+            'command': (self._menu_command, False),
+            'help': (self._menu_help, False),
+            'help_commands': (self._menu_help_commands, False),
+            'months': (self._menu_months, False),
+            'month': (self._menu_month, False),
+            'trade_evidence': (self._menu_trade_evidence, False),
+            'evidence_table': (self._menu_evidence_table, False),
+            'filters': (self._menu_filters, False),
+            'filtered': (self._menu_filtered, False),
+            'pipelines': (self._menu_pipelines, False),
+            'pipeline': (self._menu_pipeline, False),
+            'pipeline_profiles': (self._menu_pipeline_profiles, False),
+            'pipeline_profile': (self._menu_pipeline_profile, True),
+            'pipeline_toggle': (self._menu_pipeline_profile, True),
+            'confirm_delete': (self._menu_confirm_delete, False),
+            'delete': (self._menu_delete, False),
+            'manage': (self._menu_manage, False),
+            'manage_apply': (self._menu_manage_apply, False),
+            'prompt': (self._menu_prompt, False),
+        }
+        route = routes.get(action) if isinstance(action, str) else None
+        if route is None:
+            raise AqlaError("Menüfunktion ist nicht verfügbar")
+        handler, with_action = route
+        if with_action:
+            return await handler(bot, action, *args)
+        return await handler(bot, *args)
+
+    async def _menu_home(self, bot, *_args):
+        if self.extension.setup.challenge is not None:
+            await self.extension.setup.revoke()
+        return await self.home(bot)
+
+
+    async def _menu_dashboard(self, bot, *_args):
+        return await self.dashboard(bot)
+
+
+    async def _menu_journal(self, bot, *args):
+        return await self.dashboard(bot, True, args[0] if args else 0)
+
+
+    async def _menu_positions(self, bot, action, *_args):
+        return await getattr(self, action)(bot)
+
+
+    async def _menu_trade(self, bot, action, *args):
+        return await getattr(self, action)(bot, *args)
+
+
+    async def _menu_page(self, bot, *args):
+        return await self.paged(bot, *args)
+
+
+    async def _menu_text_page(self, bot, *args):
+        return await self.display(bot, args[0], args[1], raw=args[2], page=args[3])
+
+
+    async def _menu_profile_field(self, bot, *args):
+        return await self.field(bot, "profile", *args)
+
+
+    async def _menu_initialize_profile(self, bot, *args):
+        data = await self.config()
+        row = data["profiles"][args[0]]
+        if row.get("parameters") is not None:
+            raise AqlaError("Profil ist inzwischen eingerichtet; aktuelle Werte verwenden")
+        profile = TradingProfile(id=args[0], name=row["name"], parameters=Parameters())
+        await self.commands.control(action="set_profile", profile=profile.model_dump(mode="json"), expected_revision=args[1])
+        return await self.profile(bot, args[0])
+
+
+    async def _menu_field(self, bot, *args):
+        return await self.field(bot, *args)
+
+
+    async def _menu_input(self, bot, *args):
+        return await self.commit_field(bot, args[0])
+
+
+    async def _menu_network(self, bot, *args):
+        self.network = "testnet" if self.network == "mainnet" else "mainnet"
+        return await self.dashboard(bot, args[0])
+
+
+    async def _menu_period(self, bot, action, *args):
+        data = await self.rpc("dashboard", network=self.network, period=self.period, currency=self.currency)
+        rows = [(label, label) for label in data["available_periods"] if action == "period"] if action == "period" else [(label, label) for label in data["available_currencies"]]
+        return await self.paged(bot, "Zeitraum wählen" if action == "period" else "Währung wählen", rows, "select_scope", (action, args[0]))
+
+
+    async def _menu_select_scope(self, bot, *args):
+        setattr(self, args[0], args[2])
+        return await self.dashboard(bot, args[1])
+
+
+    async def _menu_sources(self, bot, *_args):
+        data = await self.config()
+        lines = [data.get("source_names", {}).get(key, key) + " · " + data.get("source_ranks", {}).get(key, {}).get("tier", "F") for key in sorted(active_sources(data))]
+        return await self.display(bot, "Quellen & Routing\n" + "\n".join(lines), [("Kanäle & Nachweise", "source_list"), ("Kanalrang ändern", "command", "aqla_rang"),
+            ("Quelle ergänzen", "prompt", "add_source", ""), ("Quelle entfernen", "prompt", "remove_source", ""),
+            ("Quelle benennen", "prompt", "rename_source", ""), ("Ranking-Regeln", "ranking"), ("Routing", "pipelines")])
+
+
+    async def _menu_source_list(self, bot, *_args):
+        data = await self.config()
+        return await self.paged(bot, "Aktuelle Quellen · Rang, Metriken und Ausschlüsse", [(data.get("source_names", {}).get(key, key), key) for key in sorted(active_sources(data))], "source_details")
+
+
+    async def _menu_source_details(self, bot, *args):
+        result = await self.rpc("ranking_status", source=args[0], history_limit=8)
+        if not result["sources"]:
+            return await self.display(bot, "Quelle ist nicht mehr aktiv.\nHistorische Rangdaten und Handelsbelege bleiben erhalten; keine Bereinigung oder erneute Aufnahme nötig.", [("Aktuelle Quellen", "source_list")])
+        text = []
+        for key, row in result["sources"].items():
+            text += [row.get("name", key) + " · " + row["tier"], "Belege: " + str(row.get("proof_total", 0)),
+                     "Metriken: " + str(row.get("metrics", {})), "Nachweise: " + str(row.get("evidence", [])),
+                     "Ausschlüsse: " + str(row.get("exclusions", []))]
+        text.append("Letzte Rangwechsel: " + str(result.get("history", [])))
+        return await self.display(bot, "\n\n".join(text), [("Rang ändern", "source_tier", args[0]), ("Quellen", "source_list")])
+
+
+    async def _menu_source_tier(self, bot, *args):
+        return await self.commands.start(bot, "aqla_rang", json.dumps(args[0]) + " ")
+
+
+    async def _menu_ranking(self, bot, *_args):
+        data = await self.config()
+        rows = []
+        for field, value in data["ranking_policy"].items():
+            rows += [(field + "." + key + ": " + str(item), field + "." + key) for key, item in value.items()] if isinstance(value, dict) else [(field + ": " + str(value), field)]
+        return await self.paged(bot, "Ranking · vollständige validierte Rangregeln", rows, "ranking_field")
+
+
+    async def _menu_ranking_field(self, bot, *args):
+        return await self.field(bot, "ranking", "", args[0])
+
+
+    async def _menu_accounts(self, bot, *_args):
+        data = await self.config()
+        lines = [key + " · " + ("aktiv" if row.get("enabled") else "gesperrt") + " · max. " + str((row.get("limits") or {}).get("max_open_trades", "—")) + " Trades · Gesamtrisiko " + number((row.get("limits") or {}).get("max_total_risk_percent")) + " %" for key, row in data["execution_accounts"].items()]
+        return await self.display(bot, "Konten & Freigaben\n" + "\n".join(lines), [("Entries sofort pausieren", "pause"), ("Entries fortsetzen", "resume"),
+            ("Kontolimits", "limits_selection"), ("Konto aktivieren/sperren", "account_selection"), ("Eigentumskonflikte", "conflicts"),
+            ("Setup-Freigabe", "setup"), ("Profile anlegen", "prompt", "create_profile", "")])
+
+
+    async def _menu_pause(self, bot, action, *_args):
+        await self.commands.control(action=action)
+        return await self.display(bot, "Neue Entries pausiert. Positionsschutz läuft weiter." if action == "pause" else "Neue Entries freigegeben.", [("Konten", "accounts")])
+
+
+    async def _menu_account_selection(self, bot, *_args):
+        data = await self.config()
+        return await self.paged(bot, "Konto wählen", [(key, key) for key in data["execution_accounts"]], "account")
+
+
+    async def _menu_limits_selection(self, bot, *_args):
+        data = await self.config()
+        return await self.paged(bot, "Limits je Ausführungskonto", [(key, key) for key, row in data["execution_accounts"].items() if row.get("configured")], "limit_fields")
+
+
+    async def _menu_limit_fields(self, bot, *args):
+        data = await self.config()
+        if not data["execution_accounts"][args[0]].get("limits"):
+            return await self.run(bot, "prompt", "initial_limits", args[0])
+        return await self.display(bot, args[0], [(LABELS[field], "field", "limits", args[0], field) for field in AccountLimits.model_fields])
+
+
+    async def _menu_account(self, bot, *args):
+        data = await self.config()
+        row = data["execution_accounts"][args[0]]
+        return await self.display(bot, args[0] + " · " + ("aktiv" if row.get("enabled") else "gesperrt"), [("Sperren" if row.get("enabled") else "Aktivieren", "account_apply", args[0], not row.get("enabled"), data["configuration_revision"])])
+
+
+    async def _menu_account_apply(self, bot, *args):
+        await self.commands.control(action="set_account_enabled", account_key=args[0], enabled=args[1], expected_revision=args[2])
+        return await self.run(bot, "accounts")
+
+
+    async def _menu_conflicts(self, bot, *_args):
+        data = await self.config()
+        return await self.paged(bot, "Eigentumskonflikte · ausschließlich belegte eigene Abschlüsse", [
+            (row["plan"]["market"]["symbol"] + " · " + row["plan"]["network"], row["trade_id"]) for row in data["trades"] if row["status"] == "conflicted"], "conflict")
+
+
+    async def _menu_conflict(self, bot, *args):
+        review = await self.rpc("conflict_review", trade_id=args[0], context_auth=self.commands.auth())
+        text = "Eigentumsprüfung · " + args[0][:8] + "\nEigene Position: " + str(review["position_size"]) + "\n" + "\n".join(review["reasons"])
+        text += "\nEs werden keine fremden Positionen oder Orders übernommen. PnL bleibt bei fehlenden Belegen unvollständig."
+        buttons = [("Belegten eigenen Abschluss bestätigen", "resolve_conflict", args[0], review["fingerprint"])] if review["resolvable"] else []
+        return await self.display(bot, text, buttons)
+
+
+    async def _menu_resolve_conflict(self, bot, *args):
+        result = await self.commands.control(action="resolve_conflict", trade_id=args[0], review_fingerprint=args[1])
+        return await self.display(bot, "Eigener Abschluss bestätigt." if result["resolved"] else "Belege haben sich geändert; erneut prüfen.", [("Konflikte", "conflicts")])
+
+
+    async def _menu_system(self, bot, *_args):
+        from .runtime_controls import RuntimeControls
+        technical = RuntimeControls(self.extension).read()
+        values = technical["values"]
+        from . import __version__
+        lines = ["System & KI · Aqla " + __version__, "Freigaben und Grenzen werden bei jeder Wirkung erneut geprüft."]
+        lines += [LABELS[key] + ": " + setting_value(value) for key, value in values.items()]
+        lines.append("Technische Übernahme: " + technical["apply_status"])
+        return await self.display(bot, "\n".join(lines), [("Technische Einstellungen", "technical"), ("Verlauf & Störungen", "activity", 0), ("Meldungsregeln", "notification_info"),
+            ("Erschöpfte Zustellungen erneut prüfen", "retry_delivery"), ("Aktualisieren", "system")])
+
+
+    async def _menu_retry_delivery(self, bot, *_args):
+        self.commands.auth()
+        await self.extension.source_worker.bind()
+        result = await self.extension.source_worker.internal("delivery_retry")
+        return await self.display(bot, "Erneut vorgemerkt: " + str(result["requeued"]) + "\nBei früher verlorener Sendeantwort kann die Meldung bereits angekommen sein.")
+
+
+    async def _menu_technical(self, bot, *_args):
+        from .runtime_controls import TechnicalSettings
+        return await self.paged(bot, "Technische Einstellung wählen", [(LABELS[key], key) for key in TechnicalSettings.model_fields], "technical_field")
+
+
+    async def _menu_technical_field(self, bot, *args):
+        return await self.field(bot, "technical", "", args[0])
+
+
+    async def _menu_notification_info(self, bot, *_args):
+        return await self.display(bot, "Automatische Meldungen\nEinstieg, tatsächliche TP-/Teilabschlüsse, vollständige Waverider-Wellen, Schließung und relevante Störungen.\nReine Lesestörungen: ab 120 Sekunden. Schutz-/Ausführungsprobleme sofort.\nRoutine, Ablehnungen und Beobachtungen: im Verlauf.\nMonatsbericht: Monatserster 09:00 Berlin.")
+
+
+    async def _menu_activity(self, bot, *args):
+        data = await self.extension.setup_request("activity", offset=args[0], limit=8)
+        rows = [str(row.get("disposition", "—")) + " · " + str(row.get("reason") or row.get("notice", {}).get("error") or row.get("notice", {}).get("change") or row.get("notice", {}).get("source_notice") or row.get("notice", {}).get("recovery_reports") or "Handelsereignis")[:230] for row in data["rows"]]
+        buttons = [("Weitere →", "activity", data["next_offset"])] if data.get("next_offset") is not None else []
+        return await self.display(bot, "Verlauf · " + str(data["total"]) + " Ereignisse\n\n" + "\n\n".join(rows), buttons)
+
+
+    async def _menu_setup(self, bot, *_args):
+        # The original private password ingress owns deletion, verification and lease issuance.
+        update = SimpleNamespace(effective_message=SimpleNamespace(text="/setup", from_user=SimpleNamespace(id=self.extension.owner, is_bot=False),
+            chat=SimpleNamespace(id=self.extension.owner, type="private")), edited_message=None, edited_channel_post=None)
+        await self.extension.setup.intercept(update, bot)
+        text = ("Die private Passwortnachfrage ist geöffnet. Passwort ausschließlich dort senden."
+                if self.extension.setup.challenge is not None else "Beachte die private Setup-Antwort im Chat.")
+        return await self.display(bot, "Setup-Freigabe\n" + text + "\nAbbrechen oder Hauptmenü beendet eine offene Nachfrage.")
+
+
+    async def _menu_command(self, bot, *args):
+        command = args[0]
+        if command in ("aqla_rang", "aqla_limits", "aqla_parameter", "aqla_maker"):
+            if command == "aqla_limits":
+                return await self.run(bot, "limits_selection")
+            return await self.commands.start(bot, command, "")
+        return await self.commands.ownership(bot, command, "")
+
+
+    async def _menu_help(self, bot, *_args):
+        return await self.display(bot, "Aqla + Hermes\nMenü und Einstellungen laufen direkt in Python. Für Erklärungen kannst du normal schreiben.\n/aqla öffnet dieses Menü; /aqla_pause pausiert neue Entries sofort.\nSetup: private Freigabe für geschützte Änderungen.\nVorhandene zugelassene Hermes-Befehle: /help und /commands.", [("Setup", "setup"), ("Befehle anzeigen", "help_commands")])
+
+
+    async def _menu_help_commands(self, bot, *_args):
+        from .command_catalog import system_catalog
+        return await self.display(bot, system_catalog().replace("`", ""))
+
+
+    async def _menu_months(self, bot, *_args):
+        data = await self.rpc("dashboard", network=self.network, period="all", currency=self.currency)
+        rows = [(value, value) for value in data["available_periods"] if value not in ("all", "current", "today", "7d", "30d")]
+        return await self.paged(bot, "Monatsberichte", rows, "month")
+
+
+    async def _menu_month(self, bot, *args):
+        data = await self.rpc("monthly_report", month=args[0], limit=8)
+        summary = data["summary"]
+        text = "Monatsbericht " + args[0] + " · Mainnet\n" + f"Abgeschlossen: {summary['trades']} · vollständig: {summary['complete']} · ausgeschlossen: {summary['excluded']}\n"
+        text += "Netto je Währung: " + ("; ".join(number(value, places=6) + " " + currency for currency, value in sorted(summary["net_by_currency"].items())) or "nicht bestätigt")
+        text += "\nTrefferquote: " + number(summary["win_rate_percent"], places=2) + " %\n" + summary["roe_sum_label"] + ": " + number(summary["roe_sum_percent"], places=2) + " %"
+        return await self.display(bot, text, [("Trades im Journal", "select_scope", "period", True, args[0])])
+
+
+    async def _menu_trade_evidence(self, bot, *args):
+        self.pending = None
+        return await self.paged(bot, "Belege wählen", [(label, label) for label in ("Orders", "Fills", "Vorgänge")], "evidence_table", (args[0],))
+
+
+    async def _menu_evidence_table(self, bot, *args):
+        trade_id, table = args[:2]
+        offset = args[2] if len(args) > 2 else 0
+        data = await self.rpc("journal_read", table=table, trade_id=trade_id, offset=offset, limit=8)
+        rows = [str(row.get("Art", "Vorgang")) + " · " + str(row.get("Order-ID", row.get("ID"))) + " · Menge " + str(row.get("Menge", "—")) + " · Preis " + str(row.get("Preis", row.get("Preis/Ziel", "—"))) for row in data["rows"]]
+        if table == "Orders":
+            rows = [text + " · Status: " + str(row.get("Status Börse") or "nicht bestätigt") + (" · ersetzt" if row.get("Ersetzt") else "") for text, row in zip(rows, data["rows"], strict=True)]
+        elif table == "Vorgänge":
+            rows = [text + " · Phase: " + str(row.get("Phase") or "nicht bestätigt") for text, row in zip(rows, data["rows"], strict=True)]
+        buttons = [("Weitere →", "evidence_table", trade_id, table, data["next_offset"])] if data.get("next_offset") is not None else []
+        if offset:
+            buttons.append(("← Vorherige", "evidence_table", trade_id, table, max(0, offset - 8)))
+        return await self.display(bot, table + " · " + trade_id[:8] + "\n\n" + "\n".join(rows), buttons)
+
+
+    async def _menu_filters(self, bot, *_args):
+        return await self.display(bot, "Journal filtern", [("Nach Symbol", "prompt", "filter_symbol", ""), ("Nach Quelle", "prompt", "filter_source", ""), ("Nach Status", "prompt", "filter_status", "")])
+
+
+    async def _menu_filtered(self, bot, *args):
+        column, value, offset = args
+        result = await self.rpc("journal_read", table="Trades", filters={column: value}, account_key="hyperliquid:" + self.network, offset=offset, limit=8)
+        buttons = [(row["Symbol"] + " · " + row["Status"], "trade", row["ID"]) for row in result["rows"]]
+        if result.get("next_offset") is not None:
+            buttons.append(("Weitere →", "filtered", column, value, result["next_offset"]))
+        if offset:
+            buttons.append(("← Vorherige", "filtered", column, value, max(0, offset - 8)))
+        return await self.display(bot, "Journal · " + column + ": " + value + "\n" + str(result["total"]) + " Treffer", buttons)
+
+
+    async def _menu_pipelines(self, bot, *_args):
+        data = await self.config()
+        return await self.paged(bot, "Quellen → Profil · Routing", [(row["name"], key) for key, row in data["pipelines"].items()] + [("Routing anlegen", "__new__")], "pipeline")
+
+
+    async def _menu_pipeline(self, bot, *args):
+        if args[0] == "__new__":
+            return await self.run(bot, "prompt", "create_pipeline", "")
+        data = await self.config()
+        row = data["pipelines"][args[0]]
+        return await self.display(bot, row["name"] + "\nQuellen: " + "; ".join(row["sources"]) + "\nProfil: " + row["targets"][0]["profile_id"] + "\nAktiv: " + str(row["enabled"]),
+            [("Aktiv umschalten", "pipeline_toggle", row["id"], data["configuration_revision"]), ("Profil ändern", "pipeline_profiles", row["id"]),
+             ("Quellen ändern", "prompt", "pipeline_sources", row["id"]), ("Umbenennen", "prompt", "pipeline_name", row["id"]), ("Löschen", "confirm_delete", "pipeline", row["id"])])
+
+
+    async def _menu_pipeline_profiles(self, bot, *args):
+        data = await self.config()
+        return await self.paged(bot, "Profil für Routing", [(row["name"], key) for key, row in data["profiles"].items()], "pipeline_profile", (args[0], data["configuration_revision"]))
+
+
+    async def _menu_pipeline_profile(self, bot, action, *args):
+        data = await self.config()
+        row = copy.deepcopy(data["pipelines"][args[0]])
+        if action == "pipeline_toggle":
+            row["enabled"] = not row["enabled"]
+        else:
+            row["targets"] = [{"exchange": "hyperliquid", "profile_id": args[2]}]
+        selected = Pipeline.model_validate({key: value for key, value in row.items() if key in Pipeline.model_fields})
+        await self.commands.control(action="set_pipeline", pipeline=selected.model_dump(mode="json"), expected_revision=args[1])
+        return await self.run(bot, "pipeline", args[0])
+
+
+    async def _menu_confirm_delete(self, bot, *args):
+        data = await self.config()
+        return await self.display(bot, args[0] + " " + args[1] + " löschen? Laufende Trades behalten ihre Pläne.", [("Dieses " + args[0] + " löschen", "delete", *args, data["configuration_revision"])])
+
+
+    async def _menu_delete(self, bot, *args):
+        await self.commands.control(action="delete_" + args[0], identity=args[1], expected_revision=args[2])
+        return await self.run(bot, "profiles" if args[0] == "profile" else "pipelines")
+
+
+    async def _menu_manage(self, bot, *args):
+        trade_id, base, requested = args
+        self.pending = {"kind": "manage", "trade_id": trade_id, "fingerprint": base, "action": requested}
+        if requested in ("reduce", "move_stop", "replace_targets"):
+            return await self.display(bot, "Trade " + trade_id[:8] + " · " + requested + "\n" + {"reduce": "Prozent der aktuell angezeigten eigenen Menge senden.", "move_stop": "Neuen Stop-Preis senden.", "replace_targets": "Alle TP-Preise in ursprünglicher Anzahl senden; mit ; trennen."}[requested])
+        return await self.display(bot, "Trade " + trade_id[:8] + " · " + requested + "\nNur die zugeordnete eigene Position wird verwaltet.", [("Jetzt " + requested + " ausführen", "manage_apply", None)])
+
+
+    async def _menu_manage_apply(self, bot, *args):
+        pending = self.pending
+        payload = {"trade_id": pending["trade_id"], "expected_fingerprint": pending["fingerprint"], "action": pending["action"]}
+        if args[0] is not None:
+            payload[{"reduce": "percent", "move_stop": "stop", "replace_targets": "targets"}[pending["action"]]] = args[0]
+        protected = pending["action"] not in ("close", "reduce", "cancel_entry", "pause_waverider")
+        from .operator_management import ManagementRequest
+        payload = ManagementRequest.model_validate(payload).model_dump(mode="json")
+        context_auth = self.commands.auth(protected=protected)
+        try:
+            result = await self.rpc("operator_manage", request=payload, context_auth=context_auth)
+        except AqlaError:
             self.pending = None
-            return await self.paged(bot, "Belege wählen", [(label, label) for label in ("Orders", "Fills", "Vorgänge")], "evidence_table", (args[0],))
-        if action == "evidence_table":
-            trade_id, table = args[:2]
-            offset = args[2] if len(args) > 2 else 0
-            data = await self.rpc("journal_read", table=table, trade_id=trade_id, offset=offset, limit=8)
-            rows = [str(row.get("Art", "Vorgang")) + " · " + str(row.get("Order-ID", row.get("ID"))) + " · Menge " + str(row.get("Menge", "—")) + " · Preis " + str(row.get("Preis", row.get("Preis/Ziel", "—"))) for row in data["rows"]]
-            if table == "Orders":
-                rows = [text + " · Status: " + str(row.get("Status Börse") or "nicht bestätigt") + (" · ersetzt" if row.get("Ersetzt") else "") for text, row in zip(rows, data["rows"], strict=True)]
-            elif table == "Vorgänge":
-                rows = [text + " · Phase: " + str(row.get("Phase") or "nicht bestätigt") for text, row in zip(rows, data["rows"], strict=True)]
-            buttons = [("Weitere →", "evidence_table", trade_id, table, data["next_offset"])] if data.get("next_offset") is not None else []
-            if offset:
-                buttons.append(("← Vorherige", "evidence_table", trade_id, table, max(0, offset - 8)))
-            return await self.display(bot, table + " · " + trade_id[:8] + "\n\n" + "\n".join(rows), buttons)
-        if action == "filters":
-            return await self.display(bot, "Journal filtern", [("Nach Symbol", "prompt", "filter_symbol", ""), ("Nach Quelle", "prompt", "filter_source", ""), ("Nach Status", "prompt", "filter_status", "")])
-        if action == "filtered":
-            column, value, offset = args
-            result = await self.rpc("journal_read", table="Trades", filters={column: value}, account_key="hyperliquid:" + self.network, offset=offset, limit=8)
-            buttons = [(row["Symbol"] + " · " + row["Status"], "trade", row["ID"]) for row in result["rows"]]
-            if result.get("next_offset") is not None:
-                buttons.append(("Weitere →", "filtered", column, value, result["next_offset"]))
-            if offset:
-                buttons.append(("← Vorherige", "filtered", column, value, max(0, offset - 8)))
-            return await self.display(bot, "Journal · " + column + ": " + value + "\n" + str(result["total"]) + " Treffer", buttons)
-        if action == "pipelines":
-            data = await self.config()
-            return await self.paged(bot, "Quellen → Profil · Routing", [(row["name"], key) for key, row in data["pipelines"].items()] + [("Routing anlegen", "__new__")], "pipeline")
-        if action == "pipeline":
-            if args[0] == "__new__":
-                return await self.run(bot, "prompt", "create_pipeline", "")
-            data = await self.config()
-            row = data["pipelines"][args[0]]
-            return await self.display(bot, row["name"] + "\nQuellen: " + "; ".join(row["sources"]) + "\nProfil: " + row["targets"][0]["profile_id"] + "\nAktiv: " + str(row["enabled"]),
-                [("Aktiv umschalten", "pipeline_toggle", row["id"], data["configuration_revision"]), ("Profil ändern", "pipeline_profiles", row["id"]),
-                 ("Quellen ändern", "prompt", "pipeline_sources", row["id"]), ("Umbenennen", "prompt", "pipeline_name", row["id"]), ("Löschen", "confirm_delete", "pipeline", row["id"])])
-        if action == "pipeline_profiles":
-            data = await self.config()
-            return await self.paged(bot, "Profil für Routing", [(row["name"], key) for key, row in data["profiles"].items()], "pipeline_profile", (args[0], data["configuration_revision"]))
-        if action in ("pipeline_profile", "pipeline_toggle"):
-            data = await self.config()
-            row = copy.deepcopy(data["pipelines"][args[0]])
-            if action == "pipeline_toggle":
-                row["enabled"] = not row["enabled"]
-            else:
-                row["targets"] = [{"exchange": "hyperliquid", "profile_id": args[2]}]
-            selected = Pipeline.model_validate({key: value for key, value in row.items() if key in Pipeline.model_fields})
-            await self.commands.control(action="set_pipeline", pipeline=selected.model_dump(mode="json"), expected_revision=args[1])
-            return await self.run(bot, "pipeline", args[0])
-        if action == "confirm_delete":
-            data = await self.config()
-            return await self.display(bot, args[0] + " " + args[1] + " löschen? Laufende Trades behalten ihre Pläne.", [("Dieses " + args[0] + " löschen", "delete", *args, data["configuration_revision"])])
-        if action == "delete":
-            await self.commands.control(action="delete_" + args[0], identity=args[1], expected_revision=args[2])
-            return await self.run(bot, "profiles" if args[0] == "profile" else "pipelines")
-        if action == "manage":
-            trade_id, base, requested = args
-            self.pending = {"kind": "manage", "trade_id": trade_id, "fingerprint": base, "action": requested}
-            if requested in ("reduce", "move_stop", "replace_targets"):
-                return await self.display(bot, "Trade " + trade_id[:8] + " · " + requested + "\n" + {"reduce": "Prozent der aktuell angezeigten eigenen Menge senden.", "move_stop": "Neuen Stop-Preis senden.", "replace_targets": "Alle TP-Preise in ursprünglicher Anzahl senden; mit ; trennen."}[requested])
-            return await self.display(bot, "Trade " + trade_id[:8] + " · " + requested + "\nNur die zugeordnete eigene Position wird verwaltet.", [("Jetzt " + requested + " ausführen", "manage_apply", None)])
-        if action == "manage_apply":
-            pending = self.pending
-            payload = {"trade_id": pending["trade_id"], "expected_fingerprint": pending["fingerprint"], "action": pending["action"]}
-            if args[0] is not None:
-                payload[{"reduce": "percent", "move_stop": "stop", "replace_targets": "targets"}[pending["action"]]] = args[0]
-            protected = pending["action"] not in ("close", "reduce", "cancel_entry", "pause_waverider")
-            from .operator_management import ManagementRequest
-            payload = ManagementRequest.model_validate(payload).model_dump(mode="json")
-            context_auth = self.commands.auth(protected=protected)
-            try:
-                result = await self.rpc("operator_manage", request=payload, context_auth=context_auth)
-            except AqlaError:
-                self.pending = None
-                return await self.display(bot, "Auftragsantwort nicht bestätigt. Es kann bereits ein Auftrag vorliegen; zuerst den aktuellen Positionsstatus prüfen.", [("Position prüfen", "trade", payload["trade_id"])])
+            return await self.display(bot, "Auftragsantwort nicht bestätigt. Es kann bereits ein Auftrag vorliegen; zuerst den aktuellen Positionsstatus prüfen.", [("Position prüfen", "trade", payload["trade_id"])])
+        self.pending = None
+        label = {"done": "verarbeitet", "pending": "angenommen; Abgleich ausstehend", "rejected": "abgelehnt", "superseded": "durch neuere Positionsdaten überholt"}.get(result["status"], result["status"])
+        return await self.display(bot, "Verwaltungsauftrag: " + label + "\nEin ungeklärter Auftrag wird mit derselben Identität abgeglichen.", [("Position anzeigen", "trade", payload["trade_id"])])
+
+
+    async def _menu_prompt(self, bot, *args):
+        data = await self.config()
+        if args[0] == "create_profile" and data["profiles"]["standard"].get("parameters") is None:
             self.pending = None
-            label = {"done": "verarbeitet", "pending": "angenommen; Abgleich ausstehend", "rejected": "abgelehnt", "superseded": "durch neuere Positionsdaten überholt"}.get(result["status"], result["status"])
-            return await self.display(bot, "Verwaltungsauftrag: " + label + "\nEin ungeklärter Auftrag wird mit derselben Identität abgeglichen.", [("Position anzeigen", "trade", payload["trade_id"])])
-        if action == "prompt":
-            data = await self.config()
-            if args[0] == "create_profile" and data["profiles"]["standard"].get("parameters") is None:
-                self.pending = None
-                return await self.profile(bot, "standard")
-            if not args[0].startswith("filter_") and args[0] != "rename_source":
-                self.commands.auth(protected=True)
-            self.pending = {"kind": "prompt", "action": args[0], "identity": args[1], "revision": data["configuration_revision"]}
-            prompts = {"create_profile": "Name des neuen Profils senden. Es übernimmt die aktuellen Standardwerte und wird keinem Routing automatisch zugewiesen.", "rename_profile": "Neuen Profilnamen senden.",
-                "initial_limits": "Noch keine Kontolimits hinterlegt. Beide ausdrücklich setzen: maximale offene Trades; Gesamtrisiko in Prozent. Beispiel: 3; 2. Es werden keine Limits stillschweigend ausgewählt.",
-                "add_source": "Telegram-ID oder @username ergänzen. Bestehende Quellen bleiben erhalten.", "remove_source": "Genau eine vorhandene Telegram-ID oder @username entfernen.",
-                "rename_source": 'Telegram-ID und "neuen Namen" senden.', "create_pipeline": "Namen des neuen Routings senden. Es wird zunächst deaktiviert mit dem Standardprofil angelegt.",
-                "pipeline_sources": "Quellen mit ; getrennt senden. * bedeutet alle ausgewählten Quellen.", "pipeline_name": "Neuen Routingnamen senden.",
-                "filter_symbol": "Exaktes Symbol senden, beispielsweise ETH.", "filter_source": "Exakte Telegram-Quellen-ID senden.", "filter_status": "Status senden, beispielsweise closed, rejected oder open."}
-            return await self.display(bot, prompts[args[0]])
-        raise AqlaError("Menüfunktion ist nicht verfügbar")
+            return await self.profile(bot, "standard")
+        if not args[0].startswith("filter_") and args[0] != "rename_source":
+            self.commands.auth(protected=True)
+        self.pending = {"kind": "prompt", "action": args[0], "identity": args[1], "revision": data["configuration_revision"]}
+        prompts = {"create_profile": "Name des neuen Profils senden. Es übernimmt die aktuellen Standardwerte und wird keinem Routing automatisch zugewiesen.", "rename_profile": "Neuen Profilnamen senden.",
+            "initial_limits": "Noch keine Kontolimits hinterlegt. Beide ausdrücklich setzen: maximale offene Trades; Gesamtrisiko in Prozent. Beispiel: 3; 2. Es werden keine Limits stillschweigend ausgewählt.",
+            "add_source": "Telegram-ID oder @username ergänzen. Bestehende Quellen bleiben erhalten.", "remove_source": "Genau eine vorhandene Telegram-ID oder @username entfernen.",
+            "rename_source": 'Telegram-ID und "neuen Namen" senden.', "create_pipeline": "Namen des neuen Routings senden. Es wird zunächst deaktiviert mit dem Standardprofil angelegt.",
+            "pipeline_sources": "Quellen mit ; getrennt senden. * bedeutet alle ausgewählten Quellen.", "pipeline_name": "Neuen Routingnamen senden.",
+            "filter_symbol": "Exaktes Symbol senden, beispielsweise ETH.", "filter_source": "Exakte Telegram-Quellen-ID senden.", "filter_status": "Status senden, beispielsweise closed, rejected oder open."}
+        return await self.display(bot, prompts[args[0]])
+
 
     async def text_input(self, bot, text):
         pending = self.pending
@@ -675,7 +855,7 @@ class TelegramMenu:
         from .native_setup import addressed_to_bot
         if not addressed_to_bot(head, bot):
             return command in aliases
-        from .native_commands import COMMANDS
+        from .command_catalog import COMMANDS
         if (text.startswith("/") and command.lstrip("/") in COMMANDS and self.extension.setup.private_owner(message)
                 and not any(getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))):
             self.fresh = True

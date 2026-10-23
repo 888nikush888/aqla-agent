@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from aqla_hyperliquid_mcp.models import require_first
+from native_helpers import require_first
 
 
 async def produce(destination: Path):

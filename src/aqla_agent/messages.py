@@ -491,7 +491,7 @@ def summary_block(notice):
 def telegram_view(data, exchanges, *, inventory=None, notification_versions=None, include_status=True):
     from aqla_hyperliquid_mcp.models import digest
 
-    from .notifications import notification_sort_key
+    from .lifecycle import notification_sort_key
     notifications = data.get("notifications", {})
     # Urgent protection notices are independent of signal batching.
     chosen = sorted(notifications, key=lambda identity: notification_sort_key(identity, notifications[identity]))[:MAX_NOTIFICATIONS]

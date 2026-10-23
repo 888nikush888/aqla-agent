@@ -1,9 +1,10 @@
 """Evidence-bound PnL for proved manual closures; native receipts stay immutable."""
-from decimal import Decimal
+
+from decimal import Decimal, InvalidOperation
+from itertools import groupby
 
 from aqla_hyperliquid_mcp.models import TERMINAL_ORDER, AqlaError, TradePlan, digest
 
-from .conflict_review import native_flat_closure
 from .evidence import verified_coverage_matches
 
 
@@ -28,7 +29,7 @@ def verified_manual_accounting(trade):
 
 
 def attribute_manual_closure(trade, observed, payments):
-    from .monthly import fill_identity
+    from .accounting import fill_identity
     plan = TradePlan.model_validate(trade["plan"])
     closure = trade.get("manual_closure", {})
     from .managed_entries import all_order_rows
@@ -143,3 +144,73 @@ def attribute_manual_closure(trade, observed, payments):
     if trade.get("manual_accounting") and trade["manual_accounting"] != result:
         raise AqlaError("A previously verified manual attribution changed")
     return result, assigned, fee_evidence
+
+
+def native_flat_closure(trade, plan, rows, order_ids):
+    """Prove a native account-flat boundary after every original own fill."""
+    if plan.market.product != "perp":
+        return None
+    unique, own, entered = {}, dict(trade.get("fill_events", {})), Decimal(0)
+    own_ids = set()
+    try:
+        for raw in rows:
+            if any(raw.get(key) is None for key in ("oid", "tid", "time", "sz", "px")) or type(raw["time"]) is not int or raw["time"] < plan.created_at:
+                return None
+            identity = digest([raw["oid"], raw["tid"], raw["time"], raw["sz"], raw["px"]])
+            if identity in unique:
+                if unique[identity] != raw:
+                    return None
+                continue
+            unique[identity] = raw
+            if identity in own and (any(own[identity].get(key) != raw.get(key) for key in ("oid", "tid", "time", "sz", "px", "fee", "feeToken", "coin"))
+                    or any(raw.get(key) != value for key, value in own[identity].get("manual_proof", {}).items())):
+                return None
+            amount, price = Decimal(str(raw["sz"])), Decimal(str(raw["px"]))
+            if not amount.is_finite() or amount <= 0 or not price.is_finite() or price <= 0:
+                return None
+            role = order_ids.get(raw["oid"])
+            if role:
+                expected_side = "B" if (plan.side == "long") == (role["kind"] == "entry") else "A"
+                if raw.get("side") != expected_side:
+                    return None
+                fact = {key: raw.get(key) for key in ("oid", "tid", "time", "sz", "px", "fee", "feeToken", "coin")}
+                fact.update(kind=role["kind"], index=role.get("index"))
+                if identity in own and own[identity] != fact:
+                    return None
+                own[identity] = fact
+                own_ids.add(identity)
+                if role["kind"] == "entry":
+                    entered += amount
+        if not entered or entered != Decimal(trade["filled_quantity"]) or set(trade.get("fill_events", {})) - unique.keys():
+            return None
+        first = min(unique[key]["time"] for key in own_ids)
+        history = sorted((row for row in unique.values() if row["time"] >= first), key=lambda row: row["time"])
+        balance, processed, path = None, set(), []
+        for _, group in groupby(history, key=lambda row: row["time"]):
+            pending = []
+            for raw in group:
+                start = Decimal(str(raw["startPosition"]))
+                if not start.is_finite() or raw.get("side") not in ("A", "B"):
+                    return None
+                end = start + Decimal(str(raw["sz"])) * (1 if raw["side"] == "B" else -1)
+                pending.append((raw, start, end))
+            if balance is None:
+                roots = {start for _, start, _ in pending} - {end for _, _, end in pending}
+                if len(roots) != 1:
+                    return None
+                balance = roots.pop()
+            while pending:
+                matches = [item for item in pending if item[1] == balance]
+                if len(matches) != 1:
+                    return None
+                raw, start, balance = matches[0]
+                pending.remove(matches[0])
+                identity = digest([raw["oid"], raw["tid"], raw["time"], raw["sz"], raw["px"]])
+                processed.add(identity)
+                path.append({key: raw.get(key) for key in ("oid", "tid", "time", "coin", "sz", "px", "startPosition", "side", "dir")})
+                if balance == 0 and own_ids <= processed:
+                    return {"fills": own, "closed_at": raw["time"], "account_position_proof": path,
+                            "basis": "proved_account_flat_after_last_owned_fill"}
+    except (InvalidOperation, KeyError, ValueError, TypeError):
+        return None
+    return None

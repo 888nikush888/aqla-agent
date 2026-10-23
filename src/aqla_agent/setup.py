@@ -131,7 +131,7 @@ class SetupGate:
             lease = self._leases.get(identity) if type(identity) is str else None
             active = bool(lease and binding == lease.binding and self._bindings.get(binding.owner_id) == binding and now < lease.expires_at)
             return {"configured": self.configured, "active": active,
-                    "remaining_seconds": max(0, int(lease.expires_at - now)) if active else 0,
+                    "remaining_seconds": max(0, int(lease.expires_at - now)) if active and lease is not None else 0,
                     "locked_seconds": max(0, int(self._locked_until.get(binding.owner_id if binding else owner_id or "", 0) - now))}
 
 
