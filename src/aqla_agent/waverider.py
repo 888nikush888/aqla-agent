@@ -476,6 +476,15 @@ def pause_cycle(state, error):
     state.update(phase="paused", reason=str(error) if isinstance(error, AqlaError) else "Waverider market evidence is unavailable")
 
 
+def cycle_state_after_error(engine, trade_id, state, persisted, error):
+    current = dict(engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("waverider", {}))
+    if observation_marker(current) != observation_marker(persisted):
+        # A completed durable transition takes precedence over an older observation.
+        return current, current
+    pause_cycle(state, error)
+    return state, persisted
+
+
 async def tick(engine, trade_id, quote):
     trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     plan = TradePlan.model_validate(trade["plan"])
@@ -519,7 +528,7 @@ async def tick(engine, trade_id, quote):
             paper_cycle(state, plan, action, price, quantity, quote.observed_at)
         state.update(reason=None, net_realized=str(realized - fees))
     except (KeyError, ValueError, TypeError, OSError, sqlite3.Error) as error:
-        pause_cycle(state, error)
+        state, persisted = cycle_state_after_error(engine, trade_id, state, persisted, error)
     save_cycle_observation(engine, trade_id, state, persisted, memory)
 
 
@@ -552,6 +561,131 @@ def own_cycle_fills(trade, oid, reentering):
                  else row["kind"] in ("waverider", "waverider_retirement"))]
 
 
+def cycle_owned_order(trade, identity, cloid, reentering):
+    rows = trade.get("entry_orders" if reentering else "exit_orders", [])
+    kinds = ("waverider",) if reentering else ("waverider", "waverider_retirement")
+    matched = [row for row in rows if row.get("operation_id") == identity and row.get("cloid") == cloid
+               and row.get("kind") in kinds and not row.get("not_sent")]
+    return matched[0] if len(matched) == 1 else None
+
+
+def cycle_request_order(trade, identity, cloid, operation, reentering):
+    row = cycle_owned_order(trade, identity, cloid, reentering)
+    if row is None or not operation or operation.get("operation_id") != identity:
+        return None
+    action = operation.get("wire_action", {})
+    orders = [order for order in action.get("orders", []) if order.get("c") == cloid]
+    if action.get("type") != "order" or len(orders) != 1:
+        return None
+    order = orders[0]
+    buy = (trade["plan"]["side"] == "long") == reentering
+    if (order.get("a") != trade["plan"]["market"]["asset_id"] or order.get("b") is not buy
+            or order.get("r") is not (not reentering)):
+        return None
+    price = row["limit"] if reentering else row["price"]
+    if Decimal(order["s"]) != Decimal(row["quantity"]) or Decimal(order["p"]) != Decimal(price):
+        return None
+    return row, order
+
+
+def cycle_known_order_ids(trade, cloid, operation):
+    known = {trade.get("order_observations", {}).get(cloid, {}).get("oid")}
+    for row in [*trade.get("entry_orders", []), *trade.get("exit_orders", [])]:
+        if row.get("cloid") == cloid:
+            known.add(row.get("oid"))
+    orders = operation.get("wire_action", {}).get("orders", [])
+    indices = {index for index, order in enumerate(orders) if order.get("c") == cloid}
+    for leg in operation.get("legs", []):
+        if leg.get("index") in indices and isinstance(leg.get("status"), dict):
+            for kind in ("resting", "filled"):
+                if isinstance(leg["status"].get(kind), dict):
+                    known.add(leg["status"][kind].get("oid"))
+    known.discard(None)
+    return known
+
+
+def cycle_native_fields_match(trade, cloid, native, wire, reentering):
+    buy = (trade["plan"]["side"] == "long") == reentering
+    return (native.get("cloid") == cloid and native.get("coin") == trade["plan"]["market"]["symbol"]
+        and native.get("side") == ("B" if buy else "A") and native.get("reduceOnly") is (not reentering)
+        and native.get("isTrigger") is False and type(native.get("oid")) is int and native["oid"] > 0
+        and Decimal(native["limitPx"]) == Decimal(wire["p"]))
+
+
+def cycle_native_sizes_match(native, wire):
+    original, remaining, requested = (Decimal(native["origSz"]), Decimal(native["sz"]), Decimal(wire["s"]))
+    if not all(value.is_finite() for value in (original, remaining, requested)):
+        return False
+    if requested != original or original <= 0:
+        return False
+    return 0 <= remaining <= original
+
+
+def cycle_native_order_matches(trade, identity, cloid, operation, status, reentering):
+    try:
+        matched = cycle_request_order(trade, identity, cloid, operation, reentering)
+        if matched is None or status.get("status") != "order":
+            return False
+        _, wire = matched
+        native = status.get("order", {}).get("order", {})
+        if not cycle_native_fields_match(trade, cloid, native, wire, reentering) or not cycle_native_sizes_match(native, wire):
+            return False
+        known = cycle_known_order_ids(trade, cloid, operation)
+        if known and known != {native["oid"]}:
+            return False
+        return not any(key != cloid and fact.get("oid") == native["oid"]
+                       for key, fact in trade.get("order_observations", {}).items())
+    except (InvalidOperation, KeyError, ValueError, TypeError):
+        return False
+
+
+def cycle_order_quantity_gap(trade, identity, cloid, operation, status, reentering):
+    if status.get("order", {}).get("status") not in TERMINAL_ORDER:
+        return None
+    if not cycle_native_order_matches(trade, identity, cloid, operation, status, reentering):
+        return None
+    try:
+        confirmed = entry_quantity_evidence(status)
+        fills = own_cycle_fills(trade, status["order"]["order"]["oid"], reentering)
+        observed = sum((Decimal(row["sz"]) for row in fills), Decimal(0))
+        gap = Decimal(confirmed) - observed if confirmed is not None else None
+        return gap if gap is not None and gap.is_finite() and gap >= 0 else None
+    except (InvalidOperation, KeyError, ValueError, TypeError):
+        return None
+
+
+def confirmed_cycle_order_fills(trade, identity, cloid, operation, status, reentering):
+    if cycle_order_quantity_gap(trade, identity, cloid, operation, status, reentering) != 0:
+        return None
+    return own_cycle_fills(trade, status["order"]["order"]["oid"], reentering)
+
+
+async def exit_fill_history_pending(engine, trade_id, signed):
+    trade = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+    identity = trade.get("suspended_wave_targets")
+    if trade.get("lifecycle_version") != 2 or not identity:
+        return False
+    direction = 1 if trade["plan"]["side"] == "long" else -1
+    if signed * direction < 0:
+        return False
+    own, _, _, _ = position_basis(trade)
+    difference = own - abs(signed)
+    if difference <= 0:
+        return False
+    operation = engine.state.read("operations")["operations"].get(identity)
+    cloid = engine.exchange.cloid(identity)
+    try:
+        if cycle_request_order(trade, identity, cloid, operation, reentering=False) is None:
+            return False
+        raw = await read_observation(lambda: engine.order_status(cloid), "exit_quantity")
+        missing = cycle_order_quantity_gap(trade, identity, cloid, operation, raw, reentering=False)
+        return missing is not None and missing > 0 and missing == difference
+    except TemporaryObservation:
+        raise
+    except (AqlaError, InvalidOperation, KeyError, TypeError):
+        return False
+
+
 def completed_cycle(state, fills):
     quantity = sum((Decimal(row["sz"]) for row in fills), Decimal(0))
     if state["phase"] == "pending_reduce":
@@ -582,12 +716,15 @@ async def resume_cycle(engine, trade_id, state):
         engine.patch_trade(trade_id, waverider=result)
         return result
     raw = await engine.order_status(cloid)
+    reentering = state["phase"] == "pending_reenter"
+    if not cycle_native_order_matches(trade, identity, cloid, operation, raw, reentering):
+        return state
     if raw.get("order", {}).get("status") not in TERMINAL_ORDER:
         return state
     await engine.capture_fills(trade_id)
     current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-    fills = own_cycle_fills(current, raw["order"]["order"]["oid"], state["phase"] == "pending_reenter")
-    if raw["order"]["status"] == "filled" and not fills:
+    fills = confirmed_cycle_order_fills(current, identity, cloid, operation, raw, reentering)
+    if fills is None:
         return state
     result = completed_cycle(state, fills)
     engine.patch_trade(trade_id, waverider=result)
@@ -600,33 +737,11 @@ def abort_cycle_exit(engine, trade_id, state, identity, not_sent):
         for row in current["exit_orders"]:
             if row.get("operation_id") == identity:
                 row.update(retired=True, **({"not_sent": True} if not_sent else {}))
-        current.update(suspended_wave_targets=None, managed_target_fingerprint=None,
+        current.update(suspended_wave_targets=None, exit_quantity_evidence_pending=False, managed_target_fingerprint=None,
                        protection_repair_pending=identity,
                        waverider={**reset_phase(state, "waiting_rise"), "cycle": state.get("cycle", 0) + 1})
     engine.state.update(abort)
     return True
-
-
-def cycle_exit_quantity_confirmed(status, fills):
-    try:
-        confirmed = entry_quantity_evidence(status)
-        observed = sum((Decimal(row["sz"]) for row in fills), Decimal(0))
-        return confirmed is not None and Decimal(confirmed) == observed
-    except (InvalidOperation, ValueError, TypeError):
-        return False
-
-
-def cycle_exit_request_matches(trade, identity, cloid, action):
-    orders = action.get("orders", [])
-    owned = [row for row in trade.get("exit_orders", []) if row.get("operation_id") == identity
-             and row.get("kind") in ("waverider", "waverider_retirement")]
-    if action.get("type") != "order" or len(orders) != 1 or len(owned) != 1:
-        return False
-    order, row = orders[0], owned[0]
-    return (order.get("c") == row.get("cloid") == cloid and order.get("r") is True
-        and order.get("a") == trade["plan"]["market"]["asset_id"]
-        and order.get("b") is (trade["plan"]["side"] == "short")
-        and Decimal(order["s"]) == Decimal(row["quantity"]) and Decimal(order["p"]) == Decimal(row["price"]))
 
 
 def definitive_cycle_exit_rejection(trade, identity, cloid, operation):
@@ -636,7 +751,7 @@ def definitive_cycle_exit_rejection(trade, identity, cloid, operation):
     from aqla_hyperliquid_mcp.api import Hyperliquid
     try:
         action = operation.get("wire_action", {})
-        if not cycle_exit_request_matches(trade, identity, cloid, action):
+        if len(action.get("orders", [])) != 1 or cycle_request_order(trade, identity, cloid, operation, reentering=False) is None:
             return False
         # A global nonce/request error is not a rejection of this exact order.
         phase, outcome, legs = Hyperliquid.decode_result(action, operation.get("result"))
@@ -644,6 +759,24 @@ def definitive_cycle_exit_rejection(trade, identity, cloid, operation):
             and legs[0].get("index") == 0 and legs[0].get("disposition") == "rejected")
     except (InvalidOperation, KeyError, ValueError, TypeError):
         return False
+
+
+def cycle_exit_positive_evidence(trade, cloid, operation):
+    if cycle_known_order_ids(trade, cloid, operation or {}):
+        return True
+    other_ids = {fact.get("oid") for key, fact in trade.get("order_observations", {}).items() if key != cloid}
+    return any(fill.get("kind") in ("waverider", "waverider_retirement") and fill.get("oid") not in other_ids
+               for fill in trade.get("fill_events", {}).values())
+
+
+async def rejected_cycle_exit_absent(engine, trade_id, trade, identity, cloid, operation):
+    if cycle_exit_positive_evidence(trade, cloid, operation):
+        return False
+    if not definitive_cycle_exit_rejection(trade, identity, cloid, operation):
+        return False
+    await engine.capture_fills(trade_id)
+    current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+    return not cycle_exit_positive_evidence(current, cloid, operation)
 
 
 async def resume_exit(engine, trade_id):
@@ -654,18 +787,19 @@ async def resume_exit(engine, trade_id):
         return True
     state = dict(trade["waverider"])
     operation = engine.state.read("operations")["operations"].get(identity)
+    cloid = engine.exchange.cloid(identity)
     if operation is None or operation.get("outcome") == "not_sent":
+        if cycle_exit_positive_evidence(trade, cloid, operation):
+            return False
         abort_cycle_exit(engine, trade_id, state, identity, not_sent=True)
         return True
-    cloid = engine.exchange.cloid(identity)
     status = await engine.order_status(cloid)
     if status.get("status") == "unknownOid":
-        if definitive_cycle_exit_rejection(trade, identity, cloid, operation):
-            await engine.capture_fills(trade_id)
-            current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-            if current.get("order_observations", {}).get(cloid, {}).get("oid") is None:
-                abort_cycle_exit(engine, trade_id, state, identity, not_sent=False)
-                return True
+        if await rejected_cycle_exit_absent(engine, trade_id, trade, identity, cloid, operation):
+            abort_cycle_exit(engine, trade_id, state, identity, not_sent=False)
+            return True
+        return False
+    if not cycle_native_order_matches(trade, identity, cloid, operation, status, reentering=False):
         return False
     if status.get("order", {}).get("status") == "open":
         plan = TradePlan.model_validate(trade["plan"])
@@ -676,10 +810,9 @@ async def resume_exit(engine, trade_id):
         return False
     await engine.capture_fills(trade_id)
     current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
-    oid = status["order"]["order"]["oid"]
-    fills = own_cycle_fills(current, oid, reentering=False)
     # Terminal order status can precede complete native fill-history visibility.
-    if not cycle_exit_quantity_confirmed(status, fills):
+    fills = confirmed_cycle_order_fills(current, identity, cloid, operation, status, reentering=False)
+    if fills is None:
         return False
     amount = sum((Decimal(row["sz"]) for row in fills), Decimal(0))
     if amount:
@@ -690,13 +823,13 @@ async def resume_exit(engine, trade_id):
             state = {**reset_phase(state, "waiting_rebound"), "sale_price": str(sale), "sold_quantity": str(amount)}
     else:
         state = {**reset_phase(state, "waiting_rise"), "cycle": state.get("cycle", 0) + 1}
-    engine.patch_trade(trade_id, suspended_wave_targets=None, managed_target_fingerprint=None, protection_repair_pending=identity, waverider=state)
+    engine.patch_trade(trade_id, suspended_wave_targets=None, exit_quantity_evidence_pending=False, managed_target_fingerprint=None, protection_repair_pending=identity, waverider=state)
     return True
 
 
 async def confirmed_cycle_quote(engine, trade_id, plan, trade):
     signed = engine.position_size(await engine.positions(plan.market), plan.market)
-    engine.owned_remaining(trade_id, signed)
+    await engine.observe_owned_remaining(trade_id, signed)
     quote = await read_observation(lambda: engine.exchange.price_snapshot(plan.market), "price")
     if any(row["phase"] in ("prepared", "sending", "unknown") for row in engine.state.read("operations")["operations"].values()):
         raise AqlaError("Unresolved operations block optional Waverider management")

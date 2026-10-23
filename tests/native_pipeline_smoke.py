@@ -178,6 +178,142 @@ def verify_pipeline_completion(SYNTHETIC_PASSWORD, args, calls, data, expected):
     print(json.dumps({"native_agent": True, "stdio_mcp": True, "mode": args.mode, "authority_verified": True, "exchange_actions": 0, "model_calls": len(calls)}))
 
 
+def classification_parameters(suffix, parameters, request, original):
+    if suffix in ("interpret_source", "trade_preview") and parameters.get("interpretation", {}).get("kind") not in ("new_signal", "trade_update"):
+        parameters = json.loads(json.dumps(parameters))
+        parameters["interpretation"]["evidence"] = [{"field": "classification", "source_id": original.source_id, "quote": "BTC Ergebnis: Ziel erreicht."}]
+        receipts = []
+        from native_tool_smoke import payload
+        def find_receipt(item):
+            if isinstance(item, dict):
+                if item.get("source_read_receipt"):
+                    receipts.append(item["source_read_receipt"])
+                for child in item.values():
+                    find_receipt(child)
+            elif isinstance(item, str):
+                parsed = payload(item)
+                if parsed:
+                    find_receipt(parsed)
+            elif isinstance(item, list):
+                for child in item:
+                    find_receipt(child)
+        for previous in request.get("messages", []):
+            if previous.get("role") == "tool":
+                find_receipt(payload(previous.get("content") or ""))
+        assert receipts, "Classification must receive a receipt from actual source_context output"
+        parameters["source_read_receipt"] = receipts[-1]
+    return parameters
+
+
+def scripted_model_response(request, calls, expected, original, now_ms):
+    tools = request.get("tools", [])
+    if tools:
+        calls.append(request)
+    index = len(calls) - 1
+    message = {"role": "assistant", "content": "Bericht erkannt; keine Order." if tools else "ready"}
+    has_tool = tools and index < len(expected) and expected[index] is not None
+    if has_tool:
+        suffix, parameters = expected[index]
+        parameters = classification_parameters(suffix, parameters, request, original)
+        available = [tool["function"]["name"] for tool in tools]
+        target = suffix if suffix in ("skill_manage", "todo_list", "session_search", "clarify") else "mcp__aqla__" + suffix
+        direct = next((name for name in available if name == target), None)
+        if direct:
+            name = direct
+        elif "tool_call" in available:
+            name, parameters = "tool_call", {"calls": [{"name": target, "arguments": parameters}]}
+        else:
+            name = require_first(name for name in available if name == target)
+        message = {"role": "assistant", "content": None, "tool_calls": [{"id": "local-call-" + str(index), "type": "function",
+                   "function": {"name": name, "arguments": json.dumps(parameters)}}]}
+    response = {"id": "local-response", "object": "chat.completion", "created": now_ms() // 1000, "model": "qa-model",
+                "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if has_tool else "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
+    return response
+
+
+def scripted_wire_payload(request, message, response, now_ms):
+    if request.get("stream"):
+        delta = dict(message)
+        if "tool_calls" in delta:
+            delta["tool_calls"] = [{"index": i, **call} for i, call in enumerate(delta["tool_calls"])]
+        chunk = {"id": "local-response", "object": "chat.completion.chunk", "created": now_ms() // 1000, "model": "qa-model",
+                 "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+        done = {**chunk, "choices": [{"index": 0, "delta": {}, "finish_reason": response["choices"][0]["finish_reason"]}]}
+        payload = ("data: " + json.dumps(chunk) + "\n\ndata: " + json.dumps(done) + "\n\ndata: [DONE]\n\n").encode()
+    else:
+        payload = json.dumps(response).encode()
+    return payload
+
+
+def scripted_model_handler(calls, expected, original, now_ms):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            return None
+
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            response = scripted_model_response(request, calls, expected, original, now_ms)
+            message = response["choices"][0]["message"]
+            payload = scripted_wire_payload(request, message, response, now_ms)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream" if request.get("stream") else "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    return Handler
+
+
+async def run_native_pipeline(args, extension, destination, model, available_toolsets, original):
+    from gateway.config import GatewayConfig, Platform
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.session import SessionSource, SessionStore
+    from run_agent import AIAgent
+
+    assert (await extension.mcp_call("aqla", "journal_status", {}))["enabled"] is True
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345")
+    store = SessionStore(destination / "hermes-home" / "sessions", GatewayConfig())
+    agent = AIAgent(model="qa-model", provider="custom", base_url=f"http://127.0.0.1:{model.server_port}/v1", api_key="local-test-only",
+                    platform="telegram", enabled_toolsets=["skills", "clarify", "todo", "session_search", *[name for name in available_toolsets if name in ("mcp-aqla")]], max_iterations=24, session_db=store._db,
+                    clarify_callback=lambda questions: {"answers": {question["id"]: "Standard" for question in questions}, "outcome": "submitted"},
+                    skip_memory=True, skip_background_review=True, quiet_mode=True, save_trajectories=False)
+
+    if args.mode == "lifecycle":
+        from native_lifecycle_smoke import verify_lifecycle
+        try:
+            return await verify_lifecycle(extension, agent, store, source, original)
+        finally:
+            agent.close()
+
+    async def handler(event):
+        return await asyncio.to_thread(agent.run_conversation, user_message=event.text)
+
+    adapter = SimpleNamespace(_message_handler=handler)
+    adapter.set_message_handler = lambda replacement: setattr(adapter, "_message_handler", replacement)
+    gateway = SimpleNamespace(_delivery_adapter_for=lambda _: adapter, session_store=store)
+    extension.boot(gateway)
+    if args.mode == "owner":
+        from native_setup_smoke import grant_fixture
+        await grant_fixture(extension)
+    event = MessageEvent(text="Setze Risiko auf 0,75 Prozent, Hebel 2, maximal drei Trades, adaptive TP-Verteilung und TP-Stop-Leiter. Passe den Master für sorgfältige Reply-Zuordnung an." if args.mode == "owner" else original.text,
+                         source=source, message_type=MessageType.TEXT, message_id="42",
+                         metadata={}, raw_message=None if args.mode == "owner" else {"forward_origin": True, "date": datetime.fromtimestamp(original.sent_at / 1000, UTC)})
+    assert extension.inbound(event, gateway) is None
+    verify_source_toolsets(extension, gateway, source)
+    from aqla_agent.usage_metrics import RUN, UsageRun
+    aggregate = UsageRun(args.mode)
+    metrics_token = RUN.set(aggregate)
+    try:
+        result = await adapter._message_handler(event)
+    finally:
+        RUN.reset(metrics_token)
+    verify_native_result(agent, aggregate, args, result)
+    agent.close()
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hermes-source", required=True)
@@ -264,127 +400,14 @@ create_server(settings, state=state, exchange=exchange).run(transport="stdio")
 
     calls = []
     original, expected = expected_scenario(SourceEvent, args, now_ms, original)
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_):
-            return None
-
-        def do_POST(self):
-            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            tools = request.get("tools", [])
-            if tools:
-                calls.append(request)
-            index = len(calls) - 1
-            message = {"role": "assistant", "content": "Bericht erkannt; keine Order." if tools else "ready"}
-            has_tool = tools and index < len(expected) and expected[index] is not None
-            if has_tool:
-                suffix, parameters = expected[index]
-                if suffix in ("interpret_source", "trade_preview") and parameters.get("interpretation", {}).get("kind") not in ("new_signal", "trade_update"):
-                    parameters = json.loads(json.dumps(parameters))
-                    parameters["interpretation"]["evidence"] = [{"field": "classification", "source_id": original.source_id, "quote": "BTC Ergebnis: Ziel erreicht."}]
-                    receipts = []
-                    from native_tool_smoke import payload
-                    def find_receipt(item):
-                        if isinstance(item, dict):
-                            if item.get("source_read_receipt"):
-                                receipts.append(item["source_read_receipt"])
-                            for child in item.values():
-                                find_receipt(child)
-                        elif isinstance(item, str):
-                            parsed = payload(item)
-                            if parsed:
-                                find_receipt(parsed)
-                        elif isinstance(item, list):
-                            for child in item:
-                                find_receipt(child)
-                    for previous in request.get("messages", []):
-                        if previous.get("role") == "tool":
-                            find_receipt(payload(previous.get("content") or ""))
-                    assert receipts, "Classification must receive a receipt from actual source_context output"
-                    parameters["source_read_receipt"] = receipts[-1]
-                available = [tool["function"]["name"] for tool in tools]
-                target = suffix if suffix in ("skill_manage", "todo_list", "session_search", "clarify") else "mcp__aqla__" + suffix
-                direct = next((name for name in available if name == target), None)
-                if direct:
-                    name = direct
-                elif "tool_call" in available:
-                    name, parameters = "tool_call", {"calls": [{"name": target, "arguments": parameters}]}
-                else:
-                    name = require_first(name for name in available if name == target)
-                message = {"role": "assistant", "content": None, "tool_calls": [{"id": "local-call-" + str(index), "type": "function",
-                           "function": {"name": name, "arguments": json.dumps(parameters)}}]}
-            response = {"id": "local-response", "object": "chat.completion", "created": now_ms() // 1000, "model": "qa-model",
-                        "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if has_tool else "stop"}],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
-            if request.get("stream"):
-                delta = dict(message)
-                if "tool_calls" in delta:
-                    delta["tool_calls"] = [{"index": i, **call} for i, call in enumerate(delta["tool_calls"])]
-                chunk = {"id": "local-response", "object": "chat.completion.chunk", "created": now_ms() // 1000, "model": "qa-model",
-                         "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-                done = {**chunk, "choices": [{"index": 0, "delta": {}, "finish_reason": response["choices"][0]["finish_reason"]}]}
-                payload = ("data: " + json.dumps(chunk) + "\n\ndata: " + json.dumps(done) + "\n\ndata: [DONE]\n\n").encode()
-            else:
-                payload = json.dumps(response).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream" if request.get("stream") else "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+    Handler = scripted_model_handler(calls, expected, original, now_ms)
 
     model = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=model.serve_forever, daemon=True)
     thread.start()
 
-    async def run():
-        from gateway.config import GatewayConfig, Platform
-        from gateway.platforms.event import MessageEvent, MessageType
-        from gateway.session import SessionSource, SessionStore
-        from run_agent import AIAgent
-
-        assert (await extension.mcp_call("aqla", "journal_status", {}))["enabled"] is True
-
-        source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345")
-        store = SessionStore(destination / "hermes-home" / "sessions", GatewayConfig())
-        agent = AIAgent(model="qa-model", provider="custom", base_url=f"http://127.0.0.1:{model.server_port}/v1", api_key="local-test-only",
-                        platform="telegram", enabled_toolsets=["skills", "clarify", "todo", "session_search", *[name for name in available_toolsets if name in ("mcp-aqla")]], max_iterations=24, session_db=store._db,
-                        clarify_callback=lambda questions: {"answers": {question["id"]: "Standard" for question in questions}, "outcome": "submitted"},
-                        skip_memory=True, skip_background_review=True, quiet_mode=True, save_trajectories=False)
-
-        if args.mode == "lifecycle":
-            from native_lifecycle_smoke import verify_lifecycle
-            try:
-                return await verify_lifecycle(extension, agent, store, source, original)
-            finally:
-                agent.close()
-
-        async def handler(event):
-            return await asyncio.to_thread(agent.run_conversation, user_message=event.text)
-
-        adapter = SimpleNamespace(_message_handler=handler)
-        adapter.set_message_handler = lambda replacement: setattr(adapter, "_message_handler", replacement)
-        gateway = SimpleNamespace(_delivery_adapter_for=lambda _: adapter, session_store=store)
-        extension.boot(gateway)
-        if args.mode == "owner":
-            from native_setup_smoke import grant_fixture
-            await grant_fixture(extension)
-        event = MessageEvent(text="Setze Risiko auf 0,75 Prozent, Hebel 2, maximal drei Trades, adaptive TP-Verteilung und TP-Stop-Leiter. Passe den Master für sorgfältige Reply-Zuordnung an." if args.mode == "owner" else original.text,
-                             source=source, message_type=MessageType.TEXT, message_id="42",
-                             metadata={}, raw_message=None if args.mode == "owner" else {"forward_origin": True, "date": datetime.fromtimestamp(original.sent_at / 1000, UTC)})
-        assert extension.inbound(event, gateway) is None
-        verify_source_toolsets(extension, gateway, source)
-        from aqla_agent.usage_metrics import RUN, UsageRun
-        aggregate = UsageRun(args.mode)
-        metrics_token = RUN.set(aggregate)
-        try:
-            result = await adapter._message_handler(event)
-        finally:
-            RUN.reset(metrics_token)
-        verify_native_result(agent, aggregate, args, result)
-        agent.close()
-        return result
-
     try:
-        asyncio.run(run())
+        asyncio.run(run_native_pipeline(args, extension, destination, model, available_toolsets, original))
         from aqla_hyperliquid_mcp.storage import read_snapshot
         data = read_snapshot(destination / "data" / "state.sqlite3")
         verify_saved_state(args, data, destination, original)

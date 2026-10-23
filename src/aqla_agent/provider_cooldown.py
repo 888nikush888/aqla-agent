@@ -86,6 +86,8 @@ def install(replace):
         if not REPLAY.get():
             return buffer(agent, notice)
 
+    # The pinned native callback keyword and public reset_at helper are distinct APIs.
+    # skipcq: PYL-W0621
     def arm_shared(agent, reason, reset_at=None):
         seconds = arm(agent, reason, reset_at=reset_at)
         if not REPLAY.get():

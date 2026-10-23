@@ -112,7 +112,7 @@ async def _inventory_details(adapter, names, orders, states):
 
 
 def _complete_snapshot(feed, states, expected, new, requested_after, after):
-    acknowledged = new or feed.aggregate_ack > requested_after and feed.state_sequence > feed.aggregate_ack
+    acknowledged = new or requested_after < feed.aggregate_ack < feed.state_sequence
     complete = states is not None and set(feed.orders) == expected and feed.state_sequence > after and feed.ready.is_set() and acknowledged
     return complete
 

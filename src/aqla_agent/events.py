@@ -131,6 +131,9 @@ class HermesExtension:
                 self._live_claims.pop(id(claim), None)
 
     async def with_event(self, incoming, gateway, callback):
+        # Keep the ingress callback signature; the event carries authority.
+        # skipcq: PTC-W0043
+        del gateway
         if self.setup.lease and self.setup.lease[1] != self.setup_binding():
             self.revoke_setup()
         self.stamp(incoming)
@@ -485,6 +488,9 @@ class HermesExtension:
         return event
 
     def attach(self, event, gateway, *, bootstrap=False, adapter=None):
+        # Lifecycle callers supply this marker; every attachment validates ingress.
+        # skipcq: PTC-W0043
+        del bootstrap
         if not self.origin(event):
             return
         # Pinned native integration interface; covered by native contract and integration checks.
@@ -659,7 +665,10 @@ class HermesExtension:
             elif isinstance(value, dict) and "structuredContent" in value:
                 value = value["structuredContent"]
             elif isinstance(value, dict) and "content" in value:
-                value = json.loads(next(block["text"] for block in value["content"] if block.get("type") == "text"))
+                block = next((block for block in value["content"] if block.get("type") == "text"), None)
+                if block is None:
+                    raise ValueError("Notification result has no text content")
+                value = json.loads(block["text"])
             else:
                 break
         return value
@@ -814,10 +823,10 @@ async def _intercept_bound_setup(extension, update, context):
     message = getattr(update, "effective_message", None)
     text = getattr(message, "text", None) or ""
     from .native_setup import addressed_to_bot
-    if text and text.split(maxsplit=1)[0].split("@", 1)[0].lower() == "/setup":
-        if (extension.setup.private_owner(message) and addressed_to_bot(text.split(maxsplit=1)[0], context.bot)
-                and not any(getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))):
-            extension.commands.cancel()
+    if (text and text.split(maxsplit=1)[0].split("@", 1)[0].lower() == "/setup"
+            and extension.setup.private_owner(message) and addressed_to_bot(text.split(maxsplit=1)[0], context.bot)
+            and not any(getattr(update, key, None) for key in ("edited_message", "edited_channel_post"))):
+        extension.commands.cancel()
     # Password admission always runs first; neither commands nor Hermes
     # receives a candidate, including slash/forwarded/edited candidates.
     if await extension.setup.intercept(update, context.bot):

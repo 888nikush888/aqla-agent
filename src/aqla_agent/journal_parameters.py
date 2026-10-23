@@ -125,14 +125,14 @@ def _profile_parameter_values(data):
 def _venue_limit_values(data):
     for venue, limits in data.get("venue_limits", {}).items():
         for field in ("max_open_trades", "max_total_risk_percent"):
-            category, label, unit, allowed, description = PARAMETERS[field]
+            _category, label, unit, allowed, _description = PARAMETERS[field]
             yield "limits:" + venue + ":" + field, "Börsenlimits", label, display(limits[field]) if limits else "Nicht festgelegt", unit, allowed, "", "Gemeinsam für alle Pipelines auf diesem Börsenkonto.", "", venue, "", data.get("configuration_revision", 0)
 
 
 def _account_limit_values(data):
     for key, limits in data.get("account_limits", {}).items():
         for field in ("max_open_trades", "max_total_risk_percent"):
-            category, label, unit, allowed, description = PARAMETERS[field]
+            _category, label, unit, allowed, _description = PARAMETERS[field]
             yield "account:" + key + ":" + field, "Kontolimits", label, display(limits[field]) if limits else "Nicht festgelegt", unit, allowed, "", "Gemeinsam je Börse/Netzwerk/Konto, einschließlich Reservierungen.", "", key, "", data.get("configuration_revision", 0)
 
 

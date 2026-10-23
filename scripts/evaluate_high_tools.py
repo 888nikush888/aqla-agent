@@ -386,6 +386,8 @@ def main():
     parser.add_argument("--workers", type=int, choices=(1, 2, 4), default=2)
     parser.add_argument("--caveman", type=Path, help="Actual deployed Caveman SKILL.md for the paired express baseline")
     args = parser.parse_args()
+    # This isolated evaluation process keeps private historical source/model logs out of stdout.
+    # skipcq: PY-A6006
     logging.disable(logging.CRITICAL)
     if args.worker_fixture:
         try:

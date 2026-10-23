@@ -37,7 +37,7 @@ def validate_sequence_stop_estimate(engine, signal, trade, plan):
         engine.validate_stop_budget(trade, plan, proposed, size=estimate)
 
 
-async def accept_sequence(engine, event_id, signal, snapshot, identity):
+async def accept_sequence(engine, event_id, signal, identity):
     candidates = engine.update_candidates(event_id, signal)
     if len(candidates) != 1:
         raise AqlaError("Management sequence requires one unambiguous own position")
@@ -89,7 +89,7 @@ async def start(engine, event_id, signal):
             raise AqlaError("This source is already bound to another management instruction")
         trade = snapshot["trades"][prior["trade_id"]]
     else:
-        trade = await accept_sequence(engine, event_id, signal, snapshot, identity)
+        trade = await accept_sequence(engine, event_id, signal, identity)
     await resume(engine, trade["trade_id"])
     current = engine.state.read("trades", entries={"trades": [trade["trade_id"]]})["trades"][trade["trade_id"]]
     sequence = current["management_sequences"][event_id]

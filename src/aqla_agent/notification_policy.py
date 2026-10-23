@@ -17,7 +17,7 @@ def _completed_wave_fills(trade, exit_order, entry):
         return None
     fills = [[fill for fill in trade.get("fill_events", {}).values() if fill["oid"] == row["oid"]] for row in pair]
     sold, bought = [sum((Decimal(fill["sz"]) for fill in group), Decimal(0)) for group in fills]
-    if sold > 0 and bought >= Decimal(entry["quantity"]) and bought <= sold:
+    if sold > 0 and Decimal(entry["quantity"]) <= bought <= sold:
         return fills[1]
 
     return None
@@ -81,6 +81,15 @@ class _NoticePolicy:
                 for key in row.get("event_keys", [])}
         self.messages, self.suppressed, self.deferred = [], {}, {}
         self.notifications = self.data.get("notifications", {})
+        self.identity, self.version = "", ""
+        self.notice: dict = {}
+        self.trade: dict | None = None
+        self.severity = "normal"
+        self.keys: list[str] = []
+        self.text: str | None = None
+        self.incident: str | None = None
+        self.incident_signature: str | None = None
+        self.observed = stamp
 
     def select_notice(self, identity, notice):
         self.identity, self.notice = identity, notice

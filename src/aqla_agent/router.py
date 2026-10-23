@@ -556,7 +556,7 @@ class Router:
         view = engine.state.read("operations", "trades")
         unresolved = any(row["phase"] in ("prepared", "sending", "unknown") for row in view["operations"].values())
         unsettled = any(row["status"] in OPEN and (row["status"] not in ("open", "opening", "waiting_entry")
-            or row.get("quantity_evidence_pending")) for row in view["trades"].values())
+            or row.get("quantity_evidence_pending") or row.get("exit_quantity_evidence_pending")) for row in view["trades"].values())
         category = "incomplete" if not engine.recovery_checked or unresolved or unsettled or any(row.get("error") or row.get("market_conflict") or row.get("replacement_unconfirmed") for row in rows) else "complete"
         return category
 

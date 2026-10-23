@@ -81,7 +81,7 @@ class Streams:
 
     def __init__(self, base_url, *, connector=connect, max_events=4096, timeout=15, max_subscriptions=128,
                  max_event_bytes=8 * 2**20, max_read_bytes=600000):
-        if any(type(value) is not int or value < 1 for value in (max_events, max_subscriptions, max_event_bytes, max_read_bytes)) or not 1024 <= max_event_bytes or not 1024 <= max_read_bytes <= 600000:
+        if any(type(value) is not int or value < 1 for value in (max_events, max_subscriptions, max_event_bytes, max_read_bytes)) or max_event_bytes < 1024 or not 1024 <= max_read_bytes <= 600000:
             raise ValueError("Stream budgets require positive counts, at least 1024 ring/read bytes and at most 600000 read bytes")
         self.url = base_url.replace("https://", "wss://") + "/ws"
         self.connector = connector

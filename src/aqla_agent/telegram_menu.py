@@ -239,9 +239,8 @@ class TelegramMenu:
         rows.append([self.button("⌂ Hauptmenü", "home"), self.button("Abbrechen", "cancel")])
         payload = {"chat_id": self.extension.owner, "text": text, "parse_mode": None, "reply_markup": {"inline_keyboard": rows}}
         previous = self.message_id
-        if self.message_id is not None and not self.fresh:
-            if await self._edit_display(bot, payload):
-                return
+        if self.message_id is not None and not self.fresh and await self._edit_display(bot, payload):
+            return
         sent = await asyncio.wait_for(bot.send_message(**payload), 10)
         self.message_id = sent.message_id
         self.fresh = False

@@ -24,6 +24,22 @@ def zone(side="long"):
         take_profits=[120, 130] if side == "long" else [70, 60])
 
 
+def retrying_entry_guard(trading, guard_read):
+    from aqla_agent.observations import TemporaryObservation
+    original = trading.live_entry_guard
+    reads = 0
+    failed = False
+    async def guard(plan, **kwargs):
+        nonlocal reads, failed
+        if kwargs.get("dispatch_operation", "").startswith("entry:"):
+            reads += 1
+            if not failed and reads == guard_read:
+                failed = True
+                raise TemporaryObservation("price_stale", "price")
+        return await original(plan, **kwargs)
+    return guard, lambda: failed
+
+
 @pytest.mark.parametrize("side", ["long", "short"])
 def test_zone_partitions_one_budget_and_round_trips(side):
     plan = make_plan(zone(side), Market(symbol="BTC", asset_id=0, product="perp", mid=100, size_decimals=2, max_leverage=20),
@@ -275,24 +291,14 @@ async def test_managed_guard_does_not_reuse_budget_after_preparation(setup, monk
 @pytest.mark.asyncio
 @pytest.mark.parametrize("guard_read", [1, 2, 3, 4])
 async def test_entry_guard_retry_stages_only_with_a_durable_request(setup, monkeypatch, guard_read):
-    from aqla_agent.observations import TemporaryObservation
     _, state, fake, _, trading = setup
     state.update(lambda data: data["policy"].update(entry_range_choice="split"))
-    original = trading.live_entry_guard
-    reads = 0
-    failed = False
-    async def guard(plan, **kwargs):
-        nonlocal reads, failed
-        if kwargs.get("dispatch_operation", "").startswith("entry:"):
-            reads += 1
-            if not failed and reads == guard_read:
-                failed = True
-                raise TemporaryObservation("price_stale", "price")
-        return await original(plan, **kwargs)
+    guard, was_failed = retrying_entry_guard(trading, guard_read)
     monkeypatch.setattr(trading, "live_entry_guard", guard)
     source, value = source_zone(trading)
     plan = await trading.preview(source.event_id, value)
     trade = await trading.execute(plan["plan_id"])
+    failed = was_failed()
     assert failed and trade["managed_entry_retry"]["attempts"] == 1 and not fake.orders
     assert all(row["phase"] == "pending" or row.get("not_sent") for row in trade["entry_orders"])
     assert not any(not row.get("retired") for row in trade["orders"])

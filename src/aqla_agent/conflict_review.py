@@ -38,7 +38,6 @@ def unsubmitted_entry(engine, snapshot, trade):
     if not entries or any(row["kind"] != "original" for row in entries):
         return False
     return unsubmitted_operations(snapshot, entries)
-    return True
 
 
 

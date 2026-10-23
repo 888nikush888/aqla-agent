@@ -315,6 +315,53 @@ def assert_private_persistence(captured, extension, home, read_snapshot):
             assert all(marker not in path.read_text(encoding="utf-8") for marker in (SYNTHETIC_PASSWORD, WRONG_SYNTHETIC_PASSWORD))
 
 
+def native_telegram_fixture(BaseRequest, sent, created, panel_edits, deleted, delete_ack, menus):
+    class Request(BaseRequest):
+        read_timeout = 1
+        @staticmethod
+        async def initialize():
+            pass
+        @staticmethod
+        async def shutdown():
+            pass
+        @staticmethod
+        async def do_request(url, method, request_data=None, **kwargs):
+            endpoint = url.rsplit("/", 1)[1]
+            if endpoint == "getMe":
+                result = {"id": 999, "is_bot": True, "first_name": "Synthetic", "username": "synthetic_bot"}
+            elif endpoint == "getUpdates":
+                result = [payload(SYNTHETIC_PASSWORD, 2)]
+            elif endpoint == "sendMessage":
+                sent.append(request_data.parameters)
+                created.append(request_data.parameters)
+                result = {"message_id": 1001 + len(created), "date": 1791490000, "chat": {"id": 12345, "type": "private"}, "text": request_data.parameters["text"]}
+            elif endpoint == "editMessageText":
+                sent.append(request_data.parameters)
+                panel_edits.append(request_data.parameters)
+                result = {"message_id": request_data.parameters["message_id"], "date": 1791490000, "chat": {"id": 12345, "type": "private"}, "text": request_data.parameters["text"]}
+            elif endpoint == "deleteMessage":
+                deleted.append(request_data.parameters)
+                result = delete_ack[0]
+            elif endpoint == "setMyCommands":
+                menus.append(request_data.parameters)
+                result = True
+            elif endpoint == "deleteMyCommands":
+                result = True
+            elif endpoint == "answerCallbackQuery":
+                result = True
+            else:
+                raise AssertionError("Unexpected native transport endpoint")
+            return 200, json.dumps({"ok": True, "result": result}).encode()
+    def payload(text, identity):
+        message = {"message_id": identity, "date": 1791490000,
+                   "chat": {"id": 12345, "type": "private"}, "from": {"id": 12345, "is_bot": False, "first_name": "Synthetic"}, "text": text}
+        if text.startswith("/"):
+            message["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
+        return {"update_id": identity, "message": message}
+
+    return Request, payload
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hermes-source", required=True)
@@ -377,48 +424,7 @@ def main():
         tool_arguments.append(arguments)
         return await native_mcp_call(server, tool, arguments)
     extension.mcp_call = record_mcp_call
-    class Request(BaseRequest):
-        read_timeout = 1
-        @staticmethod
-        async def initialize():
-            pass
-        @staticmethod
-        async def shutdown():
-            pass
-        @staticmethod
-        async def do_request(url, method, request_data=None, **kwargs):
-            endpoint = url.rsplit("/", 1)[1]
-            if endpoint == "getMe":
-                result = {"id": 999, "is_bot": True, "first_name": "Synthetic", "username": "synthetic_bot"}
-            elif endpoint == "getUpdates":
-                result = [payload(SYNTHETIC_PASSWORD, 2)]
-            elif endpoint == "sendMessage":
-                sent.append(request_data.parameters)
-                created.append(request_data.parameters)
-                result = {"message_id": 1001 + len(created), "date": 1791490000, "chat": {"id": 12345, "type": "private"}, "text": request_data.parameters["text"]}
-            elif endpoint == "editMessageText":
-                sent.append(request_data.parameters)
-                panel_edits.append(request_data.parameters)
-                result = {"message_id": request_data.parameters["message_id"], "date": 1791490000, "chat": {"id": 12345, "type": "private"}, "text": request_data.parameters["text"]}
-            elif endpoint == "deleteMessage":
-                deleted.append(request_data.parameters)
-                result = delete_ack[0]
-            elif endpoint == "setMyCommands":
-                menus.append(request_data.parameters)
-                result = True
-            elif endpoint == "deleteMyCommands":
-                result = True
-            elif endpoint == "answerCallbackQuery":
-                result = True
-            else:
-                raise AssertionError("Unexpected native transport endpoint")
-            return 200, json.dumps({"ok": True, "result": result}).encode()
-    def payload(text, identity):
-        message = {"message_id": identity, "date": 1791490000,
-                   "chat": {"id": 12345, "type": "private"}, "from": {"id": 12345, "is_bot": False, "first_name": "Synthetic"}, "text": text}
-        if text.startswith("/"):
-            message["entities"] = [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
-        return {"update_id": identity, "message": message}
+    Request, payload = native_telegram_fixture(BaseRequest, sent, created, panel_edits, deleted, delete_ack, menus)
 
     async def run():
         app = Application.builder().bot(ExtBot("999:synthetic-fixture", request=Request(), get_updates_request=Request())).build()

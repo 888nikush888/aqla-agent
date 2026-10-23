@@ -17,10 +17,12 @@ async def test_owner_pause_reconciles_existing_wave_receipt_without_another_orde
     data = {"operations": {wave_id: operation}, "operator_requests": {identity: {"status": "pending"}}}
 
     class Root:
-        def read(self, *_args, **_kwargs):
+        @staticmethod
+        def read(*_args, **_kwargs):
             return copy.deepcopy(data)
 
-        def update(self, callback):
+        @staticmethod
+        def update(callback):
             return callback(data)
 
     root = Root()

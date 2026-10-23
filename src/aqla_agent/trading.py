@@ -571,8 +571,8 @@ class Trading:
         if owned and snapshot["trades"][plan.trade_id]["status"] not in OPEN:
             raise AqlaError("Entry was terminated; no unsent exposure may execute")
         self.validate_configuration(snapshot, plan)
-        if any(row.get("quantity_evidence_pending") and row["status"] in OPEN for row in snapshot["trades"].values()):
-            raise AqlaError("Own entry quantity evidence requires reconciliation before new exposure")
+        if any((row.get("quantity_evidence_pending") or row.get("exit_quantity_evidence_pending")) and row["status"] in OPEN for row in snapshot["trades"].values()):
+            raise AqlaError("Own quantity evidence requires reconciliation before new exposure")
 
     @staticmethod
     def entry_matches_cycle(row, wave, allowed_prepared, allowed_sending):
@@ -1329,11 +1329,26 @@ class Trading:
         return None
 
 
-    async def capture_managed_entry_identities(self, trade, plan, trade_id, entry_status, terminal_cache, observed, mapping):
+    async def capture_wave_order_status(self, trade, order, status, reentering):
+        if order.get("kind") not in ("waverider", "waverider_retirement"):
+            return status
+        active = order.get("phase") != "terminal" if reentering else order.get("operation_id") == trade.get("suspended_wave_targets")
+        if not active:
+            return status
+        if status.get("order", {}).get("order", {}).get("cloid") is None:
+            status = await self.order_status(order["cloid"])
+        identity = order["operation_id"]
+        operation = self.state.read("operations", entries={"operations": [identity]})["operations"].get(identity)
+        return status if self.waves.cycle_native_order_matches(trade, identity, order["cloid"], operation, status, reentering) else None
+
+    async def capture_managed_entry_identities(self, trade, trade_id, entry_status, terminal_cache, observed, mapping):
         for entry in managed_entries.entry_orders(trade):
             if entry.get("phase") == "pending" or entry.get("not_sent"):
                 continue
             status = entry_status if entry["cloid"] == trade["entry_cloid"] else terminal_cache(entry["cloid"]) or await self.order_status(entry["cloid"])
+            status = await self.capture_wave_order_status(trade, entry, status, reentering=True)
+            if status is None:
+                continue
             observed[entry["cloid"]] = status
             oid = status.get("order", {}).get("order", {}).get("oid")
             if oid is not None:
@@ -1358,11 +1373,14 @@ class Trading:
         if entry_oid is not None:
             mapping[entry_oid] = {"kind": "entry"}
         if trade.get("lifecycle_version") == 2:
-            await self.capture_managed_entry_identities(trade, plan, trade_id, entry_status, terminal_cache, observed, mapping)
+            await self.capture_managed_entry_identities(trade, trade_id, entry_status, terminal_cache, observed, mapping)
         for order in [*trade["orders"], *trade.get("exit_orders", [])]:
             if order.get("not_sent"):
                 continue
             status = terminal_cache(order["cloid"]) or await self.order_status(order["cloid"])
+            status = await self.capture_wave_order_status(trade, order, status, reentering=False)
+            if status is None:
+                continue
             observed[order["cloid"]] = status
             oid = status.get("order", {}).get("order", {}).get("oid")
             if oid is not None:
@@ -1509,6 +1527,24 @@ class Trading:
             return Decimal(0)
         self.validate_owned_exposure(observed, owned, signed, plan)
         return observed
+
+    async def observe_owned_remaining(self, trade_id, signed):
+        try:
+            remaining = self.owned_remaining(trade_id, signed)
+        except AqlaError:
+            trade = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
+            self.assert_plan_binding(self.state.snapshot(), TradePlan.model_validate(trade["plan"]))
+            try:
+                pending = await self.waves.exit_fill_history_pending(self, trade_id, signed)
+            except TemporaryObservation:
+                self.patch_trade(trade_id, exit_quantity_evidence_pending=True)
+                raise
+            if pending:
+                self.patch_trade(trade_id, exit_quantity_evidence_pending=True)
+                raise TemporaryObservation("read_unavailable", "exit_quantity", "transport") from None
+            raise
+        return remaining
+
 
     async def effective_stop_coverage(self, trade_id, plan, remaining):
         current = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
@@ -2308,7 +2344,7 @@ class Trading:
         self.pending_replacement_stop_guard(data, row, plan, stop, operation_id)
 
 
-    async def accept_replacement_stop(self, trade_id, plan, trade, cloid, remaining, stop, operation_id, result, initialize_backup, initial_protection):
+    async def accept_replacement_stop(self, trade_id, plan, trade, cloid, stop, operation_id, result, initialize_backup, initial_protection):
         pending = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("pending_stop_update")
         preserve = initialize_backup or initial_protection or pending and pending["operation_id"] == operation_id
         self.patch_trade(trade_id, stop_price=str(stop), management_revision=trade["management_revision"] + 1,
@@ -2327,7 +2363,7 @@ class Trading:
     async def confirm_replacement_stop(self, trade_id, plan, trade, cloid, remaining, stop, operation_id, result, initialize_backup, initial_protection):
         confirmed = await self.order_status(cloid)
         if confirmed.get("order", {}).get("status") == "open" and self.stop_matches(confirmed, plan, remaining, stop):
-            return await self.accept_replacement_stop(trade_id, plan, trade, cloid, remaining, stop, operation_id, result, initialize_backup, initial_protection)
+            return await self.accept_replacement_stop(trade_id, plan, trade, cloid, stop, operation_id, result, initialize_backup, initial_protection)
         if result.get("outcome") == "not_sent":
             return result
         if result["phase"] == "rejected":

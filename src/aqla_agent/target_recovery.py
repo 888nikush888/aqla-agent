@@ -68,7 +68,7 @@ def target_history_absent(trade, plan, cloids, open_orders, history, fills):
     return True
 
 
-def complete_target_absence(exchange, data, record, trade_id, trade, cloids, evidence):
+def complete_target_absence(data, record, trade_id, trade, cloids, evidence):
     current = data["operations"][record["operation_id"]]
     owned = data["trades"][trade_id]
     if (current["phase"] not in ("sending", "unknown") or current["request_hash"] != record["request_hash"]
@@ -111,7 +111,7 @@ async def expired_target(exchange, record, observations):
                 "order_status": repeated, "open_orders": open_orders, "historical_orders": history,
                 "fills": fills}
     def complete(data):
-        return complete_target_absence(exchange, data, record, trade_id, trade, cloids, evidence)
+        return complete_target_absence(data, record, trade_id, trade, cloids, evidence)
     if not exchange.state.update(complete):
         return None
     return evidence

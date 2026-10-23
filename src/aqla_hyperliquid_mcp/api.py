@@ -126,6 +126,9 @@ class Hyperliquid:
             return response.json()
 
     async def fill_history(self, market: Market, start: int, end: int):
+        # The shared adapter API supplies a market; this endpoint returns account fills.
+        # skipcq: PTC-W0043
+        del market
         return await self.info("userFillsByTime", user=self.account, startTime=start, endTime=end)
 
     async def perp_collateral(self, meta, dex):
@@ -741,6 +744,31 @@ class Hyperliquid:
                 order["cloid"] = self.cloid(operation_id, i)
 
 
+    @staticmethod
+    def prepared_sdk_info(metadata, positions, effective_account):
+        class PreparedInfo:
+            name_to_coin = {name: market.symbol for name, market in metadata.items()}
+            coin_to_asset = {market.symbol: market.asset_id for market in metadata.values()}
+            asset_to_sz_decimals = {market.asset_id: market.size_decimals for market in metadata.values()}
+
+            @staticmethod
+            def name_to_asset(name):
+                if name not in metadata:
+                    raise AqlaError("Unknown market in exchange action")
+                return metadata[name].asset_id
+
+            @staticmethod
+            def all_mids(dex=""):
+                return {market.symbol: str(market.mid) for market in metadata.values() if market.dex == dex}
+
+            @staticmethod
+            def user_state(address, dex=""):
+                if address.lower() != effective_account.lower() or dex not in positions:
+                    raise AqlaError("Market-close helper lacks a fresh bound position snapshot")
+                return positions[dex]
+
+        return PreparedInfo
+
     async def prepare_sdk_action(self, operation_id, request, *, multisig=False, target_account=None):
         from .catalog import validate_sdk
 
@@ -773,30 +801,8 @@ class Hyperliquid:
             positions[dex] = await self.info("clearinghouseState", user=effective_account, dex=dex)
         metadata = dict(self.market_cache)
 
-        class PreparedInfo:
-            name_to_coin = {name: market.symbol for name, market in metadata.items()}
-            coin_to_asset = {market.symbol: market.asset_id for market in metadata.values()}
-            asset_to_sz_decimals = {market.asset_id: market.size_decimals for market in metadata.values()}
-
-            @staticmethod
-            def name_to_asset(name):
-                if name not in metadata:
-                    raise AqlaError("Unknown market in exchange action")
-                return metadata[name].asset_id
-
-            @staticmethod
-            def all_mids(dex=""):
-                return {market.symbol: str(market.mid) for market in metadata.values() if market.dex == dex}
-
-            @staticmethod
-            def user_state(address, dex=""):
-                if address.lower() != self_account.lower() or dex not in positions:
-                    raise AqlaError("Market-close helper lacks a fresh bound position snapshot")
-                return positions[dex]
-
-        self_account = effective_account
-
-        build = self.sdk_action_builder(PreparedInfo, target_account, metadata, signing_scope, params, operation)
+        info = self.prepared_sdk_info(metadata, positions, effective_account)
+        build = self.sdk_action_builder(info, target_account, metadata, signing_scope, params, operation)
         return request_binding, build
 
     async def sdk_action(self, operation_id, request, *, sender=None, prepare_guard=None):

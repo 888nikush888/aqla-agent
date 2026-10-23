@@ -39,7 +39,7 @@ class State:
         except portalocker.LockException as error:
             raise AqlaError("Another aqla process already owns this state") from error
         try:
-            existing, legacy_path = self._load_state(settings)
+            self.data, existing, legacy_path = self._load_state(settings)
             legacy = self._restore_trading_target(settings)
             self._validate_saved_bindings(settings)
             migrated = self._migrate_state(settings, existing, legacy_path)
@@ -61,19 +61,19 @@ class State:
         if not existing and self.path.with_suffix(self.path.suffix + ".initialized").exists():
             raise AqlaError("Previously initialized SQLite state is missing; explicit recovery is required")
         if existing or legacy_path.exists():
-            self.data = read_snapshot(self.path) if existing else json.loads(legacy_path.read_text(encoding="utf-8"))
-            if not isinstance(self.data, dict) or self.data.get("schema") not in (1, 2, 3) or self.data.get("network") != settings.network or self.data.get("account", "").lower() != settings.account.lower():
+            data = read_snapshot(self.path) if existing else json.loads(legacy_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or data.get("schema") not in (1, 2, 3) or data.get("network") != settings.network or data.get("account", "").lower() != settings.account.lower():
                 raise AqlaError("State version, account or network differs; use a separate state")
             for key in ("events", "trades", "operations", "nonces", "plans", "bindings", "sources"):
-                if key not in self.data:
+                if key not in data:
                     raise AqlaError("State is incomplete; do not restore an old snapshot blindly")
         else:
-            self.data = {"schema": 1, "network": settings.network, "account": settings.account.lower(), "trading_account": (settings.vault_address or settings.account).lower(), "sequence": 0,
+            data = {"schema": 1, "network": settings.network, "account": settings.account.lower(), "trading_account": (settings.vault_address or settings.account).lower(), "sequence": 0,
                          "policy": settings.policy.model_dump(mode="json") if settings.policy else None,
                          "policy_revision": 1 if settings.policy else 0, "paused": False,
                          "sources": settings.sources, "source_aliases": {}, "events": {}, "trades": {}, "plans": {},
                          "bindings": {}, "operations": {}, "nonces": {}, "cursors": {}, "notifications": {}, "event_tombstones": {}}
-        return existing, legacy_path
+        return data, existing, legacy_path
 
     def _restore_trading_target(self, settings):
         target = (settings.vault_address or settings.account).lower()

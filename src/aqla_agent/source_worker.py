@@ -47,6 +47,9 @@ class NativeUsageCapture:
         self.rows = []
 
     def record_auxiliary_usage(self, session_id, task, **fields):
+        # The native callback supplies request metadata; this capture retains billing facts only.
+        # skipcq: PTC-W0043
+        del session_id, task
         self.rows.append(fields)
 
 

@@ -245,6 +245,91 @@ def mcp_body(value):
     return value
 
 
+def verify_lookup_facts(previous):
+    found = mcp_body(previous)
+    assert found["rows"][0]["sent_at"] == "2026-10-11T17:39:00+02:00"
+    assert found["rows"][0]["event_status_is_fill_proof"] is False
+    assert found["rows"][0]["confirmed_own_entry_fill_count"] == 0
+
+
+def advance_scripted_tool_phase(phase, previous, outputs, reference, offset, chunks):
+    if phase[0] == "source" and outputs:
+        reference[0] = previous["output_id"]
+        phase[0] = "read"
+    elif phase[0] == "read" and outputs and "content" in previous:
+        chunks.append(previous["content"])
+        if previous["eof"]:
+            phase[0] = "core"
+        else:
+            offset[0] = previous["next_offset"]
+    elif phase[0] == "core" and outputs and reference[0]:
+        phase[0] = "catalog"
+    elif phase[0] == "catalog" and outputs:
+        phase[0] = "lookup"
+    elif phase[0] == "lookup" and outputs:
+        verify_lookup_facts(previous)
+        phase[0] = "done"
+
+
+def scripted_tool_response(request, calls, chunks, phase, reference, offset, final, event):
+    if request.get("tools"):
+        calls.append(request)
+        outputs = [message for message in request["messages"] if message.get("role") == "tool"]
+        previous = payload(outputs[-1].get("content")) if outputs else {}
+        advance_scripted_tool_phase(phase, previous, outputs, reference, offset, chunks)
+        targets = {
+            "source": ("mcp__aqla__source_context", {"event_id": event.event_id}),
+            "read": ("aqla_read_tool_result", {"output_id": reference[0], "offset": offset[0], "limit": 4096}),
+            "core": ("skills_list", {}), "catalog": ("tool_describe", {"names": ["aqla_read_tool_result"]}),
+            "lookup": ("mcp__aqla__source_lookup", {"start": "2026-10-11T17:39:00+02:00", "end": "2026-10-11T17:39:00.500+02:00"})}
+        message = {"role": "assistant", "content": "At 17:39 a source was retained; there are no confirmed own fills."}
+        if phase[0] in targets:
+            target, arguments = targets[phase[0]]
+            listed = {row["function"]["name"] for row in request["tools"]}
+            if target not in listed or phase[0] in ("core", "catalog"):
+                target, arguments = "tool_call", {"calls": [{"name": target, "arguments": arguments}]}
+            message = {"role": "assistant", "content": None, "tool_calls": [{"id": "native-" + str(len(calls)), "type": "function",
+                "function": {"name": target, "arguments": json.dumps(arguments)}}]}
+        else:
+            final[0] = True
+    else:
+        message = {"role": "assistant", "content": "ready"}
+    response = {"id": "fixture", "object": "chat.completion", "created": 1, "model": "qa-model",
+        "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
+    return response
+
+
+def scripted_tool_wire_payload(request, response):
+    message = response["choices"][0]["message"]
+    if request.get("stream"):
+        delta = dict(message)
+        if "tool_calls" in delta:
+            delta["tool_calls"] = [{"index": index, **call} for index, call in enumerate(delta["tool_calls"])]
+        chunk = {"id": "fixture", "object": "chat.completion.chunk", "model": "qa-model", "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+        done = {**chunk, "choices": [{"index": 0, "delta": {}, "finish_reason": response["choices"][0]["finish_reason"]}]}
+        encoded = ("data: " + json.dumps(chunk) + "\n\ndata: " + json.dumps(done) + "\n\ndata: [DONE]\n\n").encode()
+    else:
+        encoded = json.dumps(response).encode()
+    return encoded
+
+
+def scripted_tool_http_handler(calls, chunks, phase, reference, offset, final, event):
+    class FakeModel(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            return None
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            response = scripted_tool_response(request, calls, chunks, phase, reference, offset, final, event)
+            encoded = scripted_tool_wire_payload(request, response)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream" if request.get("stream") else "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+    return FakeModel
+
+
 async def verify_scripted_agent(extension, runner, source, event, body):
     from run_agent import AIAgent
 
@@ -253,68 +338,7 @@ async def verify_scripted_agent(extension, runner, source, event, body):
     reference = [None]
     offset = [0]
     final = [False]
-    class FakeModel(BaseHTTPRequestHandler):
-        def log_message(self, *_):
-            return None
-        def do_POST(self):
-            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if request.get("tools"):
-                calls.append(request)
-                outputs = [message for message in request["messages"] if message.get("role") == "tool"]
-                previous = payload(outputs[-1].get("content")) if outputs else {}
-                if phase[0] == "source" and outputs:
-                    reference[0] = previous["output_id"]
-                    phase[0] = "read"
-                elif phase[0] == "read" and outputs and "content" in previous:
-                    chunks.append(previous["content"])
-                    if previous["eof"]:
-                        phase[0] = "core"
-                    else:
-                        offset[0] = previous["next_offset"]
-                elif phase[0] == "core" and outputs and reference[0]:
-                    phase[0] = "catalog"
-                elif phase[0] == "catalog" and outputs:
-                    phase[0] = "lookup"
-                elif phase[0] == "lookup" and outputs:
-                    found = mcp_body(previous)
-                    assert found["rows"][0]["sent_at"] == "2026-10-11T17:39:00+02:00"
-                    assert found["rows"][0]["event_status_is_fill_proof"] is False
-                    assert found["rows"][0]["confirmed_own_entry_fill_count"] == 0
-                    phase[0] = "done"
-                targets = {
-                    "source": ("mcp__aqla__source_context", {"event_id": event.event_id}),
-                    "read": ("aqla_read_tool_result", {"output_id": reference[0], "offset": offset[0], "limit": 4096}),
-                    "core": ("skills_list", {}), "catalog": ("tool_describe", {"names": ["aqla_read_tool_result"]}),
-                    "lookup": ("mcp__aqla__source_lookup", {"start": "2026-10-11T17:39:00+02:00", "end": "2026-10-11T17:39:00.500+02:00"})}
-                message = {"role": "assistant", "content": "At 17:39 a source was retained; there are no confirmed own fills."}
-                if phase[0] in targets:
-                    target, arguments = targets[phase[0]]
-                    listed = {row["function"]["name"] for row in request["tools"]}
-                    if target not in listed or phase[0] in ("core", "catalog"):
-                        target, arguments = "tool_call", {"calls": [{"name": target, "arguments": arguments}]}
-                    message = {"role": "assistant", "content": None, "tool_calls": [{"id": "native-" + str(len(calls)), "type": "function",
-                        "function": {"name": target, "arguments": json.dumps(arguments)}}]}
-                else:
-                    final[0] = True
-            else:
-                message = {"role": "assistant", "content": "ready"}
-            response = {"id": "fixture", "object": "chat.completion", "created": 1, "model": "qa-model",
-                "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop"}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
-            if request.get("stream"):
-                delta = dict(message)
-                if "tool_calls" in delta:
-                    delta["tool_calls"] = [{"index": index, **call} for index, call in enumerate(delta["tool_calls"])]
-                chunk = {"id": "fixture", "object": "chat.completion.chunk", "model": "qa-model", "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-                done = {**chunk, "choices": [{"index": 0, "delta": {}, "finish_reason": response["choices"][0]["finish_reason"]}]}
-                encoded = ("data: " + json.dumps(chunk) + "\n\ndata: " + json.dumps(done) + "\n\ndata: [DONE]\n\n").encode()
-            else:
-                encoded = json.dumps(response).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream" if request.get("stream") else "application/json")
-            self.send_header("Content-Length", str(len(encoded)))
-            self.end_headers()
-            self.wfile.write(encoded)
+    FakeModel = scripted_tool_http_handler(calls, chunks, phase, reference, offset, final, event)
     model = ThreadingHTTPServer(("127.0.0.1", 0), FakeModel)
     threading.Thread(target=model.serve_forever, daemon=True).start()
     session = runner.session_store.get_or_create_session(source)

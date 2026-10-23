@@ -158,7 +158,7 @@ def validate_operator_action(request, engine, trade, plan):
         engine.validate_targets(trade, plan, request.targets)
 
 
-def accept_operator_request(router, request, identity, commit_check, engine, data):
+def accept_operator_request(request, identity, commit_check, engine, data):
     commit_check()
     rows = data.setdefault("operator_requests", {})
     payload = request.model_dump(mode="json")
@@ -193,7 +193,7 @@ async def submit(router, request, request_id, commit_check):
         raise AqlaError("Das ursprüngliche Ausführungskonto ist nicht verfügbar")
     async with engine.lock.work(1):
         def accept(data):
-            accept_operator_request(router, request, identity, commit_check, engine, data)
+            accept_operator_request(request, identity, commit_check, engine, data)
         router.state.update_if_changed(accept)
         try:
             return await dispatch(engine, identity)
