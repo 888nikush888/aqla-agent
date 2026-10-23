@@ -35,6 +35,8 @@ Eine über das Menü geöffnete Passwortnachfrage lässt sich mit **Abbrechen** 
 
 Positionsaufträge binden exakt einen Trade, die angezeigten Belege und eine dauerhafte Auftragsidentität. Doppelklick und Wiederanlauf erzeugen keine neue Handelsabsicht. Es gibt keinen Menüdialog zum Eröffnen neuer manueller Positionen. Bereits beendete Waverider werden nicht wieder aufgenommen.
 
+Die Kontoprüfung verwendet innerhalb der gemeinsamen Transaktion die Projektion des ursprünglichen Ausführungskontos. Ein Testnet-Auftrag wird damit auch bei einem Mainnet-Hauptzustand gegen sein eigenes Konto und Netzwerk geprüft; Änderungen an Kontobindung oder Positionsbelegen bleiben gesperrt.
+
 ## Meldungen
 
 Automatisch: tatsächlicher Einstieg, reguläre TP-/Teilabschlüsse, vollständig belegte Waverider-Wellen, Schließung und relevante Störungen. Teilfills derselben Ausführung werden bis zu 15 Sekunden gebündelt. Schutzprobleme und ungeklärte Orderausgänge haben Vorrang.

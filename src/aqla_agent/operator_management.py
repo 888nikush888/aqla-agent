@@ -145,7 +145,7 @@ async def submit(router, request, request_id, commit_check):
             if fingerprint(trade) != request.expected_fingerprint:
                 raise AqlaError("Trade hat sich geändert; aktuelle Werte erneut prüfen")
             plan = TradePlan.model_validate(trade["plan"])
-            engine.assert_plan_binding(data, plan)
+            engine.assert_plan_binding(engine.state.project(data), plan)
             if trade["status"] in ("conflicted", "cleanup"):
                 raise AqlaError("Trade hat ein ungeklärtes Eigentum oder einen ungeklärten Abschluss")
             if request.action in ("pause_waverider", "resume_waverider"):
