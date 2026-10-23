@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aqla-agent"
-version = "0.1.0"
-description = "Minimal Hermes signal trading and a complete Python Hyperliquid MCP"
+version = "0.2.0"
+description = "Aqla Telegram control center with native Hermes and guarded Hyperliquid execution"
 requires-python = ">=3.12"
 dependencies = [
   "mcp==2.2.0",
@@ -21,7 +21,6 @@ dependencies = [
 
 [project.optional-dependencies]
 sources = ["Telethon>=1.42,<2"]
-sheets = ["google-auth[requests]>=2.38,<3"]
 dev = [
     "pytest>=8.3,<10",
     "pytest-asyncio>=1,<2",
@@ -35,17 +34,17 @@ aqla-hyperliquid-mcp = "aqla_hyperliquid_mcp.__main__:main"
 aqla-telegram-login = "aqla_agent.telegram:login_main"
 aqla-install-hermes = "aqla_agent.install:main"
 aqla-build-vps = "aqla_agent.release:main"
-aqla-google-sheets-mcp = "aqla_sheets_mcp.__main__:main"
+aqla-migrate = "aqla_agent.migration:main"
 aqla-evaluate-decisions = "aqla_agent.decision_evaluation:main"
 aqla-evaluate-waverider = "aqla_agent.waverider_replay:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/aqla_agent", "src/aqla_hyperliquid_mcp", "src/aqla_sheets_mcp"]
+packages = ["src/aqla_agent", "src/aqla_hyperliquid_mcp"]
 
 [tool.hatch.build.targets.sdist]
 include = [
   "/src", "/hermes_plugin", "/skills", "/tests", "/docs", "/scripts",
-  "/.github", "/plans", "/README.md", "/IMPLEMENTATION_STATUS.md",
+  "/.github", "/README.md",
   "/pyproject.toml", "/uv.lock", "/config.example.yaml", "/hermes-runtime-overrides.txt", "/.gitignore", "/.gitattributes", "/.gitleaks.toml",
 ]
 exclude = ["**/__pycache__/**", "**/*.pyc"]

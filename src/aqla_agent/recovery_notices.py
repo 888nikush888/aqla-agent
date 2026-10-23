@@ -96,4 +96,4 @@ def record_source_notice(data, code, version, sources=()):
     data["source_status"][category] = {"signature": signature, "transition": transition}
     identity = "source-status:" + digest([category, transition])
     safe_sources = sorted({value for value in sources if isinstance(value, str) and re.fullmatch(r"-?[1-9]\d*|@[A-Za-z][A-Za-z0-9_]{3,31}", value)})
-    data["notifications"].setdefault(identity, {"source_notice": {"code": code, "category": category, "sources": safe_sources}})
+    data["notifications"].setdefault(identity, {"source_notice": {"code": code, "category": category, "sources": safe_sources}, "observed_at": now_ms()})

@@ -5,7 +5,6 @@ import httpx
 import pytest
 
 from aqla_agent.accounting import occupied_markets
-from aqla_agent.network_transition import confirm_manual_testnet_close, mainnet_state
 from aqla_hyperliquid_mcp.models import AqlaError
 
 
@@ -139,58 +138,3 @@ async def test_external_intervention_is_local_and_does_not_close_mixed_position(
     assert trading.recovery_checked and fake.actions==before
     with pytest.raises(AqlaError,match='mixed'):
         await trading.close_position(trade['trade_id'])
-
-
-@pytest.mark.asyncio
-async def test_network_cutover_keeps_ids_and_prevents_old_signal_reentry(setup,signal):
-    settings,state,fake,_,trading=setup
-    source,value=signal
-    plan=await trading.preview(source.event_id,value)
-    trade=await trading.execute(plan['plan_id'])
-    old=state.snapshot()
-    original=copy.deepcopy(old)
-    with pytest.raises(AqlaError,match='Finish'):
-        mainnet_state(old,settings.account,source.sent_at+100)
-    identity=trade['trade_id']
-    clo={row['cloid'] for row in trade['orders']}|{trade['entry_cloid']}
-    confirm_manual_testnet_close(old,identity,net_size=0,order_statuses={key:'canceled' for key in clo},stamp=source.sent_at+1)
-    assert old['trades'][identity]['manual_closure']['pnl_complete'] is False
-    from aqla_sheets_mcp.journal import HEADERS, fingerprint, project
-    row = next(row for row in project(old).values() if row['table'] == 'Orders')
-    other = copy.deepcopy(row)
-    other['record_id'] = other['values'][0] = 'aster-archive'
-    other['values'][HEADERS['Orders'].index('Börse')] = 'aster'
-    other['fingerprint'] = fingerprint(other['values'])
-    old.update(journal_order_archive={row['record_id']: row, other['record_id']: other},
-               journal_projection={'stale': 'version'}, journal_destination='previous-target')
-    transitioned=mainnet_state(old,settings.account,source.sent_at+100)
-    assert transitioned['network']=='mainnet' and transitioned['trades']=={} and transitioned['operations']=={} and transitioned['nonces']=={}
-    assert transitioned['profiles']==original['profiles']
-    assert transitioned['events'][source.event_id]['source']['historical']
-    assert transitioned['context_cutoffs']['channel']>=source.message_id
-    assert old['trades'][identity]['plan']==original['trades'][identity]['plan']
-    assert transitioned['journal_order_archive'] == {'aster-archive': other}
-    assert 'journal_projection' not in transitioned and 'journal_destination' not in transitioned
-
-
-@pytest.mark.asyncio
-async def test_namespace_journal_retains_testnet_tables_and_binding():
-    from types import SimpleNamespace
-
-    from test_sheets import Google
-
-    from aqla_sheets_mcp.client import PREFIX, SheetsClient
-    from aqla_sheets_mcp.journal import record
-
-    google=Google()
-    legacy=SheetsClient(SimpleNamespace(spreadsheet_id='unit-test'),session=google,scope='testnet:account')
-    legacy.sync([record('Trades','historic','channel','BTC','long','closed','now',100,100,1,1,0,90,'[]',10,0,1,0,1,'[]')])
-    old=copy.deepcopy(google.tables)
-    main=SheetsClient(SimpleNamespace(spreadsheet_id='unit-test',tab_namespace='mainnet'),session=google,scope='mainnet:account')
-    main.layout()
-    assert all(google.tables[key]==value for key,value in old.items())
-    assert PREFIX+'Mainnet Trades' in google.tables
-    assert {row['metadataKey'] for row in google.metadata}=={'aqla.scope','aqla.scope.mainnet'}
-    wrong=SheetsClient(SimpleNamespace(spreadsheet_id='unit-test',tab_namespace='mainnet'),session=google,scope='mainnet:other')
-    with pytest.raises(AqlaError,match='different'):
-        wrong.layout()

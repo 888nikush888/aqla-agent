@@ -137,7 +137,7 @@ def test_fresh_grouped_sibling_does_not_rewrite_exhausted_frozen_delivery(setup)
         "event_id": "event", "source_id": "channel:1", "source": {"chat_id": "channel"},
         "interpretation": {"source_refs": ["channel:1"]}}))
     state.update_metadata(("notifications",), lambda data: data["notifications"].__setitem__(
-        "old", {"event_id": "event", "error": "old fact"}))
+        "old", {"event_id": "event", "error": "old fact", "severity": "urgent"}))
     outbox = NotificationOutbox(state, "operator")
     outbox.bind("first")
     old = outbox.next_part("first")
@@ -145,7 +145,7 @@ def test_fresh_grouped_sibling_does_not_rewrite_exhausted_frozen_delivery(setup)
     outbox.complete("first", old["delivery_id"], old["part"], False)
     frozen = state.read("notification_outbox")["notification_outbox"][old["delivery_id"]]
     state.update_metadata(("notifications",), lambda data: data["notifications"].__setitem__(
-        "fresh", {"event_id": "event", "error": "new fact"}))
+        "fresh", {"event_id": "event", "error": "new fact", "severity": "urgent"}))
     fresh = outbox.next_part("first")
     assert fresh["delivery_id"] != old["delivery_id"]
     queued = state.read("notification_outbox")["notification_outbox"]

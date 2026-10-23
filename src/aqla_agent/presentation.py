@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from aqla_hyperliquid_mcp.models import Model, digest, now_ms
 
@@ -27,7 +27,7 @@ class PresentationScope(Model):
     @field_validator("period")
     @classmethod
     def valid_period(cls, value):
-        if value not in ("current", "all"):
+        if value not in ("current", "all", "today", "7d", "30d"):
             month_bounds(value)
         return value
 
@@ -134,7 +134,7 @@ class PresentationSnapshot(Model):
     equity_curve: Literal[False] = False
 
     @model_validator(mode="after")
-    def valid_snapshot(self):
+    def valid_snapshot(self, info: ValidationInfo):
         data = self.model_dump(mode="json", exclude={"fingerprint", "revision", "generated_at"})
         if digest(data) != self.fingerprint:
             raise ValueError("Presentation content does not match its fingerprint")
@@ -143,7 +143,7 @@ class PresentationSnapshot(Model):
             raise ValueError("Presentation rows do not match the selected financial scope")
         if self.scope.currency not in self.available_currencies or self.scope.period not in self.available_periods:
             raise ValueError("Presentation selection is unavailable")
-        if native_monthly_bytes(self.model_dump(mode="json")) > MAX_PRESENTATION_BYTES:
+        if (not info.context or info.context.get("transport_budget", True)) and native_monthly_bytes(self.model_dump(mode="json")) > MAX_PRESENTATION_BYTES:
             raise ValueError("Presentation exceeds its bounded transport budget")
         return self
 
@@ -202,13 +202,18 @@ def _parameters(data):
     return result
 
 
-def build_presentation(data, scope: PresentationScope | dict | None = None, clock=None) -> PresentationSnapshot:
+def build_presentation(data, scope: PresentationScope | dict | None = None, clock=None, *, transport_budget=True) -> PresentationSnapshot:
     """Read only; preserve whole-family net-R eligibility and independent currencies."""
     scope = PresentationScope.model_validate(scope or {})
     clock = now_ms() if clock is None else clock
     current = datetime.fromtimestamp(clock / 1000, BERLIN).strftime("%Y-%m")
     period = current if scope.period == "current" else scope.period
-    start, end = (None, None) if period == "all" else month_bounds(period)
+    if period in ("today", "7d", "30d"):
+        today = datetime.fromtimestamp(clock / 1000, BERLIN).replace(hour=0, minute=0, second=0, microsecond=0)
+        days = {"today": 1, "7d": 7, "30d": 30}[period]
+        start, end = int((today - timedelta(days=days - 1)).timestamp() * 1000), int((today + timedelta(days=1)).timestamp() * 1000)
+    else:
+        start, end = (None, None) if period == "all" else month_bounds(period)
     journal, selected_ids, report_rows = [], set(), {}
     for trade in data.get("trades", {}).values():
         plan = trade["plan"]
@@ -292,11 +297,11 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
     channels.sort(key=lambda row: (-TIERS.index(row.rank), -(row.score or Decimal(0)), row.source.casefold(), row.source_id))
     currencies = sorted({"USDT", "USDC", *(trade["plan"]["market"].get("quote_token", "USDC") for trade in data.get("trades", {}).values())})
     periods = sorted({current, *data.get("monthly_reports", {}), *(datetime.fromtimestamp((trade.get("closed_at") or trade["plan"]["created_at"]) / 1000, BERLIN).strftime("%Y-%m") for trade in data.get("trades", {}).values())})
-    if scope.period not in ("current", "all"):
+    if scope.period not in ("current", "all", "today", "7d", "30d"):
         periods = sorted({*periods, scope.period})
     body = dict(schema_version=1, scope=scope, scope_binding=digest({"account": data["account"], "trading_account": data.get("trading_account", data["account"]), "network": data["network"]}),
         revision=data["sequence"], generated_at=clock, resolved_period=period, period_start=start, period_end_exclusive=end,
-        available_currencies=currencies, available_periods=["current", "all", *periods],
+        available_currencies=currencies, available_periods=["current", "today", "7d", "30d", "all", *periods],
         journal=journal, channels=channels, parameters=_parameters(data), months=[PresentationMonth(month=month, revision=row.get("revision", 0),
             published_at=row.get("published_at")) for month, row in sorted(data.get("monthly_reports", {}).items())],
         net_pnl=net, fees=fees, funding=funding,
@@ -309,4 +314,4 @@ def build_presentation(data, scope: PresentationScope | dict | None = None, cloc
               if isinstance(value, list) else value for key, value in body.items() if key not in ("revision", "generated_at")}
     # Decimal is string-encoded by Pydantic, including standalone scalar fields.
     values["hit_rate_percent"] = str(body["hit_rate_percent"]) if body["hit_rate_percent"] is not None else None
-    return PresentationSnapshot(**body, fingerprint=digest(values))
+    return PresentationSnapshot.model_validate({**body, "fingerprint": digest(values)}, context={"transport_budget": transport_budget})

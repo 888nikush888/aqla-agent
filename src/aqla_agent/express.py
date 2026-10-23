@@ -10,7 +10,7 @@ from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, Sou
 from .decisions import candidates
 
 VERSION = "express-fields-v2"
-QUALIFIED_MASTER = "5e9af36c4df806e5ed16a013e52a0d8a9b0b5836960a815894990d02de2b4dd9"
+QUALIFIED_MASTER = "1ef5231d0bcb8f05aa2e8379bd7276010804cb0cfc37e03168175a3cfc000235"
 CLAIM = ContextVar("aqla_express_claim", default=None)
 ACTIVE = {"prepared", "interpreted", "applying", "waiting_preview", "recovering"}
 NUMBER = r"[0-9]+(?:[.,][0-9]+)?"

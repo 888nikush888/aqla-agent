@@ -54,7 +54,6 @@ def main():
     # Linux venv executables are symlinks. Keep that path so Python loads the
     # venv packages instead of resolving to the bare system interpreter.
     config["mcp_servers"]["aqla"]["command"] = str(Path(args.mcp_python).expanduser().absolute())
-    config["mcp_servers"]["sheets"]["command"] = str(Path(args.mcp_python).expanduser().absolute())
     if args.mode == "roi":
         bootstrap = destination / "synthetic-preview-mcp.py"
         bootstrap.write_text('''import json
@@ -96,10 +95,10 @@ create_server(settings, state=state, exchange=exchange).run(transport="stdio")
     discover_plugins(force=True)
     tool_names = discover_mcp_tools()
     assert any(name.endswith("trade_preview") for name in tool_names), tool_names
-    assert any(name == "mcp__sheets__journal_status" for name in tool_names), tool_names
+    assert any(name == "mcp__aqla__journal_status" for name in tool_names), tool_names
     assert "mcp__aqla__monthly_report" in tool_names
     assert "mcp__aqla__ranking_status" in tool_names
-    assert "mcp__sheets__publish_monthly_internal" not in tool_names
+    assert "mcp__aqla__publish_monthly_internal" not in tool_names
     from model_tools import get_available_toolsets
     available_toolsets = get_available_toolsets()
     print("MCP toolsets:", [name for name in available_toolsets if "mcp" in name or "aqla" in name])
@@ -206,7 +205,7 @@ create_server(settings, state=state, exchange=exchange).run(transport="stdio")
                     assert receipts, "Classification must receive a receipt from actual source_context output"
                     parameters["source_read_receipt"] = receipts[-1]
                 available = [tool["function"]["name"] for tool in tools]
-                target = suffix if suffix in ("skill_manage", "todo_list", "session_search", "clarify") else ("mcp__sheets__" if suffix.startswith("journal_") else "mcp__aqla__") + suffix
+                target = suffix if suffix in ("skill_manage", "todo_list", "session_search", "clarify") else "mcp__aqla__" + suffix
                 direct = next((name for name in available if name == target), None)
                 if direct:
                     name = direct
@@ -245,12 +244,12 @@ create_server(settings, state=state, exchange=exchange).run(transport="stdio")
         from gateway.session import SessionSource, SessionStore
         from run_agent import AIAgent
 
-        assert (await extension.mcp_call("sheets", "journal_status", {}))["enabled"] is False
+        assert (await extension.mcp_call("aqla", "journal_status", {}))["enabled"] is True
 
         source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="12345")
         store = SessionStore(destination / "hermes-home" / "sessions", GatewayConfig())
         agent = AIAgent(model="qa-model", provider="custom", base_url=f"http://127.0.0.1:{model.server_port}/v1", api_key="local-test-only",
-                        platform="telegram", enabled_toolsets=["skills", "clarify", "todo", "session_search", *[name for name in available_toolsets if name in ("mcp-aqla", "mcp-sheets")]], max_iterations=24, session_db=store._db,
+                        platform="telegram", enabled_toolsets=["skills", "clarify", "todo", "session_search", *[name for name in available_toolsets if name in ("mcp-aqla")]], max_iterations=24, session_db=store._db,
                         clarify_callback=lambda questions: {"answers": {question["id"]: "Standard" for question in questions}, "outcome": "submitted"},
                         skip_memory=True, skip_background_review=True, quiet_mode=True, save_trajectories=False)
 
@@ -278,16 +277,16 @@ create_server(settings, state=state, exchange=exchange).run(transport="stdio")
         from gateway.run_turn import GatewayTurnMixin
         from model_tools import get_tool_definitions
 
-        gateway._resolve_enabled_toolsets_for_source = lambda *_: ["skills", "clarify", "todo", "session_search", "mcp-aqla", "mcp-sheets"]
+        gateway._resolve_enabled_toolsets_for_source = lambda *_: ["skills", "clarify", "todo", "session_search", "mcp-aqla"]
         with extension.claim_scope(("source", "schema-probe")):
             enabled, disabled = GatewayTurnMixin._resolve_turn_toolsets(gateway, {}, source, "telegram")
             assert enabled == ["aqla-source"]
             selected_names = {row["function"]["name"] for row in get_tool_definitions(enabled, disabled, quiet_mode=True, skip_tool_search_assembly=True)}
             assert {"mcp__aqla__source_context_batch", "mcp__aqla__interpret_source_batch", "aqla_read_tool_result"} <= selected_names
-            assert not {"mcp__aqla__control", "mcp__sheets__journal_read", "clarify", "skill_manage"} & selected_names
+            assert not {"mcp__aqla__control", "mcp__aqla__journal_read", "clarify", "skill_manage"} & selected_names
         with extension.claim_scope(("operator", "schema-probe")):
             enabled, _ = GatewayTurnMixin._resolve_turn_toolsets(gateway, {}, source, "telegram")
-            assert "skills" in enabled and "mcp-sheets" in enabled
+            assert "skills" in enabled and "mcp-aqla" in enabled
         from aqla_agent.usage_metrics import RUN, UsageRun
         aggregate = UsageRun(args.mode)
         metrics_token = RUN.set(aggregate)
@@ -317,7 +316,7 @@ create_server(settings, state=state, exchange=exchange).run(transport="stdio")
         if args.mode == "owner":
             assert data["policy"]["risk_percent"] == "0.75"
             assert data["source_names"] == {"-100123": "VIP Gold"}
-            assert data["monthly_requests"] == ["2026-10"]
+            assert not data.get("monthly_requests")  # Local monthly reads have no publication side effect.
             assert data["profiles"]["backup"]["parameters"]["fallback_stop_loss_percent"] == "1"
             assert data["policy"]["take_profit_allocation"] == "adaptive" and data["policy"]["stop_management"] == "tp_ladder"
             assert data["ranking_policy"]["factors"]["B"] == "1.2" and data["ranking_revision"] == 2

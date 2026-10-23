@@ -27,7 +27,7 @@ def software_hash():
     root = Path(__file__).parent
     files = [root / name for name in ("waverider.py", "waverider_replay.py", "managed_entries.py", "trading.py", "entry.py", "inventory_stream.py",
         "entry_watch.py", "pipelines.py", "monthly.py", "percent_targets.py",
-        "account_work.py", "management_sequences.py", "interpretation_contract.py", "source_candidates.py", "semantic_contract.py", "conflict_review.py", "target_recovery.py")]
+        "account_work.py", "management_sequences.py", "operator_management.py", "interpretation_contract.py", "source_candidates.py", "semantic_contract.py", "conflict_review.py", "target_recovery.py")]
     files += [root.parent / "aqla_hyperliquid_mcp" / name for name in ("models.py", "rules.py", "api.py", "streams.py", "state.py", "storage.py")]
     return digest({path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in files})
 
@@ -361,6 +361,8 @@ async def tick(engine, trade_id, quote):
     if ended(plan, trade, quote):
         state.update(finished=True, phase="finished", reason="Configured TP or original signal deadline reached")
         engine._patch(trade_id, waverider=state)
+        return
+    if trade.get("waverider_paused"):
         return
     authority = live_authority(engine, plan)
     permitted = authority is not None

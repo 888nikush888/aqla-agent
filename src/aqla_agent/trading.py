@@ -150,9 +150,7 @@ class Trading:
                 protected_events.add(pending["event_id"])
                 protected_events.update(pending["source_revisions"].values())
                 protected_refs.update(pending["source_revisions"])
-        protected_events.update(key.removeprefix("Signale:") for key in state.get("journal_pending", {}) if key.startswith("Signale:"))
-        # State.update enqueues journal changes after this callback, in the same write.
-        if self.state.journal_enabled and inserted_event:
+        if inserted_event:
             protected_events.add(inserted_event)
         by_chat = {}
         for row in state["events"].values():
@@ -1685,7 +1683,11 @@ class Trading:
         if phase not in STOP_UPDATE_ACTIVE:
             trade.setdefault("stop_update_history", {})[request.operation_id] = saved
         status = "needs_reconciliation" if phase in STOP_UPDATE_ACTIVE else "updated" if phase == "confirmed" else "superseded" if phase == "superseded" else "rejected"
-        data["events"][request.event_id].update(status=status, stop_update_reason=reason)
+        if request.event_id.startswith("operator:"):
+            data["operator_requests"][request.event_id].update(status="pending" if phase in STOP_UPDATE_ACTIVE else "done" if phase == "confirmed" else "superseded" if phase in ("superseded", "closed_without_application") else "rejected",
+                                                             stop_update_reason=reason)
+        else:
+            data["events"][request.event_id].update(status=status, stop_update_reason=reason)
         identity = "stop-update:" + digest([request.operation_id, phase, reason])[:32]
         data["notifications"].setdefault(identity, {"trade_id": trade_id, "event_id": request.event_id,
             "stop_update": saved, "observed_at": now_ms()})

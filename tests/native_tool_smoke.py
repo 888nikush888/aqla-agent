@@ -314,7 +314,7 @@ async def verify_scripted_agent(extension, runner, source, event, body):
     threading.Thread(target=model.serve_forever, daemon=True).start()
     session = runner.session_store.get_or_create_session(source)
     agent = AIAgent(model="qa-model", provider="custom", base_url=f"http://127.0.0.1:{model.server_port}/v1", api_key="local-test-only",
-        platform="telegram", enabled_toolsets=["skills", "clarify", "todo", "session_search", "mcp-aqla", "mcp-sheets"],
+        platform="telegram", enabled_toolsets=["skills", "clarify", "todo", "session_search", "mcp-aqla"],
         session_id=session.session_id, session_db=runner.session_store._db, max_iterations=80,
         skip_memory=True, skip_background_review=True, quiet_mode=True, save_trajectories=False)
     try:

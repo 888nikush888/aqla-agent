@@ -122,7 +122,7 @@ def install(replace):
 
     def summarize_result(tool_name, tool_args, tool_content):
         capture = CAPTURE.get()
-        if (capture and owned_profile() and tool_name.startswith(("mcp__aqla__", "mcp__sheets__"))
+        if (capture and owned_profile() and tool_name.startswith(("mcp__aqla__",))
                 and isinstance(tool_content, str) and len(tool_content) > 8000):
             try:
                 identity = OutputStore(capture[2]).save(tool_content, capture[0], "history:" + tool_name)

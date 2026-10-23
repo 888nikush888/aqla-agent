@@ -11,6 +11,24 @@ from aqla_hyperliquid_mcp.models import digest
 CLOCK = millis("2026-10-09T12:00:00+02:00")
 
 
+def test_daily_and_multiday_periods_use_berlin_calendar_and_preserve_scope():
+    value = state_data(trade(close="2026-10-09T01:00:00+02:00"), trade("older", close="2026-10-06T12:00:00+02:00"))
+    today = build_presentation(value, {"period": "today"}, clock=CLOCK)
+    week = build_presentation(value, {"period": "7d"}, clock=CLOCK)
+    assert today.evaluated_trades == 1 and week.evaluated_trades == 2
+    assert today.period_start == millis("2026-10-09T00:00:00+02:00")
+    assert today.period_end_exclusive == millis("2026-10-10T00:00:00+02:00")
+
+
+def test_internal_dashboard_projection_has_no_external_snapshot_transport_limit(monkeypatch):
+    monkeypatch.setattr("aqla_agent.presentation.MAX_PRESENTATION_BYTES", 1)
+    value = state_data(trade())
+    with pytest.raises(ValueError, match="transport budget"):
+        build_presentation(value, clock=CLOCK)
+    snapshot = build_presentation(value, clock=CLOCK, transport_budget=False)
+    assert snapshot.complete_trades == 1 and snapshot.net_pnl.value is not None
+
+
 def state_data(*trades):
     result = data(*trades)
     result.update(network="testnet", account="ci-primary", trading_account="ci-primary", sequence=12,

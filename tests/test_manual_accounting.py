@@ -8,13 +8,13 @@ from test_conflict_auto import foreign_fill, native_entry
 from test_operator_recovery import conflicted, terminal_orders
 
 from aqla_agent.funding import payment
+from aqla_agent.journal import HEADERS, project
 from aqla_agent.manual_accounting import verified_manual_accounting
 from aqla_agent.monthly import report_row
 from aqla_agent.presentation import PresentationScope, build_presentation
 from aqla_agent.reporting import Reporting
 from aqla_agent.router import Router
 from aqla_hyperliquid_mcp.models import AqlaError, now_ms
-from aqla_sheets_mcp.journal import HEADERS, acknowledge, batch, project, record
 
 
 async def manual_trade(setup, signal, monkeypatch, *, mixed=False):
@@ -75,9 +75,6 @@ async def test_manual_pnl_is_evidence_bound_and_reaches_trade_fill_and_visible_j
     assert native['signed_size'] == payments[0]['signed_size']
     projected = project(snapshot)
     assert projected == journal_oracle.project(snapshot)
-    snapshot['journal_pending'] = {key: row['fingerprint'] for key, row in projected.items()
-                                   if row['table'] in ('Trades', 'Orders', 'Fills', 'Vorgänge')}
-    assert batch(snapshot, 500) == journal_oracle.batch(snapshot, 500)
     row = dict(zip(HEADERS['Trades'], projected['Trades:' + identity]['values'], strict=True))
     assert row['PnL realisiert vor Gebühren/Funding'] == float(own * 10)
     assert row['Gebühren USD'] == float(fees)
@@ -172,25 +169,4 @@ async def test_manual_accounting_cannot_outlive_changed_bound_evidence(setup, si
     assert not verified_manual_accounting(snapshot['trades'][identity])
     projected = project(snapshot)
     assert projected == journal_oracle.project(snapshot)
-    snapshot['journal_pending'] = {key: row['fingerprint'] for key, row in projected.items()
-                                   if row['table'] in ('Trades', 'Orders', 'Fills', 'Vorgänge')}
-    assert batch(snapshot, 500) == journal_oracle.batch(snapshot, 500)
-    await reporting.router.close()
-
-
-@pytest.mark.asyncio
-async def test_financial_correction_publishes_before_historical_backlog_and_preserves_audit_delivery(setup, signal, monkeypatch):
-    state, _, identity, reporting, _ = await manual_trade(setup, signal, monkeypatch)
-    await reporting.refresh(identity)
-    data = state.snapshot()
-    financial = project(data)['Trades:' + identity]
-    audit = record('Ereignisse', 'old-audit', 'now', 1, 'Trades', identity, 'before', 'after')
-    data['journal_history'] = {'old-audit': audit}
-    data['journal_pending'] = {'Ereignisse:old-audit': audit['fingerprint'], 'Trades:' + identity: financial['fingerprint']}
-    first = batch(data, 1)['records']
-    assert len(first) == 1 and first[0]['table'] == 'Trades'
-    acknowledge(data, {'Trades:' + identity: financial['fingerprint']})
-    second = batch(data, 1)['records']
-    assert len(second) == 1 and second[0]['table'] == 'Ereignisse'
-    assert second[0]['fingerprint'] == audit['fingerprint']
     await reporting.router.close()

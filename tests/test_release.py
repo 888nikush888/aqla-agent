@@ -199,7 +199,7 @@ def test_windows_junction_output_and_cache_before_use(release_project, tmp_path,
         link.rmdir()
 
 
-@pytest.mark.parametrize("name", ["src", "scripts", "README.md"])
+@pytest.mark.parametrize("name", ["src", "hermes_plugin", "README.md"])
 def test_missing_or_nonregular_allowlist_before_traversal(release_project, tmp_path, monkeypatch, name):
     path = release_project / name
     if path.is_dir():
@@ -246,7 +246,7 @@ def test_lexical_parent_segments(release_project, tmp_path, where):
         build(root, output)
 
 
-@pytest.mark.parametrize("name", ["src/out.zip", "tests/nested/out.zip", "README.md"])
+@pytest.mark.parametrize("name", ["src/out.zip", "hermes_plugin/nested/out.zip", "README.md"])
 def test_output_inside_shipping_tree(release_project, name):
     with pytest.raises(ValueError, match="Output overlaps"):
         build(release_project, release_project / name)
@@ -258,7 +258,7 @@ def test_non_zip_output_before_filesystem_use(release_project, tmp_path, monkeyp
         build(release_project, tmp_path / "out.tar")
 
 
-@pytest.mark.parametrize("name", ["src/.env", "tests/local.sqlite3", "docs/local.db", "scripts/state.json.lock", "skills/setup.initialized"])
+@pytest.mark.parametrize("name", ["src/.env", "src/local.sqlite3", "docs/local.db", "hermes_plugin/state.json.lock", "skills/setup.initialized"])
 def test_synthetic_local_state_before_archive_open(release_project, tmp_path, monkeypatch, name):
     (release_project / name).write_text("synthetic forbidden sentinel", encoding="utf-8")
     monkeypatch.setattr(release.zipfile, "ZipFile", lambda *args, **kwargs: pytest.fail("Archive opened before all members were validated"))
@@ -270,7 +270,7 @@ def test_synthetic_local_state_before_archive_open(release_project, tmp_path, mo
 
 def test_synthetic_local_state_with_previous_pair_before_archive_open(release_project, tmp_path, monkeypatch):
     output, sha, previous = _previous_pair(release_project, tmp_path)
-    (release_project / "tests/local.sqlite3").write_text("synthetic forbidden sentinel", encoding="utf-8")
+    (release_project / "src/local.sqlite3").write_text("synthetic forbidden sentinel", encoding="utf-8")
     monkeypatch.setattr(release.zipfile, "ZipFile", lambda *args, **kwargs: pytest.fail("Existing archive opened before source validation"))
     monkeypatch.setattr(release, "_read_source", lambda *args: pytest.fail("Existing pair read before source validation"))
     with pytest.raises(ValueError, match="Unsafe artifact member"):
@@ -284,7 +284,7 @@ def test_cli_returns_nonzero_without_success_json_for_forbidden_source(release_p
     package.mkdir()
     for name in ("__init__.py", "release.py", "artifact_rules.py"):
         (package / name).write_bytes((ROOT / "src/aqla_agent" / name).read_bytes())
-    (release_project / "tests/local.sqlite3").write_text("synthetic forbidden sentinel", encoding="utf-8")
+    (release_project / "src/local.sqlite3").write_text("synthetic forbidden sentinel", encoding="utf-8")
     if pythonpath == "unset":
         monkeypatch.delenv("PYTHONPATH", raising=False)
     elif pythonpath == "reversed":
@@ -304,6 +304,7 @@ def test_preserves_all_allowed_source_assets(tmp_path):
     tracked = subprocess.run(["git", "ls-files", "-z", "--", *release.SHIPPING_DIRS, *release.SHIPPING_FILES], cwd=ROOT, check=True, capture_output=True).stdout.decode().split("\0")
     expected = {"aqla-agent/" + name for name in tracked if name}
     expected.add("aqla-agent/src/aqla_agent/artifact_rules.py")
+    expected.add("aqla-agent/CONTENTS.sha256")
     with zipfile.ZipFile(result["archive"]) as archive:
         assert set(archive.namelist()) == expected
     assert result["files"] == len(expected)
@@ -493,7 +494,8 @@ def test_release_archive_has_source_and_deployment_assets_but_no_local_state_or_
         assert "aqla-agent/README.md" in names
         assert "aqla-agent/skills/aqla-master/SKILL.md" in names
         assert "aqla-agent/docs/api-coverage.md" in names
-        assert "aqla-agent/scripts/verify_artifacts.py" in names
+        assert "aqla-agent/CONTENTS.sha256" in names
+        assert not any(name.startswith(("aqla-agent/tests/", "aqla-agent/scripts/", "aqla-agent/plans/")) for name in names)
         assert "aqla-agent/hermes-runtime-overrides.txt" in names
         assert "aqla-agent/.gitleaks.toml" in names
         assert not any(".cache/" in name or ".venv/" in name or "data/state" in name or name.endswith((".secret", ".session", ".env")) for name in names)

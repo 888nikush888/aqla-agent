@@ -82,7 +82,7 @@ def main():
         assert first.success and '*Trade eröffnet*' in delivered[0]['text']
         assert '\\[' not in delivered[0]['text'].split('**Quelle**')[0]  # Name is native inline code.
         sent = await adapter.send('12345', monthly, metadata={'notify': True})
-        assert sent.success and '*Monatsbericht' in delivered[-1]['text'] and 'gid=1' in delivered[-1]['text']
+        assert sent.success and '*Monatsbericht' in delivered[-1]['text'] and '/aqla' in delivered[-1]['text'] and 'gid=1' not in delivered[-1]['text']
         for message in (entry_card, closed_card):
             sent = await adapter.send('12345', message, metadata={'notify': True})
             assert sent.success

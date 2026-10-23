@@ -33,9 +33,9 @@ def test_deployment_is_separate_and_has_native_hermes_transport(tmp_path):
     assert config["compression"]["proactive_prune_tokens"] == 48000
     assert config["plugins"]["entries"]["aqla-events"]["settings"]["owner_id"] == "12345"
     assert config["mcp_servers"]["aqla"]["command"].startswith(str(target))
-    assert config["mcp_servers"]["sheets"]["args"][1] == "aqla_sheets_mcp"
-    assert config["mcp_servers"]["sheets"]["tools"]["exclude"] == [
-        "sync_internal", "publish_monthly_internal", "sync_presentation_internal", "presentation_selection_internal"]
+    assert set(config["mcp_servers"]) == {"aqla"}
+    assert config["display"]["long_running_notifications"] is False
+    assert config["platforms"]["telegram"]["gateway_restart_notification"] is False
     assert (target / "hermes-home" / "skills" / "aqla-master" / "SKILL.md").exists()
     assert "aqla_agent.hermes_runtime" in (target / "aqla-agent.service").read_text()
     assert "TimeoutStopSec=90" in (target / "aqla-agent.service").read_text()
@@ -59,7 +59,8 @@ def test_cli_new_install_defaults_to_deepseek_flash_high(tmp_path, monkeypatch):
     assert config["plugins"]["entries"]["aqla-events"]["settings"]["source_processing"] == {"mode": "legacy"}
     assert "openrouter" not in yaml.safe_dump(config).lower()
     assert "OPENROUTER" not in (target / "vps.env").read_text()
-    assert (target / "src" / "aqla_sheets_mcp" / "parameters.py").is_file()
+    assert (target / "src" / "aqla_agent" / "journal.py").is_file()
+    assert not (target / "src" / "aqla_sheets_mcp").exists()
 
 
 def test_linux_install_uses_separate_managed_interpreters_and_pinned_hermes(tmp_path, monkeypatch):
@@ -70,7 +71,7 @@ def test_linux_install_uses_separate_managed_interpreters_and_pinned_hermes(tmp_
         commands.append((args, kwargs))
     monkeypatch.setattr(install.subprocess, "run", run)
     install.install_runtime(tmp_path)
-    assert commands[0][0] == ["uv", "sync", "--frozen", "--extra", "sources", "--extra", "sheets", "--python", "3.12", "--python-preference", "only-managed"]
+    assert commands[0][0] == ["uv", "sync", "--frozen", "--extra", "sources", "--python", "3.12", "--python-preference", "only-managed"]
     assert any("3.14" in args and "only-managed" in args for args, _ in commands)
     assert any(args[-1] == install.HERMES_COMMIT and "--detach" in args for args, _ in commands)
     assert all(options["env"]["UV_PYTHON_INSTALL_DIR"] == str(tmp_path / ".python") for _, options in commands)

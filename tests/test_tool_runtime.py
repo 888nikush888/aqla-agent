@@ -11,7 +11,7 @@ def test_monthly_pre_hook_normalizes_before_publication(extension, raw, expected
     ctx.call_mcp = lambda *args: calls.append(args) or {"ok": True}
     with ext.claim_scope(("operator", "fresh")):
         result = ext.before_tool("mcp__aqla__monthly_report", {"month": "2026-10", "diagnostics_only": raw})
-        assert bool(calls) is (not expected)
+        assert not calls  # Local monthly reads no longer request an external publication.
         if isinstance(raw, str):
             assert result["args"]["diagnostics_only"] is expected
 

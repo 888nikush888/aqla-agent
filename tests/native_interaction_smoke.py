@@ -151,23 +151,23 @@ def main():
             assert 'Profil A' in json.dumps(reply),reply
             assert extension.turn_claim.get().can_change()
             extension.before_tool('mcp_aqla_monthly_report',{'month':'2026-10'})
-            assert requests==['2026-10']
+            assert requests==[]
         assert cards and len(cards[0][1].inline_keyboard)==3
         with extension.claim_scope(('source','channel-message')):
             assert all(extension.before_tool(name,{})['action']=='block' for name in ('clarify','todo_list','session_search'))
             extension.before_tool('mcp_aqla_monthly_report',{'month':'2026-10'})
-            assert requests==['2026-10']
+            assert requests==[]
         runner._ask_clarify_question=lambda *args,**kwargs:('[user did not respond]',False)
         with extension.claim_scope(('operator','timeout-question')):
             clarify_tool([{'question':'Welches Profil?','choices':['Profil A','Profil B']}],callback=runner._clarify_callback_sync)
             assert not extension.turn_claim.get().can_change()
             extension.before_tool('mcp_aqla_monthly_report',{'month':'2026-10'})
-            assert requests==['2026-10']
+            assert requests==[]
         with extension.claim_scope(('operator','fresh-month-request')):
             extension.before_tool('mcp_aqla_monthly_report',{'month':'2026-10','diagnostics_only':True})
-            assert requests==['2026-10']
+            assert requests==[]
             extension.before_tool('mcp_aqla_monthly_report',{'month':'2026-10'})
-            assert requests==['2026-10','2026-10']
+            assert requests==[]
         extension.session_key='owner'
         pending=clarify_gateway.register('question-2','owner','Risk?',None)
         started=threading.Event()

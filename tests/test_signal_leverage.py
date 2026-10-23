@@ -195,7 +195,7 @@ def test_signal_plan_cannot_replace_capped_leverage_with_another_number(signal):
 
 
 def test_parameter_page_names_signal_mode_and_does_not_present_fixed_value_as_active(setup):
-    from aqla_sheets_mcp.journal import project
+    from aqla_agent.journal import project
     _, state, *_ = setup
     data = state.snapshot()
     data["policy"]["leverage_mode"] = "signal"

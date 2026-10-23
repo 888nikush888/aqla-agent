@@ -417,7 +417,7 @@ def lifecycle_block(data, event):
     return "\n\n".join(lines)
 
 
-def status_text(data, exchanges, sheets_enabled, inventory):
+def status_text(data, exchanges, inventory):
     active = [row for row in data["trades"].values() if row["status"] in OPEN]
     from .source_queue import queue_overview
     source_queue = queue_overview(data)
@@ -433,8 +433,7 @@ def status_text(data, exchanges, sheets_enabled, inventory):
     lines.append(f"**Belegte eigene offene Positionen:** {counts['known_own_open']} · **Entries ausstehend:** {counts['pending_entries']} · **Eigene Position ungeklärt:** {counts['unsettled_ownership']}\n"
                  f"**Aktive Trade-Vorgänge:** {len(active)} · **Ausstehende Quellen:** {pending} · **Blockierte Quellen:** {source_queue['blocked_total']}\n"
                  f"**Quellen-Recovery:** {source_queue['recovery_source_total']} · **Ungeklärte Vorgänge:** {unknown}\nBasis: gespeicherte eigene Fills; Gesamtbestand der Börsenkonten separat.")
-    queue = len(data.get("journal_pending", {}))
-    lines.append("**Sheets:** " + ("deaktiviert" if not sheets_enabled else f"{queue} Übertragungen ausstehend" if queue else "Journal synchronisiert"))
+    lines.append("**Journal:** lokal gespeichert · /aqla")
     for venue, row in inventory.items():
         if not row.get('available'):
             lines.append(f"**{VENUES.get(venue, venue)}-Konto:** vollständige Übersicht nicht verfügbar")
@@ -463,8 +462,7 @@ def monthly_message(report):
     if undated:
         lines.append(f'**Ohne belegten Schließmonat:** {undated} · keiner Summe zugeordnet')
     lines += ["ROE auf berechnete Anfangsmargin, einschließlich belegter Gebühren und Funding."]
-    if report.get("url"):
-        lines.append("[Vollständige Trade-Tabelle](" + report["url"] + ")")
+    lines.append("Details: /aqla → Journal & Berichte")
     return "\n\n".join(lines)
 
 
@@ -489,7 +487,7 @@ def summary_block(notice):
     return "\n\n".join(lines)
 
 
-def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None, notification_versions=None, include_status=True):
+def telegram_view(data, exchanges, *, inventory=None, notification_versions=None, include_status=True):
     from aqla_hyperliquid_mcp.models import digest
 
     from .notifications import notification_sort_key
@@ -602,5 +600,5 @@ def telegram_view(data, exchanges, *, sheets_enabled=True, inventory=None, notif
     for message in messages:
         message["notification_versions"] = {identity: notification_versions[identity] if notification_versions is not None else digest(notifications[identity])
                                             for identity in message["notification_ids"]}
-    return {"status": split_blocks(status_text(data, exchanges, sheets_enabled, inventory or {})) if include_status else [], "messages": messages,
+    return {"status": split_blocks(status_text(data, exchanges, inventory or {})) if include_status else [], "messages": messages,
             "remaining_notification_ids": [identity for identity in notifications if identity not in chosen]}

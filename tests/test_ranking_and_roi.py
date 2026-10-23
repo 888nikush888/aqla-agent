@@ -536,7 +536,7 @@ def test_rank_roi_fallback_telegram_and_rank_change_are_durable_facts():
     snapshot = rank_data()
     snapshot.update(events={}, operations={}, paused=False)
     snapshot["notifications"]["rank:a"] = {"rank_change": {"source_id": "channel", "old": "F", "new": "E", "network": "testnet", "metrics": {"score": "95", "drawdown_r": "0"}}}
-    view = telegram_view(snapshot, {}, sheets_enabled=False)
+    view = telegram_view(snapshot, {})
     assert view["messages"][0]["notification_ids"] == ["rank:a"] and "F → E" in view["messages"][0]["texts"][0]
 
 

@@ -6,13 +6,14 @@ import threading
 
 import portalocker
 
-from .models import AqlaError, Settings, digest
+from .models import AqlaError, Settings
 from .storage import SQLiteStore, database_path, read_snapshot
 
 METADATA_ROOTS = {"nonces": dict, "account_nonces": dict, "venue_nonces": dict, "cursors": dict,
                   "notifications": dict, "monthly_jobs": dict, "monthly_requests": list,
                   "monthly_request_generations": dict, "monthly_reports": dict,
-                  "source_jobs": dict, "notification_outbox": dict, "source_status": dict}
+                  "source_jobs": dict, "notification_outbox": dict, "source_status": dict,
+                  "notice_history": dict, "notice_policy_state": dict, "monthly_notified": dict}
 
 
 class State:
@@ -21,7 +22,6 @@ class State:
     def __init__(self, settings: Settings):
         self.path = database_path(settings.state_path)
         self._store = None
-        self.journal_enabled = settings.google_sheets.enabled
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._thread_lock = threading.RLock()
         self._lock = portalocker.Lock(str(self.path) + ".lock", timeout=0)
@@ -79,16 +79,14 @@ class State:
             if not existing and not legacy_path.exists():
                 for row in self.data["source_ranks"].values():
                     row.update(tier="F", bootstrap=False)
-            if self.journal_enabled:
-                from aqla_sheets_mcp.journal import seed
-                seed(self.data, destination=digest({"spreadsheet": settings.google_sheets.spreadsheet_id,
-                    "namespace": settings.google_sheets.tab_namespace, "network": settings.network, "account": target,
-                    "ranking": settings.ranking_enabled, "accounts": self.data.get("venue_accounts", {}),
-                    "execution_accounts": {key: {"network": row.network,
-                        "account": getattr(row, "vault_address", None) or row.account or ""}
-                        for key, row in settings.execution_accounts.items()}}))
+            from aqla_agent.journal import retire_export_queue
+            migrated = retire_export_queue(self.data) or migrated
+            if "notice_policy_state" not in self.data:
+                self.data["notice_policy_state"] = {"seen_fills": [trade_id + ":" + key
+                    for trade_id, trade in self.data["trades"].items() for key in trade.get("fill_events", {})]}
+                migrated = True
             self._store = SQLiteStore(self.path, create=not existing)
-            if not existing or migrated or legacy or self.journal_enabled:
+            if not existing or migrated or legacy:
                 self._write(self.data)
             self._store.seal()
             from aqla_agent.source_queue import repair_queue
@@ -133,10 +131,6 @@ class State:
         else:
             self._store.save(data)
 
-    def _initialize_journal_roots(self, proposed):
-        if self.journal_enabled:
-            proposed.setdefault("journal_pending", {})
-            proposed.setdefault("journal_history", {})
 
     def snapshot(self):
         with self._thread_lock:
@@ -223,16 +217,10 @@ class State:
             if conditional and all(normalized[root] == self.data.get(root, METADATA_ROOTS[root]()) for root in roots):
                 return copy.deepcopy(result)
             proposed = {**self.data, **normalized, "sequence": self.data["sequence"] + 1}
-            self._initialize_journal_roots(proposed)
             self._write(proposed)
             self.data = proposed
             return copy.deepcopy(result)
 
-    def journal_batch(self, limit=100):
-        from aqla_sheets_mcp.journal import batch
-
-        with self._thread_lock:
-            return copy.deepcopy(batch(self.data, limit))
 
     def notification_page(self, key, *, cursor=None, limit=100, view="full"):
         from aqla_agent.notifications import notification_page
@@ -253,57 +241,7 @@ class State:
         with self._thread_lock:
             return copy.deepcopy(reader_overview(self.data, max_context_messages))
 
-    def acknowledge_journal(self, accepted):
-        """The only partial path allowed to release digest-confirmed history rows."""
-        from aqla_sheets_mcp.journal import acknowledge
 
-        if not isinstance(accepted, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in accepted.items()):
-            raise AqlaError("Journal acknowledgements require record keys and fingerprint strings")
-        with self._thread_lock:
-            proposed = dict(self.data)
-            for root in ("journal_pending", "journal_history"):
-                if root in self.data:
-                    proposed[root] = dict(self.data[root])
-            result = acknowledge(proposed, accepted)
-            proposed["sequence"] = self.data["sequence"] + 1
-            self._initialize_journal_roots(proposed)
-            self._write(proposed)
-            self.data = proposed
-            return copy.deepcopy(result)
-
-    def monthly_transaction(self, action, **arguments):
-        """Fixed job operations inspect current financial evidence under the lock."""
-        from aqla_agent.monthly import (
-            acknowledge_publication,
-            fail_publication,
-            monthly_page,
-            next_job,
-            request_publication,
-        )
-
-        functions = {"job": next_job, "page": monthly_page, "failure": fail_publication,
-                     "request": request_publication, "ack": acknowledge_publication}
-        if action not in functions:
-            raise AqlaError("Unknown partial monthly job operation")
-        roots = ("monthly_jobs", "monthly_requests", "monthly_request_generations")
-        if action == "ack":
-            roots += ("monthly_reports", "notifications")
-        with self._thread_lock:
-            proposed = dict(self.data)
-            for root in roots:
-                if root in proposed:
-                    proposed[root] = copy.deepcopy(proposed[root])
-            # These reviewed builtins only read financial roots and mutate job roots.
-            # No arbitrary callback receives shared financial data through this API.
-            result = functions[action](proposed, **copy.deepcopy(arguments))
-            changed = {root: proposed[root] for root in roots if root in proposed}
-            normalized = json.loads(json.dumps(changed, allow_nan=False))
-            proposed.update(normalized)
-            proposed["sequence"] = self.data["sequence"] + 1
-            self._initialize_journal_roots(proposed)
-            self._write(proposed)
-            self.data = proposed
-            return copy.deepcopy(result)
 
     def update(self, callback):
         return self._update(callback, conditional=False)
@@ -319,9 +257,8 @@ class State:
             if conditional and json.dumps(proposed, allow_nan=False) == json.dumps(self.data, allow_nan=False):
                 return copy.deepcopy(result)
             proposed["sequence"] += 1
-            if self.journal_enabled:
-                from aqla_sheets_mcp.journal import enqueue_changes
-                enqueue_changes(self.data, proposed)
+            from aqla_agent.journal import archive_replaced_orders
+            archive_replaced_orders(self.data, proposed)
             proposed = json.loads(json.dumps(proposed, allow_nan=False))
             self._write(proposed)
             self.data = proposed

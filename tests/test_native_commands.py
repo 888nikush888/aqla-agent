@@ -248,7 +248,7 @@ async def test_rank_limits_pause_resume_and_read_commands(controls):
     for command in ("aqla_status", "aqla_kanaele", "aqla_profile", "aqla_journal"):
         assert await commands.intercept(update("/" + command), bot)
     rendered = "\n".join(row["text"] for row in bot.sent)
-    assert "synthetic-configured-book-id" in rendered and "Nachweise" in rendered and "leverage:" in rendered
+    assert "lokal in SQLite" in rendered and "Nachweise" in rendered and "leverage:" in rendered
     assert "Setup:" in rendered and "letzter Sync:" in rendered
     assert len(mutations) == 5
 

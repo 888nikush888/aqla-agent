@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from aqla_hyperliquid_mcp.models import AqlaError, GoogleSheetsSettings, Settings, SourceEvent, digest
+from aqla_hyperliquid_mcp.models import AqlaError, Settings, SourceEvent, digest
 from aqla_hyperliquid_mcp.state import State
 from aqla_hyperliquid_mcp.storage import database_path, read_snapshot
 
@@ -103,35 +103,6 @@ def test_json_migration_retains_all_identities_and_original_backup(setup, tmp_pa
         assert resumed.snapshot() == data
 
 
-def test_json_import_with_sheets_preserves_opaque_events_and_exports_valid_sources(setup, tmp_path):
-    from aqla_sheets_mcp.journal import project
-
-    settings, state, *_ = setup
-    data = state.snapshot()
-    source = SourceEvent(chat_id="channel", message_id=7, sent_at=1_800_000_000_000, text="Stored report")
-    data["events"] = {"opaque": {"event_id": "original-opaque-id", "classification": "report"},
-        source.event_id: {"event_id": source.event_id, "source_id": source.source_id,
-                          "source": source.model_dump(mode="json"), "status": "report", "interpretation": None}}
-    data["bindings"] = {"opaque": "historical-trade"}
-    path = tmp_path / "sheets-legacy" / "state.json"
-    path.parent.mkdir()
-    path.write_text(json.dumps(data), encoding="utf-8")
-    original = path.read_bytes()
-    sheets = GoogleSheetsSettings(enabled=True, spreadsheet_id="offline-sheet-" + "0" * 25,
-                                 credentials_file=tmp_path / "not-read.secret")
-    settings = settings.model_copy(update={"state_path": path, "google_sheets": sheets})
-    with State(settings) as migrated:
-        saved = migrated.snapshot()
-        assert saved["events"] == data["events"] and saved["bindings"] == data["bindings"]
-        signals = [row for row in project(saved).values() if row["table"] == "Signale"]
-        assert [row["record_id"] for row in signals] == [source.event_id]
-        assert "Signale:" + source.event_id in saved["journal_pending"]
-        assert "Signale:opaque" not in saved["journal_pending"]
-        assert read_snapshot(migrated.path)["events"] == data["events"]
-    assert path.read_bytes() == original
-    with State(settings) as restarted:
-        assert restarted.snapshot()["events"] == data["events"]
-        assert restarted.snapshot()["bindings"] == data["bindings"]
 
 
 @pytest.mark.asyncio
@@ -257,7 +228,6 @@ def test_selected_read_returns_only_detached_requested_entries(setup):
 
 
 def test_reader_projection_matches_full_snapshot_contract_and_detaches_returned_lists(setup):
-    from aqla_hyperliquid_mcp.models import SourceEvent
 
     _, state, _, _, trading = setup
     for index in range(4):
@@ -311,14 +281,6 @@ def test_reader_projection_uses_linear_grouper_without_copying_unselected_roots(
     del state.data["unselected_reader_test_body"]
 
 
-def test_metadata_commit_and_empty_journal_ack_do_not_project_full_history(setup, monkeypatch):
-    from aqla_sheets_mcp import journal
-
-    _, state, *_ = setup
-    state.journal_enabled = True
-    monkeypatch.setattr(journal, "project", lambda *_: pytest.fail("Metadata used full journal projection"))
-    state.update_metadata(("nonces",), lambda part: part["nonces"].update(scope=123))
-    assert state.acknowledge_journal({}) == {"acknowledged": 0, "pending": 0}
 
 
 def test_conditional_generic_update_preserves_bool_types_order_and_explicit_revisions(setup, monkeypatch):
@@ -337,27 +299,12 @@ def test_conditional_generic_update_preserves_bool_types_order_and_explicit_revi
     assert len(writes) == 4 and list(state.snapshot()["nonces"]) == ["two", "one"]
 
 
-def test_journal_ack_real_sqlite_abort_preserves_ram_disk_and_history(setup):
-    from aqla_sheets_mcp import journal
-
-    _, state, *_ = setup
-    state.journal_enabled = True
-    state.update(lambda data: data.update(paused=True))
-    before = state.snapshot()
-    delivered = state.journal_batch(500)["records"]
-    accepted = {journal.record_key(row): row["fingerprint"] for row in delivered}
-    assert before["journal_history"]
-    state._store.connection.execute("CREATE TRIGGER deny_ack BEFORE UPDATE ON state BEGIN SELECT RAISE(ABORT, 'ack rejected'); END")
-    with pytest.raises(AqlaError, match="Durable state write failed"):
-        state.acknowledge_journal(accepted)
-    assert state.snapshot() == read_snapshot(state.path) == before
 
 
 def test_actual_nonce_uses_detached_metadata_and_keeps_persistence_before_send(setup, monkeypatch):
-    from aqla_sheets_mcp import journal
+    from aqla_agent import journal
 
     _, state, fake, exchange, _ = setup
-    state.journal_enabled = True
     monkeypatch.setattr(journal, "project", lambda *_: pytest.fail("Actual nonce used complete journal projection"))
     nonce = exchange._nonce()
     assert state.snapshot() == read_snapshot(state.path)
@@ -400,57 +347,8 @@ def test_scoped_nonce_matches_generic_metadata_and_selected_view_is_detached(set
     assert state.snapshot() == expected
 
 
-@pytest.mark.parametrize("action", ["job", "request", "failure", "page", "ack"])
-def test_fixed_monthly_transaction_whole_state_matches_generic_and_rechecks_financial_binding(setup, monkeypatch, action):
-    import copy
-
-    from oracles import journal_85aa9d7 as oracle
-
-    from aqla_agent import monthly
-    from aqla_sheets_mcp import journal
-
-    _, state, *_ = setup
-    clock = monthly.due_at("2026-10")
-    monkeypatch.setattr(monthly, "now_ms", lambda: clock)
-    monkeypatch.setattr(journal, "now_ms", lambda: clock)
-    monkeypatch.setattr(oracle, "now_ms", lambda: clock)
-    selected = state.monthly_transaction("job")
-    state.journal_enabled = True
-    functions = {"job": monthly.next_job, "request": monthly.request_publication,
-                 "failure": monthly.fail_publication, "page": monthly.monthly_page, "ack": monthly.acknowledge_publication}
-    arguments = {"job": {}, "request": {"month": "2026-09"},
-                 "failure": {"failure": {"job": selected["job"], "error_code": "temporary"}},
-                 "page": {"binding": selected["job"], "section": "rows"},
-                 "ack": {"month": selected["report"]["month"], "fingerprint": selected["report"]["fingerprint"],
-                         "url": "synthetic", "revision": selected["report"]["revision"], "job": selected["job"]}}[action]
-    before = state.snapshot()
-    expected = copy.deepcopy(before)
-    result = functions[action](expected, **arguments)
-    expected["sequence"] += 1
-    oracle.enqueue_changes(before, expected)
-    monkeypatch.setattr(journal, "project", lambda *_: pytest.fail("Fixed monthly metadata projected all journal rows"))
-    assert state.monthly_transaction(action, **arguments) == result
-    assert state.snapshot() == read_snapshot(state.path) == expected
-    with pytest.raises(AqlaError):
-        state.monthly_transaction("unvalidated_callback", callback=lambda data: data.update(trades={}))
-    assert state.snapshot() == expected
 
 
-def test_partial_monthly_job_real_sqlite_abort_and_stale_page_do_not_mutate_finance(setup, monkeypatch):
-    from aqla_agent import monthly
-
-    _, state, *_ = setup
-    monkeypatch.setattr(monthly, "now_ms", lambda: monthly.due_at("2026-10"))
-    selected = state.monthly_transaction("job")
-    state.monthly_transaction("request", month="2026-10")
-    before = state.snapshot()
-    with pytest.raises(AqlaError, match="stale monthly job"):
-        state.monthly_transaction("page", binding=selected["job"], section="rows")
-    assert state.snapshot() == read_snapshot(state.path) == before
-    state._store.connection.execute("CREATE TRIGGER deny_job BEFORE UPDATE ON state BEGIN SELECT RAISE(ABORT, 'job rejected'); END")
-    with pytest.raises(AqlaError, match="Durable state write failed"):
-        state.monthly_transaction("job")
-    assert state.snapshot() == read_snapshot(state.path) == before
 
 
 def test_partial_metadata_actual_process_crash_keeps_committed_sqlite_and_restores(tmp_path):
@@ -485,44 +383,3 @@ os._exit(99)
         resumed._store.connection.execute("DROP TRIGGER crash_metadata")
         resumed.update_metadata(("nonces",), lambda part: part["nonces"].update(scope=19))
         assert resumed.snapshot() == read_snapshot(path)
-
-
-@pytest.mark.asyncio
-async def test_fixed_monthly_builtins_leave_normal_financial_roots_unchanged(setup, signal, tmp_path, monkeypatch):
-    import copy
-
-    import httpx
-
-    from aqla_agent import monthly
-    from aqla_hyperliquid_mcp.api import Hyperliquid
-    from aqla_hyperliquid_mcp.trades import Trading
-
-    settings, _, fake, _, _ = setup
-    selected = settings.model_copy(update={"network": "mainnet", "state_path": tmp_path / "mainnet.sqlite3"})
-    state = State(selected)
-    exchange = Hyperliquid(selected, state, httpx.AsyncClient(base_url=selected.base_url, transport=httpx.MockTransport(fake.handle)))
-    trading = Trading(exchange, state)
-    source, interpretation = signal
-    try:
-        trading.ingest(source)
-        plan = await trading.preview(source.event_id, interpretation)
-        active = await trading.execute(plan["plan_id"])
-        for target in [row for row in active["orders"] if row["kind"] == "tp"]:
-            fake.fill(target["cloid"], target["quantity"], target["price"])
-        await trading.recover()
-        monkeypatch.setattr(monthly, "now_ms", lambda: monthly.due_at("2026-10"))
-        roots = ("trades", "events", "plans", "operations", "bindings", "policy", "profiles", "source_ranks")
-        before = state.read(*roots)
-        shared = {key: state.data[key] for key in roots}
-        job = state.monthly_transaction("job")
-        assert len(job["report"]["rows"]) == 1
-        page = state.monthly_transaction("page", binding=job["job"], section="rows")
-        assert len(page["rows"]) == 1
-        state.monthly_transaction("failure", failure={"job": job["job"], "error_code": "budget"})
-        state.monthly_transaction("request", month="2026-10")
-        assert state.read(*roots) == before == copy.deepcopy(shared)
-        assert all(state.data[key] is shared[key] for key in roots)
-        assert state.snapshot() == read_snapshot(state.path)
-    finally:
-        await exchange.close()
-        state.close()

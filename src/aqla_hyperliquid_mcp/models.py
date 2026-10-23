@@ -14,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     field_serializer,
     field_validator,
     model_serializer,
@@ -117,19 +118,6 @@ class Policy(Model):
         return self
 
 
-class GoogleSheetsSettings(Model):
-    enabled: bool = False
-    spreadsheet_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{20,150}$")
-    credentials_file: Path | None = None
-    sync_interval_seconds: int = Field(default=30, ge=10, le=3600)
-    batch_size: int = Field(default=100, ge=1, le=500)
-    tab_namespace: Literal["legacy", "mainnet", "testnet"] = "legacy"
-
-    @model_validator(mode="after")
-    def configured(self):
-        if self.enabled and (not self.spreadsheet_id or not self.credentials_file):
-            raise ValueError("Enabled Google Sheets requires spreadsheet_id and credentials_file")
-        return self
 
 
 class ExpressSettings(Model):
@@ -145,6 +133,7 @@ class ReplaySettings(Model):
 
 
 class Settings(Model):
+    _configuration_file: Path | None = PrivateAttr(default=None)
     network: Literal["mainnet", "testnet"]
     account: Address
     vault_address: Address | None = None
@@ -163,16 +152,13 @@ class Settings(Model):
     telegram_api_id: int | None = None
     telegram_api_hash_file: Path | None = None
     telegram_owner_id: str | None = None
-    google_sheets: GoogleSheetsSettings = Field(default_factory=GoogleSheetsSettings)
     execution_accounts: dict[Annotated[str, Field(pattern=r"^hyperliquid:(mainnet|testnet)$")], ExecutionSettings] = Field(default_factory=dict)
     ranking_enabled: bool = False
     express: ExpressSettings = Field(default_factory=ExpressSettings)
     waverider_replay: ReplaySettings = Field(default_factory=ReplaySettings)
 
     @model_validator(mode="after")
-    def journal_network(self):
-        if self.google_sheets.tab_namespace not in ("legacy", self.network):
-            raise ValueError("Journal namespace must match its execution network")
+    def execution_networks(self):
         if any(key != "hyperliquid:" + value.network for key, value in self.execution_accounts.items()):
             raise ValueError("Hyperliquid execution account key and network differ")
         return self
@@ -196,14 +182,12 @@ class Settings(Model):
         for name in ("state_path", "private_key_file", "integration_key_file", "setup_password_hash_file", "telegram_session_file", "telegram_api_hash_file"):
             if raw.get(name):
                 raw[name] = str((path.parent / raw[name]).resolve())
-        sheets = raw.get("google_sheets") or {}
-        if sheets.get("credentials_file"):
-            sheets["credentials_file"] = str((path.parent / sheets["credentials_file"]).resolve())
-            raw["google_sheets"] = sheets
         for execution in raw.get("execution_accounts", {}).values():
             if execution.get("private_key_file"):
                 execution["private_key_file"] = str((path.parent / execution["private_key_file"]).resolve())
-        return cls.model_validate(raw)
+        result = cls.model_validate(raw)
+        result._configuration_file = path
+        return result
 
 
 class ExecutionSettings(Model):

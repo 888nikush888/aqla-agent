@@ -18,8 +18,8 @@ from aqla_agent.execution_outcome import (
     retry_view,
     trade_outcome,
 )
+from aqla_agent.journal import Table
 from aqla_agent.messages import telegram_view
-from aqla_agent.monthly import MonthlyFailure, MonthlyJobBinding, MonthlyPublication, MonthlySection
 from aqla_agent.native_setup import load_verifier
 from aqla_agent.notifications import (
     NotificationAckResult,
@@ -28,6 +28,7 @@ from aqla_agent.notifications import (
     acknowledge_notifications,
     notification_page,
 )
+from aqla_agent.operator_management import ManagementRequest
 from aqla_agent.pipelines import (
     AccountLimits,
     Pipeline,
@@ -127,6 +128,17 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
             while True:
                 try:
                     await reporting.tick()
+                    from aqla_agent.monthly import scheduled_reports
+                    reports = scheduled_reports(state.snapshot())
+                    if reports:
+                        def queue_monthly(data, reports=reports):
+                            for report in reports:
+                                month = report["month"]
+                                if data["monthly_notified"].get(month):
+                                    continue
+                                data["notifications"].setdefault("monthly-local:" + month, {"monthly_report": report, "observed_at": now_ms()})
+                                data["monthly_notified"][month] = {"queued_at": now_ms(), "fingerprint": report["fingerprint"]}
+                        state.update_metadata(("notifications", "monthly_notified"), queue_monthly)
                 except Exception:
                     import logging
                     logging.getLogger(__name__).warning("Monthly accounting evidence unavailable; completeness remains explicit")
@@ -168,9 +180,39 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "exchange_atomicity_guaranteed": False, "live_exchange_verified": False}
 
     @server.tool(annotations=read)
-    async def status(context_auth: str = "", view: Literal["full", "compact", "summary"] = "full", offset: int = 0, limit: int = 20,
+    async def status(context_auth: str = "", view: Literal["full", "compact", "summary", "configuration"] = "full", offset: int = 0, limit: int = 20,
                      view_version: str | None = None) -> dict:
         """Read effective user rules, sources, pending work, owned trades and unresolved operations."""
+        if view == "configuration":
+            authorize(context_auth, operator=True)
+            data = state.read("configuration_revision", "profiles", "pipelines", "ranking_policy", "ranking_revision",
+                              "sources", "source_names", "source_names_revision", "source_ranks", "source_aliases", "trades", "paused",
+                              "execution_accounts", "account_enabled", "account_limits", "venue_enabled", "venue_limits", "venue_accounts", "network")
+            data["execution_accounts"] = trading.accounts_ready(data)
+            data["source_ranks"] = status_view(data)
+            data["trades"] = [row for row in data["trades"].values() if row["status"] in OPEN]
+            from types import SimpleNamespace
+
+            from aqla_agent.pipelines import Parameters
+            from aqla_agent.waverider import live_authority
+            permissions = {}
+            for identity, profile_row in data["profiles"].items():
+                if not profile_row.get("parameters"):
+                    continue
+                profile_parameters = Parameters.model_validate(profile_row["parameters"])
+                permissions[identity] = {}
+                for key, account in data["execution_accounts"].items():
+                    engine = trading.engine_for(*key.split(":"))
+                    permission = None
+                    if engine and account.get("limits"):
+                        plan = SimpleNamespace(policy=profile_parameters.policy(AccountLimits.model_validate(account["limits"])),
+                            base_parameters=profile_row["parameters"], created_at=now_ms(), exchange="hyperliquid",
+                            network=engine.exchange.settings.network, account=engine.exchange.account,
+                            market=SimpleNamespace(quote_token="USDC"))
+                        permission = live_authority(engine, plan)
+                    permissions[identity][key] = permission
+            data["waverider_permissions"] = permissions
+            return data
         if view == "summary":
             snapshot = state.status_summary()
             from aqla_agent.waverider import recorder_health
@@ -188,8 +230,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                     "execution_accounts": {key: {name: value for name, value in row.items() if name != "limits"}
                                            for key, row in trading.accounts_ready(snapshot).items()},
                     "account_recovery": recovery_diagnostics(snapshot),
-                    "journal": {"enabled": settings.google_sheets.enabled, "pending": snapshot["journal_pending"],
-                                "last_synced_at": snapshot.get("journal_synced_at")},
+                    "journal": {"enabled": True, "storage": "local SQLite"},
                     "configuration_revision": snapshot["configuration_revision"], "policy_revision": snapshot["policy_revision"],
                     "inventory_refreshed": False, "details": {"tool": "status", "view": "full"},
                     "source_processing": {**processor.overview(), "delivery": outbox.overview()},
@@ -221,9 +262,79 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 "execution_accounts": trading.accounts_ready(), "ranking_policy": snapshot["ranking_policy"],
                 "ranking_revision": snapshot["ranking_revision"], "source_ranks": status_view(snapshot),
                 "telegram_view": {**page["telegram_view"], "status": telegram_view({**snapshot, "notifications": {}}, trading.accounts_ready() if snapshot["ranking_policy"]["enabled"] else ready,
-                                                                                 sheets_enabled=settings.google_sheets.enabled, inventory=inventory)["status"]},
-                "journal": {"enabled": settings.google_sheets.enabled, "pending": len(snapshot.get("journal_pending", {})), "last_synced_at": snapshot.get("journal_synced_at")}}
+                                                                                 inventory=inventory)["status"]},
+                "journal": {"enabled": True, "storage": "local SQLite"}}
         return compact_view(result, "status", {}, offset, limit, view_version) if view == "compact" else result
+
+    @server.tool(annotations=read)
+    async def journal_status() -> dict:
+        """Local journal availability and columns; no external credentials or publication queue."""
+        from aqla_agent.journal import HEADERS
+        return {"enabled": True, "storage": "local SQLite", "tables": HEADERS, "manual_trade_fact_writes": False}
+
+    @server.tool(annotations=read)
+    async def journal_statistics(group_by: Literal["gesamt", "Quelle", "Symbol", "Richtung", "Börse", "Pipeline", "Profil", "Währung"] = "gesamt",
+                                 account_key: str | None = None) -> dict:
+        """Evidence-qualified closed-trade results, separated by currency/network and including actual funding."""
+        from decimal import Decimal
+
+        from aqla_agent.monthly import report_row
+        if account_key is not None and account_key not in ("hyperliquid:mainnet", "hyperliquid:testnet"):
+            raise AqlaError("Select a configured execution account")
+        data, groups = state.snapshot(), {}
+        labels = {"Quelle": "chat_id", "Symbol": "symbol", "Richtung": "side", "Börse": "exchange", "Pipeline": "pipeline_id", "Profil": "profile_id", "Währung": "currency"}
+        for trade in data["trades"].values():
+            if trade["status"] != "closed":
+                continue
+            plan = trade["plan"]
+            context = plan.get("exchange", "hyperliquid") + ":" + plan["network"]
+            if account_key and context != account_key:
+                continue
+            row = report_row(data, trade)
+            fields = {**plan, **plan["market"], **row, "chat_id": trade["chat_id"]}
+            group = "gesamt" if group_by == "gesamt" else str(fields.get(labels[group_by], "—"))
+            identity = context + ":" + row["currency"] + ":" + group
+            selected = groups.setdefault(identity, {"network": plan["network"], "currency": row["currency"], "group": group,
+                "trades": 0, "complete": 0, "excluded": 0, "net_pnl": Decimal(0), "fees": Decimal(0), "funding": Decimal(0), "wins": 0})
+            selected["trades"] += 1
+            if not row["complete"]:
+                selected["excluded"] += 1
+                continue
+            selected["complete"] += 1
+            selected["wins"] += Decimal(row["net_pnl"]) > 0
+            for key in ("net_pnl", "fees", "funding"):
+                selected[key] += Decimal(row[key])
+        return {"groups": {identity: {key: (str(value) if row["complete"] else None) if isinstance(value, Decimal) else value for key, value in row.items()}
+                           for identity, row in groups.items()}, "funding_included": True, "storage": "local SQLite"}
+
+    @server.tool(annotations=read)
+    async def journal_read(table: Table, offset: Annotated[int, Field(ge=0)] = 0,
+                           limit: Annotated[int, Field(ge=1, le=100)] = 20,
+                           filters: dict[str, str] | None = None, account_key: str | None = None,
+                           columns: list[str] | None = None, trade_id: str | None = None) -> dict:
+        """Read local journal evidence, including historical accounts. Never writes trade facts."""
+        from aqla_agent.journal import read_page
+        return await asyncio.to_thread(read_page, state.snapshot(), table, offset=offset, limit=limit, filters=filters,
+                                       account_key=account_key, columns=columns, trade_id=trade_id)
+
+    @server.tool(annotations=read)
+    async def dashboard(network: Literal["mainnet", "testnet"] = "mainnet", period: str = "current",
+                        currency: str = "USDC", offset: Annotated[int, Field(ge=0)] = 0,
+                        limit: Annotated[int, Field(ge=1, le=20)] = 8) -> dict:
+        """Local dashboard with evidence-qualified PnL, fees and funding, separated by network and currency."""
+        from aqla_agent.presentation import build_presentation
+        data = state.snapshot()
+        snapshot = await asyncio.to_thread(build_presentation, data, {"network": network, "period": period, "currency": currency}, transport_budget=False)
+        value = snapshot.model_dump(mode="json")
+        rows = value.pop("journal")
+        for key in ("channels", "parameters", "months", "daily_pnl", "monthly_pnl", "cumulative_realized_net"):
+            value.pop(key)
+        rows.sort(key=lambda row: (row.get("closed_at") or row.get("entry_at") or 0, row["trade_id"]), reverse=True)
+        return {**value, "journal": rows[offset:offset + limit], "total": len(rows),
+                "next_offset": offset + limit if offset + limit < len(rows) else None,
+                "paused": data["paused"], "account_recovery": recovery_diagnostics(data),
+                "source_queue": queue_overview(data), "storage": "local SQLite",
+                "observations": "Last reconciled execution evidence; no new exchange orders or live price request"}
 
     @server.tool(annotations=read)
     async def source_lookup(start: str, end: str, source: str | None = None, symbol: str | None = None,
@@ -261,14 +372,13 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
     @server.tool(annotations=read)
     async def monthly_report(month: str, offset: int = 0, limit: int = 100, diagnostics_only: bool = False) -> dict:
         """Read Aqla Mainnet trades closed in YYYY-MM, fees/funding, initial-margin ROE and completeness. No exchange writes."""
-        from aqla_agent.monthly import MonthlyJob, month_bounds
+        from aqla_agent.monthly import month_bounds
         from aqla_agent.monthly import monthly_report as calculate
         if isinstance(offset, bool) or isinstance(limit, bool) or offset < 0 or not 1 <= limit <= 500:
             raise AqlaError("Monthly page requires offset >= 0 and limit between 1 and 500")
         month_bounds(month)
         snapshot = state.snapshot()
-        stored_job = snapshot.get("monthly_jobs", {}).get(month)
-        diagnostic = MonthlyJob.model_validate(stored_job).model_dump(mode="json") if stored_job else None
+        diagnostic = None
         if diagnostics_only:
             return {"month": month, "publication_job": diagnostic}
         report = calculate(snapshot, month)
@@ -299,8 +409,10 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         trade = snapshot["trades"].get(trade_id)
         if trade is None:
             raise AqlaError("Unknown Aqla trade ID")
-        operations = [operation_diagnostic_view(trading.public_operation(row)) for row in snapshot["operations"].values()
-                      if trade_id in row["operation_id"]]
+        from aqla_agent.journal import trade_operation_ids
+        operation_ids = trade_operation_ids(snapshot, trade_id)
+        operations = [operation_diagnostic_view(trading.public_operation(row)) for key, row in snapshot["operations"].items()
+                      if key in operation_ids]
         result = {"trade_id": trade_id, "status": trade["status"], "plan": trade["plan"],
                 "execution_outcome": trade_outcome(trade, entry_operations), "observation_retry": retry_view(trade),
                 "entry_diagnostic": diagnostic_view(trade, entry_operations),
@@ -460,6 +572,18 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return state.update_metadata(("notifications",), acknowledge)
 
     @server.tool(annotations=write)
+    async def operator_manage(request: ManagementRequest, context_auth: str = "") -> dict:
+        """Explicit owner management of one existing trade; never opens a new setup."""
+        from aqla_agent.operator_management import submit
+        claims = authorize(context_auth, operator=True)
+        def commit_check():
+            authorize(context_auth, operator=True)
+            if request.action not in ("close", "reduce", "cancel_entry", "pause_waverider"):
+                require_setup(claims)
+        commit_check()
+        return await submit(trading, request, claims["request_id"], commit_check)
+
+    @server.tool(annotations=write)
     async def control(action: Literal["set_policy", "pause", "resume", "set_sources", "add_sources", "remove_sources", "set_source_name", "set_source_rank", "close_trade", "resolve_conflict", "clear_notification", "set_profile", "set_pipeline", "delete_profile", "delete_pipeline", "set_exchange_limits", "set_exchange_enabled", "set_ranking_policy", "set_account_limits", "set_account_enabled"],
                       expected_revision: Annotated[int | None, Field(strict=True, ge=0)] = None, policy: Policy | None = None, sources: list[str] | None = None,
                       trade_id: str | None = None, notification_id: str | None = None, context_auth: str = "",
@@ -583,14 +707,12 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
         return await trading.conflict_review(trade_id)
 
     @server.tool(annotations=write)
-    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "journal_snapshot", "journal_ack", "monthly_job", "monthly_ack", "monthly_request", "monthly_failure", "monthly_page", "setup_bind", "setup_grant", "setup_failed", "setup_revoke", "setup_status", "presentation_snapshot", "source_configure", "source_prepare", "source_packet", "source_record", "source_apply", "source_fail", "source_overview", "source_notice", "delivery_next", "delivery_complete", "delivery_retry"], token: str, source: SourceEvent | None = None,
+    async def integration(action: Literal["ingest", "native_forward", "snapshot", "resolve_sources", "seed_context", "setup_bind", "setup_grant", "setup_failed", "setup_revoke", "setup_status", "presentation_snapshot", "source_configure", "source_prepare", "source_packet", "source_record", "source_apply", "source_fail", "source_overview", "source_notice", "delivery_next", "delivery_complete", "delivery_retry", "runtime_reload", "activity"], token: str, source: SourceEvent | None = None,
                           aliases: dict[str, str] | None = None, cutoffs: dict[str, int] | None = None,
                           context_ids: dict[str, list[int]] | None = None,
-                          accepted: dict[str, str] | None = None, month: str | None = None,
-                          publication: MonthlyPublication | None = None, job: MonthlyJobBinding | None = None,
-                          failure: MonthlyFailure | None = None, section: MonthlySection | None = None,
                           setup_binding: dict | None = None, lease_id: str | None = None,
                           generation: str | None = None, selection: dict | None = None,
+                          technical: dict | None = None,
                           processing_mode: Literal["legacy", "shadow", "hybrid"] | None = None,
                           processing_owner: str | None = None, processing_version: str | None = None,
                           job_id: str | None = None, decision_result: dict | None = None,
@@ -602,12 +724,37 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                           retry_backoff_seconds: Annotated[int, Field(strict=True, ge=1, le=300)] = 15,
                           retry_max_age_seconds: Annotated[int, Field(strict=True, ge=30, le=3600)] = 900,
                           delivery_part: int | None = None, delivery_success: bool | None = None,
+                          delivery_message_id: Annotated[str | None, Field(max_length=64)] = None,
                           offset: Annotated[int, Field(strict=True, ge=0)] = 0,
                           limit: Annotated[int, Field(strict=True, ge=1, le=100)] = 100) -> dict:
         """Internal native-plugin access, filtered out of agent tools; token never enters model context."""
         if authority is None:
             raise AqlaError("Integration key is not configured")
         authority.internal(token)
+        if action == "runtime_reload":
+            from .models import ExpressSettings, ReplaySettings
+            if not technical or set(technical) != {"express", "waverider_replay"}:
+                raise AqlaError("Only explicit technical controls may be reloaded")
+            selected = ExpressSettings.model_validate(technical["express"])
+            if settings._configuration_file is not None:
+                fresh = Settings.load(settings._configuration_file)
+                if fresh.express.model_dump(mode="json") != selected.model_dump(mode="json") or fresh.waverider_replay.model_dump(mode="json") != technical["waverider_replay"]:
+                    raise AqlaError("Technical request was superseded by the current saved configuration")
+            if selected.master_path != settings.express.master_path:
+                raise AqlaError("Technical reload cannot change the approved master path")
+            if selected.mode == "live" and not express.qualified():
+                raise AqlaError("Express master qualification is missing")
+            settings.express.mode = selected.mode
+            settings.waverider_replay = ReplaySettings.model_validate(technical["waverider_replay"])
+            for engine in trading.engines.values():
+                engine.exchange.settings.waverider_replay = settings.waverider_replay
+            return {"reloaded": True}
+        if action == "activity":
+            data = state.read("notice_history", "notifications")
+            rows = list(data.get("notice_history", {}).values())
+            rows += [{"notice": row, "disposition": "pending", "recorded_at": row.get("observed_at", 0)} for row in data["notifications"].values()]
+            rows.sort(key=lambda row: row.get("recorded_at", 0), reverse=True)
+            return {"rows": rows[offset:offset + limit], "total": len(rows), "next_offset": offset + limit if offset + limit < len(rows) else None}
         if action == "source_configure":
             configured = processor.configure(processing_mode, processing_owner, retry_max_attempts=retry_max_attempts,
                 retry_backoff_seconds=retry_backoff_seconds, retry_max_age_seconds=retry_max_age_seconds, decision_status=decision_status)
@@ -643,7 +790,7 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 return outbox.retry(processing_owner)
             if type(delivery_part) is not int or type(delivery_success) is not bool:
                 raise AqlaError("A confirmed native send result is required")
-            return outbox.complete(processing_owner, delivery_id, delivery_part, delivery_success)
+            return outbox.complete(processing_owner, delivery_id, delivery_part, delivery_success, delivery_message_id)
         if action == "presentation_snapshot":
             return state.presentation_snapshot(selection)
         if action == "setup_revoke":
@@ -667,39 +814,6 @@ def create_server(settings: Settings, *, profile="agent", exchange=None, state=N
                 setup_gate.register(binding, lease_id, None, generation)
                 return {"registered": True, "remaining_seconds": setup_gate.status(binding, lease_id)["remaining_seconds"]}
             return setup_gate.status(binding, lease_id)
-        if action == "monthly_job":
-            return state.monthly_transaction("job")
-        if action == "monthly_failure":
-            if failure is None:
-                raise AqlaError("A bound monthly publication failure is required")
-            return state.monthly_transaction("failure", failure=failure)
-        if action == "monthly_page":
-            if job is None or section is None:
-                raise AqlaError("Monthly internal page requires its selected job and section")
-            return state.monthly_transaction("page", binding=job, section=section, offset=offset, limit=limit)
-        if action == "monthly_request":
-            from datetime import datetime
-
-            from aqla_agent.monthly import BERLIN, month_bounds
-            month_bounds(month)
-            if month > datetime.now(BERLIN).strftime("%Y-%m"):
-                raise AqlaError("Zukünftige Monate haben noch keinen Monatsbericht")
-            return state.monthly_transaction("request", month=month)
-        if action == "monthly_ack":
-            if publication is None or job is None:
-                raise AqlaError("Confirmed Sheets publication and selected monthly job are required")
-            import re
-            expected = settings.google_sheets.spreadsheet_id
-            if not re.fullmatch(r"https://docs\.google\.com/spreadsheets/d/" + re.escape(expected or "") + r"/edit#gid=\d+", publication.url):
-                raise AqlaError("Monthly publication URL does not match the configured spreadsheet")
-            return state.monthly_transaction("ack", month=month, fingerprint=publication.fingerprint,
-                url=publication.url, revision=publication.revision, job=job)
-        if action == "journal_snapshot":
-            return state.journal_batch(settings.google_sheets.batch_size)
-        if action == "journal_ack":
-            if accepted is None:
-                raise AqlaError("Missing journal acknowledgements")
-            return state.acknowledge_journal(accepted)
         if action == "seed_context":
             snapshot = state.read("sources", "source_aliases")
             allowed = {*snapshot["sources"], *snapshot.get("source_aliases", {}).values()}

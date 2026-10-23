@@ -4,11 +4,11 @@ from decimal import Decimal
 import pytest
 from test_pipelines import routed  # noqa: F401 -- multi-target fixture
 
+from aqla_agent.journal import HEADERS, project
 from aqla_agent.pipelines import Parameters, Pipeline, TradingProfile, route_control
 from aqla_agent.sources import set_source_name
 from aqla_hyperliquid_mcp.models import AccountSnapshot, AqlaError, Interpretation, Market, Policy, now_ms
 from aqla_hyperliquid_mcp.rules import make_plan, verify_evidence
-from aqla_sheets_mcp.journal import HEADERS, project
 
 
 def configure(state, *, stop=None, targets=(), leverage=2, unit="course_percent"):

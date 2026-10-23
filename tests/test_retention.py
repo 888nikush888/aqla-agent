@@ -3,7 +3,6 @@ from test_updates import stop_update, waiting_gtc
 
 from aqla_agent.router import Router
 from aqla_hyperliquid_mcp.models import AqlaError, Evidence, Interpretation, SourceEvent, now_ms
-from aqla_sheets_mcp.journal import acknowledge, batch
 
 
 async def rejected_sources(setup, monkeypatch, kind="rejected"):
@@ -59,31 +58,6 @@ async def test_rejected_tombstone_prevents_old_entry_replay(setup, monkeypatch):
     await router.close()
 
 
-def test_retention_preserves_new_revision_and_pending_export(setup, monkeypatch):
-    settings, state, _, _, trading = setup
-    settings.max_events = 1000
-    stamp = now_ms()
-    monkeypatch.setattr("aqla_agent.trading.now_ms", lambda: stamp + 3_600_000)
-    originals = []
-    for index in range(1, 121):
-        source = SourceEvent(chat_id="channel", message_id=index, sent_at=stamp - 100000 + index,
-                             received_at=stamp - 100000 + index, text="stored terminal event")
-        trading.ingest(source)
-        state.update(lambda data, event_id=source.event_id: data["events"][event_id].update(status="rejected"))
-        originals.append(source)
-    newer = originals[0].model_copy(update={"edited_at": stamp + 1, "received_at": stamp + 1, "text": "new revision"})
-    trading.ingest(newer)
-    state.update(lambda data: data.setdefault("journal_pending", {}).update({"Signale:" + originals[1].event_id: {"pending": True}}))
-    settings.max_events = 100
-    state.update(trading.prune_events)
-    after = state.snapshot()
-    assert newer.event_id != originals[0].event_id and newer.source_id == originals[0].source_id
-    assert newer.event_id in after["events"] and after["events"][newer.event_id]["status"] == "pending"
-    assert originals[1].event_id in after["events"]
-    assert originals[1].event_id not in after["event_tombstones"]
-    assert len(after["events"]) == 100
-    assert len(after["event_tombstones"]) == 21
-    assert after["event_tombstones"][originals[0].event_id] == newer.source_id
 
 
 def add_terminal_events(state, stamp, count=120):
@@ -141,16 +115,6 @@ async def test_retention_preserves_unexpired_plan_revision_then_releases_it(setu
     assert not fake.actions
 
 
-def test_pending_exports_are_not_pruned_to_force_quantity_limit(setup, monkeypatch):
-    settings, state, fake, _, trading = setup
-    stamp = now_ms()
-    sources = add_terminal_events(state, stamp)
-    state.update(lambda data: data.setdefault("journal_pending", {}).update({"Signale:" + source.event_id: {"pending": True} for source in sources}))
-    settings.max_events = 100
-    monkeypatch.setattr("aqla_agent.trading.now_ms", lambda: stamp + 3_600_000)
-    state.update(trading.prune_events)
-    assert set(state.snapshot()["events"]) == {source.event_id for source in sources}
-    assert not state.snapshot()["event_tombstones"] and not fake.actions
 
 
 @pytest.mark.asyncio
@@ -244,47 +208,3 @@ def test_unknown_operations_nonces_and_source_trade_bindings_are_never_pruned(se
     assert snapshot["operations"]["unknown"]["phase"] == "unknown"
     assert snapshot["nonces"]["signer"] == 123
     assert snapshot["bindings"]["source"]["trade_id"] == "owner"
-
-
-@pytest.mark.parametrize("old_edit", [False, True], ids=["historical-message", "historical-edit"])
-def test_backdated_context_is_enqueued_before_retention_and_released_after_delivery(setup, old_edit):
-    settings, state, _, _, trading = setup
-    settings.max_events = 100
-    state.journal_enabled = True
-    base = now_ms() - 100000
-    for identity in range(1, 101):
-        trading.ingest(SourceEvent(chat_id="channel", message_id=identity, sent_at=base + identity,
-                                   text="Historischer Kontext", historical=True))
-    assert len(state.snapshot()["journal_pending"]) == 200
-    source = SourceEvent(chat_id="channel", message_id=1 if old_edit else 101,
-                         sent_at=base + 1 if old_edit else base - 10000, received_at=base - 30000,
-                         edited_at=base + 10 if old_edit else None, text="Nachgelieferter Kontext", historical=True)
-    assert trading.ingest(source)["status"] == "context"
-    snapshot = state.snapshot()
-    assert len(snapshot["events"]) == 101
-    assert source.event_id in snapshot["events"]
-    assert source.event_id not in snapshot["event_tombstones"]
-    records = batch(snapshot, 500)["records"]
-    row = next(row for row in records if row["table"] == "Signale" and row["record_id"] == source.event_id)
-    assert row["values"][13] == source.text
-    assert any(row["values"][4] == source.event_id for row in records if row["table"] == "Ereignisse")
-    accepted = {row["table"] + ":" + row["record_id"]: row["fingerprint"] for row in records}
-    state.update(lambda data: acknowledge(data, accepted))
-    state.update(trading.prune_events)
-    snapshot = state.snapshot()
-    assert len(snapshot["events"]) == 100
-    assert source.event_id in snapshot["event_tombstones"]
-    assert "Signale:" + source.event_id not in snapshot["journal_pending"]
-
-
-def test_repeated_source_ingest_does_not_replace_state_or_enqueue_journal_rows(setup, monkeypatch):
-    _, state, _, _, trading = setup
-    state.journal_enabled = True
-    source = SourceEvent(chat_id="channel", message_id=1, sent_at=now_ms(), text="Kontext", historical=True)
-    first = trading.ingest(source)
-    snapshot = state.snapshot()
-    def reject_write(_):
-        pytest.fail("A duplicate source ingest must not write the state")
-    monkeypatch.setattr(state, "_write", reject_write)
-    assert trading.ingest(source) == first
-    assert state.snapshot() == snapshot

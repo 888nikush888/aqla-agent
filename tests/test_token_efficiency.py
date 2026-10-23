@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import ValidationError
-from test_sheets import sheets  # noqa: F401 -- shared isolated Sheets boundary
 
 from aqla_agent.efficiency import WakeSchedule, decision_batch
 from aqla_agent.source_disposition import issue_receipt, verify_disposition
@@ -277,26 +276,3 @@ async def test_filtered_diagnostic_compact_continuations_preserve_sections_and_v
     state.update(lambda data: data["trades"][identity].update(entry_vwap="101"))
     with pytest.raises(ToolError, match="view_version"):
         await call(efficiency_server, "trade_diagnostics", **first["next_page"]["arguments"])
-
-
-@pytest.mark.asyncio
-async def test_journal_projection_verifies_full_row_and_filters_time(setup, sheets):  # noqa: F811 -- imported fixture
-    from aqla_sheets_mcp.journal import HEADERS, record
-    from aqla_sheets_mcp.server import create_server as sheets_server
-    settings, *_ = setup
-    settings.google_sheets, google, client = sheets
-    sources = [SourceEvent(chat_id="channel", message_id=i + 1, sent_at=1000 + i, text="Signaltext") for i in range(2)]
-    records = [record("Signale", str(i), "channel", i, stamp, "", "", "", "report", "report", "", "", "", "result", source.text, source.source_id)
-               for i, (source, stamp) in enumerate(zip(sources, ["2026-10-01T12:00:00+00:00", "2026-10-03T12:00:00+00:00"], strict=True))]
-    client.sync(records)
-    server = sheets_server(settings, client=client)
-    args = {"table": "Signale", "columns": ["Status"], "start": "2026-10-01T00:00:00+00:00",
-            "end": "2026-10-02T00:00:00+00:00", "time_column": "Gesendet (UTC)"}
-    result = await call(server, "journal_read", **args)
-    assert result["total"] == 1 and result["total_complete"]
-    assert result["rows"][0]["ID"] == "0" and result["rows"][0]["_verified"]
-    assert result["rows"][0]["_original_fingerprint"] == records[0]["fingerprint"]
-    assert "Text" not in result["rows"][0] and "Text" in result["projection"]["omitted_columns"]
-    google.tables[client.prefix + "Signale"][1][HEADERS["Signale"].index("Text")] = "tampered omitted text"
-    result = await call(server, "journal_read", **args)
-    assert not result["rows"][0]["_verified"] and result["rows"][0]["_original_fingerprint"] is None

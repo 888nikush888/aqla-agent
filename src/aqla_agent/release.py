@@ -13,9 +13,9 @@ from pathlib import Path
 
 from aqla_agent.artifact_rules import validate_member, validate_zip_members
 
-SHIPPING_DIRS = ("src", "hermes_plugin", "skills", "tests", "docs", "scripts")
+SHIPPING_DIRS = ("src", "hermes_plugin", "skills", "docs")
 SHIPPING_FILES = (
-    "README.md", "IMPLEMENTATION_STATUS.md", "pyproject.toml", "uv.lock",
+    "README.md", "pyproject.toml", "uv.lock",
     "config.example.yaml", "hermes-runtime-overrides.txt", ".gitleaks.toml",
 )
 
@@ -182,7 +182,7 @@ def build(project: Path, output: Path):
     files = _collect_sources(project)
     if all(previous):
         _verify_pair(output, sha, output.name)
-    members = [item[2] for item in files]
+    members = [item[2] for item in files] + ["aqla-agent/CONTENTS.sha256"]
     staging = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
     staged_zip, staged_sha = staging / "new.zip", staging / "new.sha256"
     recovery_zip, recovery_sha = staging / "previous.zip", staging / "previous.sha256"
@@ -191,8 +191,12 @@ def build(project: Path, output: Path):
     keep_recovery = False
     try:
         with zipfile.ZipFile(staged_zip, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+            contents = []
             for path, info, name in files:
-                archive.writestr(name, _read_source(path, info))
+                body = _read_source(path, info)
+                archive.writestr(name, body)
+                contents.append(hashlib.sha256(body).hexdigest() + "  " + name.removeprefix("aqla-agent/"))
+            archive.writestr("aqla-agent/CONTENTS.sha256", "\n".join(contents) + "\n")
         with staged_zip.open("r+b") as source:
             source.flush()
             os.fsync(source.fileno())
@@ -244,7 +248,7 @@ def build(project: Path, output: Path):
         if not keep_recovery:
             # A verified final or restored pair already exists; stale staging is harmless.
             shutil.rmtree(staging, ignore_errors=True)
-    return {"archive": str(output), "sha256": digest, "files": len(files)}
+    return {"archive": str(output), "sha256": digest, "files": len(members)}
 
 
 def main():

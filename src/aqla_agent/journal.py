@@ -1,4 +1,4 @@
-"""Deterministic public journal rows and a durable, digest-bound export queue."""
+"""Local journal projections over the authoritative transaction and execution evidence."""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,7 @@ from aqla_agent.monthly import accounting_facts, accounting_issues, fill_identit
 from aqla_agent.source_queue import is_source_row
 from aqla_hyperliquid_mcp.models import AqlaError, Model, digest, now_ms
 
-from .parameters import parameter_values
+from .journal_parameters import parameter_values
 
 HEADERS = {
     "Trades": ["ID", "Quelle", "Symbol", "Richtung", "Status", "Erstellt (UTC)", "Entry geplant", "Entry realisiert", "Menge geplant", "Gefüllt", "Offen", "SL", "TPs", "Risiko geplant USD", "Risiko reserviert USD", "PnL realisiert vor Gebühren/Funding", "Gebühren USD", "Netto vor Funding USD", "Quellen-IDs"],
@@ -215,29 +215,32 @@ def _operation_record(identity, operation):
     return record("Vorgänge", identity, timestamp(operation["created_at"]), operation["wire_action"].get("type", ""), operation["phase"], operation.get("outcome", ""), str(operation["nonce"]), timestamp(operation.get("expires_after")), text(operation["request"]), text(operation.get("result")))
 
 
-def project(data):
+def project(data, *, include_retired=False, tables=None):
+    selected = set(HEADERS) if tables is None else set(tables)
     rows = {}
     def add(row):
-        rows[record_key(row)] = row
+        if row["table"] in selected:
+            rows[record_key(row)] = row
     aliases = {value: name for name, value in data.get("source_aliases", {}).items()}
-    actions = _order_actions(data)
-    for identity, event in data["events"].items():
+    actions = _order_actions(data) if "Orders" in selected else {}
+    for identity, event in data["events"].items() if "Signale" in selected else ():
         if is_source_row(event):
             add(_signal_record(data, identity, event, aliases))
-    for identity, trade in data["trades"].items():
-        for row in _trade_records(data, identity, trade, aliases, actions):
+    for identity, trade in data["trades"].items() if selected.intersection(("Trades", "Orders", "Fills")) else ():
+        for row in _trade_records(data, identity, trade, aliases, actions, tables=selected):
             add(row)
-    for identity, operation in data["operations"].items():
+    for identity, operation in data["operations"].items() if "Vorgänge" in selected else ():
         add(_operation_record(identity, operation))
-    add(record("Regeln", "aktuell", data["network"], data["account"], data["policy_revision"], data["paused"], text(data["sources"]), text(data["policy"])))
-    for values in parameter_values(data):
+    if "Regeln" in selected:
+        add(record("Regeln", "aktuell", data["network"], data["account"], data["policy_revision"], data["paused"], text(data["sources"]), text(data["policy"])))
+    for values in parameter_values(data) if "Handelsparameter" in selected else ():
         add(record("Handelsparameter", *values))
-    for identity, pipeline in data.get("pipelines", {}).items():
+    for identity, pipeline in data.get("pipelines", {}).items() if "Pipelines" in selected else ():
         for target in pipeline["targets"]:
             add(record("Pipelines", identity + ":" + target["exchange"], pipeline["name"], text(pipeline["sources"]), target["exchange"],
                        target["profile_id"], pipeline["enabled"], data["venue_enabled"].get(target["exchange"], False), pipeline["revision"],
                        text([]), "Rang: C+ Mainnet, D/E/F Testnet"))
-    if data.get("ranking_policy"):
+    if data.get("ranking_policy") and selected.intersection(("Ränge", "Ranghistorie")):
         from aqla_agent.ranking import FACTORS, source_key
         for source, rank in data.get("source_ranks", {}).items():
             metrics = rank.get("metrics", {})
@@ -255,10 +258,94 @@ def project(data):
     for row in rows.values():
         _target_record(data, row)
     for row in data.get("journal_order_archive", {}).values():
-        rows.setdefault(record_key(row), row)
+        if row["table"] in selected:
+            rows.setdefault(record_key(row), row)
+    for row in data.get("journal_signal_archive", {}).values():
+        if row["table"] in selected:
+            rows.setdefault(record_key(row), row)
     for row in data.get("journal_history", {}).values():
         add(row)
-    return {key: row for key, row in rows.items() if not _retired_record(data, row)}
+    return {key: row for key, row in rows.items() if include_retired or not _retired_record(data, row)}
+
+
+def retire_export_queue(data):
+    """Retain old export receipts without treating them as Telegram delivery."""
+    names = ("journal_pending", "journal_destination", "journal_projection", "journal_synced_at",
+             "monthly_jobs", "monthly_requests", "monthly_request_generations")
+    removed = {name: data.pop(name) for name in names if name in data}
+    if removed:
+        data.setdefault("retired_exports", []).append({"retired_at": now_ms(), "state": removed})
+    return bool(removed)
+
+
+def archive_replaced_orders(previous, proposed):
+    """Preserve superseded owned order identities without projecting the entire ledger."""
+    actions = None
+    for identity, trade in previous.get("trades", {}).items():
+        current = proposed.get("trades", {}).get(identity)
+        if current == trade or current is not None and all(current.get(key) == trade.get(key)
+                for key in ("entry_cloid", "entry_orders", "orders", "exit_orders")):
+            continue
+        if actions is None:
+            actions = _order_actions(previous)
+        before = _trade_records(previous, identity, trade, {}, actions, tables=("Orders",))
+        after = _trade_records(proposed, identity, current, {}, actions, tables=("Orders",)) if current else []
+        kept = {row["record_id"] for row in after}
+        for row in before:
+            if row["record_id"] not in kept:
+                _target_record(previous, row)
+                proposed.setdefault("journal_order_archive", {}).setdefault(row["record_id"], row)
+    for identity in previous.get("events", {}).keys() - proposed.get("events", {}).keys():
+        event = previous["events"][identity]
+        if is_source_row(event):
+            row = _signal_record(previous, identity, event, {})
+            proposed.setdefault("journal_signal_archive", {}).setdefault(identity, row)
+
+
+def trade_operation_ids(data, trade_id):
+    trade = data["trades"].get(trade_id)
+    if trade is None:
+        raise AqlaError("Select an exact existing trade")
+    result = {identity for identity in data["operations"] if trade_id in identity.split(":")}
+    for values in [data.get("bindings", {}), *data.get("account_bindings", {}).values()]:
+        result.update(identity for identity, row in values.items() if isinstance(row, dict) and row.get("trade_id") == trade_id)
+    result.update(identity for identity, row in data.get("operator_requests", {}).items() if row["request"]["trade_id"] == trade_id)
+    for collection in ("entry_orders", "orders", "exit_orders"):
+        result.update(row["operation_id"] for row in trade.get(collection, []) if row.get("operation_id"))
+    return result
+
+
+def read_page(data, table, *, offset=0, limit=20, filters=None, account_key=None, columns=None, trade_id=None):
+    """Bounded, exact local evidence. Historical execution accounts remain readable."""
+    if table not in HEADERS or not 0 <= offset or not 1 <= limit <= 100:
+        raise AqlaError("Select an existing journal table and a bounded page")
+    headers = HEADERS[table]
+    if any(name not in headers for name in (filters or {})) or columns is not None and (
+            not columns or len(set(columns)) != len(columns) or any(name not in headers for name in columns)):
+        raise AqlaError("Select existing journal columns")
+    rows = []
+    operations = trade_operation_ids(data, trade_id) if trade_id and table == "Vorgänge" else None
+    for item in project(data, include_retired=True, tables=[table]).values():
+        if item["table"] != table:
+            continue
+        row = dict(zip(headers, item["values"], strict=True))
+        if trade_id and (table == "Vorgänge" and row["ID"] not in operations or table in ("Orders", "Fills") and row["Trade-ID"] != trade_id or table == "Trades" and row["ID"] != trade_id):
+            continue
+        if account_key and row.get("Börse", "") + ":" + row.get("Netzwerk", "") != account_key:
+            continue
+        if any(str(row.get(key)) != str(value) for key, value in (filters or {}).items()):
+            continue
+        row["_fingerprint"] = item["fingerprint"]
+        if table == "Trades":
+            from .monthly import report_row
+            row["accounting"] = report_row(data, data["trades"][item["record_id"]])
+        rows.append(row)
+    selected = rows[offset:offset + limit]
+    if columns:
+        names = {"ID", "_fingerprint", *columns}
+        selected = [{k: v for k, v in row.items() if k in names} for row in selected]
+    return {"storage": "local SQLite", "revision": data["sequence"], "table": table, "rows": selected,
+            "total": len(rows), "offset": offset, "next_offset": offset + limit if offset + limit < len(rows) else None}
 
 
 def _target_record(data, row):
@@ -270,6 +357,8 @@ def _target_record(data, row):
     operation = data["operations"].get(identity, {}) if table == "Vorgänge" else {}
     venue = plan.get("exchange", operation.get("exchange", "hyperliquid"))
     binding = data.get("venue_accounts", {}).get(venue, {})
+    if operation:
+        binding = {**binding, **{key: operation["request"][key] for key in ("network", "account") if operation.get("request", {}).get(key)}}
     start = HEADERS[table].index("Börse")
     row["values"][start:start + 7] = [venue, plan.get("network", binding.get("network", data["network"])), plan.get("account", binding.get("account", data["account"])),
                           plan.get("pipeline_id") or operation.get("pipeline_id") or "legacy", plan.get("profile_id") or operation.get("profile_id") or "standard",
@@ -295,103 +384,3 @@ def _target_record(data, row):
         row["values"][-1] = role if role in ("maker", "taker", "unknown") else "unknown"
     row["fingerprint"] = fingerprint(row["values"])
     return row
-
-
-def enqueue_changes(previous, proposed):
-    before, after = project(previous), project(proposed)
-    pending = proposed.setdefault("journal_pending", {})
-    history = proposed.setdefault("journal_history", {})
-    # A retry may replace its IDs before an earlier journal delivery succeeds.
-    archive = proposed.get("journal_order_archive", {})
-    for key, row in before.items():
-        current = after.get(key)
-        if row["table"] == "Orders" and (current is None or current is archive.get(row["record_id"]) and current != row):
-            proposed.setdefault("journal_order_archive", {})[row["record_id"]] = row
-            after[key] = row
-            pending[key] = row["fingerprint"]
-    for key, row in after.items():
-        old = before.get(key)
-        if old and old["fingerprint"] == row["fingerprint"]:
-            continue
-        pending[key] = row["fingerprint"]
-        if row["table"] != "Ereignisse":
-            identity = digest([proposed["sequence"], key, row["fingerprint"]])[:32]
-            # Short transition facts; large original texts are already in Signale.
-            def summary(item):
-                if not item:
-                    return ""
-                return text({name: value for name, value in zip(HEADERS[item["table"]], item["values"], strict=True) if name not in ("Text", "Request", "Response")})
-            audit = record("Ereignisse", identity, timestamp(now_ms()), proposed["sequence"], row["table"], row["record_id"], summary(old), summary(row))
-            history[identity] = audit
-            pending[record_key(audit)] = audit["fingerprint"]
-    if "journal_projection" in proposed:
-        proposed["journal_projection"] = {key: row["fingerprint"] for key, row in after.items() if row["table"] != "Ereignisse"}
-
-
-def _retired_configuration_key(data, key):
-    retired = data.get("retired_execution_configuration", {})
-    table, _, identity = key.partition(":")
-    if table == "Handelsparameter":
-        kind, _, remainder = identity.partition(":")
-        if kind == "limits":
-            return remainder.partition(":")[0] in retired.get("venue_limits", {})
-        if kind == "account":
-            return remainder.rpartition(":")[0] in retired.get("account_limits", {})
-    if table == "Pipelines":
-        pipeline, _, exchange = identity.rpartition(":")
-        return exchange != "hyperliquid" and any(row["exchange"] == exchange
-            for row in retired.get("pipelines", {}).get(pipeline, {}).get("targets", []))
-    return False
-
-
-def seed(data, *, destination=None):
-    pending = data.setdefault("journal_pending", {})
-    if data.get("retired_execution_configuration"):
-        cache = {}
-        for key in list(pending):
-            row = _selected_record_current(data, key, cache, {})
-            if _retired_configuration_key(data, key) or row is not None and _retired_record(data, row):
-                data["retired_execution_configuration"].setdefault("journal_pending", {})[key] = pending.pop(key)
-    rows = project(data)
-    queued = data.get("journal_projection", {}) if destination == data.get("journal_destination") else {}
-    for key, row in rows.items():
-        if destination is None or key in pending or row["table"] == "Ereignisse" or queued.get(key) != row["fingerprint"]:
-            pending[key] = row["fingerprint"]
-    if destination is not None:
-        data["journal_destination"] = destination
-        data["journal_projection"] = {key: row["fingerprint"] for key, row in rows.items() if row["table"] != "Ereignisse"}
-
-
-def batch(data, limit=100):
-    pending = data.get("journal_pending", {})
-    history = {record_key(row): row for row in data.get("journal_history", {}).values() if record_key(row) in pending}
-    selected, fallback = [], {}
-    size = 0
-    for key in sorted(pending, key=lambda key: key.partition(":")[0] not in ("Trades", "Fills")):
-        current = _selected_record(data, key, fallback, history)
-        if current is None:
-            continue
-        row = {**current, "revision": data["sequence"]}
-        extra = len(text(row).encode("utf-8"))
-        if len(selected) >= limit or size + extra > 600_000:
-            break
-        selected.append(row)
-        size += extra
-    return {"records": selected, "pending": len(pending)}
-
-
-def acknowledge(data, accepted):
-    fallback = {}
-    history = {record_key(row): row for row in data.get("journal_history", {}).values() if record_key(row) in accepted} if accepted else {}
-    pending = data.get("journal_pending", {})
-    count = 0
-    for key, version in accepted.items():
-        current = _selected_record(data, key, fallback, history)
-        if current and current["fingerprint"] == version and pending.get(key) == version:
-            pending.pop(key)
-            if current["table"] == "Ereignisse":
-                data["journal_history"].pop(current["record_id"], None)
-            count += 1
-    if count:
-        data["journal_synced_at"] = now_ms()
-    return {"acknowledged": count, "pending": len(pending)}

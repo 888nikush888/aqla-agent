@@ -48,10 +48,10 @@ def prepare(project: Path, destination: Path, owner: str,
     if destination.exists() and any(destination.iterdir()):
         raise ValueError("Deployment destination must be new and empty; existing Hermes installations are never overwritten")
     destination.mkdir(parents=True, exist_ok=True)
-    for name in ("src", "hermes_plugin", "skills", "pyproject.toml", "uv.lock", "config.example.yaml", "hermes-runtime-overrides.txt"):
+    for name in ("src", "hermes_plugin", "skills", "docs", "README.md", "pyproject.toml", "uv.lock", "config.example.yaml", "hermes-runtime-overrides.txt"):
         source, target = project / name, destination / name
         if source.is_dir():
-            shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "aqla_sheets_mcp"))
         else:
             shutil.copy2(source, target)
     secret_dir = destination / "secrets"
@@ -86,18 +86,15 @@ def prepare(project: Path, destination: Path, owner: str,
                         "proactive_prune_min_reclaim_tokens": 4096, "micro_compact": False},
         "tools": {"tool_search": {"enabled": "auto", "listing": "off"}},
         "agent": {"max_turns": 30, "reasoning_effort": "high", "clarify_timeout": 60},
-        "display": {"busy_input_mode": "queue", "interim_assistant_messages": False, "tool_progress": "log"},
-        "platform_toolsets": {"telegram": ["skills", "clarify", "todo", "session_search", "mcp-aqla", "mcp-sheets"], "cli": ["skills", "no_mcp"], "cron": ["skills", "no_mcp"]},
+        "display": {"busy_input_mode": "queue", "interim_assistant_messages": False, "tool_progress": "off", "long_running_notifications": False, "cleanup_progress": True},
+        "platform_toolsets": {"telegram": ["skills", "clarify", "todo", "session_search", "mcp-aqla"], "cli": ["skills", "no_mcp"], "cron": ["skills", "no_mcp"]},
         "mcp_servers": {"aqla": {"command": python, "args": ["-m", "aqla_hyperliquid_mcp", "--config", str(destination / "config.yaml")],
                                   "cwd": str(destination), "trust": "full", "supports_parallel_tool_calls": False,
-                                  "tools": {"exclude": ["integration"]}},
-                        "sheets": {"command": python, "args": ["-m", "aqla_sheets_mcp", "--config", str(destination / "config.yaml")],
-                                   "cwd": str(destination), "trust": "full", "supports_parallel_tool_calls": False,
-                                   "tools": {"exclude": ["sync_internal", "publish_monthly_internal", "sync_presentation_internal", "presentation_selection_internal"]}}},
+                                  "tools": {"exclude": ["integration"]}}},
         "plugins": {"enabled": ["aqla-events"], "entries": {"aqla-events": {"allow_gateway_injection": True,
-                    "mcp_allowlist": ["aqla", "sheets"], "settings": {"owner_id": owner, "config_path": str(destination / "config.yaml"), "mcp_server": "aqla", "master_path": str(home / "skills" / "aqla-master" / "SKILL.md"),
+                    "mcp_allowlist": ["aqla"], "settings": {"owner_id": owner, "config_path": str(destination / "config.yaml"), "mcp_server": "aqla", "master_path": str(home / "skills" / "aqla-master" / "SKILL.md"),
                     "source_processing": {"mode": "legacy"}}}}},
-        "platforms": {"telegram": {"enabled": True, "unauthorized_dm_behavior": "ignore", "extra": {"allow_from": [owner], "group_allow_from": []}}},
+        "platforms": {"telegram": {"enabled": True, "unauthorized_dm_behavior": "ignore", "gateway_restart_notification": False, "extra": {"allow_from": [owner], "group_allow_from": []}}},
     }
     (home / "config.yaml").write_text(yaml.safe_dump(hermes_config, sort_keys=False), encoding="utf-8")
     env = "\n".join([f"HERMES_HOME={home}", f"PYTHONPATH={destination / 'src'}",
@@ -145,7 +142,7 @@ def install_runtime(destination: Path):
     def run(args):
         environment = dict(os.environ, UV_PYTHON_INSTALL_DIR=str(destination / ".python"))
         return subprocess.run(args, cwd=destination, check=True, env=environment)
-    run([uv, "sync", "--frozen", "--extra", "sources", "--extra", "sheets", "--python", "3.12", "--python-preference", "only-managed"])
+    run([uv, "sync", "--frozen", "--extra", "sources", "--python", "3.12", "--python-preference", "only-managed"])
     source = destination / "hermes-source"
     run([git, "clone", "--filter=blob:none", "https://github.com/NousResearch/hermes-agent.git", str(source)])
     run([git, "-C", str(source), "checkout", "--detach", HERMES_COMMIT])

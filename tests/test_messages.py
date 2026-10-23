@@ -297,11 +297,11 @@ def test_long_messages_split_without_loss_or_broken_lines():
     assert '\n\n'.join(parts)=='\n\n'.join(blocks)
 
 
-def test_empty_background_has_no_message_and_disabled_sheets_is_explicit(setup):
+def test_empty_background_has_no_message_and_local_journal_is_explicit(setup):
     _,state,*_=setup
-    view=telegram_view(state.snapshot(),READY,sheets_enabled=False)
+    view=telegram_view(state.snapshot(),READY)
     assert view['messages']==[]
-    assert 'Sheets:** deaktiviert' in '\n'.join(view['status'])
+    assert 'Journal:** lokal gespeichert' in '\n'.join(view['status'])
 
 
 def test_notification_limit_exposes_unprocessed_ids(setup):

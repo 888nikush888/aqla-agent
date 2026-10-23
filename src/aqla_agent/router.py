@@ -575,6 +575,12 @@ class Router:
     async def _recover_account(self, engine):
         reports = []
         engine.recovery_packet_timeout = min(30, self._recovery_timeout)
+        from .operator_management import recover as recover_operator
+        try:
+            async with asyncio.timeout(engine.recovery_packet_timeout):
+                await recover_operator(engine)
+        except Exception:
+            reports.append({"account_key": engine.state.account_key, "error": "Owner management recovery is unconfirmed"})
         for row in engine.state.read("trades")["trades"].values():
             market = Market.model_validate(row["plan"]["market"])
             engine.exchange.market_cache[market.symbol] = market

@@ -24,11 +24,12 @@ from .ranking import TIERS
 _CATALOG_NATIVE = ContextVar("aqla_native_catalog", default=False)
 
 COMMANDS = {
+    "aqla": ("Dashboard und vollständige Steuerzentrale", ""),
     "setup": ("Private Setup-Freigabe", "[status|aus]"),
     "aqla_status": ("Trades, Konten, Sync und Setup-Zeit", ""),
     "aqla_kanaele": ("Kanalränge und Nachweise", ""),
     "aqla_profile": ("Profile und Einstellungen", ""),
-    "aqla_journal": ("Journal-Link und Synchronisierung", ""),
+    "aqla_journal": ("Lokales Journal und Monatsberichte", ""),
     "aqla_rang": ("Kanalrang ändern", '["Kanalname" C]'),
     "aqla_parameter": ("Profilparameter ändern", "[Profil Feld Wert]"),
     "aqla_maker": ("Entry/TP-Ausführung ändern", "[Profil entry|tp|beide standard|maker_only]"),
@@ -150,16 +151,12 @@ def install_menu(adapter, replace):
 
     async def owner_menu(self):
         await native_menu()
-        from hermes_cli.commands_platforms import telegram_menu_commands, telegram_menu_max_commands
         from telegram import BotCommandScopeChat
 
         from .events import EXTENSIONS
         # The owner-specific scope reserves room for EVERY system command while
         # retaining native ordering/cap and all other scopes' native selection.
-        rows, _ = await asyncio.to_thread(telegram_menu_commands, max_commands=100)
-        native = [(name, description) for name, description in rows if name not in COMMANDS]
-        cap = max(len(COMMANDS), telegram_menu_max_commands())
-        rows = native[:cap - len(COMMANDS)] + [(name, description) for name, (description, _) in COMMANDS.items()]
+        rows = [(name, COMMANDS[name][0]) for name in ("aqla", "aqla_pause", "setup")]
         for extension in tuple(EXTENSIONS):
             if extension.gateway is None or extension.gateway is getattr(self, "gateway_runner", None):
                 await self._bot.set_my_commands(self._bot_commands(rows), scope=BotCommandScopeChat(chat_id=int(extension.owner)))
@@ -220,6 +217,8 @@ class NativeCommands:
         self.dialog = None
         self.serial = asyncio.Lock()
         self.expiry_handle = None
+        from .telegram_menu import TelegramMenu
+        self.menu = TelegramMenu(self) if hasattr(extension, "config_path") else None
 
     def cancel(self):
         self.dialog = None
@@ -246,7 +245,8 @@ class NativeCommands:
         return self.extension.authority.sign("operator", "native-command:" + secrets.token_hex(16), setup=claims)
 
     async def status(self):
-        return await self.extension.mcp_call(self.extension.server, "status", {"context_auth": self.auth()})
+        return await self.extension.mcp_call(self.extension.server, "status", {"context_auth": self.auth(),
+            **({"view": "configuration"} if self.menu else {})})
 
     async def control(self, **arguments):
         # Read authority immediately before RPC. MCP rechecks again at its write.
@@ -254,6 +254,9 @@ class NativeCommands:
         return await self.extension.mcp_call(self.extension.server, "control", {**arguments, "context_auth": self.auth(protected=protected)})
 
     async def reply(self, bot, text, buttons=None, *, markdown=False):
+        if self.menu and not markdown:
+            await self.menu.display(bot, text, buttons or (), raw=True)
+            return
         if markdown:
             adapter = self.extension.binding[0]
             result = await adapter.send(self.extension.owner, text)
@@ -516,10 +519,7 @@ class NativeCommands:
         elif command == "aqla_funktionen":
             await self.reply(bot, "aqla Agent-System\n" + system_catalog())
         else:
-            journal = snapshot.get("journal", {})
-            settings = self.extension.settings.google_sheets
-            link = "https://docs.google.com/spreadsheets/d/" + settings.spreadsheet_id if settings.spreadsheet_id else "Kein Journal-Buch konfiguriert."
-            await self.reply(bot, f"{link}\nSync: {'aktiv' if journal.get('enabled') else 'aus'} · {journal.get('pending', 0)} ausstehend\nLetzter Sync: {journal.get('last_synced_at') or '—'}")
+            await self.reply(bot, "Journal: lokal in SQLite gespeichert. /aqla → Journal & Berichte")
 
     async def source_change(self, bot, command, raw):
         self.cancel()
@@ -562,6 +562,8 @@ class NativeCommands:
             await self.reply(bot, "Eigene Schließung bestätigt; Marktreservierung freigegeben. PnL unvollständig." if result["resolved"] else "Schließung nicht belegt; Reservierung bleibt bestehen. Neue Eigentumsprüfung lesen.")
 
     async def intercept(self, update, bot):
+        if self.menu and await self.menu.intercept(update, bot):
+            return True
         query = getattr(update, "callback_query", None)
         if query and str(getattr(query, "data", "")).startswith(CALLBACK_PREFIX):
             user, chat = query.from_user, getattr(query.message, "chat", None)

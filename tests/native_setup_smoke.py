@@ -85,6 +85,7 @@ def main():
     assert not any(name.endswith(("sync_presentation_internal", "presentation_selection_internal", "integration")) for name in names)
     extension = next(iter(EXTENSIONS))
     admitted, sent, deleted, menus = [], [], [], []
+    created, panel_edits = [], []
     delete_ack, tool_arguments = [True], []
     native_mcp_call = extension.mcp_call
     async def record_mcp_call(server, tool, arguments):
@@ -105,7 +106,12 @@ def main():
                 result = [payload(SYNTHETIC_PASSWORD, 2)]
             elif endpoint == "sendMessage":
                 sent.append(request_data.parameters)
-                result = {"message_id": 1001 + len(sent), "date": 1791490000, "chat": {"id": 12345, "type": "private"}, "text": request_data.parameters["text"]}
+                created.append(request_data.parameters)
+                result = {"message_id": 1001 + len(created), "date": 1791490000, "chat": {"id": 12345, "type": "private"}, "text": request_data.parameters["text"]}
+            elif endpoint == "editMessageText":
+                sent.append(request_data.parameters)
+                panel_edits.append(request_data.parameters)
+                result = {"message_id": request_data.parameters["message_id"], "date": 1791490000, "chat": {"id": 12345, "type": "private"}, "text": request_data.parameters["text"]}
             elif endpoint == "deleteMessage":
                 deleted.append(request_data.parameters)
                 result = delete_ack[0]
@@ -153,7 +159,7 @@ def main():
             await adapter._register_command_menu()
             owner_menu = next(row for row in menus if row.get("scope", {}).get("type") == "chat")
             owner_commands = owner_menu["commands"]
-            assert set(COMMANDS) <= {row["command"] for row in owner_commands}
+            assert {row["command"] for row in owner_commands} == {"aqla", "aqla_pause", "setup"}
             assert len(owner_commands) <= 60
             assert all(row["description"].startswith("aqla:" if row["command"] in COMMANDS else "Hermes:") for row in owner_commands)
             assert {row.get("scope", {}).get("type") for row in menus} >= {"default", "all_private_chats", "all_group_chats", "chat"}
@@ -256,7 +262,22 @@ def main():
             assert read_snapshot(home / "data/state.sqlite3")["paused"] is True
             assert admitted == []
             await app.process_update(Update.de_json(payload("/aqla_status", 25), app.bot))
-            assert any("Setup:" in row["text"] for row in sent) and admitted == []
+            assert any("Dashboard" in row["text"] for row in sent) and admitted == []
+            assert panel_edits, "Native menu must edit its existing panel"
+            from aqla_agent.telegram_menu import HOME
+            panel_created = len(created)
+            panel_revision = read_snapshot(home / "data/state.sqlite3")["configuration_revision"]
+            for sequence, (label, action) in enumerate(HOME, start=60):
+                await app.process_update(Update.de_json(payload("/aqla", sequence * 2), app.bot))
+                token = next(key for key, value in extension.commands.menu.tokens.items() if value[0] == action)
+                panel_callback = {"update_id": sequence * 2 + 1, "callback_query": {"id": "panel-" + str(sequence), "chat_instance": "panel-chat",
+                    "from": {"id": 12345, "is_bot": False, "first_name": "Synthetic"}, "data": token,
+                    "message": {"message_id": extension.commands.menu.message_id, "date": 1791490000,
+                        "chat": {"id": 12345, "type": "private"}, "from": {"id": 999, "is_bot": True, "first_name": "Synthetic bot"}, "text": label}}}
+                await app.process_update(Update.de_json(panel_callback, app.bot))
+                assert not any(marker in sent[-1]["text"] for marker in ("vorübergehend nicht verfügbar", "Nicht gespeichert", "Änderung nicht ausgeführt")), (action, sent[-1]["text"])
+            assert len(created) == panel_created and admitted == []
+            assert read_snapshot(home / "data/state.sqlite3")["configuration_revision"] == panel_revision
             # New source controls run through the actual native registry/PTB
             # dispatcher and real MCP revision/setup gates, with no model turn.
             existing_sources = set(read_snapshot(home / "data/state.sqlite3")["sources"])

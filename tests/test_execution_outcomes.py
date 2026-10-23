@@ -257,7 +257,7 @@ def test_mixed_targets_preserve_scopes_revision_and_receipts():
     other.update(status="conflicted", external_conflict="manual")
     counts = execution_counts(snapshot)
     assert counts["known_own_open"] == 0 and counts["unsettled_ownership"] == 1
-    assert "Belegte eigene offene Positionen:** 0" in status_text(snapshot, {}, False, {})
+    assert "Belegte eigene offene Positionen:** 0" in status_text(snapshot, {}, {})
 
 
 @pytest.mark.parametrize("kind,expected", [("new_signal", "source_revision_unconfirmed"), ("trade_update", "update_only")])

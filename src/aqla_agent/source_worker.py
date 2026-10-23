@@ -54,8 +54,8 @@ class SourceWorker:
     def __init__(self, extension, config, *, adapter=None, fallback=None):
         self.extension = extension
         self.config = SourceProcessingConfig.model_validate(config or {})
-        self.adapter = adapter or OpenRouterDecisionAdapter(os.environ.get(self.config.key_env, ""), timeout=self.config.timeout_seconds,
-            model=self.config.model, model_revision=self.config.model_revision)
+        self.adapter = adapter or (OpenRouterDecisionAdapter(os.environ.get(self.config.key_env, ""), timeout=self.config.timeout_seconds,
+            model=self.config.model, model_revision=self.config.model_revision) if self.config.mode != "legacy" else None)
         self.fallback = fallback or self.generative_fallback
         self.bound_owner = None
         self.bound_adapter = None
@@ -400,13 +400,20 @@ class SourceWorker:
         if selected.get("delivery_id") is None:
             return
         success = False
+        message_id = None
         try:
             # No final-response ledger: this outbox is the ONE owner of delivery retries.
-            result = await asyncio.wait_for(self.extension.binding[0].send(self.extension.owner, selected["text"]), 20)
+            adapter = self.extension.binding[0]
+            if selected.get("edit_message_id"):
+                result = await asyncio.wait_for(adapter.edit_message(self.extension.owner, selected["edit_message_id"], selected["text"]), 20)
+            else:
+                result = await asyncio.wait_for(adapter.send(self.extension.owner, selected["text"]), 20)
             success = result.success is True
+            message_id = getattr(result, "message_id", None)
+            message_id = str(message_id) if message_id is not None else None
         except asyncio.CancelledError:
             raise
         except Exception:
             pass
         await self.internal("delivery_complete", delivery_id=selected["delivery_id"],
-                            delivery_part=selected["part"], delivery_success=success)
+                            delivery_part=selected["part"], delivery_success=success, delivery_message_id=message_id)
