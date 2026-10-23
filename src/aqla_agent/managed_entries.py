@@ -827,7 +827,7 @@ async def refresh_wave_inventory(engine, trade_id, trade, plan, quote):
     await tick(engine, trade_id, quote)
 
 
-async def refresh_managed_protection(engine, trade_id, plan, current, trade, remaining, quote):
+async def refresh_managed_protection(engine, trade_id, plan, current, trade, quote):
     if current.get("suspended_wave_targets"):
         result = await resume_managed_wave_targets(engine, trade_id, plan)
         if result is not None:
@@ -857,7 +857,7 @@ async def refresh_managed_position(engine, trade_id, trade, plan, total, cost, r
     current = engine.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id]
     record_initial_managed_risk(engine, trade_id, plan, current)
     try:
-        result = await refresh_managed_protection(engine, trade_id, plan, current, trade, remaining, quote)
+        result = await refresh_managed_protection(engine, trade_id, plan, current, trade, quote)
         if result is not None:
             return result
     except TemporaryObservation as error:

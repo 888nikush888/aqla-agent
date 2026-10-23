@@ -481,7 +481,7 @@ def shared_quantity_engine(monkeypatch, side):
 @pytest.mark.parametrize("case", ["proved_gap", "unknown", "mismatched", "manual_extra", "manual_without_wave", "manual_after_complete", "wrong_direction", "quantity_unproved", "status_timeout"])
 @pytest.mark.asyncio
 async def test_only_exact_own_exit_quantity_can_explain_a_shared_position_difference(monkeypatch, side, case):
-    engine, payload, identity, cloid = shared_quantity_engine(monkeypatch, side)
+    engine, payload, _identity, cloid = shared_quantity_engine(monkeypatch, side)
     trade = payload["trades"]["trade"]
     observed = native_wave_status(cloid, "filled", "0")
     observed["order"]["order"]["side"] = "A" if side == "long" else "B"
