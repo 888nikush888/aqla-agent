@@ -1864,7 +1864,7 @@ class Trading:
 
 
     async def resize_legacy_targets(self, trade_id, trade, plan):
-        if (trade.get("lifecycle_version") == 2
+        if (trade is None or trade.get("lifecycle_version") == 2
                 or trade.get("pending_stop_update", {}).get("phase") in STOP_UPDATE_ACTIVE
                 or not any(order["kind"] == "tp" and not order.get("retired") for order in trade["orders"])):
             return trade
@@ -1877,7 +1877,10 @@ class Trading:
             return trade
         identity = "resize-targets:" + trade_id + ":" + digest([trade["remaining_quantity"], trade["tp_filled"], trade["targets"]])
         await self.replace_targets(trade_id, list(map(Decimal, trade["targets"])), identity)
-        return await self.ready_protection_targets(trade_id)
+        trade = await self.ready_protection_targets(trade_id)
+        if trade is not None and Decimal(trade["remaining_quantity"]) > 0:
+            return trade
+        return None
 
 
     async def ensure_protection(self, trade_id):
@@ -1896,10 +1899,8 @@ class Trading:
         if trade["status"] == "closing":
             return
         trade = await self.ready_protection_targets(trade_id)
-        if trade is None:
-            return
         trade = await self.resize_legacy_targets(trade_id, trade, plan)
-        if trade is None or Decimal(trade["remaining_quantity"]) <= 0:
+        if trade is None:
             return
         if not any(order["kind"] == "tp" and not order.get("retired") for order in trade["orders"]):
             self.stage_initial_targets(trade_id, trade, plan)
