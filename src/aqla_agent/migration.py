@@ -73,3 +73,7 @@ def main():
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     print(json.dumps(migrate(args.root, apply=args.apply)))
+
+
+if __name__ == "__main__":
+    main()
