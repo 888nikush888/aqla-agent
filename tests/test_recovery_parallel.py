@@ -91,19 +91,18 @@ async def test_startup_serves_status_while_recovery_still_gates_entries(setup, s
             entered.set()
             await asyncio.Event().wait()
     monkeypatch.setattr(router, "_recover_account", hanging)
-    async with asyncio.timeout(2):
-        async with server.settings.lifespan(server):
-            await entered.wait()
-            status = await server.call_tool("status", {"view": "summary"})
-            assert not status.is_error
-            entry = asyncio.create_task(router.execute(plan["plan_id"]))
-            try:
-                await asyncio.sleep(0)
-                assert not entry.done() and not router.engines["hyperliquid"].recovery_checked
-                assert fake.actions == []
-            finally:
-                entry.cancel()
-                await asyncio.gather(entry, return_exceptions=True)
+    async with asyncio.timeout(2), server.settings.lifespan(server):
+        await entered.wait()
+        status = await server.call_tool("status", {"view": "summary"})
+        assert not status.is_error
+        entry = asyncio.create_task(router.execute(plan["plan_id"]))
+        try:
+            await asyncio.sleep(0)
+            assert not entry.done() and not router.engines["hyperliquid"].recovery_checked
+            assert fake.actions == []
+        finally:
+            entry.cancel()
+            await asyncio.gather(entry, return_exceptions=True)
 
 
 @pytest.mark.asyncio

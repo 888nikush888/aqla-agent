@@ -589,10 +589,10 @@ async def test_pending_stop_applies_own_fill_during_entry_cancellation(setup, si
     def fill_during_cancel(request):
         nonlocal injected
         payload = json.loads(request.content)
-        if request.url.path == "/exchange" and payload["action"]["type"] == "cancelByCloid" and not injected:
-            if payload["action"]["cancels"][0]["cloid"] == trade["entry_cloid"]:
-                fake.fill(trade["entry_cloid"], Decimal(trade["plan"]["quantity"]) * fraction)
-                injected = True
+        if (request.url.path == "/exchange" and payload["action"]["type"] == "cancelByCloid" and not injected
+                and payload["action"]["cancels"][0]["cloid"] == trade["entry_cloid"]):
+            fake.fill(trade["entry_cloid"], Decimal(trade["plan"]["quantity"]) * fraction)
+            injected = True
         return original(request)
 
     exchange.client._transport = httpx.MockTransport(fill_during_cancel)

@@ -1,3 +1,4 @@
+import builtins
 import importlib.util
 import json
 import subprocess
@@ -17,6 +18,24 @@ def test_owned_trade_replay_is_rejected_before_state_creation_with_optimized_pyt
     result = subprocess.run([sys.executable, "-O", "-m", "aqla_agent.source_replay", str(fixture)],
                             input="", capture_output=True, text=True, timeout=10, check=False)
     assert result.returncode != 0 and "Owned trade fixtures require explicit isolated reconstruction" in result.stderr
+    assert not list(tmp_path.glob("state*"))
+
+
+def test_unsupported_owned_trade_fixture_is_rejected_before_runtime_imports(tmp_path, monkeypatch):
+    from aqla_agent.source_replay import serve_fixture
+
+    fixture = tmp_path / "case.json"
+    fixture.write_text(json.dumps({"packet": {"trades": [{"trade_id": "unreconstructed"}]}}))
+    original = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "httpx" or name.startswith("aqla_hyperliquid_mcp"):
+            raise AssertionError("Runtime imported before fixture validation")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    with pytest.raises(AssertionError, match="Owned trade fixtures require explicit isolated reconstruction"):
+        serve_fixture(fixture)
     assert not list(tmp_path.glob("state*"))
 
 

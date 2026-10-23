@@ -483,10 +483,11 @@ async def test_wake_observed_source_work_independent_of_zero_notifications(exten
     elif mode == "recovery":
         queue.update(recovery_operations=["entry:owned-trade"])
     pending = [f"ready-{i}" for i in range(12)] if mode == "ready" else []
-    calls, wakes = [], []
+    calls, wakes = 0, []
     async def snapshot(*args, **kwargs):
-        calls.append(1)
-        if len(calls) > 2:
+        nonlocal calls
+        calls += 1
+        if calls > 2:
             raise asyncio.CancelledError
         return {"pending": pending, "notification_pending": 0, "source_queue": queue}
     async def instant_sleep(*args):

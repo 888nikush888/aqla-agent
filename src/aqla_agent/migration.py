@@ -50,7 +50,10 @@ def migrate(root, *, apply=False):
         return result
     if os.name != "posix":
         raise AqlaError("Apply targets the stopped Linux VPS service; use dry-run elsewhere")
-    service = subprocess.run(["systemctl", "is-active", "aqla-agent.service"], capture_output=True, text=True, check=False)
+    executable = shutil.which("systemctl")
+    if executable is None:
+        raise AqlaError("systemctl is required to verify that the Aqla service is stopped")
+    service = subprocess.run([str(Path(executable).resolve()), "is-active", "aqla-agent.service"], capture_output=True, text=True, check=False)
     if service.returncode not in (3, 4) or service.stdout.strip() not in ("inactive", "failed", "unknown", ""):
         raise AqlaError("Stop aqla-agent.service before configuration migration")
     backup = root / ".updates" / ("telegram-migration-" + str(now_ms()))

@@ -15,6 +15,7 @@ def __getattr__(name):
     module = types.ModuleType(__name__ + "." + name)
     module.__file__ = str(path)
     sys.modules[module.__name__] = module
-    exec(compile(source, str(path), "exec"), module.__dict__)
+    # The fixed allowlist loads only repository-owned frozen fixtures, never external input.
+    exec(compile(source, str(path), "exec"), module.__dict__)  # skipcq: PYL-W0122
     globals()[name] = module
     return module

@@ -7,8 +7,6 @@ import sys
 from pathlib import Path
 from unittest import TestCase
 
-from .decision_evaluation import CRITICAL_FIELDS, complete_fields, equal, write_private_json
-
 INVARIANTS = TestCase()
 
 
@@ -40,6 +38,8 @@ def _comparison_values(field, left, right):
 
 
 def mismatches(interpretation, expected):
+    from .decision_evaluation import CRITICAL_FIELDS, complete_fields, equal
+
     actual = complete_fields(interpretation)
     fields = ("kind", "source_refs") if expected["kind"] not in ("new_signal", "trade_update") else (
         field for field in CRITICAL_FIELDS if field != "evidence")
@@ -57,6 +57,10 @@ def mismatches(interpretation, expected):
 
 def serve_fixture(path):
     """Expose production read/check tools only; broker HTTP always fails locally."""
+    fixture = json.loads(Path(path).read_text(encoding="utf-8"))
+    packet = fixture["packet"]
+    INVARIANTS.assertTrue(not packet.get('trades'), 'Owned trade fixtures require explicit isolated reconstruction')
+    # Reject unsupported state before importing or constructing the MCP runtime.
     import httpx
 
     from aqla_hyperliquid_mcp.api import Hyperliquid
@@ -65,12 +69,10 @@ def serve_fixture(path):
     from aqla_hyperliquid_mcp.state import State
 
     from . import source_assistance
+    from .decision_evaluation import write_private_json
     from .decisions import validate_interpretation
 
-    fixture = json.loads(Path(path).read_text(encoding="utf-8"))
-    packet = fixture["packet"]
     directory = Path(path).parent
-    INVARIANTS.assertTrue(not packet.get('trades'), 'Owned trade fixtures require explicit isolated reconstruction')
     settings = Settings(network="testnet", account="0x" + "1" * 40,
                         state_path=directory / "state.sqlite3", sources=sorted({m["chat_id"] for m in packet["messages"]}))
     state = State(settings)

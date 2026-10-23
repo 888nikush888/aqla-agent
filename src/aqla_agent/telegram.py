@@ -274,9 +274,9 @@ class TelegramReader:
                 return
             message = self.source(event.message)
             message.historical = message.message_id <= configuration.get("context_cutoffs", {}).get(message.chat_id, 0)
-            if message.chat_id in {*configuration["sources"], *self.aliases.values()}:
-                if (message.chat_id, message.message_id, message.edited_at) not in self.last_delivered_versions:
-                    await self.deliver(message)
+            if (message.chat_id in {*configuration["sources"], *self.aliases.values()}
+                    and (message.chat_id, message.message_id, message.edited_at) not in self.last_delivered_versions):
+                await self.deliver(message)
 
     @staticmethod
     def source(message, *, historical=False):

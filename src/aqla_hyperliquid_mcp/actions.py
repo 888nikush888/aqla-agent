@@ -87,6 +87,8 @@ class Builder(Model):
 
 
 class Orders(Model):
+    # Native signed payload key; preserve its public schema/property name.
+    # skipcq: PTC-W0052
     orders: list[OrderWire] = Field(min_length=1, max_length=100)
     grouping: Literal["na", "normalTpsl", "positionTpsl"] = "na"
     builder: Builder | None = None
@@ -232,6 +234,8 @@ class Halt(Model):
 
 class FeeRecipient(Model):
     dex: Venue
+    # Native wire ABI requires this exact field in signed payloads.
+    # skipcq: PTC-W0052
     feeRecipient: Address
 
 
@@ -243,6 +247,8 @@ class SubDeployer(Model):
 
 class SubDeployers(Model):
     dex: Venue
+    # Native wire ABI requires this exact field in signed payloads.
+    # skipcq: PTC-W0052
     subDeployers: list[SubDeployer]
 
 

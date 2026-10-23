@@ -40,8 +40,15 @@ async def lost_target(setup, signal, monkeypatch):
     return state, fake, exchange, trading, trade, staged, extra
 
 
-# Sequential safety assertions; control flow (including test doubles): 6.
-# skipcq: PY-R1000
+async def fill_recovered_targets(current, fake, state, trade, trading):
+    for order in current["orders"]:
+        if order["kind"] == "tp" and not order.get("retired"):
+            fake.fill(order["cloid"], order["quantity"], order["price"])
+    await trading.refresh_trade(trade["trade_id"])
+    closed = state.read("trades")["trades"][trade["trade_id"]]
+    assert closed["status"] == "closed" and closed["cleanup_complete"] and closed["remaining_quantity"] == "0"
+
+
 @pytest.mark.asyncio
 async def test_expired_target_absence_retires_exact_generation_then_restores_once(setup, signal, monkeypatch):
     state, fake, exchange, trading, trade, staged, _ = await lost_target(setup, signal, monkeypatch)
@@ -66,12 +73,7 @@ async def test_expired_target_absence_retires_exact_generation_then_restores_onc
         if row["cloid"] in {r["c"] for r in staged["action"]["orders"]}
     )
     assert all(order.get("r") for action in fake.actions[len(before) :] for order in action.get("orders", []))
-    for order in current["orders"]:
-        if order["kind"] == "tp" and not order.get("retired"):
-            fake.fill(order["cloid"], order["quantity"], order["price"])
-    await trading.refresh_trade(trade["trade_id"])
-    closed = state.read("trades")["trades"][trade["trade_id"]]
-    assert closed["status"] == "closed" and closed["cleanup_complete"] and closed["remaining_quantity"] == "0"
+    await fill_recovered_targets(current, fake, state, trade, trading)
 
 
 @pytest.mark.asyncio

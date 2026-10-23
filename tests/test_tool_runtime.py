@@ -1,3 +1,4 @@
+"""Native tool hooks share the synthetic Hermes context fixture."""
 import pytest
 from test_hermes_integration import extension  # noqa: F401 -- synthetic context
 

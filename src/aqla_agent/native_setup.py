@@ -230,12 +230,15 @@ class NativeSetup:
         return True
 
 
+# Telegram debug bodies may contain owner setup secrets; retain each record with its payload redacted.
+# skipcq: PY-A6006
 class PrivateTransportLogs(logging.Filter):
     """PTB logs incoming API bodies before handler admission; omit those records."""
     def filter(self, record):
-        if record.name.startswith("telegram"):
-            if "update" in str(record.msg).lower() or "parameters" in str(record.msg).lower() or "return value" in str(record.msg).lower():
-                record.msg, record.args, record.exc_info = "Telegram transport metadata omitted", (), None
+        if record.name.startswith("telegram") and (
+                "update" in str(record.msg).lower() or "parameters" in str(record.msg).lower()
+                or "return value" in str(record.msg).lower()):
+            record.msg, record.args, record.exc_info = "Telegram transport metadata omitted", (), None
         return True
 
 

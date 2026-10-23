@@ -13,6 +13,11 @@ from aqla_hyperliquid_mcp.auth import Authority
 from aqla_hyperliquid_mcp.models import require_first
 
 
+async def invoke_status_hook(hook):
+    assert callable(hook)
+    await hook()
+
+
 @pytest.fixture
 def controls():
     native, bot, gate, now, current, _calls, _checks = fixture_controller()
@@ -38,7 +43,7 @@ def controls():
             authority.verify(args["context_auth"], operator=True)
             if status_hook[0]:
                 hook, status_hook[0] = status_hook[0], None
-                await hook()
+                await invoke_status_hook(hook)
             return copy.deepcopy(data)
         if tool == "ranking_status":
             return {"sources": {identity: {**row, "name": data["source_names"][identity], "proof_total": 4, "evidence": [{"net_r": "1"}], "exclusions": []} for identity, row in data["source_ranks"].items()}}

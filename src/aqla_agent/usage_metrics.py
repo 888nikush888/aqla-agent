@@ -75,6 +75,14 @@ def _source_timing_key(identity):
     return hashlib.sha256(identity.encode()).hexdigest()
 
 
+def _record_tool_duration(row, duration):
+    if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
+        if "duration_seconds" not in row:
+            row["duration_seconds"] = [duration]
+        elif len(row["duration_seconds"]) < 256:
+            row["duration_seconds"].append(duration)
+
+
 @dataclass
 class UsageRun:
     origin: str
@@ -102,10 +110,7 @@ class UsageRun:
         row["errors"] += int(bool(error))
         row["repeated_results"] += int(key in self.result_hashes)
         self.result_hashes.add(key)
-        if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
-            samples = row.setdefault("duration_seconds", [])
-            if len(samples) < 256:
-                samples.append(duration)
+        _record_tool_duration(row, duration)
         if not error and isinstance(content, str):
             self.observe_source(name, content)
         if isinstance(content, str) and not error and name.endswith(("interpret_source", "interpret_source_batch")):

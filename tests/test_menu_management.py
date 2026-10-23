@@ -17,8 +17,23 @@ from aqla_hyperliquid_mcp.server import close_server, create_server
 from aqla_hyperliquid_mcp.state import State
 
 
-# Sequential safety assertions; control flow (including test doubles): 13.
-# skipcq: PY-R1000
+async def verify_menu_closed_request(bot, boundary, menu, primary, router, secondary, snapshot, state, target, token, trade):
+    assert snapshot['operator_requests'], (bot.edits or bot.sent)[-1]['text']
+    request=require_first(iter(snapshot['operator_requests'].values()))
+    assert request['status']=='done' and request['account_key']==target.state.account_key
+    assert boundary.position==0
+    if secondary:
+        assert primary.position==2 and not primary.actions
+    sent=list(boundary.actions)
+    await menu.intercept(callback(menu,token),bot)
+    assert boundary.actions==sent
+    await router.recover()
+    closes=[row for action in boundary.actions if action['type']=='order' for row in action['orders']
+        if row['r'] and row['t'].get('limit',{}).get('tif')=='Ioc']
+    assert len(closes)==1
+    assert state.snapshot()['trades'][trade['trade_id']]['status']=='closed'
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("root_network", ["mainnet", "testnet"])
 @pytest.mark.parametrize("secondary", [False, True])
@@ -74,19 +89,6 @@ async def test_actual_menu_close_uses_original_network_and_one_identity(setup, s
         if changed_account:
             assert not snapshot.get('operator_requests') and boundary.position!=0 and boundary.actions==before
             return
-        assert snapshot['operator_requests'], (bot.edits or bot.sent)[-1]['text']
-        request=require_first(iter(snapshot['operator_requests'].values()))
-        assert request['status']=='done' and request['account_key']==target.state.account_key
-        assert boundary.position==0
-        if secondary:
-            assert primary.position==2 and not primary.actions
-        sent=list(boundary.actions)
-        await menu.intercept(callback(menu,token),bot)
-        assert boundary.actions==sent
-        await router.recover()
-        closes=[row for action in boundary.actions if action['type']=='order' for row in action['orders']
-            if row['r'] and row['t'].get('limit',{}).get('tif')=='Ioc']
-        assert len(closes)==1
-        assert state.snapshot()['trades'][trade['trade_id']]['status']=='closed'
+        await verify_menu_closed_request(bot, boundary, menu, primary, router, secondary, snapshot, state, target, token, trade)
     finally:
         await close_server(server)

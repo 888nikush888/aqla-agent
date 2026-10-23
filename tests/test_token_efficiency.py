@@ -23,6 +23,29 @@ from aqla_hyperliquid_mcp.models import (
 from aqla_hyperliquid_mcp.server import close_server, create_server
 
 
+def assert_decision_batch_structure(batch, sources):
+    assert len(batch["messages"]) == 3
+    assert list(batch["messages"]) == [source.event_id for source in sources]
+    assert len(batch["configurations"]) == 1
+    assert batch["stored_trade_details_omitted"]
+    for contract in batch["interpretation_contracts"].values():
+        assert contract["workflow"] and contract["version"] and contract["candidate_limit"] == 64
+        assert contract["vetoes_are_not_classification_or_permission"] and contract["candidate_roles_are_not_inferred"]
+    assert {row["anchor_event_id"] for row in batch["items"]} == {source.event_id for source in sources}
+
+
+def verify_decision_batch_originals(batch, sources, state, efficiency_server):
+    for source, item in zip(sources, batch["items"], strict=True):
+        assert batch["messages"][source.event_id]["source"]["text"] == source.text
+        for identity in item["interpretation_assistance"]["candidate_ids"]:
+            span = batch["interpretation_candidates"][identity]
+            original = require_first(row["source"]["text"] for row in batch["messages"].values() if row["source_id"] == span["source_id"])
+            assert original[span["start"]:span["end"]] == span["quote"]
+        interpretation = Interpretation.model_validate({key: value for key, value in report_item(source, item["source_read_receipt"]).items()
+                                                        if key not in ("event_id", "source_read_receipt")})
+        verify_disposition(state.snapshot(), source.event_id, interpretation, item["source_read_receipt"], efficiency_server.aqla_authority.key)
+
+
 @pytest.fixture
 async def efficiency_server(setup):
     settings, state, _, exchange, _ = setup
@@ -97,8 +120,6 @@ async def test_summary_never_requests_a_full_state_snapshot(efficiency_server, s
     assert summary["view"] == "summary" and "account_recovery" in summary
 
 
-# Sequential safety assertions; control flow (including test doubles): 13.
-# skipcq: PY-R1000
 @pytest.mark.asyncio
 async def test_decision_context_and_batch_keep_originals_quotes_replies_and_receipts(efficiency_server, setup):
     _, state, _, _, trading = setup
@@ -112,23 +133,8 @@ async def test_decision_context_and_batch_keep_originals_quotes_replies_and_rece
     assert one["messages"][sources[0].event_id]["source"] == full["event"]["source"]
     assert one["source_read_receipt"].startswith("sr2.")
     batch = await call(efficiency_server, "source_context_batch", event_ids=[source.event_id for source in sources])
-    assert len(batch["messages"]) == 3
-    assert list(batch["messages"]) == [source.event_id for source in sources]
-    assert len(batch["configurations"]) == 1
-    assert batch["stored_trade_details_omitted"]
-    for contract in batch["interpretation_contracts"].values():
-        assert contract["workflow"] and contract["version"] and contract["candidate_limit"] == 64
-        assert contract["vetoes_are_not_classification_or_permission"] and contract["candidate_roles_are_not_inferred"]
-    assert {row["anchor_event_id"] for row in batch["items"]} == {source.event_id for source in sources}
-    for source, item in zip(sources, batch["items"], strict=True):
-        assert batch["messages"][source.event_id]["source"]["text"] == source.text
-        for identity in item["interpretation_assistance"]["candidate_ids"]:
-            span = batch["interpretation_candidates"][identity]
-            original = require_first(row["source"]["text"] for row in batch["messages"].values() if row["source_id"] == span["source_id"])
-            assert original[span["start"]:span["end"]] == span["quote"]
-        interpretation = Interpretation.model_validate({key: value for key, value in report_item(source, item["source_read_receipt"]).items()
-                                                        if key not in ("event_id", "source_read_receipt")})
-        verify_disposition(state.snapshot(), source.event_id, interpretation, item["source_read_receipt"], efficiency_server.aqla_authority.key)
+    assert_decision_batch_structure(batch, sources)
+    verify_decision_batch_originals(batch, sources, state, efficiency_server)
     separate = [len(json.dumps(await call(efficiency_server, "source_context", event_id=source.event_id, view="decision"), ensure_ascii=False)) for source in sources]
     assert len(json.dumps(batch, ensure_ascii=False)) < sum(separate)
 

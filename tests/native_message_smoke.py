@@ -40,8 +40,8 @@ def main():
                       'network': 'testnet', 'exchange': 'aster', 'requested_exchange': 'hyperliquid', 'fallback_reason': 'Confirmed absent',
                       'rank_snapshot': {'tier': 'D', 'factor': '.75'}, 'policy': {'risk_percent': '3.75'},
                       'source_tp': {'unit': 'roi_percent', 'values': ['20', '40']}, 'profile_id': 'standard', 'backup_fields': []},
-             'initial_sl_risk': {'amount': '2'}}
-    trade['fill_events'] = {'entry': {'kind': 'entry', 'sz': '2', 'px': '100', 'time': 1000}}
+             'initial_sl_risk': {'amount': '2'},
+             'fill_events': {'entry': {'kind': 'entry', 'sz': '2', 'px': '100', 'time': 1000}}}
     data = {'trades': {'trade': trade}, 'events': {}, 'operations': {}, 'paused': False,
             'source_names': {'-100123': '[VIP]* Gold_`'}, 'profiles': {'standard': {'name': 'Standard'}},
             'notifications': {'notice': {'trade_id': 'trade', 'change': {'status': 'open', 'filled_quantity': '2'},

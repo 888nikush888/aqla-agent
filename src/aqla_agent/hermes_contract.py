@@ -1,6 +1,7 @@
 """Pinned private Hermes hooks checked before any Aqla monkeypatch is installed."""
 import importlib
 import inspect
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -112,7 +113,10 @@ def check_native_contract() -> None:
         raise RuntimeError("Pinned Hermes source location is missing; no Aqla patches installed")
     root = Path(gateway.__file__).resolve().parents[1]
     try:
-        revision = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+        executable = shutil.which("git")
+        if executable is None:
+            raise OSError("Git executable is unavailable")
+        revision = subprocess.check_output([str(Path(executable).resolve()), "-C", str(root), "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
     except (OSError, subprocess.SubprocessError) as error:
         raise RuntimeError("Pinned Hermes source revision could not be verified; no Aqla patches installed") from error
     if revision != PIN:

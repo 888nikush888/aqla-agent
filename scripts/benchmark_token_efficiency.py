@@ -191,6 +191,8 @@ def main():
     parser.add_argument("--cases", nargs="+")
     args = parser.parse_args()
     sys.path[:0] = [str(ROOT / "src"), str(ROOT / "tests")]
+    # This isolated benchmark keeps private source/model logs out of its structured output.
+    # skipcq: PY-A6006
     logging.disable(logging.CRITICAL)
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         report = {} if args.replay_only else asyncio.run(packets())

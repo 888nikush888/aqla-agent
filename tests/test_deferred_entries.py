@@ -327,13 +327,6 @@ async def test_postfill_price_violation_closes_own_position_and_pauses_only_venu
     settings, state, fake, exchange, _ = setup
     router = Router(settings, state, exchange)
     original = fake.handle
-    def crossed(request):
-        result = original(request)
-        if request.url.path == "/info" and json.loads(request.content).get("type") == "userFillsByTime" and fake.position:
-            for fill in fake.fills:
-                if fill["px"] == "100":
-                    fill["px"] = "80"
-        return result
     # Change the actual entry fill record immediately after execution, before capture.
     def handle(request):
         result = original(request)

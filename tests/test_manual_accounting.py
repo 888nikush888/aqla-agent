@@ -50,18 +50,7 @@ async def manual_trade(setup, signal, monkeypatch, *, mixed=False):
     return state, fake, identity, Reporting(state, router), payments
 
 
-# Sequential safety assertions; control flow (including test doubles): 10.
-# skipcq: PY-R1000
-@pytest.mark.asyncio
-@pytest.mark.parametrize('mixed', [False, True])
-async def test_manual_pnl_is_evidence_bound_and_reaches_trade_fill_and_visible_journal(setup, signal, monkeypatch, mixed):
-    state, fake, identity, reporting, payments = await manual_trade(setup, signal, monkeypatch, mixed=mixed)
-    before = copy.deepcopy(state.snapshot()['trades'][identity])
-    actions = copy.deepcopy(fake.actions)
-    outcome = await reporting.refresh(identity)
-    assert outcome == {'complete': True, 'reason': 'complete'}, state.snapshot()['trades'][identity]['funding_coverage']
-    snapshot = state.snapshot()
-    trade = snapshot['trades'][identity]
+def assert_manual_financial_evidence(actions, before, fake, mixed, payments, snapshot, trade):
     own = Decimal(trade['filled_quantity'])
     report = report_row(snapshot, trade)
     assert report['complete'] and not report['issues']
@@ -76,6 +65,10 @@ async def test_manual_pnl_is_evidence_bound_and_reaches_trade_fill_and_visible_j
     native = trade['funding_events']['funding']
     assert native['allocation']['account_amount'] == payments[0]['amount']
     assert native['signed_size'] == payments[0]['signed_size']
+    return report, own, fees
+
+
+def assert_manual_journal_projection(fees, identity, mixed, own, snapshot):
     projected = project(snapshot)
     assert projected == journal_oracle.project(snapshot)
     row = dict(zip(HEADERS['Trades'], projected['Trades:' + identity]['values'], strict=True))
@@ -86,6 +79,20 @@ async def test_manual_pnl_is_evidence_bound_and_reaches_trade_fill_and_visible_j
     assert len(closes) == (1 if mixed else 2)
     if mixed:
         assert closes[0]['values'][4] == 'manual_close_allocated'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mixed', [False, True])
+async def test_manual_pnl_is_evidence_bound_and_reaches_trade_fill_and_visible_journal(setup, signal, monkeypatch, mixed):
+    state, fake, identity, reporting, payments = await manual_trade(setup, signal, monkeypatch, mixed=mixed)
+    before = copy.deepcopy(state.snapshot()['trades'][identity])
+    actions = copy.deepcopy(fake.actions)
+    outcome = await reporting.refresh(identity)
+    assert outcome == {'complete': True, 'reason': 'complete'}, state.snapshot()['trades'][identity]['funding_coverage']
+    snapshot = state.snapshot()
+    trade = snapshot['trades'][identity]
+    report, own, fees = assert_manual_financial_evidence(actions, before, fake, mixed, payments, snapshot, trade)
+    assert_manual_journal_projection(fees, identity, mixed, own, snapshot)
     visible = build_presentation(snapshot, PresentationScope(network='testnet', period='all'))
     selected = require_first(row for row in visible.journal if row.trade_id == identity)
     assert selected.complete and selected.net_pnl == Decimal(report['net_pnl']) and selected.exit_price == 110

@@ -119,6 +119,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--baseline", type=Path, help="Completed native high+tools+Caveman results for a paired fake execution replay")
     args = parser.parse_args()
+    # This isolated replay process keeps private historical source/model logs out of stdout.
+    # skipcq: PY-A6006
     logging.disable(logging.CRITICAL)
     payload = json.loads(args.dataset.read_text(encoding="utf-8"))
     cases = payload["cases"]

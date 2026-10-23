@@ -120,6 +120,8 @@ def atr(candles, stamp):
     return value
 
 
+# Public pure-state API: callers pass the native price increment as tick=.
+# skipcq: PYL-W0621
 def advance(state, *, side, price, basis, volatility, cycle_cost, tick, stamp):
     """Pure hysteresis state machine. An instruction is not an execution receipt."""
     result = dict(state)
