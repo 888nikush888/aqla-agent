@@ -1899,7 +1899,7 @@ class Trading:
         if trade is None:
             return
         trade = await self.resize_legacy_targets(trade_id, trade, plan)
-        if trade is None:
+        if trade is None or Decimal(trade["remaining_quantity"]) <= 0:
             return
         if not any(order["kind"] == "tp" and not order.get("retired") for order in trade["orders"]):
             self.stage_initial_targets(trade_id, trade, plan)
@@ -2941,6 +2941,7 @@ class Trading:
 
     async def replacement_target_budgets(self, trade_id, plan, trade):
         current = self.owned_remaining(trade_id, self.position_size(await self.positions(plan.market), plan.market))
+        self.patch_trade(trade_id, remaining_quantity=str(current))
         budgets = [Decimal(value) for value in trade.get("target_budgets", plan.tp_quantities)]
         consumed = [Decimal(value) for value in trade["tp_filled"]]
         outstanding = [max(Decimal(0), budget - spent) for budget, spent in zip(budgets, consumed, strict=True)]

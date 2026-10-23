@@ -14,6 +14,22 @@ def active_targets(fake):
             if row["status"] == "open" and not row["order"]["isTrigger"] and row["order"]["reduceOnly"]]
 
 
+def assert_resize_preserved(state, fake, initial, before, remaining):
+    trade = initial["trades"][before["trade_id"]]
+    current = state.snapshot()["trades"][trade["trade_id"]]
+    budgets = [max(Decimal(0), Decimal(budget) - Decimal(spent))
+               for budget, spent in zip(before["target_budgets"], before["tp_filled"], strict=True)]
+    assert Decimal(current["remaining_quantity"]) == remaining
+    assert sum(Decimal(row["sz"]) for row in active_targets(fake)) == remaining
+    assert current["tp_filled"] == before["tp_filled"]
+    assert [Decimal(row["quantity"]) for row in current["orders"] if row["kind"] == "tp" and not row.get("retired")] == [size * remaining / sum(budgets) for size in budgets if size]
+    assert current["plan"] == trade["plan"] and current["targets"] == trade["targets"]
+    assert Decimal(current["reserved_risk"]) <= Decimal(trade["reserved_risk"])
+    assert all(initial.get(key) == state.snapshot().get(key) for key in ("policy", "profiles", "account_limits"))
+    assert any(row["status"] == "open" and row["order"]["isTrigger"] and row["order"]["reduceOnly"]
+               and Decimal(row["order"]["sz"]) >= remaining for row in fake.orders.values())
+
+
 @pytest.mark.parametrize("side", ["long", "short"])
 @pytest.mark.parametrize("filled_fraction", ["0", ".25", "1"])
 async def test_legacy_reduction_resizes_only_unfilled_targets_and_is_idempotent(setup, side, filled_fraction):
@@ -30,21 +46,9 @@ async def test_legacy_reduction_resizes_only_unfilled_targets_and_is_idempotent(
         await trading.refresh_trade(trade["trade_id"])
     before = state.snapshot()["trades"][trade["trade_id"]]
     remaining = Decimal(before["remaining_quantity"]) / 2
-    budgets = [max(Decimal(0), Decimal(budget) - Decimal(spent))
-               for budget, spent in zip(before["target_budgets"], before["tp_filled"], strict=True)]
     await trading.close_position(trade["trade_id"], Decimal(50), "operator:synthetic-reduce")
     await trading.refresh_trade(trade["trade_id"])
-    current = state.snapshot()["trades"][trade["trade_id"]]
-    targets = active_targets(fake)
-    assert Decimal(current["remaining_quantity"]) == remaining
-    assert sum(Decimal(row["sz"]) for row in targets) == remaining
-    assert current["tp_filled"] == before["tp_filled"]
-    assert [Decimal(row["quantity"]) for row in current["orders"] if row["kind"] == "tp" and not row.get("retired")] == [size * remaining / sum(budgets) for size in budgets if size]
-    assert current["plan"] == trade["plan"] and current["targets"] == trade["targets"]
-    assert Decimal(current["reserved_risk"]) <= Decimal(trade["reserved_risk"])
-    assert all(original.get(key) == state.snapshot().get(key) for key in ("policy", "profiles", "account_limits"))
-    assert any(row["status"] == "open" and row["order"]["isTrigger"] and row["order"]["reduceOnly"]
-               and Decimal(row["order"]["sz"]) >= remaining for row in fake.orders.values())
+    assert_resize_preserved(state, fake, original, before, remaining)
     sent = copy.deepcopy(fake.actions)
     await trading.recover()
     await trading.recover()
@@ -113,7 +117,8 @@ async def test_legacy_resize_keeps_the_last_native_quantity_tick(setup, signal):
     assert not Decimal(current["target_budgets"][0])
 
 
-async def test_legacy_resize_recaptures_a_target_fill_racing_with_cancel(setup, signal, monkeypatch):
+@pytest.mark.parametrize("amount", [".2", "2.4"])
+async def test_legacy_resize_recaptures_a_target_fill_racing_with_cancel(setup, signal, monkeypatch, amount):
     _, state, fake, exchange, trading = setup
     source, value = signal
     plan = await trading.preview(source.event_id, value)
@@ -127,17 +132,22 @@ async def test_legacy_resize_recaptures_a_target_fill_racing_with_cancel(setup, 
         nonlocal injected
         action = json.loads(request.content).get("action", {})
         if not injected and action.get("type") == "cancelByCloid" and any(row["cloid"] == first["cloid"] for row in action["cancels"]):
-            fake.fill(first["cloid"], ".2", first["price"])
+            fake.fill(first["cloid"], amount, first["price"])
             injected = True
         return original(request)
 
     monkeypatch.setattr(exchange.client, "_transport", httpx.MockTransport(fill_before_cancel))
+    sent = len(fake.actions)
     await trading.refresh_trade(trade["trade_id"])
     await trading.refresh_trade(trade["trade_id"])
     current = state.snapshot()["trades"][trade["trade_id"]]
-    assert injected and Decimal(current["remaining_quantity"]) == Decimal("2.2")
-    assert Decimal(current["tp_filled"][0]) == Decimal(".2")
-    assert sum(Decimal(row["sz"]) for row in active_targets(fake)) == Decimal("2.2")
+    remaining = Decimal("2.4") - Decimal(amount)
+    assert injected and Decimal(current["remaining_quantity"]) == remaining
+    assert Decimal(current["tp_filled"][0]) == Decimal(amount)
+    assert sum(Decimal(row["sz"]) for row in active_targets(fake)) == remaining
+    if not remaining:
+        assert current["status"] == "closed"
+        assert not any(action["type"] == "order" for action in fake.actions[sent:])
 
 
 async def test_legacy_resize_cannot_adopt_an_extra_foreign_position(setup, signal):
