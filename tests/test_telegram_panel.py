@@ -328,6 +328,18 @@ async def test_rank_picker_excludes_inactive_rows_even_from_an_old_status_respon
 
 
 @pytest.mark.asyncio
+async def test_natural_current_source_request_opens_a_visible_native_reply_without_setup(panel):
+    menu, bot, _, changes, *_ = panel
+    menu.extension.setup.lease = None
+    await menu.home(bot)
+    old = menu.message_id
+    assert await menu.commands.intercept(update("Zeig mir alle aktuellen Quellkanäle"), bot)
+    assert len(bot.sent) == 2 and menu.message_id != old
+    assert "Aktuell ausgewählte Kanäle" in bot.sent[-1]["text"]
+    assert bot.deleted == [{"chat_id": "12345", "message_id": old}] and not changes
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("navigation", ["Abbrechen", "⌂ Hauptmenü"])
 async def test_setup_started_from_menu_can_be_cancelled_through_actual_ingress(panel, navigation):
     menu, bot, _, changes, *_ = panel

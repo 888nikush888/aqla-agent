@@ -64,7 +64,8 @@ LIMIT_FIELDS = {"offene_trades": "max_open_trades", "offene trades": "max_open_t
 def routine_query(text):
     value = " ".join(text.casefold().strip().rstrip("?!. ").split())
     aliases = {
-        "aqla_kanaele": {"alle aktuellen kanäle", "zeig mir alle kanäle", "zeige mir alle kanäle", "alle kanäle", "welche kanäle sind aktiv", "liste alle kanäle", "kanalliste"},
+        "aqla_kanaele": {"alle aktuellen kanäle", "zeig mir alle kanäle", "zeige mir alle kanäle", "alle kanäle", "welche kanäle sind aktiv", "liste alle kanäle", "kanalliste",
+                         "zeig mir alle aktuellen quellkanäle", "zeige mir alle aktuellen quellkanäle", "alle aktuellen quellkanäle", "welche quellkanäle sind aktiv"},
         "aqla_status": {"wie ist status", "wie ist der status", "status", "aktueller status", "wie ist unser status", "wie ist der aktuelle status"},
         "aqla_profile": {"alle profile", "zeige mir alle profile", "welche profile gibt es", "profile"},
         "aqla_funktionen": {"was kannst du", "welche funktionen gibt es", "welche befehle gibt es", "funktionen"},
@@ -631,6 +632,8 @@ class NativeCommands:
             return False
         if not authentic:
             return command in COMMANDS or dialog is not None
+        if self.menu and command in COMMANDS and not head.startswith("/"):
+            self.menu.fresh = True
         # Pause is an ordinary owner action even while a dialog is pending.
         if command == "aqla_pause":
             self.cancel()

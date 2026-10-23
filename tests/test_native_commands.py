@@ -90,7 +90,7 @@ def callback(token, *, actor="12345", chat="12345", chat_type="private", bot=Fal
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text", ["ALLE AKTUELLEN KANÄLE", "ALLEAKTUELLENKANÄLE", "zeig mir alle kanäle", "zeigmirallekanäle", "wie ist Status?", "wieistStatus", "alle profile", "was kannst du?"])
+@pytest.mark.parametrize("text", ["ALLE AKTUELLEN KANÄLE", "ALLEAKTUELLENKANÄLE", "zeig mir alle kanäle", "zeigmirallekanäle", "wie ist Status?", "wieistStatus", "alle profile", "was kannst du?", "Zeig mir alle aktuellen Quellkanäle", "zeigmiralleaktuellenquellkanäle"])
 async def test_routine_german_queries_are_native_authenticated_and_no_model(controls, text):
     commands, bot, _, mutations, *_ = controls
     commands.extension.setup.lease = None
