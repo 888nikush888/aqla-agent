@@ -28,7 +28,8 @@ def test_week_old_original_entries_keep_exact_deadline_and_risk(signal, setup, e
     _, interpretation = signal
     stamp = now_ms()
     source_time = stamp - 604800000 + remaining_ms
-    interpretation = interpretation.model_copy(update={"entry": entry, "entry_prices": [Decimal(98), Decimal(100)]})
+    prices = [Decimal(98), Decimal(100)] if entry == "range" else [Decimal(100)]
+    interpretation = interpretation.model_copy(update={"entry": entry, "entry_prices": prices})
     market = Market(symbol="BTC", asset_id=0, product="perp", size_decimals=2, mid="100", max_leverage=20)
     account = AccountSnapshot(equity="10000", available_margin="10000", observed_at=stamp)
     parameters = Parameters(risk_percent="0.75", max_notional_quote="650", entry_range_choice="split",
