@@ -26,6 +26,8 @@ Positive = Annotated[Decimal, Field(gt=0, allow_inf_nan=False)]
 Nonnegative = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 Address = Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{40}$")]
 UpdateAction = Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"]
+StopManagement = Literal["break_even", "tp_ladder", "tp2_to_tp1"]
+STOP_LADDERS = {"tp_ladder": ((1, None), (3, 0), (4, 1)), "tp2_to_tp1": ((2, 0),)}
 DEFAULT_UPDATES: tuple[UpdateAction, ...] = ("move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry")
 MAX_SIGNAL_AGE_SECONDS = 7 * 24 * 60 * 60
 
@@ -75,7 +77,8 @@ class Policy(Model):
     take_profit_allocation: Literal["equal", "halving", "custom", "adaptive", "first_target"] = "equal"
     take_profit_weights: list[Positive] = Field(default_factory=list, max_length=20)
     break_even_after_tp: int | None = Field(default=None, ge=1, le=20)
-    stop_management: Literal["break_even", "tp_ladder"] = "break_even"
+    stop_management: StopManagement = Field(default="break_even",
+        description="break_even: own fill trigger selected separately; tp_ladder: TP1 to entry, TP3 to TP1, TP4 to TP2; tp2_to_tp1: only after full own TP1 and TP2 fills, remaining stop to frozen TP1. Never widen a tighter stop.")
     allowed_updates: list[UpdateAction] = Field(default_factory=lambda: list(DEFAULT_UPDATES))
     allow_stop_widening: bool = False
     cost_reserve_bps: Nonnegative = Field(default=Decimal("10"), le=1000)

@@ -11,6 +11,7 @@ from pydantic import Field
 from aqla_hyperliquid_mcp.api import Hyperliquid
 from aqla_hyperliquid_mcp.models import (
     OPEN,
+    STOP_LADDERS,
     STOP_UPDATE_ACTIVE,
     TERMINAL_ORDER,
     UNFINISHED,
@@ -1419,7 +1420,7 @@ class Trading:
     @staticmethod
     def completed_target_prices(trade, plan, target_fills):
         completed_prices = dict(trade.get("completed_target_prices", {}))
-        if plan.policy.stop_management == "tp_ladder":
+        if plan.policy.stop_management in STOP_LADDERS:
             # Freeze the effective target price before later source updates can change it.
             for index, budget in enumerate(trade.get("target_budgets", [])):
                 if budget is not None and Decimal(budget) > 0 and target_fills[index] >= Decimal(budget):
@@ -1436,7 +1437,7 @@ class Trading:
         self.patch_trade(trade_id, fill_events=owned, filled_quantity=str(total), tp_filled=[str(size) for size in target_fills],
                     fill_execution_roles=roles, **({"fill_execution_role_conflicts": conflicts} if conflicts else {}),
                     entry_vwap=str(cost / total) if total else trade["entry_vwap"],
-                    **({"completed_target_prices": completed_prices} if plan.policy.stop_management == "tp_ladder" else {}))
+                    **({"completed_target_prices": completed_prices} if plan.policy.stop_management in STOP_LADDERS else {}))
         return total, cost
 
 
@@ -1913,7 +1914,7 @@ class Trading:
         pending = self.state.read("trades", entries={"trades": [trade_id]})["trades"][trade_id].get("pending_stop_update")
         if pending and pending["phase"] in STOP_UPDATE_ACTIVE:
             return
-        if plan.policy.stop_management == "tp_ladder":
+        if plan.policy.stop_management in STOP_LADDERS:
             await self.advance_stop_ladder(trade_id)
             return
         await self.advance_break_even(trade_id, trade, plan)
@@ -2033,7 +2034,9 @@ class Trading:
     def reached_stop_stages(trade):
         budgets = [Decimal(value) if value is not None else Decimal(0) for value in trade.get("target_budgets", [])]
         fills = [Decimal(value) for value in trade["tp_filled"]]
-        reached = [stage for stage in (1, 3, 4) if stage <= len(budgets) and all(
+        mode = trade.get("plan", {}).get("policy", {}).get("stop_management", "tp_ladder")
+        stages = STOP_LADDERS.get(mode, STOP_LADDERS["tp_ladder"])
+        reached = [stage for stage, _ in stages if stage <= len(budgets) and all(
             0 < budgets[index] <= fills[index] for index in range(stage))]
         return reached
 
@@ -2041,16 +2044,18 @@ class Trading:
     @staticmethod
     def stop_ladder_price(trade, stage, intents):
         if str(stage) in intents:
-            price = Decimal(intents[str(stage)])
-        elif stage == 1:
-            price = managed_entries.current_reference(trade)
-        else:
-            index = 0 if stage == 3 else 1
-            reference = trade.get("completed_target_prices", {}).get(str(index))
-            if reference is None:
-                raise AqlaError("Completed TP reference is not proved; preserve existing stop")
-            price = Decimal(reference)
-        return price
+            return Decimal(intents[str(stage)])
+        mode = trade.get("plan", {}).get("policy", {}).get("stop_management", "tp_ladder")
+        schedule = dict(STOP_LADDERS.get(mode, STOP_LADDERS["tp_ladder"]))
+        if stage not in schedule:
+            raise AqlaError("Stop stage is not configured for this plan")
+        index = schedule[stage]
+        if index is None:
+            return managed_entries.current_reference(trade)
+        reference = trade.get("completed_target_prices", {}).get(str(index))
+        if reference is None:
+            raise AqlaError("Completed TP reference is not proved; preserve existing stop")
+        return Decimal(reference)
 
 
     async def advance_stop_ladder(self, trade_id):

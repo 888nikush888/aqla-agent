@@ -12,6 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from aqla_hyperliquid_mcp.models import (
+    STOP_LADDERS,
     AccountSnapshot,
     AqlaError,
     Interpretation,
@@ -320,6 +321,7 @@ class ReplaySimulation:
         self.peak, self.drawdown, self.losses, self.cycles = (Decimal(0), Decimal(0), Decimal(0), 0)
         self.entries = self.plan.entry_legs or [self.plan]
         self.completed, self.entered, self.pending = (set(), set(), None)
+        self.completed_target_prices = {}
         self.state = {"phase": "waiting_rise"}
         self.stopped, self.previous = (False, -1)
         self.latency = max(1000, int(case["latency_ms"]))
@@ -618,17 +620,14 @@ class ReplaySimulation:
             self.target_spent[index] += filled
             if self.target_spent[index] >= self.target_budgets[index]:
                 self.completed.add(index)
+                self.completed_target_prices.setdefault(index, self.target_prices[index])
 
     def tighten_stop(self):
-        if self.plan.policy.stop_management == "tp_ladder":
-            if 3 in self.completed and all(i in self.completed for i in range(4)):
-                proposed = self.target_prices[1]
-            elif 2 in self.completed and all(i in self.completed for i in range(3)):
-                proposed = self.target_prices[0]
-            elif 0 in self.completed:
-                proposed = self.venue_average
-            else:
-                proposed = self.stop
+        if self.plan.policy.stop_management in STOP_LADDERS:
+            proposed = self.stop
+            for stage, index in STOP_LADDERS[self.plan.policy.stop_management]:
+                if all(i in self.completed for i in range(stage)):
+                    proposed = self.venue_average if index is None else self.completed_target_prices[index]
             self.stop = max(self.stop, proposed) if self.sign == 1 else min(self.stop, proposed)
         elif self.plan.policy.break_even_after_tp and all(
             i in self.completed for i in range(self.plan.policy.break_even_after_tp)

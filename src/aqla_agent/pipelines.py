@@ -17,6 +17,7 @@ from aqla_hyperliquid_mcp.models import (
     Model,
     Policy,
     Positive,
+    StopManagement,
     UpdateAction,
     digest,
     now_ms,
@@ -58,7 +59,8 @@ class Parameters(Model):
     take_profit_allocation: Literal["equal", "halving", "custom", "adaptive", "first_target"] = "equal"
     take_profit_weights: list[Positive] = Field(default_factory=list, max_length=20)
     break_even_after_tp: int | None = Field(default=None, ge=1, le=20)
-    stop_management: Literal["break_even", "tp_ladder"] = "break_even"
+    stop_management: StopManagement = Field(default="break_even",
+        description="tp2_to_tp1 moves only the remaining stop to the completed TP1 after full own TP1/TP2 fills; no move at TP1 and no widening. Other modes retain their existing behavior.")
     allowed_updates: list[UpdateAction] = Field(default_factory=lambda: list(DEFAULT_UPDATES))
     allow_stop_widening: bool = False
     cost_reserve_bps: Annotated[Decimal, Field(ge=0, le=1000)] = Decimal("10")

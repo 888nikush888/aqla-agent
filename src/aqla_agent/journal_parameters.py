@@ -1,7 +1,7 @@
 """Readable trading settings; display only, never a second configuration source."""
 from decimal import Decimal
 
-from aqla_hyperliquid_mcp.models import MAX_SIGNAL_AGE_SECONDS, Policy
+from aqla_hyperliquid_mcp.models import MAX_SIGNAL_AGE_SECONDS, STOP_LADDERS, Policy
 
 # Field -> category, label, unit, allowed values, explanation.
 PARAMETERS = {
@@ -32,7 +32,7 @@ PARAMETERS = {
     "take_profit_allocation": ("Take Profit", "TP-Verteilung", "", "Gleichmäßig / Halbieren / Eigene Gewichte / Adaptiv / 100 % an TP1", "Adaptiv: maximal fünf erste Signalziele, 50/25/12,5/7,5/5 %. Falls Mindestgrößen nicht reichen, weniger Ziele ohne größere Position. Das letzte erhält den Rest. 100 % an TP1 nutzt nur das erste Ziel."),
     "take_profit_weights": ("Take Profit", "Eigene TP-Gewichte", "% je TP", "Bis 20 Werte > 0; Summe 100", "Nur für eigene Gewichte. Anzahl muss den TPs des Signals entsprechen; minimale Börsengrößen gelten weiterhin."),
     "break_even_after_tp": ("Stop Loss", "Einstand nach TP", "TP-Nummer", "1 bis 20 oder deaktiviert", "Verschiebt den Stop nach vollständiger Ausführung des ausgewählten TP auf den tatsächlichen Einstand."),
-    "stop_management": ("Stop Loss", "Stop-Verwaltung", "", "Einstand nach gewähltem TP / TP-Leiter", "TP-Leiter: nach bestätigtem TP1 auf Entry-VWAP, nach TP3 auf TP1, nach TP4 auf TP2. Vorhandene engere Stops bleiben erhalten."),
+    "stop_management": ("Stop Loss", "Stop-Verwaltung", "", "Einstand nach gewähltem TP / TP-Leiter / nach TP2 auf TP1", "TP-Leiter: TP1→Einstand, TP3→TP1, TP4→TP2. Nach TP2 auf TP1: erst nach vollständig bestätigten eigenen TP1-/TP2-Fills den Reststop auf den festgehaltenen TP1 setzen. Kein Nachziehen bei TP1; engere Stops bleiben erhalten."),
     "allowed_updates": ("Updates", "Erlaubte Signal-Updates", "", "Stop ändern / Einstand / TPs ersetzen / Reduzieren / Schließen / Entry stornieren", "Legt fest, welche Update-Arten aus Quellen automatisch umgesetzt werden dürfen."),
     "allow_stop_widening": ("Stop Loss", "Stop-Ausweitung erlauben", "", "Ja / Nein", "Erlaubt weiter entfernte Stops nur innerhalb der weiterhin geprüften Risikogrenzen."),
     "cost_reserve_bps": ("Risiko", "Kostenreserve", "Basispunkte", "0 bis 1000", "Puffer in der Risikoberechnung. 1 Basispunkt = 0,01 % des Preises; keine tatsächliche Gebührenabrechnung."),
@@ -50,6 +50,7 @@ VALUE_LABELS = {
     "signal_deadline": "Bis Entry-Frist oder TP", "until_target": "Bis gewähltem TP",
     "equal": "Gleichmäßig", "halving": "Halbieren", "custom": "Eigene Gewichte",
     "adaptive": "Adaptiv (maximal fünf Ziele)", "first_target": "100 % an TP1", "tp_ladder": "TP-Leiter: TP1→Entry, TP3→TP1, TP4→TP2",
+    "tp2_to_tp1": "Nach TP2 auf TP1",
     "move_stop": "Stop ändern", "break_even": "Einstand", "replace_targets": "TPs ersetzen",
     "reduce": "Reduzieren", "close": "Schließen", "cancel_entry": "Entry stornieren",
 }
@@ -104,7 +105,7 @@ def _policy_parameter_values(data, current):
         unit = backup_unit(field, current or {}, unit)
         if field == "leverage" and current is not None and current["leverage_mode"] == "signal":
             value = "Nicht verwendet (Signalmodus)"
-        if field == "break_even_after_tp" and current is not None and current["stop_management"] == "tp_ladder":
+        if field == "break_even_after_tp" and current is not None and current["stop_management"] in STOP_LADDERS:
             value = "Nicht verwendet (TP-Leiter)"
         if field == "take_profit_weights" and current is not None and current["take_profit_allocation"] != "custom":
             value = "Nicht verwendet"

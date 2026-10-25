@@ -24,6 +24,8 @@ Backup ergänzt ausschließlich fehlende Angaben. Seine Prozentwerte und Einheit
 
 TP-Verteilung unterstützt gleich, halbierend, benutzerdefiniert, adaptiv und erstes Ziel. Individuelle Gewichte müssen vollständig gültig sein. Break-even und TP-Leiter verwenden tatsächliche eigene Fills und die bestätigte Restmenge. Rundung, Börsenminimum und Richtung bleiben verbindlich.
 
+Die zusätzliche Stop-Regel `tp2_to_tp1` zieht nach vollständig bestätigten eigenen TP1- und TP2-Fills den Stop der Restposition einmalig auf den beim TP1-Abschluss festgehaltenen Zielpreis. Bei TP1 erfolgt kein automatisches Nachziehen. Ein bereits engerer Stop bleibt erhalten. Wenn TP2 die Position vollständig schließt, wird kein neuer Stop angelegt. Die normale TP-Leiter behält ihre bisherigen Stufen; das Waverider-Endziel ist davon unabhängig.
+
 Quellen-Updates können Stop, Break-even, Ziele, Reduktion, Schließung und Entry-Storno betreffen. Erlaubte Aktionen sind im Profil gespeichert; Stop-Ausweitung bleibt gesondert beschränkt. Zusammengesetzte Verwaltung benutzt den bestehenden dauerhaften Aktionsplan mit bestätigter Mengenbasis und Reihenfolge.
 
 ## Waverider
