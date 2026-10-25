@@ -12,6 +12,7 @@ from pydantic import Field, model_serializer, model_validator
 
 from aqla_hyperliquid_mcp.models import (
     DEFAULT_UPDATES,
+    MAX_SIGNAL_AGE_SECONDS,
     AqlaError,
     Model,
     Policy,
@@ -53,7 +54,7 @@ class Parameters(Model):
     entry_execution: Literal["standard", "maker_only"] = "standard"
     take_profit_execution: Literal["standard", "maker_only"] = "standard"
     max_slippage_percent: Positive = Field(default=Decimal("0.3"), le=10)
-    max_signal_age_seconds: int = Field(default=300, ge=1, le=86400)
+    max_signal_age_seconds: int = Field(default=300, ge=1, le=MAX_SIGNAL_AGE_SECONDS)
     take_profit_allocation: Literal["equal", "halving", "custom", "adaptive", "first_target"] = "equal"
     take_profit_weights: list[Positive] = Field(default_factory=list, max_length=20)
     break_even_after_tp: int | None = Field(default=None, ge=1, le=20)

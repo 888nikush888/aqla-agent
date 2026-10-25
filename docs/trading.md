@@ -14,7 +14,7 @@ Profiländerungen gelten für neue Planungen. Alte Trades behalten ihre Profile 
 
 Einzelentry, Entry-Zone und zwei ausdrückliche Entries verwenden ein gemeinsames Risiko-/Mengenbudget. Die Bereichsauswahl unterstützt near, far, midpoint und split. Nachrücken eines weiteren Einstiegs erfordert die vorhandenen Budget-, Frische-, Eigentums- und Schutzprüfungen. Teilfills derselben Order sind keine Doppelorders.
 
-Ausdrücklich verzögerte Signale warten auf ihre belegte Bedingung. Die ursprüngliche Signalfrist wird nie verlängert. Standard- und Maker-only-Ausführung bleiben getrennte Optionen für Entry und TP. Maker-only wird nicht stillschweigend in eine Takerorder umgewandelt.
+Ausdrücklich verzögerte Signale warten auf ihre belegte Bedingung. Die Signalfrist ist von einer Sekunde bis sieben Tage einstellbar; der Ausgangswert bleibt fünf Minuten. Sie beginnt am ursprünglichen Signalzeitpunkt und wird durch Wiederanlauf oder spätere Profiländerungen nicht verlängert. Auch bei einer langen Signalfrist müssen Konto, Kurs und Orderbuch vor der Ausführung aktuell bestätigt sein. Standard- und Maker-only-Ausführung bleiben getrennte Optionen für Entry und TP. Maker-only wird nicht stillschweigend in eine Takerorder umgewandelt.
 
 Express erkennt ausschließlich qualifizierte eindeutige Vorlagen und verwendet denselben Interpretations- und Handelspfad. Harmlose Kopfzeilen schaffen keine zusätzliche Handelsautorität. Unbekannte Formen gehen an die normale Interpretation. Änderungen am qualifizierten Master müssen ausdrücklich nachgeprüft werden.
 

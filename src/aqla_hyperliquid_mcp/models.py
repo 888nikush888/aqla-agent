@@ -27,6 +27,7 @@ Nonnegative = Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 Address = Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{40}$")]
 UpdateAction = Literal["move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry"]
 DEFAULT_UPDATES: tuple[UpdateAction, ...] = ("move_stop", "break_even", "replace_targets", "reduce", "close", "cancel_entry")
+MAX_SIGNAL_AGE_SECONDS = 7 * 24 * 60 * 60
 
 
 def now_ms() -> int:
@@ -70,7 +71,7 @@ class Policy(Model):
     waverider_lifetime: Literal["signal_deadline", "until_target"] = Field(default="signal_deadline", repr=False,
         description="until_target keeps an already filled setup's waves active until its selected TP; original entry deadlines never change")
     max_slippage_percent: Positive = Field(default=Decimal("0.3"), le=10)
-    max_signal_age_seconds: int = Field(default=300, ge=1, le=86400)
+    max_signal_age_seconds: int = Field(default=300, ge=1, le=MAX_SIGNAL_AGE_SECONDS)
     take_profit_allocation: Literal["equal", "halving", "custom", "adaptive", "first_target"] = "equal"
     take_profit_weights: list[Positive] = Field(default_factory=list, max_length=20)
     break_even_after_tp: int | None = Field(default=None, ge=1, le=20)

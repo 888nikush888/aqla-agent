@@ -1,7 +1,7 @@
 """Readable trading settings; display only, never a second configuration source."""
 from decimal import Decimal
 
-from aqla_hyperliquid_mcp.models import Policy
+from aqla_hyperliquid_mcp.models import MAX_SIGNAL_AGE_SECONDS, Policy
 
 # Field -> category, label, unit, allowed values, explanation.
 PARAMETERS = {
@@ -28,7 +28,7 @@ PARAMETERS = {
     "waverider_until_tp": ("Verwaltung", "Waverider-Ende", "TP", "1–20 / last", "Am gewählten oder letzten vorhandenen TP enden neue Wellen; Laufzeit laut Waverider-Einstellung."),
     "waverider_lifetime": ("Verwaltung", "Waverider-Laufzeit", "", "signal_deadline / until_target", "Bis zur Entry-Frist oder unabhängig davon bis zum gewählten TP. Ursprüngliche Entries behalten immer ihre Signalfrist; SL und Risikobudget bleiben verbindlich."),
     "max_slippage_percent": ("Ausführung", "Maximale Slippage", "% Referenzpreis", "> 0 bis 10", "Preisgrenze für Marktorders relativ zum Referenzpreis. Eine vollständige Ausführung wird dadurch nicht garantiert."),
-    "max_signal_age_seconds": ("Einstieg", "Maximales Signalalter", "Sekunden", "1 bis 86400", "Gültigkeitsdauer ab ursprünglichem Signalzeitpunkt. Die Frist wird durch Wiederholung nicht verlängert."),
+    "max_signal_age_seconds": ("Einstieg", "Maximales Signalalter", "Sekunden", f"1 bis {MAX_SIGNAL_AGE_SECONDS}", "Gültigkeitsdauer ab ursprünglichem Signalzeitpunkt. Die Frist wird durch Wiederholung nicht verlängert."),
     "take_profit_allocation": ("Take Profit", "TP-Verteilung", "", "Gleichmäßig / Halbieren / Eigene Gewichte / Adaptiv / 100 % an TP1", "Adaptiv: maximal fünf erste Signalziele, 50/25/12,5/7,5/5 %. Falls Mindestgrößen nicht reichen, weniger Ziele ohne größere Position. Das letzte erhält den Rest. 100 % an TP1 nutzt nur das erste Ziel."),
     "take_profit_weights": ("Take Profit", "Eigene TP-Gewichte", "% je TP", "Bis 20 Werte > 0; Summe 100", "Nur für eigene Gewichte. Anzahl muss den TPs des Signals entsprechen; minimale Börsengrößen gelten weiterhin."),
     "break_even_after_tp": ("Stop Loss", "Einstand nach TP", "TP-Nummer", "1 bis 20 oder deaktiviert", "Verschiebt den Stop nach vollständiger Ausführung des ausgewählten TP auf den tatsächlichen Einstand."),
