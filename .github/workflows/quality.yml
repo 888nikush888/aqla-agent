@@ -41,7 +41,7 @@ jobs:
       - run: uv run --no-sync aqla-hyperliquid-mcp --check-coverage
       - name: Tests, including the local WebSocket server
         run: uv run --no-sync pytest -q -n 2 --dist loadfile --durations=25 --junitxml=reports/tests.xml --cov=aqla_agent --cov=aqla_hyperliquid_mcp --cov-branch --cov-fail-under=70 --cov-report=term-missing:skip-covered --cov-report=xml:reports/coverage.xml
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: test-reports-python-${{ matrix.python }}
@@ -140,7 +140,7 @@ jobs:
         run: |
           PYTHONPATH=src .cache/hermes-venv/bin/python tests/native_tool_smoke.py --hermes-source .cache/hermes-source --home .cache/tool-output-home --mcp-python .venv/bin/python
           .cache/hermes-venv/bin/python tests/native_token_efficiency_smoke.py --hermes-source .cache/hermes-source --home .cache/token-efficiency-home
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: native-hermes-dependency-report
@@ -173,7 +173,7 @@ jobs:
           uv pip install --python .cache/wheel-check/bin/python dist/*.whl
           .cache/wheel-check/bin/python -m aqla_hyperliquid_mcp --check-coverage
           .cache/wheel-check/bin/aqla-install-hermes --destination .cache/wheel-deploy --owner-id 12345 --model ci-only --model-url https://example.invalid/v1 --prepare-only
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aqla-agent-vps
           path: dist/
